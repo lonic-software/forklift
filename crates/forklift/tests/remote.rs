@@ -12972,13 +12972,14 @@ impl StrippedRemote {
         let signed = pallet_head(area, "b", "main");
 
         let trust = area.path("server-root/.forklift/trust");
+        // The office ref and its copy.
         let office: Vec<PathBuf> = walk(&area.path("server-root/.forklift")).into_iter()
             .filter(|entry| entry.file_name().is_some_and(|name| name == "office"))
             .collect();
-        assert_eq!(office.len(), 1, "{:?}", office);
+        assert_eq!(office.len(), 2, "{:?}", office);
 
         let mut stripped = Vec::new();
-        for path in [trust, area.path("server-root/.forklift/trust-copy"), office[0].clone()] {
+        for path in [trust, area.path("server-root/.forklift/trust-copy")].into_iter().chain(office) {
             stripped.push((path.clone(), std::fs::read(&path).unwrap()));
             forklift_core::util::file_utils::remove_file(&path).unwrap();
         }

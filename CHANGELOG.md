@@ -27,6 +27,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **Each metadata pallet's ref now has a copy.** Every change to a ref under `.forklift/meta/` also
+  writes the same bytes to `.forklift/meta-copy/<name>`, under the same lock, in the order that
+  leaves the copy at the newer head if the write is interrupted. Beside a ref that reads, garbage
+  collection keeps the head the copy names as well as the ref's own.
 - **A killed process no longer leaves a lock to remove by hand.** The bay's lock, the object
   store's lock and a served warehouse's `serve.lock` are now kernel locks, released when the
   process holding them ends, however it ends. A `forklift-server` that crashed or was killed

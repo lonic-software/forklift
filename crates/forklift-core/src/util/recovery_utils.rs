@@ -1583,6 +1583,12 @@ struct WalkRoots {
 /// Every user and every meta pallet head, for [`gc_root_sources`] and [`durable_root_sources`]. A
 /// ref that cannot be read is an error under `FailClosed`, and a note in `degraded` under
 /// `Tolerate`.
+///
+/// A meta ref that reads also yields its copy's head, in every mode, when the copy parses and
+/// names another head: a crash or a failed restore can leave the copy ahead of its ref, and its
+/// head must outlive the grace period until the copy is mended. A copy that does not parse adds
+/// nothing and fails nothing; one that cannot be read is an error under `FailClosed` and a note
+/// under `Tolerate`, as a ref is. The copy of a ref that does not read is not consulted here.
 fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<String>) -> Result<(Vec<String>, Vec<String>), String> {
     let mut parcels: Vec<String> = Vec::new();
     let mut meta_heads: Vec<String> = Vec::new();
@@ -1609,7 +1615,27 @@ fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<St
 
             match (namespace, head) {
                 (pallet_utils::PalletNamespace::User, Some(head)) => parcels.push(head),
-                (pallet_utils::PalletNamespace::Meta, Some(head)) => meta_heads.push(head),
+                (pallet_utils::PalletNamespace::Meta, Some(head)) => {
+                    let copy = match pallet_utils::read_meta_copy_state(&name) {
+                        Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => pallet_utils::parse_ref_bytes(&bytes),
+                        Ok(_) => None,
+                        Err(e) => match bay_policy {
+                            bay_utils::BayReadPolicy::FailClosed => return Err(e),
+                            bay_utils::BayReadPolicy::Tolerate => {
+                                degraded.push(format!(
+                                    "the copy of pallet \"{}\"'s ref could not be read this run ({}); a head \
+                                    only it names was treated as held by nothing rather than blocking this command.",
+                                    pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire(), e
+                                ));
+                                None
+                            }
+                        },
+                    };
+                    if let Some(copied) = copy.filter(|copied| *copied != head) {
+                        meta_heads.push(copied);
+                    }
+                    meta_heads.push(head);
+                }
                 (_, None) => {}
             }
         }
@@ -6197,6 +6223,56 @@ mod tests {
 
         assert!(referenced.contains(&target_hash),
             "a shard-only reference (absent from the ledger) must still be found by the walk");
+    }
+
+    /// A meta ref's copy left ahead of its intact ref (a crash or a failed restore between the
+    /// two writes) has its head rooted beside the ref's, in GC's fail-closed read too, so the
+    /// head outlives the grace period until the copy is mended.
+    /// Revert: yield only the ref's own head → H2 is not among the meta heads → red.
+    #[test]
+    fn a_copy_left_ahead_of_its_ref_roots_its_head() {
+        use crate::util::pallet_utils::{self, tests::{scratch, stub_parcel}};
+
+        let (_root, _scope) = scratch("recovery-copy-ahead");
+        pallet_utils::write_position_in(&crate::globals::forklift_root(), &pallet_utils::BayPosition::new("main", None)).unwrap();
+        let (h1, h2) = (stub_parcel("h1"), stub_parcel("h2"));
+        pallet_utils::update_meta_pallet_head("tags", None, &h1, &pallet_utils::RefPreconditions::NONE).unwrap();
+        std::fs::write(pallet_utils::get_meta_copy_path("tags"), format!("{}\n", h2)).unwrap();
+
+        let bay_dirs = bay_utils::all_bay_state_dirs().unwrap();
+        let sources = gc_root_sources(
+            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        ).unwrap();
+
+        assert!(sources.meta_heads.contains(&h1), "{:?}", sources.meta_heads);
+        assert!(sources.meta_heads.contains(&h2), "the copy's head must be rooted: {:?}", sources.meta_heads);
+
+        // A copy that does not parse adds nothing and fails nothing.
+        std::fs::write(pallet_utils::get_meta_copy_path("tags"), "not a hash\n").unwrap();
+        let sources = gc_root_sources(
+            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        ).unwrap();
+        assert_eq!(sources.meta_heads, vec![h1.clone()]);
+
+        // A copy that cannot be read (here the copy folder is a file, so reading under it fails)
+        // fails GC closed, and is a note under heal's tolerant read. Unix only: Windows reports a
+        // path under a file as not found, so there the copy reads as absent and adds nothing.
+        // Revert: read an unreadable copy as absent → GC's read succeeds → red.
+        #[cfg(unix)]
+        {
+        let copies = crate::globals::forklift_root().join(pallet_utils::FOLDER_NAME_META_COPY_ROOT);
+        crate::util::file_utils::remove_dir_all(&copies).unwrap();
+        std::fs::write(&copies, "not a folder\n").unwrap();
+        let closed = gc_root_sources(
+            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        );
+        assert!(closed.is_err(), "an unreadable copy must fail GC closed: {:?}", closed.map(|s| s.meta_heads));
+        let tolerated = gc_root_sources(
+            &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::FailClosed,
+        ).unwrap();
+        assert_eq!(tolerated.meta_heads, vec![h1]);
+        assert!(tolerated.degraded.iter().any(|note| note.contains("the copy of pallet \"@tags\"")), "{:?}", tolerated.degraded);
+        }
     }
 
     // ---- §8.3 torn rescan (I5) ----
