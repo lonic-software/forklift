@@ -1125,8 +1125,8 @@ fn rebuilt_meta(data: &serde_json::Value) -> Vec<(String, String, String)> {
         .collect()
 }
 
-// Mutations: drop the copy write from a forward meta write (so the copy stays at H1), or skip
-// the meta pass in heal → red.
+// Mutation: skip both meta passes in heal → @tags stays lost, red. Either pass alone rebuilds it
+// here; the pass ahead of `--ref` and the refusing pass after the taint are pinned below.
 #[test]
 fn a_lost_meta_ref_is_rebuilt_from_its_copy() {
     let area = Area::new("meta-lost");

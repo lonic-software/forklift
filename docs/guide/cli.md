@@ -2891,6 +2891,21 @@ rebuild a ref: the list may record the pallet's deletion. It refuses with `tombs
 (exit 55) and names `forklift-server tombstone repair`, which the server's operator runs; heal the
 refs after that.
 
+#### Damaged metadata pallet refs
+
+A metadata pallet's ref (`.forklift/meta/<name>`, such as `@tags`'s) has a copy at
+`.forklift/meta-copy/<name>`. `heal` rebuilds a lost or damaged one from that copy or, with no copy,
+from the parcel the damaged file's remaining bytes still name, as for a pallet's ref. When both
+name a head and they differ, the copy is taken only when it descends from the other along first
+parents, which is where an interrupted write leaves it; otherwise `heal` changes nothing and refuses
+with `ref_damaged`, naming both. The head chosen must pass the checks a write of that pallet must
+pass before it is written. A copy that is lost or names another head beside a ref that reads is set
+to the ref's head, with a `Note:`.
+
+`heal` does not rebuild the office's ref (`@office`) or the redactions' (`@redactions`). Every
+other metadata pallet is checked against both, so while either is damaged, `heal` refuses every
+damaged metadata ref, listing the head each copy names. Write the head into the file by hand.
+
 #### A damaged fetch scope
 
 In a sparse warehouse, a fetch scope (`.forklift/config/fetch-scope`) that is lost or cannot be read

@@ -25,6 +25,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   file's change). Two bays popping one park no longer both apply it: the second applies nothing
   and says the park was taken.
 
+- **`heal` rebuilds a lost or damaged metadata pallet ref.** A ref under `.forklift/meta/` (such
+  as `@tags`'s) that is gone or no longer holds a parcel hash is rebuilt from its copy, or from the
+  parcel its remaining bytes still name, once the head passes the checks a write of that pallet
+  must pass. A copy that disagrees with those bytes is taken only when it descends from them;
+  otherwise `heal` refuses with both heads (`ref_damaged`, exit 53). A copy lost or out of step
+  beside a ref that reads is set back to the ref. The office's and the redactions' own refs are
+  not rebuilt: while either is damaged, every damaged metadata ref is refused, to be set by hand.
+
 ### Changed
 
 - **Each metadata pallet's ref now has a copy.** Every change to a ref under `.forklift/meta/` also
