@@ -1167,6 +1167,11 @@ pub enum AnchorPrecondition {
     /// The anchor file must still hold exactly these bytes. Compared as bytes, not as a decoded
     /// anchor: any rewrite refuses.
     Bytes(Vec<u8>),
+
+    /// The trust file's copy must still hold exactly these bytes: a decision that judged the
+    /// copy's anchor, as heal does when the trust file is lost and the office is rebuilt.
+    /// [`AnchorPrecondition::Bytes`] reads the trust file only, so it cannot pin this one.
+    CopyBytes(Vec<u8>),
 }
 
 /// The pallet heads a trust write recorded as its boundary.
@@ -1221,10 +1226,16 @@ pub(crate) fn check_preconditions(_lock: &crate::util::lock_utils::RefLock,
     }
 
     let anchor = match &preconditions.anchor {
-        AnchorPrecondition::NotConsumed => None,
+        AnchorPrecondition::NotConsumed | AnchorPrecondition::CopyBytes(_) => None,
         AnchorPrecondition::Absent => Some(None),
         AnchorPrecondition::Bytes(bytes) => Some(Some(bytes.as_slice())),
     };
+
+    if let AnchorPrecondition::CopyBytes(bytes) = &preconditions.anchor {
+        if crate::util::office_utils::read_trust_copy_bytes()?.as_deref() != Some(bytes.as_slice()) {
+            return Err(RefUpdateError::AnchorMoved);
+        }
+    }
 
     if let Some(expected) = anchor {
         if crate::util::office_utils::read_trust_anchor_bytes()?.as_deref() != expected {

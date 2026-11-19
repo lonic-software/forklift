@@ -760,6 +760,54 @@ pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+/// The bytes of the trust file's copy, undecoded (`None`: nothing stands there), for a write
+/// conditioned on them ([`AnchorPrecondition::CopyBytes`](pallet_utils::AnchorPrecondition::CopyBytes)).
+///
+/// # Returns
+/// * `Err` - If something other than a file, or a link to one, stands there, or it could not be
+///           read.
+pub(crate) fn read_trust_copy_bytes() -> Result<Option<Vec<u8>>, String> {
+    match read_trust_file(FILE_NAME_TRUST_COPY) {
+        Ok(bytes) => Ok(bytes),
+        Err(TrustFileError::NotAFile(path)) => Err(format!("The trust file's copy (\"{}\") is not a file or a link to one.", path)),
+        Err(TrustFileError::Unreadable(why)) => Err(why),
+    }
+}
+
+/// Which of the trust file and its copy an anchor was read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustFileKind {
+    Trust,
+    Copy,
+}
+
+/// The anchors the trust file and its copy hold, in that order, each with the bytes it was
+/// decoded from: what heal verifies a rebuilt office head against. A file that is missing, is not
+/// a file, does not parse, or that a newer Forklift wrote gives none, and neither does one that
+/// could not be read, which is noted.
+pub(crate) fn trust_file_anchors(notes: &mut Vec<String>) -> Vec<(TrustFileKind, TrustAnchor, Vec<u8>)> {
+    let mut anchors = Vec::new();
+
+    for (kind, name) in [(TrustFileKind::Trust, FILE_NAME_TRUST), (TrustFileKind::Copy, FILE_NAME_TRUST_COPY)] {
+        match read_trust_entry(name) {
+            Ok(Some(Ok(bytes))) => {
+                let parsed = std::str::from_utf8(&bytes).ok().and_then(|text| parse_trust_anchor_classified(text).ok());
+
+                if let Some(anchor) = parsed {
+                    anchors.push((kind, anchor, bytes));
+                }
+            }
+            Ok(_) => {}
+            Err(why) => notes.push(format!(
+                "\"{}\" could not be read, so its anchor was not used to verify the office: {}",
+                forklift_root().join(name).to_string_lossy(), why.trim_end_matches('.')
+            )),
+        }
+    }
+
+    anchors
+}
+
 /// Why the trust file's bytes could not be read.
 enum TrustFileError {
     /// Something other than a file, or a link to one, stands at its path, named here: damage,

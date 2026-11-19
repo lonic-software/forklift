@@ -1104,35 +1104,184 @@ fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>)
     }
 }
 
-/// Run one repair pass over every meta ref: a ref that reads has a lost or differing copy set to
-/// it, and a lost or damaged ref other than the office's and `@redactions`' is rebuilt from its
-/// copy or its own bytes, while both of those read. A lost or damaged office or `@redactions` ref
-/// is refused, and so is every other damaged meta ref beside it, since each is verified against
-/// the office and checked against the redactions.
+/// What a meta repair pass did: the meta refs' [`Repair`], and the trust file repair run between
+/// the office's rebuild and the other meta refs'.
+#[derive(Debug, Default)]
+pub struct MetaRepair {
+    pub repair: Repair,
+    pub trust: crate::util::office_utils::TrustRepair,
+}
+
+/// A meta repair pass that stopped at the trust file repair: its refusal, and the office's
+/// rebuild when that landed before it.
+#[derive(Debug)]
+pub struct TrustStopped {
+    pub error: String,
+    pub rebuilt: Vec<Rebuilt>,
+}
+
+fn is_office(state: &MetaState) -> bool {
+    state.name == crate::util::office_utils::OFFICE_PALLET_NAME
+}
+
+fn is_redactions(state: &MetaState) -> bool {
+    state.name == crate::util::redaction_utils::REDACTIONS_PALLET_NAME
+}
+
+/// Run one repair pass over every meta ref, in three steps:
+/// 1. A lost or damaged office ref is rebuilt from its copy or its own bytes, at a head whose
+///    chain verifies against the anchor of the trust file or, failing that, of its copy, while
+///    `@redactions` reads. The write is pinned to the bytes of the file that anchor came from,
+///    not to the office, whose ref is what is being rebuilt.
+/// 2. The trust file and its copy are repaired ([`repair_trust`]), reading the office as step 1
+///    left it, so a trust file lost beside a lost office is restored once the office stands.
+/// 3. Every meta ref that reads has a lost or differing copy set to it, and a lost or damaged
+///    ref other than the office's and `@redactions'` is rebuilt from its copy or its own bytes,
+///    verified against the anchor and the office as step 2 left them, while both of those read.
+///    A lost or damaged `@redactions` ref is refused, and so is every other damaged meta ref
+///    beside it or beside an office step 1 did not rebuild, since each is verified against the
+///    office and checked against the redactions.
 ///
 /// [`Pass::BeforeTaint`] refuses nothing and drops a write that failed, leaving both to
 /// [`Pass::AfterTaint`], which judges again.
 ///
+/// [`repair_trust`]: crate::util::office_utils::repair_trust
+///
 /// # Returns
-/// * `Ok(Repair)`  - What it rebuilt, and in [`Pass::AfterTaint`] what it refused.
-/// * `Err(String)` - If the meta refs or their copies could not be listed.
-pub fn repair_meta(pass: Pass) -> Result<Repair, String> {
+/// * `Ok(MetaRepair)`      - What it rebuilt, and in [`Pass::AfterTaint`] what it refused; and
+///                           what the trust file repair wrote and noted.
+/// * `Err(TrustStopped)`   - The trust file repair's refusal, with the office rebuild that
+///                           landed before it.
+pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
     let mut report = Repair::default();
-    let states = meta_states(&mut report.notes)?;
+    let mut tainted = None;
+
+    // Never fails today (what cannot be read is noted), so the trust repair below always runs.
+    let states = meta_states(&mut report.notes).unwrap_or_default();
+    let redactions_damaged = states.iter().any(|state| is_redactions(state) && state.damage().is_some());
+    let office = states.iter().find(|state| is_office(state) && state.damage().is_some());
+    let office_judged = office.is_some() && !redactions_damaged;
+
+    if let (Some(state), false) = (office, redactions_damaged) {
+        let tainted = tainted.get_or_insert_with(|| Tainted::read(&mut report.notes));
+        rebuild_office(state, tainted, pass, &mut report);
+    }
+
+    let trust = crate::util::office_utils::repair_trust()
+        .map_err(|error| TrustStopped { error, rebuilt: report.rebuilt.clone() })?;
+
+    if report.stopped.is_none() {
+        repair_other_meta(pass, office_judged, &mut tainted, &mut report);
+    }
+
+    Ok(MetaRepair { repair: report, trust })
+}
+
+/// Step 1 of [`repair_meta`]: judge the damaged office ref `state` and write it.
+fn rebuild_office(state: &MetaState, tainted: &Tainted, pass: Pass, report: &mut Repair) {
+    let refuse = |report: &mut Repair, reason: String, candidates: Vec<Candidate>| if pass == Pass::AfterTaint {
+        report.refused.push(Refused { pallet: state.wire(), reason, candidates });
+    };
+
+    let (head, source) = match choose_meta(state, tainted) {
+        Ok(chosen) => chosen,
+        Err((reason, candidates)) => return refuse(report, reason, candidates),
+    };
+    let candidates = vec![Candidate { head: head.clone(), source: source.to_string() }];
+
+    // The trust file's anchor first, so a copy is used only when the trust file is lost or does
+    // not verify the head. The head is never chosen by the anchor: a head neither verifies is
+    // refused.
+    let anchors = crate::util::office_utils::trust_file_anchors(&mut report.notes);
+    let mut failures = Vec::new();
+    let mut verified = None;
+
+    for (kind, anchor, bytes) in anchors {
+        let file = match kind {
+            crate::util::office_utils::TrustFileKind::Trust => "the trust file",
+            crate::util::office_utils::TrustFileKind::Copy => "the trust file's copy",
+        };
+
+        match crate::util::audit_utils::verify_office_chain(&anchor, &head) {
+            Ok(_) => {
+                verified = Some(match kind {
+                    crate::util::office_utils::TrustFileKind::Trust => pallet_utils::AnchorPrecondition::Bytes(bytes),
+                    crate::util::office_utils::TrustFileKind::Copy => pallet_utils::AnchorPrecondition::CopyBytes(bytes),
+                });
+                break;
+            }
+            Err(why) => failures.push(format!("against the anchor of {}: {}", file, why.to_string().trim_end_matches('.'))),
+        }
+    }
+
+    let Some(anchor) = verified else {
+        return refuse(report, match failures.is_empty() {
+            true => format!("parcel {} cannot be verified: neither the trust file nor its copy holds an anchor heal can read", head),
+            false => format!("parcel {} does not verify as the office's history {}", head, failures.join("; nor ")),
+        }, candidates);
+    };
+
+    let preconditions = pallet_utils::RefPreconditions {
+        office: pallet_utils::OfficePrecondition::NotConsumed,
+        anchor,
+        pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+    };
+
+    write_meta_rebuild(state, head, source, &preconditions, pass, report);
+}
+
+/// Write the rebuild of damaged meta ref `state` at `head`, found at `source`, and report it.
+///
+/// # Returns
+/// * `true` - If the pass stops here (`report.stopped` says why).
+fn write_meta_rebuild(state: &MetaState, head: String, source: &str, preconditions: &pallet_utils::RefPreconditions, pass: Pass, report: &mut Repair) -> bool {
+    let damage = state.damage().expect("only a damaged ref is rebuilt");
+    let candidates = vec![Candidate { head: head.clone(), source: source.to_string() }];
+    let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions);
+
+    // A write can land and still report a failure (under a standing taint, its rename goes
+    // through and the taint is reported), so the ref read back decides.
+    let landed = pallet_utils::get_pallet_head_in(PalletNamespace::Meta, &state.name).ok().flatten().as_deref() == Some(head.as_str());
+
+    let reason = match written {
+        _ if landed => {
+            report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
+            return false;
+        }
+        // As in the user pass: the refusal is the answer, and what this pass rebuilt stays
+        // reported.
+        Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
+            report.stopped = Some(error);
+            return true;
+        }
+        Err(_) if pass == Pass::BeforeTaint => return false,
+        Err(error) => format!("the rebuild at {} was not written: {}", head, error),
+        Ok(()) => format!("the rebuild at {} did not read back", head),
+    };
+
+    if pass == Pass::AfterTaint {
+        report.refused.push(Refused { pallet: state.wire(), reason, candidates });
+    }
+
+    false
+}
+
+/// Step 3 of [`repair_meta`], over the meta refs as the steps before it left them. The office is
+/// skipped when step 1 judged it (`office_judged`), which reported it.
+fn repair_other_meta(pass: Pass, office_judged: bool, tainted: &mut Option<Tainted>, report: &mut Repair) {
+    let states = meta_states(&mut report.notes).unwrap_or_default();
 
     let blocking: Vec<String> = states.iter()
-        .filter(|state| state.damage().is_some())
-        .filter(|state| [crate::util::office_utils::OFFICE_PALLET_NAME, crate::util::redaction_utils::REDACTIONS_PALLET_NAME].contains(&state.name.as_str()))
+        .filter(|state| state.damage().is_some() && (is_office(state) || is_redactions(state)))
         .map(MetaState::wire)
         .collect();
 
-    let tainted = match states.iter().any(|state| state.damage().is_some()) {
-        true => Some(Tainted::read(&mut report.notes)),
-        false => None,
-    };
+    if states.iter().any(|state| state.damage().is_some()) && tainted.is_none() {
+        *tainted = Some(Tainted::read(&mut report.notes));
+    }
 
     for state in &states {
-        let Some(damage) = state.damage() else {
+        let Some(_) = state.damage() else {
             if let Some(head) = state.reference.as_deref().and_then(pallet_utils::parse_ref_bytes) {
                 if state.copy != pallet_utils::MetaCopyState::Bytes(state.reference.clone().unwrap_or_default()) {
                     mend_copy(state, &head, pass, &mut report.notes);
@@ -1141,13 +1290,17 @@ pub fn repair_meta(pass: Pass) -> Result<Repair, String> {
             continue;
         };
 
+        if office_judged && is_office(state) {
+            continue;
+        }
+
         let mut refuse = |reason: String, candidates: Vec<Candidate>| if pass == Pass::AfterTaint {
             report.refused.push(Refused { pallet: state.wire(), reason, candidates });
         };
 
         let choice = choose_meta(state, tainted.as_ref().expect("read when a ref is damaged"));
 
-        if blocking.contains(&state.wire()) {
+        if is_redactions(state) || (is_office(state) && blocking.contains(&state.wire())) {
             let candidates = match choice {
                 Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
                 Err((_, candidates)) => candidates,
@@ -1181,27 +1334,10 @@ pub fn repair_meta(pass: Pass) -> Result<Repair, String> {
             }
         };
 
-        let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, &preconditions);
-
-        // A write can land and still report a failure (under a standing taint, its rename goes
-        // through and the taint is reported), so the ref read back decides.
-        let landed = pallet_utils::get_pallet_head_in(PalletNamespace::Meta, &state.name).ok().flatten().as_deref() == Some(head.as_str());
-
-        match written {
-            _ if landed => report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() }),
-            // As in the user pass: the refusal is the answer, and what this pass rebuilt stays
-            // reported.
-            Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
-                report.stopped = Some(error);
-                break;
-            }
-            Err(_) if pass == Pass::BeforeTaint => {}
-            Err(error) => refuse(format!("the rebuild at {} was not written: {}", head, error), candidates),
-            Ok(()) => refuse(format!("the rebuild at {} did not read back", head), candidates),
+        if write_meta_rebuild(state, head, source, &preconditions, pass, report) {
+            break;
         }
     }
-
-    Ok(report)
 }
 
 #[cfg(test)]

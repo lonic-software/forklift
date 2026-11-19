@@ -202,6 +202,7 @@ impl Operation {
                 AnchorPrecondition::NotConsumed => String::new(),
                 AnchorPrecondition::Absent => "absent".to_string(),
                 AnchorPrecondition::Bytes(bytes) => format!("bytes {}", crate::util::sign_utils::to_hex(bytes)),
+                AnchorPrecondition::CopyBytes(bytes) => format!("copy-bytes {}", crate::util::sign_utils::to_hex(bytes)),
             },
             // The pathspec's length, then its paths, so the carried triples after it stay apart.
             self.pathspec.len().to_string(),
@@ -286,8 +287,9 @@ impl Operation {
             anchor: match anchor.as_str() {
                 "" => AnchorPrecondition::NotConsumed,
                 "absent" => AnchorPrecondition::Absent,
-                _ => match anchor.strip_prefix("bytes ").map(crate::util::sign_utils::from_hex) {
-                    Some(Ok(bytes)) => AnchorPrecondition::Bytes(bytes),
+                _ => match (anchor.strip_prefix("bytes "), anchor.strip_prefix("copy-bytes ")) {
+                    (Some(hex), _) => AnchorPrecondition::Bytes(crate::util::sign_utils::from_hex(hex).map_err(|_| "is malformed.".to_string())?),
+                    (_, Some(hex)) => AnchorPrecondition::CopyBytes(crate::util::sign_utils::from_hex(hex).map_err(|_| "is malformed.".to_string())?),
                     _ => return Err("is malformed.".to_string()),
                 },
             },
@@ -937,6 +939,7 @@ mod tests {
         for (office, anchor) in [
             (OfficePrecondition::At(Some("e".repeat(64))), AnchorPrecondition::Bytes(b"anchor\nbytes".to_vec())),
             (OfficePrecondition::At(None), AnchorPrecondition::Absent),
+            (OfficePrecondition::NotConsumed, AnchorPrecondition::CopyBytes(b"copy\nbytes".to_vec())),
             (OfficePrecondition::NotConsumed, AnchorPrecondition::NotConsumed),
         ] {
             operation.office = office;
