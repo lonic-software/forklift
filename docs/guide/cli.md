@@ -2926,7 +2926,7 @@ or the damaged file names one parcel. A ref lost together with its copy leaves
 nothing to tell it from one never written, and reads as empty. A link at any pallet's ref path is
 never followed: the read refuses it as blocked, naming moving it aside, and `heal` leaves it with
 a `Note:` naming the same. A ref whose path cannot be read is refused, never read as a pallet never
-written, naming making the ref's file readable.
+written, naming making the ref's file and the folders on the way to it readable.
 
 The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the
 trust file or, when that file is lost, is not a file, does not read as an anchor or does not

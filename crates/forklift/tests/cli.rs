@@ -8060,7 +8060,10 @@ fn heal_restores_the_trust_file_before_ref_sets_a_damaged_user_ref() {
 #[test]
 fn damaged_trust_refuses_with_its_code_and_names_heal_where_heal_mends() {
     fn sidecar_of_head(warehouse: &TestWarehouse) -> std::path::PathBuf {
-        let head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+        sidecar_of(warehouse, "pallets/main")
+    }
+    fn sidecar_of(warehouse: &TestWarehouse, reference: &str) -> std::path::PathBuf {
+        let head = std::fs::read_to_string(warehouse.root.join(".forklift").join(reference)).unwrap();
         let head = head.trim();
         warehouse.root.join(".forklift/objects").join(&head[0..2]).join(format!("{}.sig", &head[2..]))
     }
@@ -8103,6 +8106,10 @@ fn damaged_trust_refuses_with_its_code_and_names_heal_where_heal_mends() {
             &["audit", "--full"], 70, "signature_damaged", "", "clone the warehouse again from a remote that holds the parcel"),
         ("head signature lost", Box::new(|w| forklift_core::util::file_utils::remove_file(sidecar_of_head(w)).unwrap()),
             &["audit", "--full"], 71, "signature_missing", "", "may have been tampered with"),
+        // The office's own chain: every office parcel is signed, so a lost signature there is
+        // the same refusal, never one that reads as damage to the parcel.
+        ("office head signature lost", Box::new(|w| forklift_core::util::file_utils::remove_file(sidecar_of(w, "meta/office")).unwrap()),
+            &["audit"], 71, "signature_missing", "", "carries no signature in this store, and every office parcel is signed"),
     ];
 
     for (index, (case, damage, command, exit, code, step, phrase)) in cases.into_iter().enumerate() {

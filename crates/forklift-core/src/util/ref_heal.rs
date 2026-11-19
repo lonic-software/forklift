@@ -425,15 +425,17 @@ pub fn detect(notes: &mut Vec<String>) -> Result<Vec<DamagedRef>, String> {
 
     for (which, dir) in checkouts(notes).0 {
         match pallet_utils::read_position_in(&dir) {
-            // Judged as it stands, as above: whatever stands at the ref's path was judged there,
-            // and a path whose state cannot be read tells nothing of a loss.
+            // Judged as it stands, as above: a file at the ref's path was judged there, anything
+            // else standing there (a folder, a link) is no ref and is named, and a path whose state
+            // cannot be read tells nothing of a loss.
             Ok(position) if position.base.is_some() => {
                 let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, &position.pallet);
-                match std::fs::symlink_metadata(&path) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match pallet_utils::read_file_state(&path) {
+                    Ok(pallet_utils::MetaCopyState::Bytes(_)) => {}
+                    Ok(pallet_utils::MetaCopyState::Absent) => {
                         found.entry(position.pallet).or_insert(RefDamage::Missing);
                     }
+                    Ok(pallet_utils::MetaCopyState::Other) => push_note(notes, not_a_file_note(&position.pallet, &path)),
                     Err(error) => push_note(notes, format!(
                         "Whether {} stands on a lost pallet ref could not be told: the ref of pallet \"{}\" (\"{}\") could not be read: {}",
                         which, position.pallet, path.to_string_lossy(), error
@@ -867,7 +869,7 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                         break;
                     }
                     Err(error) => match read_back(PalletNamespace::User, &damaged.pallet, &head) {
-                        ReadBack::Landed => {
+                        ReadBack::Landed if !taint_unrecorded(&error) => {
                             push_note(&mut report.notes, landed_despite(&damaged.pallet, &head, &error));
                             report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source });
                         }
@@ -886,6 +888,13 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
     }
 
     Ok(report)
+}
+
+/// Whether a ref write's `error` says its folder was not synced and no taint records that, so the
+/// ref it renamed into place is visible but not durable, and nothing heals it: such a write is
+/// never reported as a rebuild, whatever the ref reads back as.
+fn taint_unrecorded(error: &RefUpdateError) -> bool {
+    matches!(error, RefUpdateError::Failed(error) if crate::util::file_utils::is_taint_unrecorded(error))
 }
 
 /// The note for a rebuild of the ref of `pallet` (as it is written on the wire) at `head` that
@@ -1498,25 +1507,79 @@ fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaS
     Ok(states)
 }
 
-/// Whether `head` is `ancestor` or descends from it along first parents. The error says what the
-/// failed parcel read tells of that history.
-fn first_parent_descends(head: &str, ancestor: &str) -> Result<bool, (String, crate::util::file_utils::ReadFault)> {
-    let mut at = head.to_string();
-    let mut seen = BTreeSet::new();
+/// Which of a meta ref's two heads descends from the other along first parents.
+#[derive(Debug, PartialEq, Eq)]
+enum Descent {
+    /// The copy's head descends from what the ref's bytes name.
+    CopyAhead,
+    /// What the ref's bytes name descends from the copy's head.
+    RefAhead,
+    /// Neither descends from the other.
+    Neither,
+}
+
+/// One first-parent walk from a head toward the head it may descend from.
+struct DescentWalk {
+    at: Option<String>,
+    target: String,
+    seen: BTreeSet<String>,
+    failed: Option<(String, crate::util::file_utils::ReadFault)>,
+    reached: bool,
+}
+
+impl DescentWalk {
+    fn new(head: &str, target: &str) -> Self {
+        DescentWalk { at: Some(head.to_string()), target: target.to_string(), seen: BTreeSet::new(), failed: None, reached: false }
+    }
+
+    /// Take one step; false once the walk has reached its target, ended or failed.
+    fn step(&mut self) -> bool {
+        let Some(at) = self.at.take() else { return false };
+        if at == self.target {
+            self.reached = true;
+            return false;
+        }
+        if !self.seen.insert(at.clone()) {
+            return false;
+        }
+        match object_utils::load_parcel_faulted(&at) {
+            Ok(parcel) => self.at = parcel.parents.first().cloned(),
+            Err(error) => self.failed = Some(error),
+        }
+        self.at.is_some()
+    }
+}
+
+/// Which of `copy` and `salvaged` (two different heads) descends from the other along first
+/// parents. The two walks step in turn, so the one that descends is found in as many steps as
+/// it lies ahead, however long the other's history; a read that failed on one walk decides
+/// nothing while the other can still settle it.
+///
+/// # Returns
+/// * `Err((copy_side, error))` - Neither walk settled it and one failed: whether it was the
+///                               copy's walk, and what the failed parcel read tells.
+fn which_descends(copy: &str, salvaged: &str) -> Result<Descent, (bool, (String, crate::util::file_utils::ReadFault))> {
+    let mut from_copy = DescentWalk::new(copy, salvaged);
+    let mut from_ref = DescentWalk::new(salvaged, copy);
 
     loop {
-        if at == ancestor {
-            return Ok(true);
+        let copy_going = from_copy.step();
+        if from_copy.reached {
+            return Ok(Descent::CopyAhead);
         }
+        let ref_going = from_ref.step();
+        if from_ref.reached {
+            return Ok(Descent::RefAhead);
+        }
+        if !copy_going && !ref_going {
+            break;
+        }
+    }
 
-        if !seen.insert(at.clone()) {
-            return Ok(false);
-        }
-
-        match object_utils::load_parcel_faulted(&at)?.parents.first() {
-            Some(parent) => at = parent.clone(),
-            None => return Ok(false),
-        }
+    match (from_copy.failed, from_ref.failed) {
+        (Some(error), _) => Err((true, error)),
+        (None, Some(error)) => Err((false, error)),
+        (None, None) => Ok(Descent::Neither),
     }
 }
 
@@ -1579,17 +1642,15 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
                         crate::util::file_utils::ReadFault::Untold => Owner::Unread(None),
                     });
 
-                    match first_parent_descends(&copy, &salvaged) {
-                        Ok(true) => Ok((copy, FROM_COPY)),
-                        Ok(false) => match first_parent_descends(&salvaged, &copy) {
-                            Ok(true) => Ok((salvaged, "what the ref's own bytes still name")),
-                            Ok(false) => Err((format!(
-                                "its copy names {} and its own bytes name {}, and neither descends along first parents from the other, so nothing proves either the newer",
-                                copy, salvaged
-                            ), candidates, Owner::Own(Verdict::Diverged))),
-                            Err(error) => Err(untold((&format!("what its own bytes name, {},", salvaged), &format!("its copy's head {}", copy)), error, candidates)),
-                        },
-                        Err(error) => Err(untold((&format!("its copy's head {}", copy), &format!("{}, what its own bytes name,", salvaged)), error, candidates)),
+                    match which_descends(&copy, &salvaged) {
+                        Ok(Descent::CopyAhead) => Ok((copy, FROM_COPY)),
+                        Ok(Descent::RefAhead) => Ok((salvaged, "what the ref's own bytes still name")),
+                        Ok(Descent::Neither) => Err((format!(
+                            "its copy names {} and its own bytes name {}, and neither descends along first parents from the other, so nothing proves either the newer",
+                            copy, salvaged
+                        ), candidates, Owner::Own(Verdict::Diverged))),
+                        Err((false, error)) => Err(untold((&format!("what its own bytes name, {},", salvaged), &format!("its copy's head {}", copy)), error, candidates)),
+                        Err((true, error)) => Err(untold((&format!("its copy's head {}", copy), &format!("{}, what its own bytes name,", salvaged)), error, candidates)),
                     }
                 }
             }
@@ -2119,6 +2180,10 @@ fn read_back(namespace: PalletNamespace, name: &str, head: &str) -> ReadBack {
 /// said to be unwritten. A precondition that moved refused before anything was written.
 fn unwritten_reason(head: &str, error: &RefUpdateError, read: &ReadBack) -> String {
     match (error, read) {
+        (_, ReadBack::Landed) => format!(
+            "the rebuild at {} was written but is not durable, and no taint records that: the write reported {}",
+            head, error
+        ),
         (RefUpdateError::Failed(_), ReadBack::Unread(why)) => format!(
             "the rebuild at {} may have been written: the write reported {}, and its ref could not be read back: {}",
             head, error, why
@@ -2151,8 +2216,9 @@ fn write_meta_rebuild(state: &MetaState,
             report.stopped = Some(error);
             return true;
         }
-        // As in the user pass: what the write reported stands beside the ref it wrote.
-        _ if matches!(read, ReadBack::Landed) => {
+        // As in the user pass: what the write reported stands beside the ref it wrote, unless it
+        // says the ref is not durable and no taint records it.
+        _ if matches!(read, ReadBack::Landed) && !written.as_ref().is_err_and(taint_unrecorded) => {
             if let Err(error) = &written {
                 push_note(&mut report.notes, landed_despite(&state.wire(), &head, error));
             }
@@ -2351,8 +2417,10 @@ mod tests {
     // A user rebuild whose head the trust check refuses was never written, whatever its ref
     // reads back as; one whose write landed though it reported an error is rebuilt, with what
     // the write reported beside it.
+    // A rebuild that landed with its folder not synced and no taint recording that is neither.
     // Mutations: route the trust refusal through the write's error → "may have been written",
-    // red; let a landed read-back drop the write's error → no note, red.
+    // red; let a landed read-back drop the write's error → no note, red; let a landed read-back
+    // win over an unrecorded taint → main is rebuilt, red.
     #[test]
     fn a_user_rebuild_says_what_its_write_did() {
         let (_root, _scope) = scratch("ref-heal-user-write");
@@ -2385,6 +2453,19 @@ mod tests {
         let said = format!("The ref of pallet \"main\" was rebuilt at {}, though its write reported: ", head);
         assert!(rebuilt.notes.iter().any(|note| note.starts_with(&said) && note.contains("injected directory-sync failure for")), "{:?}", rebuilt.notes);
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
+
+        // Landed, but its folder not synced and no taint recording that: visible and not
+        // durable, so it is not rebuilt, and it is not said to be unwritten.
+        std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
+        let unrecorded = {
+            let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder);
+            let _taint = crate::util::file_utils::TaintRecordFaultGuard::failing();
+            repair(Pass::AfterTaint).unwrap()
+        };
+        assert!(unrecorded.rebuilt.is_empty(), "{:?}", unrecorded.rebuilt);
+        let main = unrecorded.refused.iter().find(|refused| refused.pallet == "main").expect("main is refused");
+        assert!(main.reason.starts_with(&format!("the rebuild at {} was written but is not durable, and no taint records that: the write reported ", head)), "{}", main.reason);
+        assert!(main.reason.contains("injected taint-record failure"), "{}", main.reason);
     }
 
     // An unread refusal's way out is the step its read named, when that is not heal itself: it
@@ -2667,6 +2748,38 @@ mod tests {
         }
     }
 
+    // Which head descends is settled by the walk that reaches the other, whichever walk is longer
+    // and whatever the other could not read: a ref one parcel ahead of a copy whose older history
+    // cannot be read is ahead, not untold, and the copy one parcel ahead the same way. Only when
+    // neither walk settles it does a failed read say why, on the side that failed. Mutation: walk
+    // the copy's history to its end first → the first assertion reads `Err((true, _))`, red.
+    #[test]
+    fn the_head_that_descends_is_found_whatever_the_other_history_cannot_read() {
+        use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
+
+        let (_root, _scope) = scratch("ref-heal-which-descends");
+        let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+        let parcel = |parents: Vec<String>, what: &str| {
+            stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), parents, &operator, what, None).unwrap()
+        };
+        let object = |hash: &str| {
+            let (folder, file) = crate::util::file_utils::get_path_for_object(hash).unwrap();
+            std::path::PathBuf::from(folder).join(file)
+        };
+        let root = parcel(Vec::new(), "root");
+        let middle = parcel(vec![root.clone()], "middle");
+        let top = parcel(vec![middle.clone()], "top");
+        let elsewhere = parcel(Vec::new(), "elsewhere");
+        crate::util::file_utils::remove_file(&object(&root)).unwrap();
+        std::fs::write(object(&root), b"no object").unwrap();
+
+        assert_eq!(which_descends(&middle, &top).map_err(|(side, _)| side), Ok(Descent::RefAhead));
+        assert_eq!(which_descends(&top, &middle).map_err(|(side, _)| side), Ok(Descent::CopyAhead));
+        assert_eq!(which_descends(&middle, &elsewhere).map_err(|(side, _)| side), Err(true));
+        assert_eq!(which_descends(&elsewhere, &middle).map_err(|(side, _)| side), Err(false));
+        assert_eq!(which_descends(&elsewhere, &parcel(Vec::new(), "apart")).map_err(|(side, _)| side), Ok(Descent::Neither));
+    }
+
     // A ref ahead of its copy, the copy naming the parent of what the ref's own bytes name (a write
     // whose copy was not mended, a copy restored from an older backup), is linear history: it is
     // rebuilt at what its own bytes name, never refused as diverged. Mutation: check the descent
@@ -2820,6 +2933,20 @@ mod tests {
         assert!(tags.reason.contains(&format!("the rebuild at {} may have been written: the write reported", parcel)), "{:?}", tags);
         assert!(tags.reason.contains("and its ref could not be read back: the read was refused for the test"), "{:?}", tags);
         assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+
+        // Landed with its folder not synced and no taint recording that: visible and not
+        // durable, so it is no rebuild, and its way out stays settling why. Mutation: let the
+        // landed read-back win over an unrecorded taint → @tags is rebuilt, red.
+        let refused = {
+            let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder);
+            let _taint = crate::util::file_utils::TaintRecordFaultGuard::failing();
+            repair_meta(Pass::AfterTaint).unwrap().repair
+        };
+        assert!(refused.rebuilt.is_empty(), "{:?}", refused.rebuilt);
+        let tags = refused.refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+        assert!(tags.reason.starts_with(&format!("the rebuild at {} was written but is not durable, and no taint records that", parcel)), "{:?}", tags);
+        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+        crate::util::file_utils::remove_file(&ref_path).unwrap();
 
         let rebuilt = repair_meta(Pass::AfterTaint).unwrap().repair;
         assert!(rebuilt.refused.is_empty(), "{:?}", rebuilt.refused);

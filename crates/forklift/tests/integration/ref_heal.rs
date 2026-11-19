@@ -1812,6 +1812,12 @@ fn a_damaged_signature_beside_a_meta_parcel_is_never_the_refs_own() {
         }
         let step = forklift_core::util::ref_heal::unread_step(&format!("@{}", pallet));
         assert_eq!(refused["error"]["next_step"], step.as_str(), "{}: {}", case, refused);
+        // A lost signature names the only way out, so the step it lifts to is no dead end.
+        // Mutation: leave a lost signature uncoded → the remedy is missing, red.
+        if damage == "missing" {
+            let message = refused["error"]["message"].as_str().unwrap();
+            assert!(message.contains("clone the warehouse again from a remote you trust"), "{}: {}", case, message);
+        }
         assert!(!removal.status.success(), "{}: {}", case, text(&removal.stdout));
         assert!(said.contains("was not removed: heal could not read what it needs to judge it"), "{}: {}", case, said);
         assert!(!root.join(".forklift").join("removed-refs").exists(), "{}: nothing is kept", case);

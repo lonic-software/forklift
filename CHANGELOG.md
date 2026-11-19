@@ -76,7 +76,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   that cannot be read, or a link at its path, is refused, naming what to make readable or replace.
   A link at any pallet's ref path is never followed: it refuses as blocked, naming moving it aside,
   and `heal` leaves it with the same step. A ref whose path cannot be read refuses, naming making
-  the ref's file readable, where it read as a pallet never written. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
+  the ref's file and the folders on the way to it readable, where it read as a pallet never written. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
   report names each pallet whose ref could not be read (`pallets_unread` in `--json`) instead of
   leaving it out, and no longer says no pallet's history reaches the objects while one is named (`--json`
   schema 60).

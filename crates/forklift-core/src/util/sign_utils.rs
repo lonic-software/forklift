@@ -609,6 +609,23 @@ fn signature_damaged(why: String) -> String {
     signature_damaged_saying(why, "So that stored signature is damaged")
 }
 
+/// The refusal of a parcel stacked after trust was established that carries no signature in this
+/// store, for `why`, which names the parcel. Nothing the store keeps says whether it was signed
+/// and its signature was lost, or was stacked unsigned, so the refusal names the restore that
+/// mends the first and the warning the second needs.
+pub fn signature_missing(why: String) -> String {
+    crate::error::CoreError::refusal(
+        crate::error::RefusalCode::SignatureMissing,
+        format!(
+            "{}. A lost signature and a stripped one look alike, so the warehouse may have been \
+            tampered with. Restore the warehouse's objects from a backup, or clone the warehouse \
+            again from a remote you trust.",
+            why.trim_end().trim_end_matches('.')
+        ),
+        "",
+    ).into()
+}
+
 /// [`signature_damaged`], `so` saying what follows from `why`.
 fn signature_damaged_saying(why: String, so: &str) -> String {
     crate::error::CoreError::refusal(

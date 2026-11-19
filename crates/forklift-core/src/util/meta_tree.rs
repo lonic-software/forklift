@@ -1604,9 +1604,10 @@ pub fn verify_meta_content(pallet: &str,
         let attribution = match office {
             Some(office) => match verify_meta_signature(pallet, hash, office, &mut distrust_boundaries)? {
                 Some(key) => Attribution::Signed(key),
+                None if legacy.admits(pallet, hash)? => declared_operator(pallet, hash, parcel)?,
                 None => {
-                    legacy.require(pallet, hash)?;
-                    declared_operator(pallet, hash, parcel)?
+                    let parent_cells = parent_spine.as_ref().and_then(|parent| parent.cells.as_deref());
+                    return Err(unsigned_after_trust(pallet, hash, parcel, parent_cells));
                 }
             },
             None => declared_attribution(pallet, hash, parcel)?,
@@ -1740,22 +1741,10 @@ impl<'b> LegacyHistory<'b> {
         LegacyHistory { boundary, reachable: None }
     }
 
-    /// Refuse the unsigned parcel `hash` unless the boundary reaches it.
-    fn require(&mut self, pallet: &str, hash: &str) -> Result<(), MetaCheckError> {
-        // A walk that cannot resolve the boundary says nothing of the parcel.
-        if self.reaches(pallet, hash)? {
-            return Ok(());
-        }
-
-        // Nothing the store keeps says a parcel was signed: its signature lies beside it, so a
-        // signature lost from the store reads as none at all. The refusal stands, and is no
-        // verdict on the parcel's history.
-        Err(MetaCheckError::Untold(format!(
-            "Parcel {} on @{} carries no signature in this store and was stacked after trust was \
-            established. Every meta parcel stacked under an office must be signed by a key of \
-            the office; a lost signature and a stripped one look alike.",
-            hash, pallet
-        )))
+    /// Whether the boundary reaches the unsigned parcel `hash`, so that it is history from before
+    /// trust. A walk that cannot resolve the boundary says nothing of the parcel.
+    fn admits(&mut self, pallet: &str, hash: &str) -> Result<bool, MetaCheckError> {
+        Ok(self.reaches(pallet, hash)?)
     }
 
     /// Whether the boundary reaches the parcel `hash`. A walk that crossed an absent reference
@@ -1852,6 +1841,52 @@ fn declared_operator<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Result
     }
 
     Ok(Attribution::Declared(identifier))
+}
+
+/// The refusal of parcel `hash` on `pallet`, which carries no signature in this store and was
+/// stacked after trust was established, under a parent whose cells are `parent_cells`.
+///
+/// Nothing the store keeps beside a parcel says it was signed, but its cells do: each changed
+/// cell names its writer, a signing key or an operator, inside the hash-covered tree. A parcel
+/// that writes a cell stamped with an operator was written unsigned, and is refused whatever lies
+/// beside it, since a signed parcel's cells name its key (rule (c)): that is a verdict. Any other
+/// parcel, one whose cells name keys, or that writes none, or whose cells this read cannot give,
+/// may have lost its signature, which is no verdict; its refusal names the restore. The cells are
+/// read only for their stamps, so nothing else in them is judged before the signature is.
+fn unsigned_after_trust(pallet: &str, hash: &str, parcel: &Parcel, parent_cells: Option<&str>) -> MetaCheckError {
+    let operator_stamp = || -> Option<(String, String)> {
+        let Ok(Ok(spine)) = read_spine(&parcel.tree_hash) else { return None };
+        let mut changes = Vec::new();
+        diff_entries(
+            "",
+            root_entry(parent_cells),
+            root_entry(spine.cells.as_deref()),
+            &mut |path, hash| load_level_checked(path, hash, true),
+            &mut changes,
+        ).ok()?;
+
+        changes.iter().find_map(|change| {
+            let cell = object_utils::load_blob_faulted(change.after.as_ref()?).ok()?;
+            match parse_cell(&cell.content).ok()?.stamp {
+                Stamp::Operator(identifier) => Some((change.path.clone(), identifier)),
+                Stamp::Signer(_) => None,
+            }
+        })
+    };
+
+    match operator_stamp() {
+        Some((path, identifier)) => MetaCheckError::Verdict(Verdict::SignatureRefused, format!(
+            "Parcel {} on @{} was stacked after trust was established and written unsigned: it \
+            writes the cell {} stamped by operator {}. Every meta parcel stacked under an office \
+            must be signed by a key of the office.",
+            hash, pallet, path, identifier
+        )),
+        None => MetaCheckError::Untold(sign_utils::signature_missing(format!(
+            "Parcel {} on @{} was stacked after trust was established and carries no signature in \
+            this store",
+            hash, pallet
+        ))),
+    }
 }
 
 /// A cell's stamp, for a refusal.
@@ -3459,6 +3494,24 @@ mod tests {
             assert!(error.contains(refused.as_str()) && error.contains("after trust was established"), "{}", error);
         }
 
+        // Its own cells say it was written unsigned (stamped by an operator, which a signed
+        // parcel's changed cells never are), so that refusal is the parcel's own verdict. A
+        // parcel whose changed cells name a key was signed by it, and with no signature in this
+        // store it is a lost signature, which no check decides: the coded refusal naming the
+        // backup. Mutations: keep every unsigned parcel's refusal untold → the first assertion
+        // reads Untold, red; read every one as refused → the second reads a verdict, red.
+        let judged = verify_meta_content(PALLET, &TestRules, Some(&office), &[first.clone()], Admission::Admit, None, &second);
+        assert!(matches!(&judged, Err(MetaCheckError::Verdict(Verdict::SignatureRefused, message))
+            if message.contains("written unsigned: it writes the cell y stamped by operator alice")), "{:?}", judged.map_err(String::from));
+        let keyed_cells = apply_edits(Some(&cells_of(&first).unwrap()), &[set("k", &cell(alice.id(), "5"))]).unwrap();
+        let keyed = forge_unsigned(&[&first], keyed_cells.as_deref(), "alice");
+        let judged = verify_meta_content(PALLET, &TestRules, Some(&office), &[first.clone()], Admission::Admit, None, &keyed);
+        let Err(MetaCheckError::Untold(untold)) = judged else { panic!("{:?}", judged.map_err(String::from)) };
+        let (code, message, next) = crate::error::deframe(&untold).unwrap();
+        assert_eq!(code, "signature_missing", "{}", untold);
+        assert!(message.contains("carries no signature in this store") && message.contains("clone the warehouse again from a remote you trust"), "{}", message);
+        assert_eq!(next, "");
+
         // A signed parcel continues the pre-trust history, leaving its cells as they are.
         let signed_cells = apply_edits(Some(&cells_of(&first).unwrap()), &[set("z", &cell(alice.id(), "3"))]).unwrap();
         let signed = forge(&[&first], &kv(), signed_cells.as_deref(), &alice.signer());
@@ -3543,7 +3596,8 @@ mod tests {
         // And the other way: under an office, an unsigned parcel and a declared stamp refuse.
         let office = office(&[&alice.record]);
         let declared = forge_unsigned(&[], cells(&[("x", &declared_cell("alice", "1"))]).as_deref(), "alice");
-        assert!(verify(&office, None, &declared).unwrap_err().contains("carries no signature"));
+        let error = verify(&office, None, &declared).unwrap_err();
+        assert!(error.contains("written unsigned: it writes the cell x stamped by operator alice"), "{}", error);
         let mixed = forge(&[], &kv(), cells(&[("x", &declared_cell("alice", "1"))]).as_deref(), &alice.signer());
         let error = verify(&office, None, &mixed).unwrap_err();
         assert!(error.contains("unsigned by operator alice") && error.contains(alice.id()), "{}", error);

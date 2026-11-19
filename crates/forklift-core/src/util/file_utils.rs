@@ -960,13 +960,54 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(),
 /// [`taint_utils::activate`] has been called in this process — see
 /// [`taint_utils::record_taint`]'s own doc comment.
 fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String {
+    #[cfg(test)]
+    if TAINT_RECORD_FAULT.with(|fault| fault.get()) {
+        return format!("{}{}injected taint-record failure)", sync_error, TAINT_UNRECORDED);
+    }
+
     match taint_utils::record_taint(final_paths) {
         Ok(()) => sync_error,
-        Err(taint_error) => format!(
-            "{} (additionally, while recording a durability taint for the affected object(s): {})",
-            sync_error, taint_error
-        ),
+        Err(taint_error) => format!("{}{}{})", sync_error, TAINT_UNRECORDED, taint_error),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`taint_after_sync_failure`] report that the taint could not be recorded, as an
+    /// unactivated process's record never fails. See [`TaintRecordFaultGuard`].
+    static TAINT_RECORD_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII scope for [`TAINT_RECORD_FAULT`]: armed while it lives, cleared on construction's
+/// failure and on `Drop`, so it never bleeds into another test on a reused thread.
+#[cfg(test)]
+pub(crate) struct TaintRecordFaultGuard;
+
+#[cfg(test)]
+impl TaintRecordFaultGuard {
+    /// Fail every taint record that follows a failed directory sync on this thread.
+    pub(crate) fn failing() -> Self {
+        TAINT_RECORD_FAULT.with(|fault| fault.set(true));
+        TaintRecordFaultGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for TaintRecordFaultGuard {
+    fn drop(&mut self) {
+        TAINT_RECORD_FAULT.with(|fault| fault.set(false));
+    }
+}
+
+/// What [`taint_after_sync_failure`] puts between the sync error and the taint write's own.
+const TAINT_UNRECORDED: &str = " (additionally, while recording a durability taint for the affected object(s): ";
+
+/// Whether `error`, as a write reported it, says a directory sync failed and no taint records
+/// it: what the write renamed into place is visible, not durable, and nothing will heal it. A
+/// writer that reads its target back as landed must not report such a write as done. A message
+/// that merely holds the same words reads the same way, which only ever refuses.
+pub fn is_taint_unrecorded(error: &str) -> bool {
+    error.contains(TAINT_UNRECORDED)
 }
 
 /// Process-global count of currently-armed [`SelfTripExemptionGuard`]s. A *counter*, not a bool,

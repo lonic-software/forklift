@@ -127,8 +127,9 @@ impl From<OfficeChainError> for String {
 ///                                              endorsement checks.
 /// * `Err(OfficeChainError::Unreadable(..))`  - If a parcel or its signature cannot be read
 ///                                              from the store.
-/// * `Err(OfficeChainError::SignatureDamaged(_))` - If a signature reads but is damaged, or is
-///                                              in a form no check can run on.
+/// * `Err(OfficeChainError::SignatureDamaged(_))` - If a signature is missing from the store
+///                                              (the coded `signature_missing`), or reads but is
+///                                              damaged, or is in a form no check can run on.
 /// * `Err(OfficeChainError::Newer(_))`        - If a signature names a version this build does
 ///                                              not know, or a parcel of the chain, or an object
 ///                                              it holds, reads whole but this build cannot
@@ -245,12 +246,12 @@ fn office_parcel_signer(hash: &str, state: &OfficeState) -> Result<String, Offic
     // below.
     let raw = sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, ChainFault::Untold))?;
     // Nothing the store keeps says a parcel was signed, so a signature lost from it reads as none:
-    // the store lacks it, as it holds a damaged one damaged.
-    let raw = raw.ok_or_else(|| SignatureDamaged(format!(
-        "The office parcel {} carries no signature in this store. Every office parcel is signed; a \
-        lost signature and a stripped one look alike.",
+    // the store lacks it, as it holds a damaged one damaged. Its refusal is the coded
+    // `signature_missing`, which names the restore.
+    let raw = raw.ok_or_else(|| SignatureDamaged(sign_utils::signature_missing(format!(
+        "The office parcel {} carries no signature in this store, and every office parcel is signed",
         hash
-    )))?;
+    ))))?;
     let signature = sign_utils::decode_stored_parcel_signature_classified(&raw, hash).map_err(|refused| match refused {
         sign_utils::SignatureDecode::Newer(message) => Newer(message),
         sign_utils::SignatureDecode::Damaged(message) => SignatureDamaged(message),
@@ -700,15 +701,10 @@ pub fn verify_pallet_history(head: &str,
                 } else {
                     return Err(HistoryRefusal::verdict(match reason {
                         // A lost signature and a stripped one look alike, so the wording keeps both.
-                        TrustBoundaryReason::Unsigned => crate::error::CoreError::refusal(
-                            crate::error::RefusalCode::SignatureMissing,
-                            format!(
-                                "Parcel {} was stacked after trust was established but carries no \
-                                signature. The warehouse may have been tampered with.",
-                                hash
-                            ),
-                            "",
-                        ).into(),
+                        TrustBoundaryReason::Unsigned => sign_utils::signature_missing(format!(
+                            "Parcel {} was stacked after trust was established but carries no signature",
+                            hash
+                        )),
                         TrustBoundaryReason::UnknownKey(key_id) => format!(
                             "Parcel {} is signed with key {}, which is not tracked in the \
                             office. The warehouse may have been tampered with.",
@@ -950,7 +946,7 @@ pub(crate) fn classify_signature_of(hash: &str, signature: Option<sign_utils::Pa
             verify_signature_of(hash, &signature, office_state, "parcel")?;
 
             let key = office_state.find_key(&signature.key_id)
-                .expect("verify_one_signature found this key");
+                .expect("verify_signature_of found this key");
 
             if key.is_active() {
                 SignatureTrust::Verified { key_id: signature.key_id }
@@ -1810,27 +1806,9 @@ fn verify_self_service_change(previous: &OfficeState,
     Ok(())
 }
 
-/// Verify one parcel's signature against a key registry.
-///
-/// # Arguments
-/// * `parcel_hash` - The parcel to verify.
-/// * `state`       - The office state whose keys are acceptable.
-/// * `kind`        - What is being verified (for error messages).
-///
-/// # Returns
-/// * `Ok(())`      - If the signature is valid.
-/// * `Err(String)` - If the sidecar is missing, the key is unknown, or the signature
-///                   does not verify.
-pub fn verify_one_signature(parcel_hash: &str,
-                            state: &OfficeState,
-                            kind: &str) -> Result<(), String> {
-    let signature = sign_utils::load_parcel_signature(parcel_hash)?
-        .ok_or(format!("The {} {} carries no signature.", kind, parcel_hash))?;
-    Ok(verify_signature_of(parcel_hash, &signature, state, kind)?)
-}
-
-/// [`verify_one_signature`] of the signature `signature` already read for `parcel_hash`. A parcel
-/// with none is its caller's to judge: nothing the store keeps says a parcel was signed.
+/// Verify the signature `signature`, already read for `parcel_hash`, against the keys of `state`:
+/// `kind` names what is verified, for the refusal. A parcel with none is its caller's to judge:
+/// nothing the store keeps beside it says a parcel was signed.
 pub(crate) fn verify_signature_of(parcel_hash: &str,
                                   signature: &sign_utils::ParcelSignature,
                                   state: &OfficeState,
