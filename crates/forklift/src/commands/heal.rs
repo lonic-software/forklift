@@ -1414,7 +1414,7 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
 }
 
 /// Each refused ref's line, then its candidate heads, which the hand step writes.
-fn refusal_lines<'a>(refused: impl IntoIterator<Item = &'a ref_heal::Refused>) -> Vec<String> {
+fn refusal_lines(refused: &[ref_heal::Refused]) -> Vec<String> {
     let mut lines = Vec::new();
 
     for refused in refused {
@@ -1431,9 +1431,19 @@ fn refusal_lines<'a>(refused: impl IntoIterator<Item = &'a ref_heal::Refused>) -
     lines
 }
 
-/// `error`, with the refusal lines of every ref refused before the pass stopped.
+/// `error`, with a sentence for every ref refused before the pass stopped, naming its candidate
+/// heads inline, since the message is one paragraph.
 fn refused_too<'a>(error: String, refused: impl IntoIterator<Item = &'a ref_heal::Refused>) -> String {
-    refusal_lines(refused).iter().fold(error, |error, line| forklift_core::error::append_to_message(error, line))
+    refused.into_iter().fold(error, |error, refused| {
+        let candidates = match refused.candidates.is_empty() {
+            true => "nothing names a head for it".to_string(),
+            false => format!("candidates: {}", refused.candidates.iter()
+                .map(|candidate| format!("{} ({})", candidate.head, candidate.source)).collect::<Vec<_>>().join(", ")),
+        };
+        forklift_core::error::append_to_message(error, &format!(
+            "The ref of pallet \"{}\" was not rebuilt: {}; {}.", refused.pallet, refused.reason.trim_end_matches('.'), candidates
+        ))
+    })
 }
 
 /// Restore the checkout's scope from its copy, or set it to the paths `--scope` named.
