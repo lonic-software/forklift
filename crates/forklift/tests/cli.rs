@@ -7927,20 +7927,44 @@ fn heal_does_not_rebuild_the_office_beside_a_trust_file_a_newer_version_wrote() 
 // message.
 #[test]
 fn heal_does_not_rebuild_an_office_whose_chain_the_store_cannot_give() {
-    let (warehouse, _) = enrolled_warehouse("heal-office-unreadable");
-    let forklift = warehouse.root.join(".forklift");
-    let office = office_head(&warehouse);
-    forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
-    forklift_core::util::file_utils::remove_file(forklift.join(loose_object_relative_path(&office))).unwrap();
+    // A chain parcel the store decided is absent is the head's own refusal, so its removal is the
+    // step; one whose file could not be read says nothing of the head, so heal names itself again.
+    // Mutations: own every unreadable chain → "unreadable" next_step is the removal, red; own none
+    // → "absent" next_step is "forklift heal", red.
+    let cases: &[&str] = if cfg!(unix) { &["absent", "unreadable"] } else { &["absent"] };
+    for case in cases {
+        let (warehouse, _) = enrolled_warehouse(&format!("heal-office-{}", case));
+        let forklift = warehouse.root.join(".forklift");
+        let office = office_head(&warehouse);
+        let object = forklift.join(loose_object_relative_path(&office));
+        forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
+        match *case {
+            "absent" => forklift_core::util::file_utils::remove_file(&object).unwrap(),
+            _ => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
+                }
+            }
+        }
 
-    let refused = warehouse.run(&["--json", "heal"]);
+        let refused = warehouse.run(&["--json", "heal"]);
+        #[cfg(unix)]
+        if *case == "unreadable" {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
 
-    assert_ne!(refused.status.code(), Some(0), "{}{}", stdout(&refused), stderr(&refused));
-    let value = json(&refused);
-    let message = value["error"]["message"].as_str().unwrap();
-    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} could not be verified against the anchor: ", office)), "{}", value);
-    assert!(!message.contains("does not verify as the office's history"), "{}", value);
-    assert!(!forklift.join("meta/office").exists(), "nothing was written");
+        assert_ne!(refused.status.code(), Some(0), "{}: {}{}", case, stdout(&refused), stderr(&refused));
+        let value = json(&refused);
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} could not be verified against the anchor: ", office)), "{}", value);
+        assert!(!message.contains("does not verify as the office's history"), "{}", value);
+        let step = if *case == "absent" { "forklift heal --remove-ref @office" } else { "forklift heal" };
+        assert_eq!(value["error"]["next_step"], step, "{}: {}", case, value);
+        assert!(!forklift.join("meta/office").exists(), "nothing was written");
+    }
 }
 
 /// An office whose copy is ahead of what its damaged ref's bytes still name, along first parents,

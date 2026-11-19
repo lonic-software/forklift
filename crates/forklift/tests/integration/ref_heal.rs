@@ -1459,10 +1459,12 @@ fn a_meta_removal_heal_did_not_judge_says_why_from_that_pallets_own_note() {
 // The removal of a meta ref heal refuses as its own, with no taint standing; and refused, writing
 // nothing, while a taint stands. Mutations: drop the taint condition from the meta admission →
 // "tainted" red (the kept bytes land, and the write reports the taint); refuse a meta ref whose
-// salvage is unknown, as a user ref's removal does → "unknown" red.
+// salvage is unknown, as a user ref's removal does → "unknown" red; read an object whose file could
+// not be read as one the store holds damaged → "untold" next_step is the removal, red.
 #[test]
 fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
-    for case in ["tainted", "unknown"] {
+    let cases: &[&str] = if cfg!(unix) { &["tainted", "unknown", "untold"] } else { &["tainted", "unknown"] };
+    for &case in cases {
         let area = Area::new(&format!("meta-remove-{}", case));
         let (root, _, _) = tagged(&area);
         let tags = meta_head(&root, "tags").unwrap();
@@ -1474,6 +1476,17 @@ fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
                 forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
                 std::fs::write(meta_copy_path(&root, "tags"), b"not a hash").unwrap();
                 plant_taint(&root, &[&"ab".repeat(32)]);
+            }
+            // No copy, and the ref's bytes a prefix of a head whose loose file cannot be read:
+            // that says nothing of the object, so heal names itself again.
+            "untold" => {
+                forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
+                std::fs::write(meta_path(&root, "tags"), &tags.as_bytes()[..12]).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(loose_object(&root, &tags), std::fs::Permissions::from_mode(0o000)).unwrap();
+                }
             }
             // No copy, and the ref's bytes a prefix of a head whose loose object is corrupt: a
             // verdict of the store, unlike a read it could not make, so the salvage is unknown.
@@ -1493,6 +1506,19 @@ fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
                 assert!(text(&removal.stderr).contains("run \"forklift heal\" first, without --remove-ref"), "{}", text(&removal.stderr));
                 assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
                 assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), b"not a hash");
+            }
+            "untold" => {
+                let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+                let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(loose_object(&root, &tags), std::fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+                assert!(!removal.status.success(), "{}", text(&removal.stdout));
+                assert!(text(&removal.stderr).contains("heal did not refuse it for a reason of its own"), "{}", text(&removal.stderr));
+                assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
             }
             _ => {
                 let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
