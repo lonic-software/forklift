@@ -2917,12 +2917,14 @@ office's rebuilt head before the office is written. If `@redactions`' ref or its
 rebuilt, `heal` refuses every damaged metadata ref, listing the head each copy names. Write the
 head into the file by hand.
 
-Beside a durability taint, `heal` rebuilds the metadata refs it can settle before the taint
-recovery and judges the rest again after it, when what the taint records may have been checked or
-fetched again. A metadata ref whose remaining bytes name an object the taint records waits for that
-second pass. If the taint still stands, `heal` stops there, and its `durability_taint` refusal names
-the metadata refs it rebuilt and each one still lost or damaged, which a later `heal` judges again
-once the taint is resolved.
+Beside a durability taint, `heal` judges the damaged metadata refs twice: before the taint
+recovery, rebuilding those it can settle, and again after it, once what the taint records has been
+checked or fetched again. One it cannot settle before the recovery, for example because its
+remaining bytes name an object the taint records, is left for the second pass. A refusal that stops
+the run before that pass, such as a `durability_taint` refusal for a taint that still stands, names
+each metadata ref left for it with the heads found, beside those already rebuilt. Running `heal`
+again once the taint is resolved judges them again; while the taint stands, write one of the heads
+named into the ref's file by hand.
 
 #### A damaged fetch scope
 

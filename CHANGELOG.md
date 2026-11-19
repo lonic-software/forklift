@@ -36,9 +36,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   next, ahead of every other metadata ref, which is checked against it; beside a damaged office
   the head it is to be rebuilt at is verified first, and the office is checked against that head.
   While either ref is damaged and was not rebuilt, every damaged metadata ref is refused, to be set
-  by hand. Beside a durability taint, what cannot be settled before the taint recovery is judged
-  again after it, and a refusal at a taint that still stands names each metadata ref still lost
-  or damaged.
+  by hand. Beside a durability taint, a metadata ref that cannot be settled before the taint
+  recovery is judged again after it; a refusal that stops the run before then, such as one for a
+  taint that still stands, names each ref left for that pass with the heads found.
 
 ### Changed
 
