@@ -771,6 +771,7 @@ impl Tools<'_> {
         for path in conflicted {
             let file = self.warehouse.join(path);
             let shown = self.git(&["cat-file", "blob", &format!("{}:{}", ours, path)])?;
+            #[allow(clippy::disallowed_methods, reason = "a file of the harness's own warehouse, which nothing else holds open")]
             let written = if shown.succeeded() { std::fs::write(&file, &shown.stdout) } else { std::fs::remove_file(&file) };
             match written {
                 Ok(()) => {}
@@ -788,6 +789,7 @@ impl Tools<'_> {
     /// Forklift's working tree as a git tree id, hashed through an index built from nothing, so
     /// no stat cache from an earlier hash can stand in for a file's content.
     fn forklift_tree(&self) -> Result<String, String> {
+        #[allow(clippy::disallowed_methods, reason = "the harness's own scratch index, which nothing else holds open")]
         match std::fs::remove_file(&self.index) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1153,6 +1155,7 @@ pub fn run(options: &ReplayOptions, progress: &dyn Fn(&str)) -> Result<ReplayRep
     std::fs::write(&stream_path, &stream).map_err(|error| format!("cannot write {}: {}", stream_path.display(), error))?;
     drop(stream);
     build("importing the rewritten history", tools.run(&git, &["--git-dir", &mirror_text, "fast-import", "--quiet", "--force"], &mirror, &environment, BUILD_LIMIT, Some(&stream_path)))?;
+    #[allow(clippy::disallowed_methods, reason = "the harness's own stream, read in full by the import above")]
     let _ = std::fs::remove_file(&stream_path);
     let rewrite = Rewrite { gitlinks_dropped, forkliftignore_dropped, forkliftignore_ticket: IGNORE_TICKET.to_string() };
 
