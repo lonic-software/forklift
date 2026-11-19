@@ -7782,38 +7782,213 @@ fn heal_restores_a_lost_trust_file_from_its_copy_and_signing_resumes() {
     assert!(sidecar.exists(), "the stack after heal is signed");
 }
 
-/// A client whose trust file and office ref are both lost, with the copies standing, gets its trust
-/// file back from the copy, which is left as it was; the office ref, which heal does not rebuild,
-/// is refused as ref_damaged with the hand fix, and what refuses next is the missing office, never
-/// the trust.
-// Revert: require a copy that verifies beside an unborn office → heal writes nothing, and stack
-// refuses trust_damaged.
+/// The office ref's head, as its file holds it.
+fn office_head(warehouse: &TestWarehouse) -> String {
+    std::fs::read_to_string(warehouse.root.join(".forklift/meta/office")).unwrap().trim_end().to_string()
+}
+
+/// What a heal's JSON report says it rebuilt, as (pallet, head) pairs.
+fn rebuilt_refs(value: &serde_json::Value) -> Vec<(String, String)> {
+    value["data"]["refs_rebuilt"].as_array().into_iter().flatten()
+        .map(|rebuilt| (rebuilt["pallet"].as_str().unwrap().to_string(), rebuilt["head"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+/// A client whose office ref is lost or damaged and whose trust file is lost, with both copies
+/// standing, gets its office back from the office's copy, verified against the anchor of the trust
+/// file's copy, and then its trust file back from that copy, which is left as it was. Signing
+/// resumes.
+// Revert: judge the office against the trust file's anchor alone, never its copy's → the office
+// is not rebuilt ahead of the trust repair. The damaged office: repair_trust cannot
+// read it, so neither file is restored and heal refuses. The lost office: it reads unborn, so the
+// trust file is restored beside it with the unborn-office note, and the office only after the
+// taint recovery.
 #[test]
-fn heal_restores_the_trust_file_beside_a_lost_office_from_its_copy() {
-    let (warehouse, anchor) = enrolled_warehouse("heal-lost-anchor-and-office");
-    let forklift = warehouse.root.join(".forklift");
-    for lost in ["trust", "meta/office"] {
-        forklift_core::util::file_utils::remove_file(forklift.join(lost)).unwrap();
+fn heal_rebuilds_a_lost_office_and_then_restores_the_trust_file_from_its_copy() {
+    office_and_anchor_heal(false);
+}
+
+#[test]
+fn heal_rebuilds_a_damaged_office_and_then_restores_the_trust_file_from_its_copy() {
+    office_and_anchor_heal(true);
+}
+
+/// The two cases above: the office ref lost, or `damaged` to bytes that name no head.
+fn office_and_anchor_heal(damaged: bool) {
+    {
+        let name = if damaged { "heal-damaged-office-lost-anchor" } else { "heal-lost-office-lost-anchor" };
+        let (warehouse, anchor) = enrolled_warehouse(name);
+        let forklift = warehouse.root.join(".forklift");
+        let office = office_head(&warehouse);
+        forklift_core::util::file_utils::remove_file(forklift.join("trust")).unwrap();
+        match damaged {
+            true => std::fs::write(forklift.join("meta/office"), b"not a head\n").unwrap(),
+            false => forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap(),
+        }
+
+        let healed = warehouse.run(&["--json", "heal"]);
+
+        assert_eq!(healed.status.code(), Some(0), "{}: {}{}", name, stdout(&healed), stderr(&healed));
+        let value = json(&healed);
+        assert_eq!(rebuilt_refs(&value), vec![("@office".to_string(), office.clone())], "{}: {}", name, value);
+        assert_eq!(value["data"]["trust_restored"]["written"], "trust", "{}: {}", name, value);
+        let notes = value["data"]["notes"].to_string();
+        assert!(!notes.contains("The office pallet is unborn"), "{}: the office stands when the trust file is restored: {}", name, notes);
+        assert_eq!(office_head(&warehouse), office, "{}", name);
+        assert_eq!(std::fs::read(forklift.join("trust")).unwrap(), anchor, "{}", name);
+        assert_eq!(std::fs::read(forklift.join("trust-copy")).unwrap(), anchor, "{}: the copy is left as it was", name);
+
+        warehouse.write_file("code.txt", if damaged { "v3\n" } else { "v2\n" });
+        assert_success(&warehouse.run(&["load", "."]));
+        let stacked = warehouse.run(&["--json", "stack", "-m", "after heal"]);
+        assert_eq!(stacked.status.code(), Some(0), "{}: {}{}", name, stdout(&stacked), stderr(&stacked));
+        let parcel = json(&stacked)["data"]["parcel"].as_str().unwrap().to_string();
+        assert!(forklift.join("objects").join(&parcel[0..2]).join(format!("{}.sig", &parcel[2..])).exists(), "{}: signed", name);
     }
+}
+
+/// A lost office ref beside an intact trust file is rebuilt from its copy. The write pins the
+/// anchor, never the office, whose ref is the loss being healed.
+// Revert: pin the office write to the office head it rebuilds (OfficePrecondition::At) → the lost
+// ref reads unborn under the lock, the write is refused as the office moved, and heal refuses
+// the office.
+#[test]
+fn heal_rebuilds_a_lost_office_ref_from_its_copy() {
+    let (warehouse, _) = enrolled_warehouse("heal-lost-office");
+    let office = office_head(&warehouse);
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/meta/office")).unwrap();
 
     let healed = warehouse.run(&["--json", "heal"]);
 
-    assert_eq!(healed.status.code(), Some(53), "{}{}", stdout(&healed), stderr(&healed));
-    let value = json(&healed);
-    assert_eq!(value["error"]["code"], "ref_damaged", "{}", value);
-    assert_eq!(value["error"]["details"]["refs_refused"][0]["pallet"], "@office", "{}", value);
-    assert_eq!(value["error"]["details"]["trust_restored"]["written"], "trust", "{}", value);
-    let notes = value["error"]["details"]["notes"].to_string();
-    assert!(notes.contains("The office pallet is unborn beside a trust file"), "{}", notes);
-    assert!(notes.contains("by hand") && notes.contains("re-admits any key revoked"), "no remote: the hand fix: {}", notes);
-    assert_eq!(std::fs::read(forklift.join("trust")).unwrap(), anchor);
-    assert_eq!(std::fs::read(forklift.join("trust-copy")).unwrap(), anchor, "the copy is left as it was");
+    assert_eq!(healed.status.code(), Some(0), "{}{}", stdout(&healed), stderr(&healed));
+    assert_eq!(rebuilt_refs(&json(&healed)), vec![("@office".to_string(), office.clone())], "{}", stdout(&healed));
+    assert_eq!(office_head(&warehouse), office);
+    assert_success(&warehouse.run(&["audit"]));
+}
 
-    warehouse.write_file("code.txt", "v2\n");
-    assert_success(&warehouse.run(&["load", "."]));
-    let refused = warehouse.run(&["--json", "stack", "-m", "over a lost office"]);
-    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
-    assert_ne!(json(&refused)["error"]["code"], "trust_damaged", "{}", stdout(&refused));
+/// A lost office ref whose copy names a parcel that is no office history the anchor verifies is
+/// refused, and nothing is written.
+// Revert: skip the office chain's verification against the anchor → the user parcel is written as
+// the office.
+#[test]
+fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
+    let (warehouse, _) = enrolled_warehouse("heal-office-unverified");
+    let forklift = warehouse.root.join(".forklift");
+    let main = std::fs::read_to_string(forklift.join("pallets/main")).unwrap().trim_end().to_string();
+    forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
+    std::fs::write(forklift.join("meta-copy/office"), format!("{}\n", main)).unwrap();
+
+    let refused = warehouse.run(&["--json", "heal"]);
+
+    assert_eq!(refused.status.code(), Some(53), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json(&refused);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"", main)), "{}", value);
+    assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\""), "{}", value);
+    assert_eq!(message.matches("\") holds an anchor it does not verify against").count(), 2, "both files judged: {}", value);
+    assert!(!forklift.join("meta/office").exists(), "nothing was written");
+}
+
+/// A trust file or copy a newer version wrote is never judged past: the office is not rebuilt
+/// against the other file's anchor beside it, though that verifies, and the trust repair refuses
+/// the file.
+// Revert: judge only the file reached (read a newer trust file as one that does not parse and go
+// on to the copy; never look at a copy once the trust file serves) → the office is written beside
+// what only a newer version reads.
+#[test]
+fn heal_does_not_rebuild_the_office_beside_a_trust_file_a_newer_version_wrote() {
+    for newer in ["trust", "trust-copy"] {
+        let (warehouse, _) = enrolled_warehouse(&format!("heal-office-newer-{}", newer));
+        let forklift = warehouse.root.join(".forklift");
+        forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
+        std::fs::write(forklift.join(newer), "version = 999\n").unwrap();
+
+        let refused = warehouse.run(&["--json", "heal"]);
+
+        assert_ne!(refused.status.code(), Some(0), "{}: {}{}", newer, stdout(&refused), stderr(&refused));
+        let value = json(&refused);
+        assert!(value["error"]["message"].as_str().unwrap().contains("version 999"), "{}: {}", newer, value);
+        assert!(!forklift.join("meta/office").exists(), "{}: the office was not rebuilt", newer);
+    }
+}
+
+/// An office chain the store cannot give is no verdict on the anchor: the rebuild is refused as
+/// unverifiable, never as a head neither file verifies, and nothing is written.
+// Revert: read an unreadable chain as "does not verify" → heal refuses with the verification
+// message.
+#[test]
+fn heal_does_not_rebuild_an_office_whose_chain_the_store_cannot_give() {
+    let (warehouse, _) = enrolled_warehouse("heal-office-unreadable");
+    let forklift = warehouse.root.join(".forklift");
+    let office = office_head(&warehouse);
+    forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
+    forklift_core::util::file_utils::remove_file(forklift.join(loose_object_relative_path(&office))).unwrap();
+
+    let refused = warehouse.run(&["--json", "heal"]);
+
+    assert_ne!(refused.status.code(), Some(0), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json(&refused);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} could not be verified against the anchor: ", office)), "{}", value);
+    assert!(!message.contains("does not verify as the office's history"), "{}", value);
+    assert!(!forklift.join("meta/office").exists(), "nothing was written");
+}
+
+/// An office whose copy is ahead of what its damaged ref's bytes still name, along first parents,
+/// is rebuilt at the copy's head: a forward write moves the copy first.
+// Revert: prefer what the ref's bytes name over a copy descending from it → rebuilt at H1.
+#[test]
+fn heal_rebuilds_a_damaged_office_at_its_copy_when_the_copy_descends_from_its_bytes() {
+    let (warehouse, _) = enrolled_warehouse("heal-office-ahead");
+    let first = office_head(&warehouse);
+    let dev = keygen_admit_args(&warehouse, "dev@forklift");
+    assert_success(&warehouse.run(&["office", "admit", &dev[0], &dev[1], &dev[2]]));
+    let second = office_head(&warehouse);
+    assert_ne!(first, second, "the admission moves the office");
+
+    // The ref's bytes name H1 by a prefix; the copy names H2, whose first parent is H1.
+    std::fs::write(warehouse.root.join(".forklift/meta/office"), &first.as_bytes()[..16]).unwrap();
+
+    let healed = warehouse.run(&["--json", "heal"]);
+
+    assert_eq!(healed.status.code(), Some(0), "{}{}", stdout(&healed), stderr(&healed));
+    assert_eq!(rebuilt_refs(&json(&healed)), vec![("@office".to_string(), second.clone())], "{}", stdout(&healed));
+    assert_eq!(office_head(&warehouse), second);
+    assert_success(&warehouse.run(&["audit"]));
+}
+
+/// A trust file lost beside its copy, with the office intact, is restored before `--ref` (and
+/// `--position`) read the anchor, so the user ref they set is written and heal exits 0.
+// Revert: skip the meta sequence ahead of --ref, leaving it to the pass after the taint → the
+// --ref write's trust read refuses trust_damaged first.
+#[test]
+fn heal_restores_the_trust_file_before_ref_sets_a_damaged_user_ref() {
+    for position in [false, true] {
+        let name = if position { "heal-anchor-before-ref-position" } else { "heal-anchor-before-ref" };
+        let (warehouse, anchor) = enrolled_warehouse(name);
+        let forklift = warehouse.root.join(".forklift");
+        let main = std::fs::read_to_string(forklift.join("pallets/main")).unwrap().trim_end().to_string();
+        forklift_core::util::file_utils::remove_file(forklift.join("trust")).unwrap();
+        std::fs::write(forklift.join("pallets/main"), &main.as_bytes()[..20]).unwrap();
+
+        let set = format!("main={}", main);
+        let mut args = vec!["--json", "heal", "--ref", set.as_str()];
+        if position {
+            // --position sets only a position that is lost, with no copy to restore it from.
+            for lost in ["position", "position-copy"] {
+                forklift_core::util::file_utils::remove_file(forklift.join(lost)).unwrap();
+            }
+            args.extend(["--position", "main"]);
+        }
+        let healed = warehouse.run(&args);
+
+        assert_eq!(healed.status.code(), Some(0), "{}: {}{}", name, stdout(&healed), stderr(&healed));
+        assert_eq!(std::fs::read(forklift.join("trust")).unwrap(), anchor, "{}", name);
+        assert_eq!(std::fs::read_to_string(forklift.join("pallets/main")).unwrap().trim_end(), main, "{}", name);
+        if position {
+            assert!(forklift.join("position").exists(), "{}: the position is set", name);
+        }
+    }
 }
 
 /// Each damage to an enrolled warehouse's trust, office ref or signatures refuses with its own code

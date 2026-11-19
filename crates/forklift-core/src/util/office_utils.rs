@@ -760,6 +760,112 @@ pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+/// What stands at the trust file's path and at its copy's, in that order: what heal judges a
+/// rebuilt office head against ([`office_rebuild_anchor`]), and what a write conditioned on that
+/// judgement compares under the lock
+/// ([`AnchorPrecondition::Files`](pallet_utils::AnchorPrecondition::Files)).
+///
+/// # Returns
+/// * `Err` - If either could not be read.
+pub(crate) fn observe_trust_files() -> Result<(pallet_utils::TrustEntryState, pallet_utils::TrustEntryState), String> {
+    let observe = |name: &str| -> Result<pallet_utils::TrustEntryState, String> {
+        Ok(match read_trust_entry(name)? {
+            None => pallet_utils::TrustEntryState::Absent,
+            Some(Err(_)) => pallet_utils::TrustEntryState::NotAFile,
+            Some(Ok(bytes)) => pallet_utils::TrustEntryState::Bytes(bytes),
+        })
+    };
+
+    Ok((observe(FILE_NAME_TRUST)?, observe(FILE_NAME_TRUST_COPY)?))
+}
+
+/// The anchor precondition of heal's rebuild of the office ref at `head`: the trust file and its
+/// copy as they stand, once the anchor of the trust file or, where that one does not serve, of
+/// its copy verifies `head` as the office's history. Each is judged as the trust file repair
+/// judges it ([`anchor_serves`]), so the two never disagree on which anchor serves. The anchor
+/// never chooses the head.
+///
+/// # Returns
+/// * `Ok(AnchorPrecondition::Files)` - Both files, as judged.
+/// * `Err(String)`                   - Why the head is not written, as a refusal's reason:
+///                                     neither file holds an anchor that verifies it; a newer
+///                                     version wrote one; or a file, the served state or the
+///                                     office chain could not be read, which says nothing of the
+///                                     head.
+pub(crate) fn office_rebuild_anchor(head: &str) -> Result<pallet_utils::AnchorPrecondition, String> {
+    let unjudged = |why: String| format!("parcel {} could not be verified against the anchor: {}", head, why.trim_end_matches('.'));
+    let (trust, copy) = observe_trust_files().map_err(unjudged)?;
+    let served = crate::util::tombstone_utils::served_state().map_err(unjudged)? != crate::util::tombstone_utils::ServedState::Never;
+    let mut said = Vec::new();
+
+    // What a newer version wrote is that version's to judge, the file not reached included: an
+    // office written beside it would stand where only that version reads the anchor.
+    for (entry, name) in [(&trust, FILE_NAME_TRUST), (&copy, FILE_NAME_TRUST_COPY)] {
+        if let pallet_utils::TrustEntryState::Bytes(bytes) = entry {
+            if newer_refusal_in(bytes).is_some() {
+                return Err(format!(
+                    "\"{}\" was written by a newer version of Forklift, so heal does not verify the office against it",
+                    forklift_root().join(name).to_string_lossy()
+                ));
+            }
+        }
+    }
+
+    for entry in [&trust, &copy] {
+        let bytes = match entry {
+            pallet_utils::TrustEntryState::Absent => {
+                said.push("is lost");
+                continue;
+            }
+            pallet_utils::TrustEntryState::NotAFile => {
+                said.push("is not a file or a link to one");
+                continue;
+            }
+            pallet_utils::TrustEntryState::Bytes(bytes) => bytes,
+        };
+
+        let anchor = match std::str::from_utf8(bytes).map(parse_trust_anchor_classified) {
+            Ok(Ok(anchor)) => anchor,
+            // A newer version's file refused above.
+            Ok(Err(_)) | Err(_) => {
+                said.push("does not read as an anchor");
+                continue;
+            }
+        };
+
+        match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served).map_err(unjudged)? {
+            true => return Ok(pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }),
+            false => said.push("holds an anchor it does not verify against"),
+        }
+    }
+
+    Err(format!(
+        "parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
+        head, forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), said[0],
+        forklift_root().join(FILE_NAME_TRUST_COPY).to_string_lossy(), said[1]
+    ))
+}
+
+/// Whether the anchor `anchor`, parsed from the trust-file `bytes` (`Err`: the entry is not a
+/// file), serves beside the office head `office_head` (`None`: unborn) of a root that has been
+/// `served` or not.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether it serves.
+/// * `Err(String)` - The office chain could not be read ([`judge_trust_bytes`]), which says
+///                   nothing of the anchor.
+fn anchor_serves(bytes: &Result<Vec<u8>, String>, anchor: &TrustAnchor, office_head: Option<&str>, served: bool) -> Result<bool, String> {
+    match office_head {
+        None => Ok(served),
+        // A server's re-genesis adopts the office head and names the genesis it succeeds; an
+        // anchor that names none is no re-genesis. The named genesis is not required to root the
+        // head: a second re-genesis before the office moves names the first one's, which roots
+        // nothing, and the server reads its trust file through this same window.
+        Some(head) if served && anchor.prior_genesis.is_some() && anchor.adopts.as_deref() == Some(head) => Ok(true),
+        Some(head) => Ok(judge_trust_bytes(bytes, head)? == TrustJudged::Usable),
+    }
+}
+
 /// Why the trust file's bytes could not be read.
 enum TrustFileError {
     /// Something other than a file, or a link to one, stands at its path, named here: damage,
@@ -2072,15 +2178,7 @@ fn plan_trust_repair(files: &TrustFiles, notes: &mut Vec<String>) -> Result<Opti
         let (Some(file), Some(anchor)) = (file, anchor) else {
             return Ok(false);
         };
-        match office_head {
-            None => Ok(served),
-            // A server's re-genesis adopts the office head and names the genesis it succeeds; an
-            // anchor that names none is no re-genesis. The named genesis is not required to root the
-            // head: a second re-genesis before the office moves names the first one's, which roots
-            // nothing, and the server reads its trust file through this same window.
-            Some(head) if served && anchor.prior_genesis.is_some() && anchor.adopts.as_deref() == Some(head.as_str()) => Ok(true),
-            Some(head) => Ok(judge_trust_bytes(file, head)? == TrustJudged::Usable),
-        }
+        anchor_serves(file, anchor, office_head.as_deref(), served)
     };
 
     if matches!((trust, copy), (Some(Ok(trust)), Some(Ok(copy))) if trust == copy) {

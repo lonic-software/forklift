@@ -1221,6 +1221,25 @@ fn a_copy_naming_a_parcel_that_fails_verification_is_refused_not_written() {
     assert!(!meta_path(&root, "tags").exists(), "nothing was written");
 }
 
+// Revert: refuse the office beside a damaged @redactions with the hand step heal gives
+// @redactions → the office's refusal tells the user to write it by hand.
+#[test]
+fn a_lost_office_beside_a_lost_redactions_ref_waits_on_it() {
+    let area = Area::new("meta-office-waits");
+    let (root, _, second) = tagged(&area);
+    area.run_ok(&root, &["office", "enroll"]);
+
+    std::fs::create_dir_all(meta_copy_path(&root, "redactions").parent().unwrap()).unwrap();
+    std::fs::write(meta_copy_path(&root, "redactions"), format!("{}\n", second)).unwrap();
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "office")).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("The ref of pallet \"@office\" was not rebuilt: heal rebuilds it only while the ref of pallet \"@redactions\" reads, and that is damaged too: set that first"), "{}", refused);
+    assert!(message.contains("The ref of pallet \"@redactions\" was not rebuilt: heal does not rebuild this ref"), "{}", refused);
+    assert!(!meta_path(&root, "office").exists(), "nothing was written");
+}
+
 // Mutation: refuse only the office and @redactions themselves, not the refs judged against them →
 // @tags is rebuilt beside a lost @redactions, red.
 #[test]

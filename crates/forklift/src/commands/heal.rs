@@ -135,24 +135,23 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         None => error,
     };
 
-    // Before anything reads the trust anchor, whether or not a taint stands: a lost or damaged
-    // trust file stops every such reader, and its copy can put it back. A refusal stops the run
-    // with nothing here written.
-    let trust_repair = office_utils::repair_trust().map_err(config_said)?;
+    // Before anything reads the trust anchor or a meta ref, whether or not a taint stands: the
+    // office first, then the trust file and its copy, then the other meta refs, which are verified
+    // against both. A lost or damaged trust file stops every reader of the anchor, and its copy
+    // can put it back; a meta ref is read by any later step. Only the trust file repair's refusal
+    // stops the run, naming the office when its rebuild landed first; what this pass cannot
+    // settle, or fails to write, the pass after the taint recovery judges again.
+    let meta_first = ref_heal::repair_meta(Pass::BeforeTaint).map_err(|stopped| {
+        let error = stopped.rebuilt.iter().fold(config_said(stopped.error), |error, rebuilt| forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt)));
+        stopped.notes.iter().fold(error, |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))
+    })?;
+    let trust_repair = meta_first.trust;
     ref_notes.extend(trust_repair.notes);
-
-    // Then the meta refs, after the trust file their verification reads and before every later
-    // step, any of which may read one. Nothing here refuses or stops the run: what this pass
-    // cannot settle, or fails to write, the pass after the taint recovery judges again.
-    let meta_first = ref_heal::repair_meta(Pass::BeforeTaint).unwrap_or_else(|error| {
-        ref_notes.push(format!("The meta pallet refs were not judged before the taint recovery: {}", error.trim_end_matches('.')));
-        ref_heal::Repair::default()
-    });
-    ref_notes.extend(meta_first.notes);
-    if let Some(error) = meta_first.stopped {
+    ref_notes.extend(meta_first.repair.notes);
+    if let Some(error) = meta_first.repair.stopped {
         ref_notes.push(format!("Not every meta pallet ref was judged before the taint recovery: {}", error.trim_end_matches('.')));
     }
-    let meta_rebuilt = meta_first.rebuilt;
+    let meta_rebuilt = meta_first.repair.rebuilt;
 
     // Every refusal from here on says what this run already wrote, the trust file and the meta
     // refs among it.
@@ -425,7 +424,27 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // After the taint, which may have refetched what a candidate lacked; before the operation
     // recovery, whose landed test reads the ref.
     // The meta refs first, as before the taint: a user ref's rebuild reads the office.
-    let meta_second = ref_heal::repair_meta(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    let meta_second = match ref_heal::repair_meta(Pass::AfterTaint) {
+        Ok(meta) => meta,
+        Err(stopped) => {
+            refs_rebuilt.extend(stopped.rebuilt);
+            ref_notes.extend(stopped.notes);
+            return Err(changed_after(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes));
+        }
+    };
+    // The trust repair runs in both passes; what it noted in the first is said once. After a
+    // first write the two files agree, so a second one means they moved between the passes: the
+    // report names the first, and the second is noted.
+    let trust_restored_after = meta_second.trust.restored;
+    if let (Some(_), Some(after)) = (&trust_repair.restored, &trust_restored_after) {
+        ref_notes.push(format!("{} (after the taint recovery).", after.sentence().trim_end_matches('.')));
+    }
+    for note in meta_second.trust.notes {
+        if !ref_notes.contains(&note) {
+            ref_notes.push(note);
+        }
+    }
+    let meta_second = meta_second.repair;
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
     if let Some(error) = meta_second.stopped {
@@ -888,7 +907,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         parked_rebuilt,
         position_rebuilt: early_position.or(late_position),
         config_repaired,
-        trust_restored: trust_repair.restored.clone(),
+        trust_restored: trust_repair.restored.clone().or(trust_restored_after),
         inventory_rebuilt,
         inventory_held,
         was_tainted: outcome.was_tainted,

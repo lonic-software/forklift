@@ -109,15 +109,18 @@ what only that ref reached is then no longer kept by any pallet.
 
 **Do not** write the ref file by hand: `heal --ref` checks that the parcel's history is complete.
 
-A meta pallet's ref (a name starting with `@`, such as `@redactions`) is not rebuilt: no checkout or
-journal records its head. Restore its file from a backup, or write the head parcel's hash into it.
+A meta pallet's ref (a name starting with `@`, such as `@tags`) is rebuilt from its copy
+(`.forklift/meta-copy/<name>`), the office's among them. `@redactions`' is not rebuilt, and neither
+is one `heal` refuses: restore its file from a backup, or write the head parcel's hash into it.
 
 The office pallet's ref (`.forklift/meta/office`) missing beside a trust file refuses as `ref_damaged`
 too, in the commands that need the verified office, such as `stack`, `audit` and `office enroll`: the anchor stands, but there is no office to check
 anything against. `forklift lower` takes the office pallet from a remote that holds it and verifies it against the
 trust file. `forklift lift` asks the remote, so it names lower as the next step only where the remote
 holds this warehouse's office; other commands name it as a way out where a remote is configured.
-Without one, restore the ref from a
+`forklift heal` rebuilds the ref from its copy (`.forklift/meta-copy/office`) where that stands and
+verifies against the anchor, unless a newer version of Forklift wrote the trust file or its copy, or
+the office's history cannot be read from the store. With neither a remote nor a copy to rebuild from, restore the ref from a
 backup, or write the office pallet's head parcel hash into it by hand. Write the latest head you know
 of: an older one re-admits any key revoked since. If `office enroll` stopped before it wrote the office
 pallet, there is no ref to restore. Where no remote holds this anchor, move the trust file (`.forklift/trust`) and

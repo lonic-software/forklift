@@ -1167,6 +1167,25 @@ pub enum AnchorPrecondition {
     /// The anchor file must still hold exactly these bytes. Compared as bytes, not as a decoded
     /// anchor: any rewrite refuses.
     Bytes(Vec<u8>),
+
+    /// The trust file and its copy must each still stand as they did: a decision that judged
+    /// both, as heal's rebuild of the office ref does, taking the copy's anchor only where the
+    /// trust file's does not serve. [`AnchorPrecondition::Bytes`] reads the trust file only, so a
+    /// copy, or a trust file the decision found lost or unusable, would move unseen.
+    Files { trust: TrustEntryState, copy: TrustEntryState },
+}
+
+/// What stood at the trust file's path, or its copy's, when a decision read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustEntryState {
+    /// Nothing.
+    Absent,
+
+    /// Something other than a file, or a link to one.
+    NotAFile,
+
+    /// A file holding exactly these bytes.
+    Bytes(Vec<u8>),
 }
 
 /// The pallet heads a trust write recorded as its boundary.
@@ -1221,10 +1240,18 @@ pub(crate) fn check_preconditions(_lock: &crate::util::lock_utils::RefLock,
     }
 
     let anchor = match &preconditions.anchor {
-        AnchorPrecondition::NotConsumed => None,
+        AnchorPrecondition::NotConsumed | AnchorPrecondition::Files { .. } => None,
         AnchorPrecondition::Absent => Some(None),
         AnchorPrecondition::Bytes(bytes) => Some(Some(bytes.as_slice())),
     };
+
+    if let AnchorPrecondition::Files { trust, copy } = &preconditions.anchor {
+        let (found_trust, found_copy) = crate::util::office_utils::observe_trust_files()?;
+
+        if &found_trust != trust || &found_copy != copy {
+            return Err(RefUpdateError::AnchorMoved);
+        }
+    }
 
     if let Some(expected) = anchor {
         if crate::util::office_utils::read_trust_anchor_bytes()?.as_deref() != expected {
@@ -4172,6 +4199,36 @@ pub(crate) mod tests {
 
         assert_eq!(refused, Err(RefUpdateError::AnchorMoved));
         assert_eq!(crate::util::office_utils::read_trust_anchor().unwrap().map(|anchor| anchor.genesis), Some(hash('0')));
+    }
+
+    // Revert: compare only the copy, or only the trust file, under `Files` → that case's write
+    // lands beside the file that moved.
+    #[test]
+    fn a_write_judged_against_both_trust_files_is_refused_when_either_moved() {
+        let (root, _scope) = scratch("anchor-files");
+        let forklift = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
+        let read = plant_anchor('0');
+        std::fs::write(forklift.join("trust-copy"), &read).unwrap();
+        file_utils::remove_file(forklift.join("trust")).unwrap();
+        let judged = AnchorPrecondition::Files { trust: TrustEntryState::Absent, copy: TrustEntryState::Bytes(read.clone()) };
+        update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+
+        // The positive: both as judged, and the write lands.
+        update_pallet_head("main", Some(&hash('1')), &hash('2'), &anchor_is(judged.clone())).unwrap();
+
+        // A trust file put back meanwhile, beside the copy as judged.
+        std::fs::write(forklift.join("trust"), &read).unwrap();
+        let refused = update_pallet_head("main", Some(&hash('2')), &hash('3'), &anchor_is(judged.clone()));
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved), "the trust file moved");
+
+        // The copy rewritten meanwhile, beside the trust file as judged (lost).
+        file_utils::remove_file(forklift.join("trust")).unwrap();
+        let mut respelled = read.clone();
+        respelled.extend_from_slice(b"# respelled\n");
+        std::fs::write(forklift.join("trust-copy"), &respelled).unwrap();
+        let refused = update_pallet_head("main", Some(&hash('2')), &hash('3'), &anchor_is(judged));
+        assert_eq!(refused, Err(RefUpdateError::AnchorMoved), "the copy moved");
+        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('2')), "neither refused write landed");
     }
 
     // Revert: treat `Absent` as `NotConsumed` → an unsigned write lands under an anchor.

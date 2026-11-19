@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::inventory_item_state::InventoryItemState;
-use crate::util::pallet_utils::{self, AnchorPrecondition, BayPosition, OfficePrecondition, RefPreconditions};
+use crate::util::pallet_utils::{self, AnchorPrecondition, BayPosition, OfficePrecondition, RefPreconditions, TrustEntryState};
 use crate::util::shift_utils::{self, CarriedEntry, CarriedItem, FileOp, TreeProvenance};
 use crate::util::{cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, park_utils, path_utils, record_utils};
 
@@ -202,6 +202,7 @@ impl Operation {
                 AnchorPrecondition::NotConsumed => String::new(),
                 AnchorPrecondition::Absent => "absent".to_string(),
                 AnchorPrecondition::Bytes(bytes) => format!("bytes {}", crate::util::sign_utils::to_hex(bytes)),
+                AnchorPrecondition::Files { trust, copy } => format!("files {} {}", trust_entry_code(trust), trust_entry_code(copy)),
             },
             // The pathspec's length, then its paths, so the carried triples after it stay apart.
             self.pathspec.len().to_string(),
@@ -286,8 +287,12 @@ impl Operation {
             anchor: match anchor.as_str() {
                 "" => AnchorPrecondition::NotConsumed,
                 "absent" => AnchorPrecondition::Absent,
-                _ => match anchor.strip_prefix("bytes ").map(crate::util::sign_utils::from_hex) {
-                    Some(Ok(bytes)) => AnchorPrecondition::Bytes(bytes),
+                _ => match (anchor.strip_prefix("bytes "), anchor.strip_prefix("files ").map(|codes| codes.split(' ').collect::<Vec<_>>())) {
+                    (Some(hex), _) => AnchorPrecondition::Bytes(crate::util::sign_utils::from_hex(hex).map_err(|_| "is malformed.".to_string())?),
+                    (_, Some(codes)) => match codes.as_slice() {
+                        [trust, copy] => AnchorPrecondition::Files { trust: parse_trust_entry_code(trust)?, copy: parse_trust_entry_code(copy)? },
+                        _ => return Err("is malformed.".to_string()),
+                    },
                     _ => return Err("is malformed.".to_string()),
                 },
             },
@@ -325,6 +330,26 @@ thread_local! {
     /// warehouse a command runs against is per thread (see `globals`), so tests running side by
     /// side each own their own.
     static RAISED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// A trust file's state in an anchor precondition's record: `absent`, `not-a-file`, or
+/// `bytes:<hex>`, so an empty file is told from a missing one.
+fn trust_entry_code(state: &TrustEntryState) -> String {
+    match state {
+        TrustEntryState::Absent => "absent".to_string(),
+        TrustEntryState::NotAFile => "not-a-file".to_string(),
+        TrustEntryState::Bytes(bytes) => format!("bytes:{}", crate::util::sign_utils::to_hex(bytes)),
+    }
+}
+
+/// The state [`trust_entry_code`] wrote as `code`.
+fn parse_trust_entry_code(code: &str) -> Result<TrustEntryState, String> {
+    match (code, code.strip_prefix("bytes:")) {
+        ("absent", _) => Ok(TrustEntryState::Absent),
+        ("not-a-file", _) => Ok(TrustEntryState::NotAFile),
+        (_, Some(hex)) => Ok(TrustEntryState::Bytes(crate::util::sign_utils::from_hex(hex).map_err(|_| "is malformed.".to_string())?)),
+        _ => Err("is malformed.".to_string()),
+    }
 }
 
 /// The path of the active bay's marker file.
@@ -937,6 +962,14 @@ mod tests {
         for (office, anchor) in [
             (OfficePrecondition::At(Some("e".repeat(64))), AnchorPrecondition::Bytes(b"anchor\nbytes".to_vec())),
             (OfficePrecondition::At(None), AnchorPrecondition::Absent),
+            (OfficePrecondition::NotConsumed, AnchorPrecondition::Files {
+                trust: TrustEntryState::Absent,
+                copy: TrustEntryState::Bytes(b"copy\nbytes".to_vec()),
+            }),
+            (OfficePrecondition::NotConsumed, AnchorPrecondition::Files {
+                trust: TrustEntryState::NotAFile,
+                copy: TrustEntryState::Bytes(Vec::new()),
+            }),
             (OfficePrecondition::NotConsumed, AnchorPrecondition::NotConsumed),
         ] {
             operation.office = office;
