@@ -2043,14 +2043,11 @@ fn write_head_locked(
                 }
                 (WriteOrder::Forward, true) => {
                     let prior = read_copy_state_at(&copy)?;
-                    let copied = match prior == MetaCopyState::Bytes(bytes.clone()) {
-                        true => Ok(false),
-                        false => write_copy_file(&copy, &bytes).map(|()| true),
-                    };
-
-                    match copied {
-                        Ok(copied) => match write_ref_file(&path, name, &bytes) {
-                            Err(e) if copied && !landed() => Err(restore_copy(&copy, &prior, e)),
+                    // A copy already at the new bytes is not written again (`write_copy_file`),
+                    // and `restore_copy` finds it at its prior state.
+                    match write_copy_file(&copy, &bytes) {
+                        Ok(()) => match write_ref_file(&path, name, &bytes) {
+                            Err(e) if !landed() => Err(restore_copy(&copy, &prior, e)),
                             written => written,
                         },
                         // The ref is not written, so it holds its prior head.
