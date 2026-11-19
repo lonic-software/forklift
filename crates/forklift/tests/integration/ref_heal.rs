@@ -1346,8 +1346,8 @@ fn sorted(mut rebuilt: Vec<(String, String, String)>) -> Vec<(String, String, St
 }
 
 // Mutation: check @redactions' own rebuild against its ref as read (no chosen head passed to the
-// write) → the damaged ref fails the check and nothing is rebuilt, red. A lost ref reads as no
-// redactions, so that case stays green under this mutation until a lost meta ref reads loudly.
+// write) → the damaged ref fails the check and nothing is rebuilt, red; a lost one is refused where it is
+// read, so that case is red too.
 #[test]
 fn a_lost_or_damaged_redactions_ref_is_rebuilt_from_its_copy_ahead_of_the_refs_checked_against_it() {
     for lost in [false, true] {
@@ -1370,8 +1370,8 @@ fn a_lost_or_damaged_redactions_ref_is_rebuilt_from_its_copy_ahead_of_the_refs_c
 
 // Mutations: verify the head chosen for @redactions against the office ref as read → in this
 // anchored warehouse the office reads as unborn or damaged, so both are refused, red; check the
-// office's write against the @redactions ref as read → the damaged ref fails it, red (a lost one
-// reads as no redactions, so that case stays green under it until a lost meta ref reads loudly).
+// office's write against the @redactions ref as read → the damaged ref fails it, and a lost one is
+// refused where it is read, red in both cases.
 #[test]
 fn a_lost_or_damaged_office_beside_a_lost_or_damaged_redactions_ref_is_rebuilt_with_it() {
     for lost in [false, true] {
