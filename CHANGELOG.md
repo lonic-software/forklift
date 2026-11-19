@@ -53,7 +53,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   written: `tag list` printed no tags, `lower` took the remote's head as a first adoption, and
   garbage collection held nothing for it. The next step names `forklift heal` when the copy holds a
   parcel hash, or a damaged ref's own bytes name one parcel, and the hand fix otherwise; a copy
-  that cannot be read is refused, asking for it to be made readable. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
+  that cannot be read, or a link at its path, is refused, naming what to make readable or replace. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
   report names each pallet whose ref could not be read (`pallets_unread` in `--json`) instead of
   leaving it out, and no longer says no pallet's history reaches the objects while one is named (`--json`
   schema 60).
