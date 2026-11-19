@@ -1313,6 +1313,14 @@ fn a_lost_office_beside_a_redactions_ref_heal_cannot_verify_waits_on_it() {
     assert!(message.contains("The ref of pallet \"@office\" was not rebuilt: it is checked against the redactions, and the ref of pallet \"@redactions\" is damaged too, with no head heal can verify: set that first"), "{}", refused);
     assert!(message.contains(&format!("The ref of pallet \"@redactions\" was not rebuilt: parcel {} does not pass verification", second)), "{}", refused);
     assert!(!meta_path(&root, "office").exists() && !meta_path(&root, "redactions").exists(), "nothing was written");
+
+    // Nothing names a @redactions head at all: no head was chosen, so none was verified.
+    forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "redactions")).unwrap();
+    std::fs::write(meta_path(&root, "redactions"), b"not a head\n").unwrap();
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("The ref of pallet \"@office\" was not rebuilt: it is checked against the redactions, and the ref of pallet \"@redactions\" is damaged too, and heal chose no head for it: set that first"), "{}", refused);
+    assert!(!meta_path(&root, "office").exists(), "nothing was written");
 }
 
 // Mutation: refuse only the office and @redactions themselves, not the refs judged against them →

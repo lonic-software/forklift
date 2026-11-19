@@ -1312,8 +1312,13 @@ impl HeadWriteCheck {
     pub(crate) fn stands(&self, lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
         match &self.outcome {
             Ok(check) => check.holds(lock),
+            // A refusal or failure judged against a chosen head is reported only while the
+            // @redactions ref and copy still read as judged; otherwise the move is the answer.
+            Err(_) if self.judged.is_some() => {
+                let judged = self.judged.as_ref().expect("matched as judged");
+                pallet_utils::meta_ref_stands_as(REDACTIONS_PALLET_NAME, &judged.damage, &judged.copy).map_err(|e| e.to_string())
+            }
             Err(pallet_utils::RefUpdateError::Redacted { .. }) => Ok(true),
-            Err(_) if self.judged.is_some() => Ok(true),
             Err(_) => match &self.redactions {
                 Some(read) => Ok(*read == pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)?),
                 None => Ok(true),

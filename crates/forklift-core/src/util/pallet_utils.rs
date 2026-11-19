@@ -3662,9 +3662,10 @@ pub(crate) mod tests {
 
         /// A meta rebuild judged against the head heal chose for a damaged `@redactions` is checked
         /// against that head, not the ref, and is refused as moved, not checked again, once that
-        /// ref's copy changed before the hold; with both as judged, it lands.
-        /// Revert: have the hold read the `@redactions` head for a judged check too → the damaged
-        /// ref fails it, red.
+        /// ref's copy or the ref itself changed before the hold, a refusal included; with both as
+        /// judged, it lands. Revert: have the hold read the `@redactions` head for a judged check
+        /// too → the damaged ref fails it, red; judge the copy alone → the ref set by hand is
+        /// written past, red; report a judged refusal without the re-read → redacted, not moved, red.
         #[test]
         fn a_rebuild_judged_against_a_chosen_redactions_head_is_refused_once_that_ref_moves() {
             use crate::util::redaction_utils::{JudgedRedactions, REDACTIONS_PALLET_NAME};
@@ -3675,7 +3676,7 @@ pub(crate) mod tests {
             let copy = read_meta_copy_state(REDACTIONS_PALLET_NAME).unwrap();
             let damaged = b"not a head\n".to_vec();
             std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, REDACTIONS_PALLET_NAME), &damaged).unwrap();
-            let judged = JudgedRedactions { head: chosen.clone(), damage: RefDamage::Unreadable(damaged), copy: copy.clone() };
+            let judged = JudgedRedactions { head: chosen.clone(), damage: RefDamage::Unreadable(damaged.clone()), copy: copy.clone() };
 
             let h1 = super::stub_parcel("h1");
             let tags = read_meta_copy_state("tags").unwrap();
@@ -3694,6 +3695,38 @@ pub(crate) mod tests {
 
             let MetaCopyState::Bytes(bytes) = &copy else { panic!("the redaction wrote a copy") };
             std::fs::write(&copy_path, bytes).unwrap();
+
+            // The ref set by hand to another head before the hold, its copy as judged.
+            let ref_path = get_pallet_ref_path(PalletNamespace::Meta, REDACTIONS_PALLET_NAME);
+            let moved_ref = ref_path.clone();
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&moved_ref, format!("{}\n", super::stub_parcel("other"))).unwrap();
+            })));
+            match repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &h1, &RefPreconditions::NONE, Some(&judged)) {
+                Err(RefUpdateError::Moved(moved)) => assert_eq!(moved.reference, PalletRef::meta(REDACTIONS_PALLET_NAME)),
+                other => panic!("expected @redactions moved by its ref, got {:?}", other),
+            }
+            assert_eq!(get_meta_pallet_head("tags").unwrap(), None, "nothing was written");
+
+            std::fs::write(&ref_path, &damaged).unwrap();
+
+            // A head naming the redacted blob, judged against the chosen head, while the copy
+            // moves before the hold: the move is the answer, not the redaction.
+            let named = parcel(&tree(&[("a", &blob("unrelated"), DirEntryType::Normal)]), &[]);
+            let moved_copy = copy_path.clone();
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&moved_copy, format!("{}\n", super::stub_parcel("other"))).unwrap();
+            })));
+            match repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &named, &RefPreconditions::NONE, Some(&judged)) {
+                Err(RefUpdateError::Moved(moved)) => assert_eq!(moved.reference, PalletRef::meta(REDACTIONS_PALLET_NAME)),
+                other => panic!("expected @redactions moved over the redaction, got {:?}", other),
+            }
+            std::fs::write(&copy_path, bytes).unwrap();
+            assert_redacted(
+                repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &named, &RefPreconditions::NONE, Some(&judged)),
+                "a", &blob("unrelated"),
+            );
+
             repair_meta_pallet_head("tags", &RefDamage::Missing, &tags, &h1, &RefPreconditions::NONE, Some(&judged)).unwrap();
             assert_eq!(get_meta_pallet_head("tags").unwrap().as_deref(), Some(h1.as_str()));
         }
