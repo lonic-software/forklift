@@ -2545,6 +2545,12 @@ pub enum ReadFault {
     /// index of another format version or a base read failed some other way, or the absence was
     /// left undecided or is a redaction's or a withholding's.
     Untold,
+    /// The store gave the object whole, its bytes matching its address, but this build cannot
+    /// parse them. The store verifies every object it gives, so this is never damage: a newer
+    /// Forklift may have written it, and only a build that reads it can judge it. No verdict on
+    /// the object. Every parse of verified bytes gives this, never [`ReadFault::Content`]; only a
+    /// whole object of a kind this build knows, which is not the kind asked for, is a verdict.
+    Newer,
 }
 
 impl ReadFault {

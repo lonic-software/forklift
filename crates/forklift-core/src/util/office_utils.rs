@@ -884,7 +884,7 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
                 "holds an anchor whose chain to the head could not be read ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
             ), AnchorRefusal::Unread)),
-            Err(ChainUnjudged::Newer(why)) => said.push((format!(
+            Err(ChainUnjudged::Newer(why) | ChainUnjudged::Unread(why, crate::util::file_utils::ReadFault::Newer)) => said.push((format!(
                 "holds an anchor whose chain to the head is in a version this Forklift does not read ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
             ), AnchorRefusal::Newer)),
@@ -1214,11 +1214,12 @@ pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<(Parcel, Of
 /// Why [`check_office_parcel_shape_faulted`] refused.
 #[derive(Debug)]
 pub(crate) enum OfficeShapeError {
-    /// What the store gave is not of office shape, or a record in it does not parse: a verdict
-    /// on the parcel.
+    /// What the store gave is not of office shape: a verdict on the parcel.
     NotOffice(String),
 
-    /// An object could not be read, with what the store's answer says of it.
+    /// An object could not be read, or a record of it reads whole but does not parse
+    /// ([`ReadFault::Newer`](crate::util::file_utils::ReadFault::Newer)), with what the store's
+    /// answer says of it.
     Unread(String, crate::util::file_utils::ReadFault),
 }
 
@@ -2791,10 +2792,12 @@ fn read_office_state_of_faulted(office_parcel_hash: &str) -> Result<OfficeState,
                 office_parcel_hash, name, file_name, error
             ), fault)
         };
-        let unparseable = |file_name: &str, error: String| NotOffice(format!(
-            "The office parcel {} holds a record {}/{} that does not parse: {}",
+        // A record the store verified that does not parse is one this build cannot read, never
+        // damage.
+        let unparseable = |file_name: &str, error: String| OfficeShapeError::Unread(format!(
+            "The office parcel {} holds a record {}/{} that this Forklift cannot parse: {}",
             office_parcel_hash, name, file_name, error
-        ));
+        ), crate::util::file_utils::ReadFault::Newer);
 
         match name.as_str() {
             TREE_NAME_USERS => {
@@ -2991,10 +2994,11 @@ fn store_record(toml: &str) -> Result<String, String> {
 }
 
 /// Load one record blob as a string. The error says what it tells of the record: a blob that is
-/// not UTF-8 is [`ReadFault::Content`](crate::util::file_utils::ReadFault::Content).
+/// not UTF-8, which the store verified, is one this build cannot read,
+/// [`ReadFault::Newer`](crate::util::file_utils::ReadFault::Newer).
 fn load_record_faulted(hash: &str) -> Result<String, (String, crate::util::file_utils::ReadFault)> {
     String::from_utf8(object_utils::load_blob_faulted(hash)?.content)
-        .map_err(|_| (format!("The metadata record {} is not valid UTF-8.", hash), crate::util::file_utils::ReadFault::Content))
+        .map_err(|_| (format!("The metadata record {} is not valid UTF-8, so this Forklift cannot read it.", hash), crate::util::file_utils::ReadFault::Newer))
 }
 
 /// [`load_record_faulted`]'s bytes-in-hand sibling — parses a record blob's content as a string from an
@@ -4661,7 +4665,7 @@ pub(crate) mod tests {
 
         let planted = plant_office(&[], &[entry("x.toml", "not = [toml".to_string())], Vec::new(), None);
         let error = read_office_state_of(&planted).err().expect("an unparseable record must not read");
-        assert!(error.contains(&planted) && error.contains("keys/x.toml") && error.contains("does not parse"),
+        assert!(error.contains(&planted) && error.contains("keys/x.toml") && error.contains("cannot parse"),
             "the error must name the parcel and the file: {}", error);
 
         drop(scope);

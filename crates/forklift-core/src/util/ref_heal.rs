@@ -250,6 +250,10 @@ enum Salvage {
     /// could not be consulted, or left the answer undecided), or a pack that may hold a match the
     /// store cannot list. What heal could not read is no verdict on the ref.
     Untold(String),
+
+    /// A match the store gave whole that this build cannot parse: a newer Forklift may have
+    /// written it, so it is no verdict on the ref.
+    Newer(String),
 }
 
 /// Everything the warehouse says about one pallet's head.
@@ -436,7 +440,7 @@ fn gather(damaged: &DamagedRef, tainted: &Tainted, notes: &mut Vec<String>) -> E
         match salvage(bytes, tainted) {
             Ok(Salvage::Nothing) => {}
             Ok(Salvage::Found(head)) => evidence.candidates.push((head, Source::Salvage)),
-            Ok(Salvage::Unknown(reason) | Salvage::Untold(reason)) => evidence.salvage_unknown = Some(reason),
+            Ok(Salvage::Unknown(reason) | Salvage::Untold(reason) | Salvage::Newer(reason)) => evidence.salvage_unknown = Some(reason),
             Ok(Salvage::Ambiguous(parcels, dropped)) => {
                 evidence.salvage_unknown = Some(format!("its bytes match more than one parcel: {}", parcels.join(", ")));
                 evidence.salvage_ambiguous = parcels;
@@ -517,12 +521,14 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
 
 /// Whose heal's refusal of a meta ref is when the salvage of its bytes, `salvaged`, names no head
 /// it takes and no copy does either: the ref's own when the store's answer is a verdict (nothing,
-/// several parcels, a match it decided is unknown), unread when the store said nothing (a match or
-/// a pack it could not read, a lookup that failed). A found head refuses only through what
-/// follows (its verification), so it is the ref's own here.
+/// several parcels, a match it decided is unknown), a newer build's when a match is one this
+/// build cannot parse, unread when the store said nothing (a match or a pack it could not read, a
+/// lookup that failed). A found head refuses only through what follows (its verification), so it
+/// is the ref's own here.
 fn salvage_owner(salvaged: &Result<Salvage, String>) -> Owner {
     match salvaged {
         Ok(Salvage::Found(_) | Salvage::Nothing | Salvage::Ambiguous(..) | Salvage::Unknown(_)) => Owner::Own,
+        Ok(Salvage::Newer(_)) => Owner::Newer,
         Ok(Salvage::Untold(_)) | Err(_) => Owner::Unread(None),
     }
 }
@@ -546,6 +552,7 @@ fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
     let mut parcels = Vec::new();
     let mut unknown = Vec::new();
     let mut untold = Vec::new();
+    let mut newer = Vec::new();
 
     for hash in matches {
         if tainted.covers(&hash) {
@@ -561,15 +568,22 @@ fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
             Ok(Ok(_)) => parcels.push(hash),
             Err((_, ReadFault::Untold)) => untold.push(hash),
             Err((_, ReadFault::Content)) => unknown.push(hash),
+            Err((_, ReadFault::Newer)) => newer.push(hash),
             // Bytes that read whole, told from their one parse: another kind of object drops
-            // out, and none at all is damage.
+            // out, and bytes this build cannot parse are no damage, since the store verified them.
             Ok(Err(object_utils::NotAParcel::Other(_))) => {}
-            Ok(Err(object_utils::NotAParcel::Malformed(_))) => unknown.push(hash),
+            Ok(Err(object_utils::NotAParcel::Newer(_))) => newer.push(hash),
         }
     }
 
     if parcels.len() > 1 {
-        return Salvage::Ambiguous(parcels, !unknown.is_empty() || !untold.is_empty());
+        return Salvage::Ambiguous(parcels, !unknown.is_empty() || !untold.is_empty() || !newer.is_empty());
+    }
+
+    if let Some(hash) = newer.first() {
+        return Salvage::Newer(format!(
+            "what its bytes name may be object {}, which this Forklift cannot read: a newer Forklift may have written it", hash
+        ));
     }
 
     if let Some(hash) = untold.first() {
@@ -1411,6 +1425,7 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
                         copy, salvaged, error.trim_end_matches('.')
                     ), candidates, match fault {
                         crate::util::file_utils::ReadFault::Content => Owner::Own,
+                        crate::util::file_utils::ReadFault::Newer => Owner::Newer,
                         crate::util::file_utils::ReadFault::Untold => Owner::Unread(None),
                     })),
                 },
@@ -1420,7 +1435,7 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
             candidates.extend(parcels.into_iter().map(|head| Candidate { head, source: Source::Salvage.describe() }));
             Err(("its own bytes name one of several parcels, not which".to_string(), candidates, unchosen))
         }
-        Salvage::Unknown(why) | Salvage::Untold(why) => Err((why, candidates, unchosen)),
+        Salvage::Unknown(why) | Salvage::Untold(why) | Salvage::Newer(why) => Err((why, candidates, unchosen)),
     }
 }
 
@@ -2222,6 +2237,46 @@ mod tests {
         assert!(removed.is_none(), "{:?}", removed);
         assert!(error.contains("was not removed") && error.contains("Upgrade Forklift to a version that reads it"), "{}", error);
         assert_eq!(std::fs::read(&ref_path).unwrap(), b"not a head\n", "nothing was removed");
+    }
+
+    // A parcel the store gives whole, its bytes matching its address, in a loose object version
+    // this build does not know is no damage: a newer Forklift may have written it. Named by the
+    // copy or by the ref's own bytes, its step is the upgrade, and its removal refuses.
+    // Mutation: file a parse failure of verified bytes as damage (`ReadFault::Content`,
+    // `Salvage::Unknown`) → the ref's own, the removal runs, red.
+    #[test]
+    fn a_meta_head_in_a_newer_object_version_names_the_upgrade_and_is_not_removed() {
+        use crate::util::tag_utils::TAGS_PALLET_NAME;
+
+        for (case, by_copy) in [("the copy", true), ("the ref's own bytes", false)] {
+            let (_root, _scope) = scratch("ref-heal-newer-object");
+            let tree = crate::util::meta_tree::store_meta_tree(b"forklift-meta 1 tags", None).unwrap();
+            let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+            let parcel = crate::util::meta_tree::stack_meta_parcel(tree, Vec::new(), &operator, "tags", None).unwrap();
+            let newer = crate::util::object_utils::store_copy_in_version(&parcel, 2);
+            let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
+            let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
+            for path in [&ref_path, &copy_path] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            }
+            let (reference, copy) = match by_copy {
+                true => (b"not a head\n".to_vec(), format!("{}\n", newer).into_bytes()),
+                false => (newer.as_bytes()[..12].to_vec(), b"not a head\n".to_vec()),
+            };
+            std::fs::write(&ref_path, &reference).unwrap();
+            std::fs::write(&copy_path, &copy).unwrap();
+
+            let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+            let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+            assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Newer, "{}: {:?}", case, tags);
+            assert_eq!(meta_step(tags, &refused), "Upgrade Forklift to a version that reads it, then run \"forklift heal\" again.", "{}", case);
+
+            let mut notes = Vec::new();
+            let (error, removed) = remove_damaged_meta_ref("@tags", &refused, &[], &mut notes).unwrap_err();
+            assert!(removed.is_none(), "{}: {:?}", case, removed);
+            assert!(error.contains("was not removed"), "{}: {}", case, error);
+            assert_eq!(std::fs::read(&ref_path).unwrap(), reference, "{}: nothing was removed", case);
+        }
     }
 
     /// Record an unsigned redaction of a blob of `content`, and return the `@redactions` head.

@@ -290,10 +290,27 @@ pub(crate) fn load_parcel_judged(hash: &str) -> Result<Result<Parcel, NotAParcel
     Ok(decode_parcel_judged(hash, &bytes))
 }
 
-/// [`load_parcel`], whose error says what it tells of the parcel: bytes that read but are not a
-/// parcel are [`file_utils::ReadFault::Content`], as the store's own verdicts are.
+/// [`load_parcel`], whose error says what it tells of the parcel: a whole object of another kind
+/// is a verdict, [`file_utils::ReadFault::Content`], and bytes this build cannot parse are
+/// [`file_utils::ReadFault::Newer`].
 pub(crate) fn load_parcel_faulted(hash: &str) -> Result<Parcel, (String, file_utils::ReadFault)> {
-    load_parcel_judged(hash)?.map_err(|error| (error.into(), file_utils::ReadFault::Content))
+    load_parcel_judged(hash)?.map_err(|error| match error {
+        NotAParcel::Other(message) => other_kind(message),
+        NotAParcel::Newer(message) => (message, file_utils::ReadFault::Newer),
+    })
+}
+
+/// Parse object bytes the store gave, which it verified against their address: bytes this build
+/// cannot parse are no damage, so their refusal is [`file_utils::ReadFault::Newer`], never a
+/// verdict.
+fn parse_verified(bytes: &[u8]) -> Result<ParsedObject, (String, file_utils::ReadFault)> {
+    parser::object::loose_object_parser::parse(bytes).map_err(|error| (error, file_utils::ReadFault::Newer))
+}
+
+/// The refusal of a whole object of a kind this build knows that is not the kind asked for: the
+/// one verdict a parse of verified bytes gives.
+fn other_kind(message: String) -> (String, file_utils::ReadFault) {
+    (message, file_utils::ReadFault::Content)
 }
 
 /// Why object bytes that read whole are not a parcel ([`decode_parcel_judged`]): told from the
@@ -303,14 +320,15 @@ pub(crate) enum NotAParcel {
     /// They are another kind of object, whole: the message names its type.
     Other(String),
 
-    /// They are no object at all.
-    Malformed(String),
+    /// They match their address, so they are no damage, but this build cannot parse them: a
+    /// newer Forklift may have written them. No verdict on the object.
+    Newer(String),
 }
 
 impl From<NotAParcel> for String {
     fn from(refusal: NotAParcel) -> String {
         match refusal {
-            NotAParcel::Other(message) | NotAParcel::Malformed(message) => message,
+            NotAParcel::Other(message) | NotAParcel::Newer(message) => message,
         }
     }
 }
@@ -324,7 +342,7 @@ pub(crate) fn decode_parcel(hash: &str, bytes: &[u8]) -> Result<Parcel, String> 
 /// [`decode_parcel`], telling bytes that are another kind of object from bytes that are none.
 pub(crate) fn decode_parcel_judged(hash: &str, bytes: &[u8]) -> Result<Parcel, NotAParcel> {
     match parser::object::loose_object_parser::parse(bytes)
-        .map_err(|e| NotAParcel::Malformed(format!("Parcel {} could not be read: {}", hash, e)))?
+        .map_err(|e| NotAParcel::Newer(format!("Parcel {} could not be read by this Forklift: {}", hash, e)))?
     {
         ParsedObject::Parcel(parcel) => Ok(parcel),
         other => Err(NotAParcel::Other(format!("Object {} is a {}, not a parcel.", hash, other.get_type()))),
@@ -391,18 +409,17 @@ fn parse_tree_uncached(hash: &str) -> Result<(TreeItem, usize), String> {
     parse_tree_uncached_faulted(hash).map_err(|(error, _)| error)
 }
 
-/// [`parse_tree_uncached`], whose error says what it tells of the tree: bytes that read but do not
-/// parse as a tree are [`file_utils::ReadFault::Content`].
+/// [`parse_tree_uncached`], whose error says what it tells of the tree: a whole object of another
+/// kind is [`file_utils::ReadFault::Content`], and bytes this build cannot parse
+/// [`file_utils::ReadFault::Newer`] ([`parse_verified`]).
 fn parse_tree_uncached_faulted(hash: &str) -> Result<(TreeItem, usize), (String, file_utils::ReadFault)> {
     // Only the parse borrows the bytes, so take the shared `Arc` — a byte-cache hit is a pointer
     // clone under its lock, not a copy of the whole tree object.
     let bytes = file_utils::retrieve_object_by_hash_shared_classified(hash)
         .map_err(|(error, cause)| (error, file_utils::ReadFault::of(cause)))?;
-    let content = |error: String| (error, file_utils::ReadFault::Content);
-
-    let tree = match parser::object::loose_object_parser::parse(&bytes).map_err(content)? {
+    let tree = match parse_verified(&bytes)? {
         ParsedObject::Tree(tree) => tree,
-        other => return Err(content(format!("Object {} is a {}, not a tree.", hash, other.get_type()))),
+        other => return Err(other_kind(format!("Object {} is a {}, not a tree.", hash, other.get_type()))),
     };
 
     Ok((tree, bytes.len()))
@@ -488,18 +505,15 @@ pub fn load_blob(hash: &str) -> Result<Blob, String> {
     load_blob_faulted(hash).map_err(|(error, _)| error)
 }
 
-/// [`load_blob`], whose error says what it tells of the blob: bytes that read but do not parse as
-/// a blob are [`file_utils::ReadFault::Content`].
+/// [`load_blob`], whose error says what it tells of the blob, as [`parse_tree_uncached_faulted`]'s.
 pub(crate) fn load_blob_faulted(hash: &str) -> Result<Blob, (String, file_utils::ReadFault)> {
     // Borrow-only (the parse), so share the cached `Arc` — the win the read cache exists for on a
     // reconstruction-heavy walk (`blame`/`diff`/`export`) that reloads the same blobs and bases.
     let bytes = file_utils::retrieve_object_by_hash_shared_classified(hash)
         .map_err(|(error, cause)| (error, file_utils::ReadFault::of(cause)))?;
-    let content = |error: String| (error, file_utils::ReadFault::Content);
-
-    match parser::object::loose_object_parser::parse(&bytes).map_err(content)? {
+    match parse_verified(&bytes)? {
         ParsedObject::Blob(blob) => Ok(blob),
-        other => Err(content(format!("Object {} is a {}, not a blob.", hash, other.get_type()))),
+        other => Err(other_kind(format!("Object {} is a {}, not a blob.", hash, other.get_type()))),
     }
 }
 
@@ -847,6 +861,20 @@ pub fn verify_object_bytes(hash: &str, bytes: &[u8]) -> Result<(), String> {
     VERIFY_CALLS.with(|calls| calls.set(calls.get() + 1));
 
     verify_object_hash(hash, &hash_object_bytes(bytes))
+}
+
+/// Store a copy of stored object `hash` whose loose object version byte is `version`, its hash
+/// right for those bytes, as a newer Forklift would write one; return its hash. Writes past the
+/// store's version gate, which only a newer build's own writes do.
+#[cfg(test)]
+pub(crate) fn store_copy_in_version(hash: &str, version: u8) -> String {
+    let mut bytes = file_utils::retrieve_object_by_hash_uncached(hash).unwrap();
+    assert!(version < 0x80 && bytes[0] == 1, "a single-byte version over the current one");
+    bytes[0] = version;
+    let newer = hash_object_bytes(&bytes);
+    let (path, file_name) = file_utils::get_path_for_object(&newer).unwrap();
+    file_utils::write_object_to_file(std::path::Path::new(&path), &file_name, zstd::encode_all(&bytes[..], 0).unwrap()).unwrap();
+    newer
 }
 
 #[cfg(test)]

@@ -31,8 +31,9 @@ pub enum OfficeChainError {
     /// signature the store cannot give is told as saying nothing, and one that reads but does not
     /// parse as damaged.
     Unreadable(String, crate::util::file_utils::ReadFault),
-    /// A signature of the chain reads whole but names a version this build does not know, so a
-    /// newer Forklift may have written it: no verdict on the chain, which an upgrade can judge.
+    /// A signature of the chain, a parcel of it or an object a parcel holds, reads whole but in a
+    /// version or form this build does not know, so a newer Forklift may have written it: no
+    /// verdict on the chain, which an upgrade can judge.
     Newer(String),
     /// Every parcel up to `parcel` is authentic, but `parcel` breaks key permanence, exceeds
     /// its signer's privileges, or adds a key for another user endorsed by a non-admin.
@@ -110,11 +111,23 @@ impl From<OfficeChainError> for String {
 ///                                              from the store, or a signature reads but is
 ///                                              damaged.
 /// * `Err(OfficeChainError::Newer(_))`        - If a signature names a version this build does
-///                                              not know.
+///                                              not know, or a parcel of the chain, or an object
+///                                              it holds, reads whole but this build cannot
+///                                              parse it.
 /// * `Err(OfficeChainError::Unauthorized{..})` - If, before any inauthentic parcel, a parcel
 ///                                              breaks key permanence, exceeds its signer's
 ///                                              privileges, or adds a key endorsed beyond
 ///                                              its authorizer's authority.
+/// A store read of the office chain that failed, as [`OfficeChainError`] tells it: bytes this
+/// build cannot parse are [`OfficeChainError::Newer`], so [`OfficeChainError::Unreadable`] never
+/// carries [`ReadFault::Newer`](crate::util::file_utils::ReadFault::Newer).
+fn chain_unreadable((message, fault): (String, crate::util::file_utils::ReadFault)) -> OfficeChainError {
+    match fault {
+        crate::util::file_utils::ReadFault::Newer => OfficeChainError::Newer(message),
+        fault => OfficeChainError::Unreadable(message, fault),
+    }
+}
+
 pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<OfficeState, OfficeChainError> {
     use OfficeChainError::{Inauthentic, Newer, Unauthorized, Unreadable};
 
@@ -125,10 +138,14 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
         chain.push(cursor.clone());
 
         // Read before the genesis is recognised, so that a genesis the store cannot give is
-        // told as unreadable too. An object that is there but is not a parcel is a verdict.
+        // told as unreadable too. A whole object of another kind is a verdict; bytes this build
+        // cannot parse are a newer build's.
         let parcel = object_utils::load_parcel_judged(&cursor)
-            .map_err(|(message, fault)| Unreadable(message, fault))?
-            .map_err(|refusal| Inauthentic(refusal.into()))?;
+            .map_err(chain_unreadable)?
+            .map_err(|refusal| match refusal {
+                object_utils::NotAParcel::Other(message) => Inauthentic(message),
+                object_utils::NotAParcel::Newer(message) => Newer(message),
+            })?;
 
         if cursor == anchor.genesis {
             break;
@@ -151,7 +168,7 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
     for hash in &chain {
         let (shaped, state) = crate::util::office_utils::check_office_parcel_shape_faulted(hash).map_err(|error| match error {
             crate::util::office_utils::OfficeShapeError::NotOffice(message) => Inauthentic(message),
-            crate::util::office_utils::OfficeShapeError::Unread(message, fault) => Unreadable(message, fault),
+            crate::util::office_utils::OfficeShapeError::Unread(message, fault) => chain_unreadable((message, fault)),
         })?;
 
         if *hash == anchor.genesis && !shaped.parents.is_empty() {
@@ -4432,30 +4449,58 @@ mod tests {
 
         for shape in OddOfficeShape::ALL {
             let odd = odd_office_parcel(shape, &head, &fixture.admin, &fixture.admin_key_id);
-            let refusal = chain_refusal(&fixture.anchor, &odd);
+            // A record this build cannot parse is one a newer Forklift may have written: refused
+            // all the same, as no verdict.
+            let refusal = match shape {
+                OddOfficeShape::StrayFileUnderUsers => match verify_office_chain(&fixture.anchor, &odd) {
+                    Err(OfficeChainError::Newer(message)) => message,
+                    other => panic!("a record this build cannot parse is a newer one's: {:?}", other.map(|_| ())),
+                },
+                _ => chain_refusal(&fixture.anchor, &odd),
+            };
             assert!(refusal.contains(&odd), "{:?} must be named: {}", shape, refusal);
         }
     }
 
     /// A trust file whose chain to the office head crosses a stored signature this build cannot
-    /// judge, one naming a newer version or one damaged, is no verdict on that trust file: heal
+    /// judge, one naming a newer version or one damaged, or a head parcel in a loose object
+    /// version this build does not know, is no verdict on that trust file: heal
     /// writes nothing over it, even beside a copy that serves the head (a served root's
     /// re-genesis, which adopts the head and so serves with no walk), and says why.
     // Revert: judge a newer signature as the walk's verdict (`OfficeChainError::Newer` →
     // `TrustJudged::Unverified` in `judge_trust_bytes`) → the copy is written over the trust file
     // → the "newer" row is red; class a damaged one as inauthentic in `verify_office_chain` → the
-    // "damaged" row is red.
+    // "damaged" row is red; file a parcel this build cannot parse as inauthentic in
+    // `verify_office_chain` → the "newer parcel" row is red.
     #[test]
     fn a_trust_file_whose_chain_crosses_a_signature_heal_cannot_judge_is_not_written_over() {
         let mut newer = crate::util::byte_utils::number_to_vlq_bytes(2);
         newer.extend([0u8, 0u8]);
 
-        for (name, sidecar, says) in [("newer", newer, "upgrading Forklift reads it"), ("damaged", vec![0xffu8], "So that stored signature is damaged")] {
-            let fixture = PrivilegeFixture::new(&format!("trust-unjudged-{}", name));
+        for (name, sidecar, says) in [
+            ("newer", Some(newer), "upgrading Forklift reads it"),
+            ("damaged", Some(vec![0xffu8]), "So that stored signature is damaged"),
+            ("newer parcel", None, "could not be read by this Forklift"),
+        ] {
+            let fixture = PrivilegeFixture::new(&format!("trust-unjudged-{}", name.replace(' ', "-")));
             let (_, head) = fixture.admit("bob@x", Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
             // Served before the sidecar is replaced: the first serve reads it.
             assert!(crate::util::tombstone_utils::mark_served(true).unwrap(), "{}: the root is served", name);
-            file_utils::write_file_atomically(&sign_utils::get_signature_path(&head).unwrap(), &sidecar).unwrap();
+            let head = match sidecar {
+                Some(sidecar) => {
+                    file_utils::write_file_atomically(&sign_utils::get_signature_path(&head).unwrap(), &sidecar).unwrap();
+                    head
+                }
+                // The office's head is the same parcel as a newer Forklift would store it.
+                None => {
+                    let newer = crate::util::object_utils::store_copy_in_version(&head, 2);
+                    let office = crate::util::office_utils::OFFICE_PALLET_NAME;
+                    for path in [crate::util::pallet_utils::get_pallet_ref_path(crate::util::pallet_utils::PalletNamespace::Meta, office), crate::util::pallet_utils::get_meta_copy_path(office)] {
+                        file_utils::write_file_atomically(&path, format!("{}\n", newer).as_bytes()).unwrap();
+                    }
+                    newer
+                }
+            };
             // The serve verified the chain as it stood; a stored signature never changes outside a
             // test, so the memo is dropped for the walk to read the new one. It holds only what
             // can be recomputed.

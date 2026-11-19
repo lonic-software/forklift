@@ -1086,13 +1086,15 @@ fn read_pallet_spine(pallet: &str, parcel_hash: &str, expected: MetaKind) -> Res
 
     let spine = match read_spine(&parcel.tree_hash)? {
         Ok(spine) => spine,
-        Err(SpineFault::NoFormat) => return Err(MetaCheckError::Content(format!(
+        // The spine is read before its format marker is, so no format this build knows vouches
+        // for it: a tree it cannot read as one is no verdict, as bytes it cannot parse are not.
+        Err(SpineFault::NoFormat) => return Err(MetaCheckError::Newer(format!(
             "The meta pallet @{} has no format marker at {}: it was written by an older forklift, \
             and this one cannot read it.",
             pallet, parcel_hash
         ))),
-        Err(SpineFault::Malformed(why)) => return Err(MetaCheckError::Content(format!(
-            "The meta pallet @{} is malformed at {}: {}.", pallet, parcel_hash, why
+        Err(SpineFault::Malformed(why)) => return Err(MetaCheckError::Newer(format!(
+            "The meta pallet @{} is not a spine this forklift reads at {}: {}.", pallet, parcel_hash, why
         ))),
     };
 
@@ -1459,6 +1461,7 @@ impl MetaCheckError {
     pub(crate) fn of_read((message, fault): (String, file_utils::ReadFault)) -> MetaCheckError {
         match fault {
             file_utils::ReadFault::Content => MetaCheckError::Content(message),
+            file_utils::ReadFault::Newer => MetaCheckError::Newer(message),
             file_utils::ReadFault::Untold => MetaCheckError::Untold(message),
         }
     }
@@ -1679,9 +1682,13 @@ pub fn verify_meta_update(pallet: &str,
     // nothing of its parcels.
     let office = match (anchor, office_head) {
         (Some(anchor), Some(office_head)) => Some(audit_utils::verify_office_chain_memoized(anchor, office_head).map_err(|error| match error {
-            audit_utils::OfficeChainError::Newer(message) => MetaCheckError::Newer(message),
-            audit_utils::OfficeChainError::Unreadable(message, _) => MetaCheckError::Untold(message),
-            audit_utils::OfficeChainError::Inauthentic(message)
+            audit_utils::OfficeChainError::Newer(message)
+            | audit_utils::OfficeChainError::Unreadable(message, file_utils::ReadFault::Newer) => MetaCheckError::Newer(message),
+            audit_utils::OfficeChainError::Unreadable(message, file_utils::ReadFault::Untold) => MetaCheckError::Untold(message),
+            // The store decided part of the office chain is absent or damaged: nothing of the
+            // pallet is unread, and the office's history does not verify.
+            audit_utils::OfficeChainError::Unreadable(message, file_utils::ReadFault::Content)
+            | audit_utils::OfficeChainError::Inauthentic(message)
             | audit_utils::OfficeChainError::Unauthorized { message, .. } => MetaCheckError::Trust(message, TrustGap::ChainRefused),
         })?),
         (None, None) => None,
