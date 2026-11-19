@@ -398,12 +398,19 @@ pub fn detect(notes: &mut Vec<String>) -> Result<Vec<DamagedRef>, String> {
     for pallet in pallet_utils::list_pallets_in(PalletNamespace::User)? {
         let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, &pallet);
 
-        match std::fs::read(&path) {
-            Ok(bytes) => {
+        // Judged as it stands, never through a link, as every read of the ref judges it.
+        match pallet_utils::read_file_state(&path) {
+            Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => {
                 if pallet_utils::parse_ref_bytes(&bytes).is_none() {
                     found.insert(pallet, RefDamage::Unreadable(bytes));
                 }
             }
+            Ok(pallet_utils::MetaCopyState::Absent) => {}
+            Ok(pallet_utils::MetaCopyState::Other) => push_note(notes, format!(
+                "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it. \
+                Move it aside, then run heal again.",
+                pallet, path.to_string_lossy()
+            )),
             Err(error) => push_note(notes, format!(
                 "The ref of pallet \"{}\" could not be read to tell whether it is damaged: {}", pallet, error
             )),
@@ -1407,7 +1414,8 @@ fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaS
             Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => Some(bytes),
             Ok(pallet_utils::MetaCopyState::Other) => {
                 skipped.push((name.clone(), format!(
-                    "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it.",
+                    "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it. \
+                    Move it aside, then run heal again.",
                     meta_wire(&name), path.to_string_lossy()
                 )));
                 continue;

@@ -787,15 +787,33 @@ pub fn get_meta_pallet_head(name: &str) -> Result<Option<String>, String> {
 /// * `Ok(None)`         - If the pallet is unborn: it has no ref file, and, for a meta pallet,
 ///   no copy either.
 /// * `Err(String)`      - If the name is invalid, or the ref file could not be read, or it
-///   does not contain a valid hash, or a meta pallet's ref file is missing while its copy stands
-///   (each a [`RefusalCode::RefDamaged`] refusal but the first two).
+///   does not contain a valid hash, or a link or anything else that is neither a file nor a folder
+///   stands at its path, or a meta pallet's ref file is missing while its copy stands (each a
+///   [`RefusalCode::RefDamaged`] refusal but the first two).
 pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
     validate_pallet_name(name)?;
 
     let path = get_pallet_ref_path(namespace, name);
 
-    if path.is_file() {
-        return read_ref_file(namespace, name, &path);
+    // A ref is judged as it stands, never through a link: nothing writes one at a ref's path, and
+    // heal, which reads it the same way, judges no ref a link stands at. A folder holds the refs of
+    // names below this one, so it is no ref of this one.
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.is_file() {
+            return read_ref_file(namespace, name, &path);
+        }
+        if !metadata.is_dir() {
+            return Err(CoreError::refusal(
+                RefusalCode::RefDamaged,
+                format!(
+                    "The ref of pallet \"{}\" (\"{}\") is blocked: something that is not a file stands at its path. \
+                    Nothing was changed.",
+                    PalletRef { namespace, name: name.to_string() }.to_wire(),
+                    path.to_string_lossy()
+                ),
+                BLOCKED_REF_STEP,
+            ).into());
+        }
     }
 
     if namespace == PalletNamespace::User {
@@ -845,7 +863,7 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
         Ok(_) => (
             "is blocked",
             "something that is not a file stands at its path".to_string(),
-            "Move aside what stands at the ref's path, then run the command again.".to_string(),
+            BLOCKED_REF_STEP.to_string(),
         ),
     };
 
@@ -864,6 +882,9 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
 }
 
 const HEAL_STEP: &str = "forklift heal";
+
+/// The step for a ref something that is not a file stands at: heal judges no such ref.
+const BLOCKED_REF_STEP: &str = "Move aside what stands at the ref's path, then run the command again.";
 
 /// The step for a meta ref whose copy could not be read: `heal` skips such a ref, and what fails
 /// may be the copy or a folder on the way to it.
@@ -3229,6 +3250,32 @@ pub(crate) mod tests {
             let (message, next) = step("tags");
             assert!(message.contains("is blocked: something that is not a file stands at its path"), "{}", message);
             assert_eq!(next, "Move aside what stands at the ref's path, then run the command again.");
+            drop(_scope);
+
+            // A link at the ref's path is never followed, in either namespace, though what it
+            // points at names a head: nothing writes one, and heal judges no ref a link stands at,
+            // so heal is never the step, and heal names the same one.
+            let (_root, _scope) = scratch("ref-a-link");
+            write("tags", None, &h1).unwrap();
+            let target = forklift_root().join("elsewhere");
+            std::fs::write(&target, format!("{}\n", h1)).unwrap();
+            for (namespace, name) in [(PalletNamespace::Meta, "tags"), (PalletNamespace::User, "main")] {
+                let path = get_pallet_ref_path(namespace, name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                if path.is_file() {
+                    file_utils::remove_file(&path).unwrap();
+                }
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+                let refused = get_pallet_head_in(namespace, name).map_err(|e| e.to_string());
+                let refused = refused.expect_err(name);
+                let (_, message, next) = crate::error::deframe(&refused).unwrap();
+                assert!(message.contains("is blocked: something that is not a file stands at its path"), "{}: {}", name, message);
+                assert_eq!(next, "Move aside what stands at the ref's path, then run the command again.", "{}", name);
+            }
+            let mut notes = Vec::new();
+            let found = crate::util::ref_heal::detect(&mut notes).unwrap();
+            assert!(found.is_empty(), "heal files no ref a link stands at: {:?}", found.iter().map(|d| &d.pallet).collect::<Vec<_>>());
+            assert!(notes.iter().any(|note| note.contains("ref of pallet \"main\"") && note.contains("Move it aside")), "{:?}", notes);
         }
 
         /// A meta ref's repair is a compare-and-set on its copy as well as its ref: a copy that
