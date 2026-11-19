@@ -2917,6 +2917,21 @@ office's rebuilt head before the office is written. If `@redactions`' ref or its
 rebuilt, `heal` refuses every damaged metadata ref, listing the head each copy names. Write the
 head into the file by hand.
 
+`heal` judges the damaged metadata refs twice: before its taint recovery, rebuilding those it can
+settle, and again after it, once what a durability taint records has been checked or fetched again.
+One it cannot settle the first time, for example because its remaining bytes name an object a taint
+records, is left for the second. A refusal that stops the run before the second pass, such as a
+`durability_taint` refusal for a taint that still stands, names each metadata ref left that way,
+with the heads found for it, beside those already rebuilt; one after it names those it refused. A
+refusal that stops either pass before it has judged every damaged metadata ref names the rest as
+not yet judged. A later `heal` judges them again.
+
+Beside a taint whose record is torn, every object counts as one the taint may have lost. A
+metadata ref whose remaining bytes still name an object is then left each time, and the taint's
+rescan, which reads every ref, cannot finish past it, so running `heal` again resolves neither; the
+refusal says so. Check that a head named for the ref is one this store holds, then write it into
+the ref's file by hand; `heal` does not verify a head written that way.
+
 #### A damaged fetch scope
 
 In a sparse warehouse, a fetch scope (`.forklift/config/fetch-scope`) that is lost or cannot be read

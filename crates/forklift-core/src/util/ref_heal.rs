@@ -124,6 +124,18 @@ pub struct Repair {
     /// The refs it refused to rebuild (only [`Pass::AfterTaint`] refuses; the first pass defers).
     pub refused: Vec<Refused>,
 
+    /// The meta refs [`Pass::BeforeTaint`] judged and left for [`Pass::AfterTaint`], each with
+    /// why and every head it found: a run that stops before that pass names them.
+    pub deferred: Vec<Refused>,
+
+    /// The lost or damaged meta refs, as `@<name>`, that a meta pass which stopped never judged:
+    /// neither rebuilt, refused nor deferred.
+    pub unjudged: Vec<String>,
+
+    /// The deferred meta refs, as `@<name>`, whose own bytes name only objects that a taint whose
+    /// record is torn, or could not be read, counts as possibly lost; and which of the two it was.
+    pub held: Option<TaintHold>,
+
     /// What narrowed the evidence: a position, journal or marker that could not be read.
     pub notes: Vec<String>,
 
@@ -278,6 +290,8 @@ pub fn detect(notes: &mut Vec<String>) -> Result<Vec<DamagedRef>, String> {
 struct Tainted {
     hashes: BTreeSet<String>,
     torn: bool,
+    /// Whether the taint could not be read, which [`Tainted::read`] takes as torn.
+    unread: bool,
 }
 
 impl Tainted {
@@ -286,10 +300,11 @@ impl Tainted {
             Ok(state) => Tainted {
                 hashes: state.recorded.iter().filter_map(|path| file_utils::hash_from_object_path(path)).collect(),
                 torn: state.torn,
+                unread: false,
             },
             Err(error) => {
                 push_note(notes, format!("The durability taint could not be read, so every object salvaged from a damaged ref counts as possibly lost: {}", error));
-                Tainted { hashes: BTreeSet::new(), torn: true }
+                Tainted { hashes: BTreeSet::new(), torn: true, unread: true }
             }
         }
     }
@@ -1123,8 +1138,26 @@ pub struct MetaRepair {
 pub struct TrustStopped {
     pub error: String,
     pub rebuilt: Vec<Rebuilt>,
+    /// What [`Pass::BeforeTaint`] deferred before it stopped: the office, when it left that.
+    pub deferred: Vec<Refused>,
+    /// What [`Pass::AfterTaint`] refused before it stopped: the office, when it refused that.
+    pub refused: Vec<Refused>,
+    /// Every other lost or damaged meta ref, as `@<name>`, which the pass stopped before judging.
+    pub unjudged: Vec<String>,
+    /// The deferred refs the taint held ([`Repair::held`]).
+    pub held: Option<TaintHold>,
     /// What the pass noted before it stopped, the office step's among them.
     pub notes: Vec<String>,
+}
+
+/// The meta refs [`Pass::BeforeTaint`] deferred only because a taint counts every object as one it
+/// may have lost, and why it does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaintHold {
+    /// Whether the taint could not be read at all, rather than read as torn.
+    pub unread: bool,
+    /// The refs, as `@<name>`.
+    pub refs: Vec<String>,
 }
 
 fn is_office(state: &MetaState) -> bool {
@@ -1157,8 +1190,8 @@ fn is_redactions(state: &MetaState) -> bool {
 ///
 /// [`JudgedRedactions`]: crate::util::redaction_utils::JudgedRedactions
 ///
-/// [`Pass::BeforeTaint`] refuses nothing and drops a write that failed, leaving both to
-/// [`Pass::AfterTaint`], which judges again.
+/// [`Pass::BeforeTaint`] refuses nothing: what it would refuse, a write that failed among it,
+/// it lists as deferred ([`Repair::deferred`]) for [`Pass::AfterTaint`], which judges again.
 ///
 /// [`repair_trust`]: crate::util::office_utils::repair_trust
 ///
@@ -1182,22 +1215,61 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
         judged = rebuild_office(state, redactions, tainted, pass, &mut report);
     }
 
-    let trust = match crate::util::office_utils::repair_trust() {
-        Ok(trust) => trust,
+    let trust = crate::util::office_utils::repair_trust();
+    if trust.is_ok() && report.stopped.is_none() {
+        repair_other_meta(pass, office.is_some(), judged, &mut tainted, &mut report);
+    }
+    // A pass that stopped, at the trust repair or inside step 3, names what it never judged.
+    if trust.is_err() || report.stopped.is_some() {
+        report.unjudged = unjudged_in(&mut report);
+    }
+    report.held = tainted.as_ref().filter(|tainted| tainted.torn).and_then(|tainted| held_in(tainted, &mut report));
+
+    match trust {
+        Ok(trust) => Ok(MetaRepair { repair: report, trust }),
         Err(error) => {
             let mut notes = std::mem::take(&mut report.notes);
             if let Some(stopped) = report.stopped.take() {
                 notes.push(format!("The office pallet's ref was not rebuilt: {}", stopped.trim_end_matches('.')));
             }
-            return Err(TrustStopped { error, rebuilt: std::mem::take(&mut report.rebuilt), notes });
+            Err(TrustStopped {
+                error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred),
+                refused: std::mem::take(&mut report.refused), unjudged: std::mem::take(&mut report.unjudged), held: report.held.take(), notes,
+            })
         }
-    };
-
-    if report.stopped.is_none() {
-        repair_other_meta(pass, office.is_some(), judged, &mut tainted, &mut report);
     }
+}
 
-    Ok(MetaRepair { repair: report, trust })
+/// The lost or damaged meta refs, as `@<name>`, that `report` neither rebuilt, refused nor
+/// deferred: what a pass that stopped never judged. Read again, since step 3 judges from its own
+/// read; what that read could not judge is noted into `report`.
+fn unjudged_in(report: &mut Repair) -> Vec<String> {
+    let mut notes = Vec::new();
+    let states = meta_states(&mut notes).unwrap_or_default();
+    for note in notes {
+        push_note(&mut report.notes, note);
+    }
+    let judged = |wire: &str| report.rebuilt.iter().any(|rebuilt| rebuilt.pallet == wire)
+        || report.refused.iter().chain(&report.deferred).any(|refused| refused.pallet == wire);
+    states.iter().filter(|state| state.damage().is_some()).map(MetaState::wire).filter(|wire| !judged(wire)).collect()
+}
+
+/// The refs `report` deferred whose own bytes, read again, name only objects `tainted` counts as
+/// possibly lost; `None` when there are none. Beside a torn taint every object counts so.
+fn held_in(tainted: &Tainted, report: &mut Repair) -> Option<TaintHold> {
+    if report.deferred.is_empty() {
+        return None;
+    }
+    let mut notes = Vec::new();
+    let states = meta_states(&mut notes).unwrap_or_default();
+    for note in notes {
+        push_note(&mut report.notes, note);
+    }
+    let held = |wire: &str| states.iter().find(|state| state.wire() == wire)
+        .and_then(|state| state.reference.as_deref())
+        .is_some_and(|bytes| matches!(salvage(bytes, tainted), Ok(Salvage::Unknown(_))));
+    let refs: Vec<String> = report.deferred.iter().map(|deferred| deferred.pallet.clone()).filter(|wire| held(wire)).collect();
+    (!refs.is_empty()).then_some(TaintHold { unread: tainted.unread, refs })
 }
 
 /// What step 1 of [`repair_meta`] judged of a damaged `@redactions` beside a damaged office, for
@@ -1288,11 +1360,13 @@ fn judged_redactions(state: &MetaState, head: String) -> crate::util::redaction_
     }
 }
 
-/// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`] only,
-/// since the pass before the taint recovery leaves its refusals to the one after it.
+/// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`]; the pass
+/// before the taint recovery defers it to that pass instead.
 fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String, candidates: Vec<Candidate>) {
-    if pass == Pass::AfterTaint {
-        report.refused.push(Refused { pallet: state.wire(), reason, candidates });
+    let refused = Refused { pallet: state.wire(), reason, candidates };
+    match pass {
+        Pass::AfterTaint => report.refused.push(refused),
+        Pass::BeforeTaint => report.deferred.push(refused),
     }
 }
 
@@ -1326,7 +1400,6 @@ fn write_meta_rebuild(state: &MetaState,
             report.stopped = Some(error);
             return true;
         }
-        Err(_) if pass == Pass::BeforeTaint => return false,
         Err(error) => format!("the rebuild at {} was not written: {}", head, error),
         Ok(()) => format!("the rebuild at {} did not read back", head),
     };
@@ -1506,12 +1579,12 @@ mod tests {
     fn bytes_matching_more_than_one_parcel_are_unknown_not_nothing() {
         let (_root, _scope) = scratch("ref-heal-judge");
         let (one, two) = (stub_parcel("1"), stub_parcel("2"));
-        let clean = Tainted { hashes: BTreeSet::new(), torn: false };
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
 
         assert_eq!(judge(vec![one.clone()], &clean), Salvage::Found(one.clone()));
         assert_eq!(judge(vec![one.clone(), two.clone()], &clean), Salvage::Ambiguous(vec![one.clone(), two.clone()], false));
 
-        let tainted = Tainted { hashes: BTreeSet::from(["f".repeat(HASH_LENGTH)]), torn: false };
+        let tainted = Tainted { hashes: BTreeSet::from(["f".repeat(HASH_LENGTH)]), torn: false, unread: false };
         assert_eq!(judge(vec![one.clone(), two.clone(), "f".repeat(HASH_LENGTH)], &tainted), Salvage::Ambiguous(vec![one, two], true));
     }
 
@@ -1549,7 +1622,7 @@ mod tests {
         // Between step 1 and step 3, the copy moves back to the older head.
         std::fs::write(pallet_utils::get_meta_copy_path(REDACTIONS_PALLET_NAME), format!("{}\n", older)).unwrap();
         let state = state_named(&mut notes);
-        let clean = Tainted { hashes: BTreeSet::new(), torn: false };
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
         let mut report = Repair::default();
 
         let rebuilt = rebuild_redactions(&state, &[], Some(RedactionsJudged::Verified(judged, FROM_COPY)), &clean, Pass::AfterTaint, &mut report);
