@@ -120,7 +120,7 @@ trust file. `forklift lift` asks the remote, so it names lower as the next step 
 holds this warehouse's office; other commands name it as a way out where a remote is configured.
 `forklift heal` rebuilds the ref from its copy (`.forklift/meta-copy/office`) where that stands and
 verifies against the anchor, unless a newer version of Forklift wrote the trust file or its copy, or
-the office's history cannot be read from the store. Without either, restore the ref from a
+the office's history cannot be read from the store. With neither a remote nor a copy to rebuild from, restore the ref from a
 backup, or write the office pallet's head parcel hash into it by hand. Write the latest head you know
 of: an older one re-admits any key revoked since. If `office enroll` stopped before it wrote the office
 pallet, there is no ref to restore. Where no remote holds this anchor, move the trust file (`.forklift/trust`) and
