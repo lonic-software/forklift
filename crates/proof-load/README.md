@@ -46,6 +46,11 @@ ahead.
 generated history instead, faulting nothing, and writes `perf.md` and `perf.json`. See
 [Measuring performance](../../docs/guide/proof-load.md#11-measuring-performance).
 
+`proof-load replay --source <repo> --out <folder> --forklift <path> --git <path>` replays the
+two-parent merges of a real git history in Forklift, compares each with git's merge of the same
+two commits, and writes `replay.md` and `replay.json`. See
+[Replaying merges](../../docs/guide/proof-load.md#12-replaying-merges).
+
 To look at a report in a window, use [`tools/proof-load-desktop`](../../tools/proof-load-desktop/README.md).
 
 ## Tests

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use proof_load::perf;
+use proof_load::{perf, replay};
 use proof_load::run::{self, Progress, RunOptions};
 
 #[derive(Parser)]
@@ -146,6 +146,35 @@ enum Command {
         #[arg(long)]
         against: Option<PathBuf>,
     },
+    /// Replays the two-parent merges of a real git history in Forklift, each from its two parents,
+    /// compares every path with git's merge of the same two commits, judges the differences against
+    /// the tickets this build was shipped with, and writes replay.json and replay.md.
+    Replay {
+        /// The git repository whose merges to replay. It is read only: the harness mirrors it into
+        /// its scratch area first. A shallow repository is refused.
+        #[arg(long)]
+        source: PathBuf,
+        /// The commit whose history is replayed: any revision git resolves to a commit, a detached
+        /// HEAD or a commit id included.
+        #[arg(long = "ref", default_value = "HEAD")]
+        reference: String,
+        /// An empty or new directory for the scratch area and the replay report.
+        #[arg(long)]
+        out: PathBuf,
+        /// The forklift binary to replay the merges in, by path.
+        #[arg(long)]
+        forklift: PathBuf,
+        /// The git binary, by path, that mirrors the history and makes the reference merges.
+        #[arg(long)]
+        git: PathBuf,
+        /// How many merges to replay. All of them without it.
+        #[arg(long)]
+        sample: Option<usize>,
+        /// Shuffles the merges before --sample takes the first ones. Without it they are taken in
+        /// git's rev-list order.
+        #[arg(long)]
+        seed: Option<u64>,
+    },
 }
 
 /// Shows a run's messages on stderr; the report itself is the files the run writes.
@@ -188,6 +217,17 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Replay { source, reference, out, forklift, git, sample, seed } => {
+            let options = replay::ReplayOptions { source, reference, out, forklift, git, sample, seed };
+            match replay::run(&options, &|text| eprintln!("proof-load: {}", text)) {
+                Ok(report) if report.failed() => ExitCode::from(1),
+                Ok(_) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("proof-load: {}", error);
+                    ExitCode::from(2)
+                }
+            }
+        }
     }
 }
 
@@ -218,7 +258,7 @@ mod tests {
         let guide = prose(&std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guide/proof-load.md")).unwrap());
         let cli = super::Cli::command();
         let subcommands: Vec<&clap::Command> = cli.get_subcommands().collect();
-        assert_eq!(subcommands.iter().map(|subcommand| subcommand.get_name()).collect::<Vec<_>>(), ["run", "perf"]);
+        assert_eq!(subcommands.iter().map(|subcommand| subcommand.get_name()).collect::<Vec<_>>(), ["run", "perf", "replay"]);
         // A flag counts where it stands alone: `--forklift` inside `--forklift-server` is not it.
         let named = |flag: &str| guide.match_indices(flag).any(|(at, _)| !guide[at + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-'));
         for subcommand in subcommands {

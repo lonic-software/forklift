@@ -5,6 +5,11 @@
 #
 # Non-blocking while its flake rate is unknown: the run step continues on error, so the job reports
 # its grades without failing the check. Whether and how it gates after the trial is FORK-445.
+#
+# The replay job replays this repository's own merges through Forklift, the merge the pull request
+# would land included, and compares each with git's merge of the same two commits. A history gives
+# the same result on every run, so its run step does not continue on error: a verdict that fails
+# anything fails the job. Like the fault lane, it is outside `ci passed`.
 name: proof load
 
 on:
@@ -125,4 +130,48 @@ jobs:
             ${{ runner.temp }}/proof-load/*.json
             ${{ runner.temp }}/proof-load/report.md
             ${{ runner.temp }}/proof-load/traces/
+          if-no-files-found: warn
+
+  replay:
+    name: proof load replay
+    runs-on: ubuntu-latest
+    # The hang guard. Replaying this history's 290 merges took under two minutes on macOS release.
+    timeout-minutes: 30
+    steps:
+      # The full history: the harness refuses a shallow one.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: replay
+
+      - name: Build the binary under test and the harness
+        run: cargo build --release --locked -p forklift -p proof-load
+
+      # github.sha is the merge commit the pull request would land, so that merge is a row too.
+      - name: Run
+        id: run
+        run: |
+          bin=target/release
+          "$bin/proof-load" replay --source . --ref ${{ github.sha }} --out "$RUNNER_TEMP/replay" \
+            --forklift "$bin/forklift" --git "$(command -v git)"
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          echo "Run step: ${{ steps.run.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUNNER_TEMP/replay/replay.md" ]; then cat "$RUNNER_TEMP/replay/replay.md" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: proof-load-replay
+          path: |
+            ${{ runner.temp }}/replay/replay.json
+            ${{ runner.temp }}/replay/replay.md
           if-no-files-found: warn
