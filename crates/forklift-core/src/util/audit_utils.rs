@@ -31,10 +31,11 @@ pub enum OfficeChainError {
     /// said nothing of it; a signature the store cannot give is told as saying nothing. Bytes the
     /// store gave whole that this build cannot parse are [`OfficeChainError::Newer`], never this.
     Unreadable(String, ChainFault),
-    /// A parcel's signature reads but does not decode in the version it names, or decodes in a form
-    /// no check can run on (not 64 bytes): the store holds that signature damaged, while the parcel
-    /// it signs may be whole. No verdict on the chain's history (a damaged version byte reads as
-    /// any version), and one a restored signature mends.
+    /// A parcel's signature is missing from the store, reads but does not decode in the version it
+    /// names, or decodes in a form no check can run on (not 64 bytes): the store holds that
+    /// signature lost or damaged, while the parcel it signs may be whole. No verdict on the chain's
+    /// history (nothing the store keeps says a parcel was signed, and a damaged version byte reads
+    /// as any version), and one a restored signature mends.
     SignatureDamaged(String),
     /// A signature of the chain, a parcel of it or an object a parcel holds, reads whole but in a
     /// version or form this build does not know, so a newer Forklift may have written it: no
@@ -234,27 +235,33 @@ fn chain_unreadable((message, fault): (String, crate::util::file_utils::ReadFaul
 }
 
 /// The operator whose key, active in `state`, signed office parcel `hash`: the refusal when its
-/// signature cannot be read, is damaged or no check can run on it says nothing of the chain; one
-/// that is missing, by a key `state` does not track or revoked in it, or that does not verify is
-/// the walk's verdict.
+/// signature cannot be read, is missing, is damaged or no check can run on it says nothing of the
+/// chain; one by a key `state` does not track or revoked in it, or that does not verify is the
+/// walk's verdict.
 fn office_parcel_signer(hash: &str, state: &OfficeState) -> Result<String, OfficeChainError> {
     use OfficeChainError::{Inauthentic, Newer, SignatureDamaged, Unreadable};
 
     // A signature the store cannot give is unreadable, not a verdict: only what reads is judged
     // below.
     let raw = sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, ChainFault::Untold))?;
-    let signature = raw.map(|bytes| sign_utils::decode_stored_parcel_signature_classified(&bytes, hash)).transpose().map_err(|refused| match refused {
+    // Nothing the store keeps says a parcel was signed, so a signature lost from it reads as none:
+    // the store lacks it, as it holds a damaged one damaged.
+    let raw = raw.ok_or_else(|| SignatureDamaged(format!(
+        "The office parcel {} carries no signature in this store. Every office parcel is signed; a \
+        lost signature and a stripped one look alike.",
+        hash
+    )))?;
+    let signature = sign_utils::decode_stored_parcel_signature_classified(&raw, hash).map_err(|refused| match refused {
         sign_utils::SignatureDecode::Newer(message) => Newer(message),
         sign_utils::SignatureDecode::Damaged(message) => SignatureDamaged(message),
     })?;
-    verify_signature_of(hash, signature.as_ref(), state, "office parcel").map_err(|refused| match refused {
+    verify_signature_of(hash, &signature, state, "office parcel").map_err(|refused| match refused {
         SignatureCheckError::Refused(message) => Inauthentic(message),
         SignatureCheckError::Unchecked(message) => SignatureDamaged(message),
     })?;
 
     // A revoked key must not extend the office chain: the signer has to be active in the state
     // the signature is checked against.
-    let signature = signature.expect("verify_signature_of refuses a parcel with no signature");
 
     state.find_key(&signature.key_id)
         .filter(|key| key.is_active())
@@ -940,7 +947,7 @@ pub(crate) fn classify_signature_of(hash: &str, signature: Option<sign_utils::Pa
         }
 
         Some(signature) => {
-            verify_signature_of(hash, Some(&signature), office_state, "parcel")?;
+            verify_signature_of(hash, &signature, office_state, "parcel")?;
 
             let key = office_state.find_key(&signature.key_id)
                 .expect("verify_one_signature found this key");
@@ -1817,18 +1824,18 @@ fn verify_self_service_change(previous: &OfficeState,
 pub fn verify_one_signature(parcel_hash: &str,
                             state: &OfficeState,
                             kind: &str) -> Result<(), String> {
-    Ok(verify_signature_of(parcel_hash, sign_utils::load_parcel_signature(parcel_hash)?.as_ref(), state, kind)?)
+    let signature = sign_utils::load_parcel_signature(parcel_hash)?
+        .ok_or(format!("The {} {} carries no signature.", kind, parcel_hash))?;
+    Ok(verify_signature_of(parcel_hash, &signature, state, kind)?)
 }
 
-/// [`verify_one_signature`] of the signature `signature` already read for `parcel_hash` (`None`:
-/// it has none).
+/// [`verify_one_signature`] of the signature `signature` already read for `parcel_hash`. A parcel
+/// with none is its caller's to judge: nothing the store keeps says a parcel was signed.
 pub(crate) fn verify_signature_of(parcel_hash: &str,
-                                  signature: Option<&sign_utils::ParcelSignature>,
+                                  signature: &sign_utils::ParcelSignature,
                                   state: &OfficeState,
                                   kind: &str) -> Result<(), SignatureCheckError> {
     use SignatureCheckError::{Refused, Unchecked};
-
-    let signature = signature.ok_or(Refused(format!("The {} {} carries no signature.", kind, parcel_hash)))?;
 
     let key = state.find_key(&signature.key_id)
         .ok_or(Refused(format!(
@@ -1860,8 +1867,8 @@ pub(crate) fn verify_signature_of(parcel_hash: &str,
 /// Why [`verify_signature_of`] refused a parcel's signature.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SignatureCheckError {
-    /// It was checked and refused: there is none, its key is not tracked, or it does not verify
-    /// against its key. A verdict on the parcel.
+    /// It was checked and refused: its key is not tracked, or it does not verify against its key.
+    /// A verdict on the parcel.
     Refused(String),
 
     /// It decodes, but neither it nor its key is in a form a check can run on (a signature not 64
@@ -4531,9 +4538,9 @@ mod tests {
 
     // A parcel past the genesis is judged by its signature before its records: a record this build
     // cannot parse is a newer build's only in a parcel a key of the office signed, and in one no
-    // key signed, or one whose signature does not verify, it is a forgery. Mutation: parse the
-    // records before the signature (`signed_before` always `None`) → "unsigned" and "forged" read
-    // as newer, red.
+    // key signed, or one whose signature does not verify, it is a forgery; one whose signature is
+    // lost is no verdict either way. Mutation: parse the records before the signature
+    // (`signed_before` always `None`) → "unsigned" and "forged" read as newer, red.
     #[test]
     fn an_office_parcel_is_judged_by_its_signature_before_its_records() {
         use crate::util::office_utils::tests::{odd_office_parcel, OddOfficeShape};
@@ -4550,7 +4557,13 @@ mod tests {
                 _ => file_utils::write_file_atomically(&path, &[signed[..signed.len() - 65].to_vec(), vec![64], vec![0; 64]].concat()).unwrap(),
             }
 
-            let refusal = chain_refusal(&fixture.anchor, &odd);
+            // A lost signature is no verdict on the chain, a forged one is the walk's; neither
+            // lets the records be read as a newer build's.
+            let refusal = match (case, verify_office_chain(&fixture.anchor, &odd)) {
+                ("unsigned", Err(OfficeChainError::SignatureDamaged(message))) => message,
+                ("unsigned", other) => panic!("a lost signature is no verdict: {:?}", other.map(|_| ())),
+                _ => chain_refusal(&fixture.anchor, &odd),
+            };
             let said = if case == "unsigned" { "carries no signature" } else { "does not verify against key" };
             assert!(refusal.contains(&odd) && refusal.contains(said), "{}: {}", case, refusal);
         }

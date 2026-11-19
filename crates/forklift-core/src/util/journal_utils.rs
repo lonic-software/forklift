@@ -2578,7 +2578,7 @@ mod tests {
 
         restore_refs(&restored).unwrap();
 
-        assert!(!pallet_utils::does_pallet_exist("gone"));
+        assert!(!pallet_utils::does_pallet_exist("gone").unwrap());
     }
 
     #[test]

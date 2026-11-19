@@ -1747,9 +1747,13 @@ impl<'b> LegacyHistory<'b> {
             return Ok(());
         }
 
-        Err(MetaCheckError::Verdict(Verdict::SignatureRefused, format!(
-            "Parcel {} on @{} carries no signature and was stacked after trust was established. \
-            Every meta parcel stacked under an office must be signed by a key of the office.",
+        // Nothing the store keeps says a parcel was signed: its signature lies beside it, so a
+        // signature lost from the store reads as none at all. The refusal stands, and is no
+        // verdict on the parcel's history.
+        Err(MetaCheckError::Untold(format!(
+            "Parcel {} on @{} carries no signature in this store and was stacked after trust was \
+            established. Every meta parcel stacked under an office must be signed by a key of \
+            the office; a lost signature and a stripped one look alike.",
             hash, pallet
         )))
     }

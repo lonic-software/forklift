@@ -1756,17 +1756,21 @@ fn a_meta_ref_refused_only_because_the_office_was_names_the_office_and_is_not_re
 
 // A damaged signature beside a parcel of a lost meta ref's history is no verdict on the ref, on
 // the office or beside it: the store holds the parcel whole, and the signature over it is what
-// cannot be read. So is a signature that decodes but cannot be checked (it is not 64 bytes). Heal
-// refuses the ref as unread, never as its own, and the removal is refused and keeps it. A forged
+// cannot be read. So is a signature that decodes but cannot be checked (it is not 64 bytes), and
+// one missing from the store: nothing it keeps says a parcel was signed, so a lost signature
+// reads as none. Heal refuses the ref as unread, never as its own, and the removal is refused and
+// keeps it. A forged
 // signature, one that is checked against its key and refused, is a verdict: the removal is the
 // step, and it removes the ref. Mutations: read the damaged sidecar of a non-office parcel as a
 // refused signature → "tags damaged" next_step is the removal, red; read a damaged signature on
 // the office's chain as the anchor's own refusal → "office damaged" next_step is the removal,
 // red; read a signature that cannot be checked as refused → "tags short" next_step is the
-// removal, red.
+// removal, red; read a missing signature after trust as refused → "tags missing" next_step is the
+// removal, red; read a missing signature on the office's chain as inauthentic → "office missing"
+// next_step is the removal, red.
 #[test]
 fn a_damaged_signature_beside_a_meta_parcel_is_never_the_refs_own() {
-    for (pallet, damage) in [("tags", "damaged"), ("office", "damaged"), ("tags", "short"), ("tags", "forged")] {
+    for (pallet, damage) in [("tags", "damaged"), ("office", "damaged"), ("tags", "short"), ("tags", "missing"), ("office", "missing"), ("tags", "forged")] {
         let case = format!("{} {}", pallet, damage);
         let area = Area::new(&format!("meta-signature-{}-{}", pallet, damage));
         let (root, _, _) = tagged(&area);
@@ -1778,12 +1782,12 @@ fn a_damaged_signature_beside_a_meta_parcel_is_never_the_refs_own() {
         // Version 1, the key id, then a one-byte length and the 64-byte signature.
         assert_eq!(signed[signed.len() - 65], 64, "{}: {:?}", case, signed);
         let key = signed[..signed.len() - 65].to_vec();
-        let bytes = match damage {
-            "damaged" => vec![1u8, 0xff],
-            "short" => [key, vec![63], vec![7; 63]].concat(),
-            _ => [key, vec![64], vec![0; 64]].concat(),
-        };
-        std::fs::write(&sidecar, bytes).unwrap();
+        match damage {
+            "missing" => forklift_core::util::file_utils::remove_file(&sidecar).unwrap(),
+            "damaged" => std::fs::write(&sidecar, [1u8, 0xff]).unwrap(),
+            "short" => std::fs::write(&sidecar, [key, vec![63], vec![7; 63]].concat()).unwrap(),
+            _ => std::fs::write(&sidecar, [key, vec![64], vec![0; 64]].concat()).unwrap(),
+        }
         forklift_core::util::file_utils::remove_file(&meta_path(&root, pallet)).unwrap();
 
         let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));

@@ -2504,7 +2504,7 @@ pub fn retrieve_named_object_by_hash(hash: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Who named the hash a read is for, which decides what an absence nothing accounts for is told.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Absence {
     /// History reached it, so the store should hold it: refused
     /// [`RefusalCode::ObjectUnreadable`], naming `forklift heal`.
@@ -2950,13 +2950,22 @@ fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, (String, Option<
     };
 
     // Pack files whose hash set is unknown may hold it; they never change the verdict
-    // (I4), only what the reader is told; a folder that cannot be listed adds nothing, so
-    // the read still names the missing object.
-    let holders = crate::util::pack_utils::unindexed_holders().unwrap_or_default();
+    // (I4), only what the reader is told. A pack registry that cannot be loaded leaves the
+    // absence undecided: what it would have listed may hold the object.
+    let (holders, registry) = match crate::util::pack_utils::unindexed_holders() {
+        Ok(holders) => (holders, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let missing = match &registry {
+        Some(error) => format!(
+            "{}. Whether a pack file holds it could not be told: {}", missing, error
+        ),
+        None => missing,
+    };
 
     // Nothing left undecided and nothing says the store ever held it: a hash the caller
     // was handed is simply not here.
-    let decided = records_decided && holders.is_empty();
+    let decided = records_decided && registry.is_none() && holders.is_empty();
     if absence == Absence::Named && decided {
         return Err((format!("Object {} is not in this store.", hash), None));
     }
@@ -6518,6 +6527,34 @@ mod tests {
         assert!(result.is_err(), "a loose file that hashes wrong must fail the read, got {:?}", result);
         assert!(result.unwrap_err().contains("corrupt"), "the error should name the corruption");
 
+        remove_dir_all(&temp).ok();
+    }
+
+    // An absence is the store's verdict only when nothing that might hold the object is left
+    // unread: a pack registry that cannot be loaded leaves it undecided, so no verdict leans on it.
+    // Mutation: count a registry that fails to load as no holders → the cause is None, red.
+    #[test]
+    fn a_pack_registry_that_cannot_be_loaded_leaves_an_absence_undecided() {
+        let temp = std::env::temp_dir().join(format!("forklift-absent-registry-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let hash = blake3::hash(b"never stored here").to_hex().to_string();
+
+        // The registry loads: the store decided the object is not here.
+        let (why, cause) = read_object_as_classified(&hash, Absence::Named).unwrap_err();
+        assert_eq!(cause, None, "{}", why);
+        assert!(matches!(ReadFault::of(cause), ReadFault::Decided(Decided::Absent)), "{}", why);
+
+        let _failing = crate::util::pack_utils::fail_unindexed_holders("the pack registry could not be read");
+        for absence in [Absence::Named, Absence::History] {
+            let (why, cause) = read_object_as_classified(&hash, absence).unwrap_err();
+            assert_eq!(cause, Some(Unreadable::Other), "{:?}: {}", absence, why);
+            assert!(matches!(ReadFault::of(cause), ReadFault::Untold), "{:?}: {}", absence, why);
+            assert!(why.contains("Whether a pack file holds it could not be told: the pack registry could not be read"), "{:?}: {}", absence, why);
+        }
+
+        drop(_failing);
         remove_dir_all(&temp).ok();
     }
 

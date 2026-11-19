@@ -239,7 +239,7 @@ mod tests {
         let refused = test_support::block_on(crate::commands::pallet::create_pallet("side", None))
             .expect_err("switching to a new pallet during a consolidation must be refused");
         assert!(refused.contains("consolidation is in progress"), "{}", refused);
-        assert!(!pallet_utils::does_pallet_exist("side"), "a refused pallet create must leave no pallet behind");
+        assert!(!pallet_utils::does_pallet_exist("side").unwrap(), "a refused pallet create must leave no pallet behind");
 
         // Any other switch to a pallet at the very same head: the merge must not land there.
         pallet_utils::update_pallet_head("side", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();

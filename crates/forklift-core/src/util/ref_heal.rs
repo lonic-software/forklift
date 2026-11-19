@@ -41,7 +41,7 @@
 //! settle.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -381,6 +381,16 @@ fn checkouts(notes: &mut Vec<String>) -> (Vec<(String, PathBuf)>, bool) {
     }
 }
 
+/// The note for the ref of `pallet` (as it is written on the wire) at `path`, which heal leaves
+/// unjudged since something that is not a file stands there.
+fn not_a_file_note(pallet: &str, path: &Path) -> String {
+    format!(
+        "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it. \
+        Move it aside, then run heal again.",
+        pallet, path.to_string_lossy()
+    )
+}
+
 fn push_note(notes: &mut Vec<String>, note: String) {
     if !notes.contains(&note) {
         notes.push(note);
@@ -406,11 +416,7 @@ pub fn detect(notes: &mut Vec<String>) -> Result<Vec<DamagedRef>, String> {
                 }
             }
             Ok(pallet_utils::MetaCopyState::Absent) => {}
-            Ok(pallet_utils::MetaCopyState::Other) => push_note(notes, format!(
-                "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it. \
-                Move it aside, then run heal again.",
-                pallet, path.to_string_lossy()
-            )),
+            Ok(pallet_utils::MetaCopyState::Other) => push_note(notes, not_a_file_note(&pallet, &path)),
             Err(error) => push_note(notes, format!(
                 "The ref of pallet \"{}\" could not be read to tell whether it is damaged: {}", pallet, error
             )),
@@ -419,13 +425,22 @@ pub fn detect(notes: &mut Vec<String>) -> Result<Vec<DamagedRef>, String> {
 
     for (which, dir) in checkouts(notes).0 {
         match pallet_utils::read_position_in(&dir) {
-            Ok(position) => {
-                if position.base.is_some()
-                    && !pallet_utils::get_pallet_ref_path(PalletNamespace::User, &position.pallet).exists()
-                {
-                    found.entry(position.pallet).or_insert(RefDamage::Missing);
+            // Judged as it stands, as above: whatever stands at the ref's path was judged there,
+            // and a path whose state cannot be read tells nothing of a loss.
+            Ok(position) if position.base.is_some() => {
+                let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, &position.pallet);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        found.entry(position.pallet).or_insert(RefDamage::Missing);
+                    }
+                    Err(error) => push_note(notes, format!(
+                        "Whether {} stands on a lost pallet ref could not be told: the ref of pallet \"{}\" (\"{}\") could not be read: {}",
+                        which, position.pallet, path.to_string_lossy(), error
+                    )),
                 }
             }
+            Ok(_) => {}
             Err(error) => push_note(notes, format!(
                 "Whether {} stands on a lost pallet ref could not be told: {}", which, error
             )),
@@ -828,45 +843,79 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                 candidates: listed(&evidence.candidates),
                 meta: None,
             }),
-            Choice::Rebuild(head, source) => match trusted(&damaged.pallet, &head)
-                .map_err(RefUpdateError::Failed)
-                .and_then(|preconditions| pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions))
-            {
-                Ok(()) => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
-                // Damaged tombstones refuse every ref write alike, and only the operator's repair
-                // mends them, so the refusal is the answer, with its own next step. What this pass
-                // already rebuilt stays reported.
-                Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
-                    report.stopped = Some(error);
-                    break;
+            Choice::Rebuild(head, source) => {
+                // A head whose history the trust check refuses is refused before anything is
+                // written, so nothing of it is read back. The first pass leaves it to the second,
+                // as it does a failed write.
+                let preconditions = match trusted(&damaged.pallet, &head) {
+                    Ok(preconditions) => preconditions,
+                    Err(_) if pass == Pass::BeforeTaint => continue,
+                    Err(error) => {
+                        let reason = format!("the rebuild at {} was not written: {}", head, error);
+                        report.refused.push(Refused { pallet: damaged.pallet.clone(), reason, candidates: listed(&evidence.candidates), meta: None });
+                        continue;
+                    }
+                };
+
+                match pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions) {
+                    Ok(()) => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
+                    // Damaged tombstones refuse every ref write alike, and only the operator's
+                    // repair mends them, so the refusal is the answer, with its own next step.
+                    // What this pass already rebuilt stays reported.
+                    Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
+                        report.stopped = Some(error);
+                        break;
+                    }
+                    Err(error) => match read_back(PalletNamespace::User, &damaged.pallet, &head) {
+                        ReadBack::Landed => {
+                            push_note(&mut report.notes, landed_despite(&damaged.pallet, &head, &error));
+                            report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source });
+                        }
+                        // The first pass leaves a failed write to the second, which reports it.
+                        _ if pass == Pass::BeforeTaint => {}
+                        read => report.refused.push(Refused {
+                            pallet: damaged.pallet.clone(),
+                            reason: unwritten_reason(&head, &error, &read),
+                            candidates: listed(&evidence.candidates),
+                            meta: None,
+                        }),
+                    },
                 }
-                // The first pass leaves a failed write to the second, which reports it.
-                Err(_) if pass == Pass::BeforeTaint => {}
-                Err(error) => match read_back(PalletNamespace::User, &damaged.pallet, &head) {
-                    ReadBack::Landed => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
-                    read => report.refused.push(Refused {
-                        pallet: damaged.pallet.clone(),
-                        reason: unwritten_reason(&head, &error, &read),
-                        candidates: listed(&evidence.candidates),
-                        meta: None,
-                    }),
-                },
-            },
+            }
         }
     }
 
     Ok(report)
 }
 
+/// The note for a rebuild of the ref of `pallet` (as it is written on the wire) at `head` that
+/// landed although its write reported `error`: a failure after the ref's rename (its folder not
+/// synced, a taint standing) leaves the ref written, and what the write reported stands beside it.
+fn landed_despite(pallet: &str, head: &str, error: &RefUpdateError) -> String {
+    format!("The ref of pallet \"{}\" was rebuilt at {}, though its write reported: {}", pallet, head, error)
+}
+
 /// The trust state a ref of `pallet` rebuilt or set at `head` is written under: in a warehouse
 /// with an anchor, `head`'s history verifies against the anchor and office as they are now, as
 /// an undone delete's does, since the written head is a local head no take verifies again.
 fn trusted(pallet: &str, head: &str) -> Result<pallet_utils::RefPreconditions, String> {
+    #[cfg(test)]
+    if TRUSTED_REFUSED.with(|refused| refused.get()) {
+        return Err("the trust check was refused for the test".to_string());
+    }
+
     journal_utils::trust_preconditions_saying(
         &format!("The history of parcel {} does not pass this warehouse's trust check, so the ref of pallet \"{}\" is not set to it:", head, pallet),
         head,
         "Nothing was changed.",
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`trusted`] refuse, since no unit fixture holds an office whose trust check a
+    /// rebuilt user head fails.
+    static TRUSTED_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Find `pallet` among the damaged refs, refusing a ref that is not damaged.
@@ -1041,10 +1090,19 @@ pub struct Removed {
     /// copy, or the copy was not removed. Always `None` for a user pallet, which has no copy.
     pub kept_copy: Option<String>,
 
-    /// For a meta pallet, heal's verdict on the ref that admitted its removal. `None` for a user
-    /// pallet, whose ref is removed only when its bytes do not read.
+    /// Which namespace's ref it was, and what admitted its removal.
     #[serde(skip)]
-    pub verdict: Option<Verdict>,
+    pub kind: RemovedKind,
+}
+
+/// Which namespace's ref `--remove-ref` removed, and what admitted its removal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovedKind {
+    /// A user pallet's, removed only when its bytes do not read.
+    User,
+
+    /// A meta pallet's, removed on heal's verdict on its ref.
+    Meta(Verdict),
 }
 
 /// The folder unreadable refs that `--remove-ref` removed are kept in.
@@ -1063,7 +1121,7 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
 
     pallet_utils::remove_damaged_ref(pallet, bytes, &kept).map_err(|error| error.to_string())?;
 
-    Ok(Removed { pallet: pallet.to_string(), kept_ref: Some(kept.to_string_lossy().into_owned()), kept_copy: None, verdict: None })
+    Ok(Removed { pallet: pallet.to_string(), kept_ref: Some(kept.to_string_lossy().into_owned()), kept_copy: None, kind: RemovedKind::User })
 }
 
 /// The path under the removed-refs folder for bytes removed from `stem`'s file: the first that is
@@ -1248,7 +1306,7 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
         _ => None,
     };
     let said = |path: &Option<std::path::PathBuf>| path.as_ref().map(|path| path.to_string_lossy().into_owned());
-    let removed = |kept_copy: Option<String>| Removed { pallet: wire.to_string(), kept_ref: said(&kept_ref), kept_copy, verdict: Some(verdict) };
+    let removed = |kept_copy: Option<String>| Removed { pallet: wire.to_string(), kept_ref: said(&kept_ref), kept_copy, kind: RemovedKind::Meta(verdict) };
 
     match pallet_utils::remove_damaged_meta_ref(name, &meta.damage, &meta.copy, kept_ref.as_deref(), kept_copy.as_deref()) {
         Ok(()) => Ok(removed(said(&kept_copy))),
@@ -1416,11 +1474,7 @@ fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaS
             Ok(pallet_utils::MetaCopyState::Absent) => None,
             Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => Some(bytes),
             Ok(pallet_utils::MetaCopyState::Other) => {
-                skipped.push((name.clone(), format!(
-                    "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it. \
-                    Move it aside, then run heal again.",
-                    meta_wire(&name), path.to_string_lossy()
-                )));
+                skipped.push((name.clone(), not_a_file_note(&meta_wire(&name), &path)));
                 continue;
             }
             Err(error) => {
@@ -1468,6 +1522,9 @@ fn first_parent_descends(head: &str, ancestor: &str) -> Result<bool, (String, cr
 
 const FROM_COPY: &str = "the ref's copy";
 
+/// A meta ref's refusal before any write: why, the heads found, and whose refusal it is.
+type MetaRefusal = (String, Vec<Candidate>, Owner);
+
 /// The head a damaged meta ref is rebuilt at, and where it was found, or why none is.
 ///
 /// A copy that differs is taken as ahead of the ref because a forward write moves the copy first.
@@ -1475,10 +1532,8 @@ const FROM_COPY: &str = "the ref's copy";
 /// the two leaves the copy at the head it was undoing, and this would rebuild there. Only a
 /// journaled command's refs are put back, and none of `journal_op`'s commands (stack, consolidate,
 /// pick, shift) writes a meta ref: `git grep -l -E 'update_meta_pallet_head|PalletNamespace::Meta'`
-/// over their command and util modules finds none.
-/// A meta ref's refusal before any write: why, the heads found, and whose refusal it is.
-type MetaRefusal = (String, Vec<Candidate>, Owner);
-
+/// over their command and util modules finds none. A ref ahead of its copy (a write whose copy
+/// was not mended, a copy restored from an older backup) is rebuilt at what its own bytes name.
 fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), MetaRefusal> {
     let copy = state.copy_head();
     let mut candidates: Vec<Candidate> = copy.iter()
@@ -1509,25 +1564,34 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
             match copy {
                 None => Ok((salvaged, "what the ref's own bytes still name")),
                 Some(copy) if copy == salvaged => Ok((copy, FROM_COPY)),
-                // A copy a forward write left ahead of its ref is in this shape; one an interrupted
-                // re-genesis or a hand edit left need not be, and nothing proves it the newer.
-                Some(copy) => match first_parent_descends(&copy, &salvaged) {
-                    Ok(true) => Ok((copy, FROM_COPY)),
-                    Ok(false) => Err((format!(
-                        "its copy names {}, which does not descend along first parents from {}, what its own bytes name, so nothing proves either the newer",
-                        copy, salvaged
-                    ), candidates, Owner::Own(Verdict::Diverged))),
+                // A copy a forward write left ahead of its ref is in this shape, and a ref whose
+                // copy was not mended in the other; one an interrupted re-genesis or a hand edit
+                // left need not be either, and then nothing proves either the newer.
+                Some(copy) => {
                     // History the store decided is damaged or gone proves neither the newer; a
                     // read that said nothing of it is no verdict.
-                    Err((error, fault)) => Err((format!(
-                        "whether its copy's head {} descends from {}, what its own bytes name, could not be told: {}",
-                        copy, salvaged, error.trim_end_matches('.')
+                    let untold = |(descendant, ancestor): (&str, &str), (error, fault): (String, crate::util::file_utils::ReadFault), candidates| (format!(
+                        "whether {} descends from {} could not be told: {}",
+                        descendant, ancestor, error.trim_end_matches('.')
                     ), candidates, match fault {
                         crate::util::file_utils::ReadFault::Decided(decided) => Owner::Own(Verdict::Object(decided)),
                         crate::util::file_utils::ReadFault::Newer => Owner::Newer,
                         crate::util::file_utils::ReadFault::Untold => Owner::Unread(None),
-                    })),
-                },
+                    });
+
+                    match first_parent_descends(&copy, &salvaged) {
+                        Ok(true) => Ok((copy, FROM_COPY)),
+                        Ok(false) => match first_parent_descends(&salvaged, &copy) {
+                            Ok(true) => Ok((salvaged, "what the ref's own bytes still name")),
+                            Ok(false) => Err((format!(
+                                "its copy names {} and its own bytes name {}, and neither descends along first parents from the other, so nothing proves either the newer",
+                                copy, salvaged
+                            ), candidates, Owner::Own(Verdict::Diverged))),
+                            Err(error) => Err(untold((&format!("what its own bytes name, {},", salvaged), &format!("its copy's head {}", copy)), error, candidates)),
+                        },
+                        Err(error) => Err(untold((&format!("its copy's head {}", copy), &format!("{}, what its own bytes name,", salvaged)), error, candidates)),
+                    }
+                }
             }
         }
         Salvage::Ambiguous(parcels, _) => {
@@ -2081,15 +2145,19 @@ fn write_meta_rebuild(state: &MetaState,
     let read = read_back(PalletNamespace::Meta, &state.name, &head);
 
     let (reason, owner) = match written {
-        _ if matches!(read, ReadBack::Landed) => {
-            report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
-            return false;
-        }
         // As in the user pass: the refusal is the answer, and what this pass rebuilt stays
         // reported.
         Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
             report.stopped = Some(error);
             return true;
+        }
+        // As in the user pass: what the write reported stands beside the ref it wrote.
+        _ if matches!(read, ReadBack::Landed) => {
+            if let Err(error) = &written {
+                push_note(&mut report.notes, landed_despite(&state.wire(), &head, error));
+            }
+            report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
+            return false;
         }
         // A precondition that moved is heal's own race: a later heal judges the ref afresh.
         Err(error @ (RefUpdateError::Moved(_) | RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved
@@ -2279,6 +2347,45 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
 mod tests {
     use super::*;
     use crate::util::pallet_utils::tests::{scratch, stub_parcel};
+
+    // A user rebuild whose head the trust check refuses was never written, whatever its ref
+    // reads back as; one whose write landed though it reported an error is rebuilt, with what
+    // the write reported beside it.
+    // Mutations: route the trust refusal through the write's error → "may have been written",
+    // red; let a landed read-back drop the write's error → no note, red.
+    #[test]
+    fn a_user_rebuild_says_what_its_write_did() {
+        let (_root, _scope) = scratch("ref-heal-user-write");
+        let head = stub_parcel("head");
+        let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Damaged, its bytes still naming the head.
+        std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
+
+        TRUSTED_REFUSED.with(|refused| refused.set(true));
+        READ_BACK_UNREAD.with(|unread| unread.set(true));
+        let before = repair(Pass::BeforeTaint);
+        let after = repair(Pass::AfterTaint);
+        READ_BACK_UNREAD.with(|unread| unread.set(false));
+        TRUSTED_REFUSED.with(|refused| refused.set(false));
+        let before = before.unwrap();
+        assert!(before.refused.is_empty() && before.rebuilt.is_empty(), "the first pass leaves it: {:?}", before.refused);
+        let after = after.unwrap();
+        let main = after.refused.iter().find(|refused| refused.pallet == "main").expect("main is refused");
+        assert_eq!(main.reason, format!("the rebuild at {} was not written: the trust check was refused for the test", head));
+        assert_eq!(std::fs::read(&path).unwrap(), &head.as_bytes()[..20], "the ref is left alone");
+
+        let folder = path.parent().unwrap().to_path_buf();
+        let rebuilt = {
+            let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder);
+            repair(Pass::AfterTaint).unwrap()
+        };
+        assert!(rebuilt.refused.is_empty(), "{:?}", rebuilt.refused);
+        assert_eq!(rebuilt.rebuilt.iter().map(|rebuilt| (rebuilt.pallet.as_str(), rebuilt.head.as_str())).collect::<Vec<_>>(), vec![("main", head.as_str())]);
+        let said = format!("The ref of pallet \"main\" was rebuilt at {}, though its write reported: ", head);
+        assert!(rebuilt.notes.iter().any(|note| note.starts_with(&said) && note.contains("injected directory-sync failure for")), "{:?}", rebuilt.notes);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
+    }
 
     // An unread refusal's way out is the step its read named, when that is not heal itself: it
     // reaches meta_step and the removal's refusal, and leaves the reason, so no message restates
@@ -2548,7 +2655,7 @@ mod tests {
             match verdict {
                 Some(verdict) => {
                     let removed = removal.unwrap_or_else(|(error, _)| panic!("{}: {}", row, error));
-                    assert_eq!(removed.verdict, Some(verdict), "{}", row);
+                    assert_eq!(removed.kind, RemovedKind::Meta(verdict), "{}", row);
                     assert!(!ref_path.exists(), "{}: the ref is removed", row);
                 }
                 None => {
@@ -2558,6 +2665,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    // A ref ahead of its copy, the copy naming the parent of what the ref's own bytes name (a write
+    // whose copy was not mended, a copy restored from an older backup), is linear history: it is
+    // rebuilt at what its own bytes name, never refused as diverged. Mutation: check the descent
+    // from the copy only → @tags is refused as its own (Diverged), and the `rebuilt` assertion
+    // fails, red.
+    #[test]
+    fn a_meta_ref_ahead_of_its_copy_is_rebuilt_at_what_its_own_bytes_name() {
+        use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
+        use crate::util::tag_utils::TAGS_PALLET_NAME;
+
+        let (_root, _scope) = scratch("ref-heal-ahead-of-copy");
+        let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+        let tree = || store_meta_tree(b"forklift-meta 1 tags", None).unwrap();
+        let parent = stack_meta_parcel(tree(), Vec::new(), &operator, "parent", None).unwrap();
+        let child = stack_meta_parcel(tree(), vec![parent.clone()], &operator, "child", None).unwrap();
+        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
+        let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
+        for path in [&ref_path, &copy_path] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&ref_path, &child.as_bytes()[..12]).unwrap();
+        std::fs::write(&copy_path, format!("{}\n", parent)).unwrap();
+
+        let repair = repair_meta(Pass::AfterTaint).unwrap().repair;
+        let refused: Vec<_> = repair.refused.iter().filter(|refused| refused.pallet == "@tags").collect();
+        assert!(refused.is_empty(), "{:?}", refused);
+        let rebuilt: Vec<_> = repair.rebuilt.iter().filter(|rebuilt| rebuilt.pallet == "@tags").map(|rebuilt| (rebuilt.head.as_str(), rebuilt.source.as_str())).collect();
+        assert_eq!(rebuilt, vec![(child.as_str(), "what the ref's own bytes still name")]);
+        assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(child.as_str()));
     }
 
     // A head in a format this build does not know reads whole and is no verdict on the ref: a

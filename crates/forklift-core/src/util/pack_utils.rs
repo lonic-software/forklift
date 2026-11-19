@@ -1936,6 +1936,11 @@ pub(crate) fn sweep_unreadable_reason(hash: &str) -> Result<Option<String>, Stri
 /// * `Ok(Vec<PathBuf>)` - The files, indexes first, each in name order.
 /// * `Err(String)`      - The pack registry itself could not be loaded.
 pub(crate) fn unindexed_holders() -> Result<Vec<PathBuf>, String> {
+    #[cfg(test)]
+    if let Some(error) = UNINDEXED_HOLDERS_FAIL.with(|slot| slot.borrow().clone()) {
+        return Err(error);
+    }
+
     let pack_set = loaded_packs()?;
     let mut holders: Vec<PathBuf> = pack_set.unenumerable.iter()
         .filter(|pack| !pack.foreign_version)
@@ -1944,6 +1949,26 @@ pub(crate) fn unindexed_holders() -> Result<Vec<PathBuf>, String> {
     holders.sort();
     holders.extend(orphan_data_files(&pack_folder(), &pack_set.stamp.names));
     Ok(holders)
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNINDEXED_HOLDERS_FAIL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Make [`unindexed_holders`] on this thread fail with `error` until the guard drops: a registry
+/// that cannot be loaded after a read's miss loaded it, which only another thread's eviction and a
+/// failing reload reach otherwise.
+#[cfg(test)]
+pub(crate) fn fail_unindexed_holders(error: &str) -> impl Drop {
+    struct Failing;
+    impl Drop for Failing {
+        fn drop(&mut self) {
+            UNINDEXED_HOLDERS_FAIL.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    UNINDEXED_HOLDERS_FAIL.with(|slot| *slot.borrow_mut() = Some(error.to_string()));
+    Failing
 }
 
 /// What the packs cannot list, read once ([`unlisted_packs`]) for any number of prefixes

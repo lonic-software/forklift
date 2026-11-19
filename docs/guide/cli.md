@@ -2913,9 +2913,10 @@ refs after that.
 A metadata pallet's ref (`.forklift/meta/<name>`, such as `@tags`'s) has a copy at
 `.forklift/meta-copy/<name>`. `heal` rebuilds a lost or damaged one from that copy or, with no copy,
 from the parcel the damaged file's remaining bytes still name, as for a pallet's ref. When both
-name a head and they differ, the copy is taken only when it descends from the other along first
-parents, which is where a write interrupted moving the pallet forward leaves it; otherwise `heal`
-changes nothing and refuses with `ref_damaged`, naming both. The head chosen must verify as that
+name a head and they differ, the copy is taken when it descends from the other along first
+parents, which is where a write interrupted moving the pallet forward leaves it, and the head the
+damaged file names is taken when it descends from the copy, which is where a copy left behind
+leaves it; otherwise `heal` changes nothing and refuses with `ref_damaged`, naming both. The head chosen must verify as that
 pallet's history, against the office, before it is written. A copy that is lost or names another
 head beside a ref that reads is set to the ref's head, with a `Note:`.
 
@@ -2924,7 +2925,8 @@ than read it as a pallet never written, and names `forklift heal` when the copy 
 or the damaged file names one parcel. A ref lost together with its copy leaves
 nothing to tell it from one never written, and reads as empty. A link at any pallet's ref path is
 never followed: the read refuses it as blocked, naming moving it aside, and `heal` leaves it with
-a `Note:` naming the same.
+a `Note:` naming the same. A ref whose path cannot be read is refused, never read as a pallet never
+written, naming making the ref's file readable.
 
 The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the
 trust file or, when that file is lost, is not a file, does not read as an anchor or does not

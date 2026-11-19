@@ -1657,17 +1657,17 @@ fn removed_sentence(removed: &ref_heal::Removed) -> String {
         Some(kept) => format!("the damaged ref of pallet \"{}\", keeping its bytes in \"{}\"", removed.pallet, kept),
         None => format!("the lost ref of pallet \"{}\"", removed.pallet),
     };
-    match removed.pallet.starts_with('@') {
-        true => format!(
+    match removed.kind {
+        ref_heal::RemovedKind::Meta(verdict) => format!(
             "Removed {}{}, which heal refused as its own: {}. The pallet now reads empty, and what only it reached is no longer held by any pallet.",
             ref_said,
             match &removed.kept_copy {
                 Some(kept) => format!(", and its copy, keeping the copy's bytes in \"{}\"", kept),
                 None => String::new(),
             },
-            removed.verdict.map_or("a verdict heal did not name", ref_heal::Verdict::describe)
+            verdict.describe()
         ),
-        false => format!(
+        ref_heal::RemovedKind::User => format!(
             "Removed the unreadable ref of pallet \"{}\", keeping its bytes in \"{}\"; what only it reached is no longer held by any pallet.",
             removed.pallet, removed.kept_ref.as_deref().unwrap_or_default()
         ),

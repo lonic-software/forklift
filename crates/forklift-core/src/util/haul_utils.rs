@@ -475,11 +475,13 @@ fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option
 }
 
 /// The refusal `why` of a cell the rules read and cannot: a newer forklift's, for a schema this
-/// build does not know; otherwise one on the cell's own content.
+/// build does not know; a malformed history's, for a cell whose envelope does not parse;
+/// otherwise one on the cell's own content.
 fn newer_or_content(read: &CellRead, why: String) -> MetaCheckError {
     match read {
         CellRead::Unknown { .. } => MetaCheckError::Newer(why),
-        CellRead::Readable(_) | CellRead::Malformed(_) => broken(why),
+        CellRead::Malformed(_) => MetaCheckError::Verdict(crate::util::ref_heal::Verdict::Malformed, why),
+        CellRead::Readable(_) => broken(why),
     }
 }
 
@@ -1249,6 +1251,25 @@ pub fn find_haul(id_prefix: &str) -> Result<Haul, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A cell whose envelope does not parse is a malformed history, as every other read of a meta
+    // tree names it, never a rule its content breaks. Mutation: fold `Malformed` into the
+    // readable arm (`broken`) → `RuleBroken`, red.
+    #[test]
+    fn a_malformed_haul_cell_is_a_malformed_history() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+
+        let (_root, _scope) = crate::util::pallet_utils::tests::scratch("haul-malformed-cell");
+        let mut blob = LooseObjectBuilder::build_blob(&crate::model::blob::Blob { content: b"signer = [".to_vec() });
+        blob.store().unwrap();
+        let cells = meta_tree::apply_edits(None, &[CellEdit::Set { path: "h1/opened".to_string(), blob: blob.hash.clone() }]).unwrap();
+
+        match opened_in(cells.as_deref(), "h1", &HaulRules) {
+            Err(MetaCheckError::Verdict(crate::util::ref_heal::Verdict::Malformed, why)) =>
+                assert_eq!(why, "the proposal at h1/opened cannot be read by this forklift"),
+            other => panic!("expected a malformed history, got {:?}", other.map(|_| ()).map_err(String::from)),
+        }
+    }
 
     fn opened() -> Opened {
         Opened {
