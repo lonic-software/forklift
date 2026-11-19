@@ -88,7 +88,7 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 **Schema 60** (current): a metadata pallet's ref whose file is missing while its copy
 (`.forklift/meta-copy/<name>`) stands is refused as `ref_damaged` (exit 53) wherever it is read,
 where it used to read as a pallet never written, and the `next_step` names `forklift heal` when the
-copy, or what a damaged ref's file still names, gives heal a head to rebuild at. `heal`'s
+copy holds a parcel hash, or a damaged ref's file names one parcel. `heal`'s
 `objects_lost` details carry `pallets_unread`, each pallet whose ref could not be read.
 
 **Schema 59**: a lock another forklift process holds is refused with a code of its own,

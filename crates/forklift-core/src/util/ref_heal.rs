@@ -436,11 +436,11 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     Ok(judge(matches, tainted))
 }
 
-/// Whether a damaged ref's `bytes` give `heal` a head to judge: they name a parcel, one of
-/// several, or one that may be lost, or what they name could not be looked up, which heal looks
-/// up again. Only bytes that name nothing at all leave heal nothing.
+/// Whether a damaged ref's `bytes` name the one parcel `heal` rebuilds it at. Bytes that name one
+/// of several parcels, one that is tainted or cannot be read, or that could not be looked up,
+/// leave heal refusing, so they do not count.
 pub(crate) fn salvage_names_a_head(bytes: &[u8]) -> bool {
-    !matches!(salvage(bytes, &Tainted::read(&mut Vec::new())), Ok(Salvage::Nothing))
+    matches!(salvage(bytes, &Tainted::read(&mut Vec::new())), Ok(Salvage::Found(_)))
 }
 
 /// The salvage among `matches`: the one readable parcel, unless another parcel also matches, or
@@ -1593,6 +1593,24 @@ mod tests {
 
         let tainted = Tainted { hashes: BTreeSet::from(["f".repeat(HASH_LENGTH)]), torn: false, unread: false };
         assert_eq!(judge(vec![one.clone(), two.clone(), "f".repeat(HASH_LENGTH)], &tainted), Salvage::Ambiguous(vec![one, two], true));
+    }
+
+    // Mutation: count every salvage but Nothing → bytes naming only an unreadable object give
+    // heal a head, so a reader names `forklift heal`, which then refuses, red.
+    #[test]
+    fn only_bytes_naming_one_parcel_give_heal_a_head() {
+        let (_root, _scope) = scratch("ref-heal-salvage-names");
+        let one = stub_parcel("1");
+        assert!(salvage_names_a_head(&one.as_bytes()[..12]), "one parcel is a head");
+
+        // A file at an object's path that reads as no kind of object: an unknown match.
+        let unreadable = format!("ab{}", "c".repeat(HASH_LENGTH - 2));
+        let (folder, file) = crate::util::file_utils::get_path_for_object(&unreadable).unwrap();
+        let folder = std::path::PathBuf::from(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(file), b"not an object").unwrap();
+        assert_eq!(salvage(&unreadable.as_bytes()[..12], &Tainted::read(&mut Vec::new())).unwrap(), Salvage::Unknown(unreadable.clone()));
+        assert!(!salvage_names_a_head(&unreadable.as_bytes()[..12]), "an unreadable match is no head heal takes");
     }
 
     /// Record an unsigned redaction of a blob of `content`, and return the `@redactions` head.

@@ -2903,8 +2903,8 @@ pallet's history, against the office, before it is written. A copy that is lost 
 head beside a ref that reads is set to the ref's head, with a `Note:`.
 
 Until then, every other command that reads such a ref refuses with `ref_damaged` (exit 53) rather
-than read it as a pallet never written, and names `forklift heal` when the copy, or what the damaged
-file still names, gives `heal` a head to rebuild at. A ref lost together with its copy leaves
+than read it as a pallet never written, and names `forklift heal` when the copy holds a parcel hash,
+or the damaged file names one parcel. A ref lost together with its copy leaves
 nothing to tell it from one never written, and reads as empty.
 
 The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the

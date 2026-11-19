@@ -4655,7 +4655,7 @@ mod tests {
         name: &'static str,
         trust: Option<Vec<u8>>,
         copy: Option<Vec<u8>>,
-        /// The office pallet's ref is removed: its head reads unborn.
+        /// The office pallet's ref and its copy are removed: its head reads unborn.
         unborn: bool,
         code: Option<crate::error::RefusalCode>,
         says: &'static str,

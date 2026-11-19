@@ -7802,10 +7802,8 @@ fn rebuilt_refs(value: &serde_json::Value) -> Vec<(String, String)> {
 /// file's copy, and then its trust file back from that copy, which is left as it was. Signing
 /// resumes.
 // Revert: judge the office against the trust file's anchor alone, never its copy's → the office
-// is not rebuilt ahead of the trust repair. The damaged office: repair_trust cannot
-// read it, so neither file is restored and heal refuses. The lost office: it reads unborn, so the
-// trust file is restored beside it with the unborn-office note, and the office only after the
-// taint recovery.
+// is not rebuilt ahead of the trust repair, so the office or the trust file is not back as this
+// test expects, red.
 #[test]
 fn heal_rebuilds_a_lost_office_and_then_restores_the_trust_file_from_its_copy() {
     office_and_anchor_heal(false);
@@ -7853,8 +7851,8 @@ fn office_and_anchor_heal(damaged: bool) {
 /// A lost office ref beside an intact trust file is rebuilt from its copy. The write pins the
 /// anchor, never the office, whose ref is the loss being healed.
 // Revert: pin the office write to the office head it rebuilds (OfficePrecondition::At) → the lost
-// ref reads unborn under the lock, the write is refused as the office moved, and heal refuses
-// the office.
+// ref does not read as that head under the lock, the write is refused, and heal refuses the
+// office.
 #[test]
 fn heal_rebuilds_a_lost_office_ref_from_its_copy() {
     let (warehouse, _) = enrolled_warehouse("heal-lost-office");

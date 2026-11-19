@@ -1436,8 +1436,8 @@ pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
 }
 
 /// [`check_head_write`] against the redactions at `judged.head`, the head heal chose for a lost or
-/// damaged `@redactions` ref, which is not read: a damaged one names no head, and a lost one would
-/// read as no redactions at all. The write's hold then re-reads `@redactions`' ref and copy in
+/// damaged `@redactions` ref, which is not read: a damaged one names no head, and a lost one is
+/// refused where it is read. The write's hold then re-reads `@redactions`' ref and copy in
 /// place of its head, and the write is refused as moved when either is no longer as heal judged
 /// it ([`HeadWriteCheck::judged`]).
 pub(crate) fn check_head_write_judged(namespace: pallet_utils::PalletNamespace,
