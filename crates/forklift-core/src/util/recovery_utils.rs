@@ -6307,26 +6307,28 @@ mod tests {
         ).unwrap();
         assert_eq!(sources.meta_heads, vec![h1.clone()]);
 
-        // A copy that cannot be read (here the copy folder is a file, so reading under it fails)
-        // fails GC closed, and is a note under heal's tolerant read. Unix only: Windows reports a
-        // path under a file as not found, so there the copy reads as absent and adds nothing.
+        // A copy that cannot be read (here its file's mode lets nobody read it) fails GC closed,
+        // and is a note under heal's tolerant read. Unix only, and skipped where the mode does not
+        // stop the read (run as root).
         // Revert: read an unreadable copy as absent → GC's read succeeds → red.
         #[cfg(unix)]
         {
-        let copies = crate::globals::forklift_root().join(pallet_utils::FOLDER_NAME_META_COPY_ROOT);
-        crate::util::file_utils::remove_dir_all(&copies).unwrap();
-        std::fs::write(&copies, "not a folder\n").unwrap();
-        let closed = gc_root_sources(
-            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
-        );
-        assert!(closed.is_err(), "an unreadable copy must fail GC closed: {:?}", closed.map(|s| s.meta_heads));
-        // Heal's read, which tolerates the office it cannot read as well (every meta ref's copy
-        // stands in the folder that is now a file).
-        let tolerated = gc_root_sources(
-            &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::Tolerate,
-        ).unwrap();
-        assert_eq!(tolerated.meta_heads, vec![h1]);
-        assert!(tolerated.degraded.iter().any(|note| note.contains("the copy of pallet \"@tags\"")), "{:?}", tolerated.degraded);
+        use std::os::unix::fs::PermissionsExt;
+        let copy = pallet_utils::get_meta_copy_path("tags");
+        std::fs::write(&copy, format!("{}\n", h2)).unwrap();
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&copy).is_err() {
+            let closed = gc_root_sources(
+                &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+            );
+            assert!(closed.is_err(), "an unreadable copy must fail GC closed: {:?}", closed.map(|s| s.meta_heads));
+            let tolerated = gc_root_sources(
+                &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::FailClosed,
+            ).unwrap();
+            assert_eq!(tolerated.meta_heads, vec![h1.clone()]);
+            assert!(tolerated.degraded.iter().any(|note| note.contains("the copy of pallet \"@tags\"")), "{:?}", tolerated.degraded);
+        }
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
     }
 
