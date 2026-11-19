@@ -1390,13 +1390,16 @@ pub fn stack_meta_edits(pallet: &str,
 /// only what is stated as a verdict is told as one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaCheckError {
-    /// The checked parcels break a rule, or the store decided one of theirs (a parcel, a tree or
-    /// a cell they hold) is absent or holds it damaged.
+    /// The store positively decided about the checked parcels' own history: one of theirs (a
+    /// parcel, a tree, a cell or a signature they hold) is absent or held damaged, or it reads
+    /// whole but is not what the check needs: it does not decode, it breaks a rule of the pallet,
+    /// or its signature does not verify.
     Content(String),
 
-    /// It says nothing of the checked parcels: the store could not be read, a signature could not
-    /// be read, or what they are checked against (the office chain, the trust state, a trust or
-    /// distrust boundary) does not verify or cannot be resolved.
+    /// It says nothing of the checked parcels: the store could not be read (an environment error,
+    /// a pack index heal rebuilds, an absence left undecided), or what they are checked against
+    /// (the office chain, the trust state, a trust or distrust boundary) does not verify or cannot
+    /// be resolved. Any error not stated as a verdict is this one.
     Untold(String),
 }
 

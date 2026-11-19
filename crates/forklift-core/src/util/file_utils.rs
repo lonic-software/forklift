@@ -2536,11 +2536,14 @@ pub(crate) enum StoreReadOutcome {
 /// What a failed read says of the object it was asked for, to a check that judges that object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadFault {
-    /// The store decided the object is absent, or holds it damaged: a verdict on the object.
+    /// The store positively decided about the object: it is absent, or the bytes it holds at the
+    /// address are damaged (a loose file that does not decompress to the address, a pack record
+    /// that does not rebuild to it). A verdict on the object.
     Content,
-    /// The read says nothing of the object: the store could not be consulted, an index of another
-    /// format version or a base read failed some other way, or the absence was left undecided or
-    /// is a redaction's or a withholding's.
+    /// The read says nothing of the object: the store could not be consulted, a pack index is
+    /// damaged or its data file did not load (heal rebuilds it, and the object may be in it), an
+    /// index of another format version or a base read failed some other way, or the absence was
+    /// left undecided or is a redaction's or a withholding's.
     Untold,
 }
 
@@ -2548,8 +2551,8 @@ impl ReadFault {
     /// What a failure whose cause [`read_object_as_classified`] gives as `cause` says.
     pub(crate) fn of(cause: Option<Unreadable>) -> ReadFault {
         match cause {
-            None | Some(Unreadable::PackDamage | Unreadable::LooseCorrupt | Unreadable::RecordDamage) => ReadFault::Content,
-            Some(Unreadable::Other) => ReadFault::Untold,
+            None | Some(Unreadable::LooseCorrupt | Unreadable::RecordDamage) => ReadFault::Content,
+            Some(Unreadable::PackDamage | Unreadable::Other) => ReadFault::Untold,
         }
     }
 }
@@ -2561,7 +2564,7 @@ impl ReadFault {
 pub(crate) enum Unreadable {
     /// A pack index heal acts on: one whose data file did not load (a quarantined pair), or one
     /// with a corrupt bucket. Heal rebuilds such an index from its data file, or names what it
-    /// held as lost.
+    /// held as lost; until it has, the read says nothing of the object (a [`ReadFault::Untold`]).
     PackDamage,
     /// A loose file at the address whose bytes do not decompress, or decompress to other content.
     /// Heal names the object as lost; the file is kept where it is.
