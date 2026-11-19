@@ -2751,8 +2751,9 @@ mod tests {
     // Which head descends is settled by the walk that reaches the other, whichever walk is longer
     // and whatever the other could not read: a ref one parcel ahead of a copy whose older history
     // cannot be read is ahead, not untold, and the copy one parcel ahead the same way. Only when
-    // neither walk settles it does a failed read say why, on the side that failed. Mutation: walk
-    // the copy's history to its end first → the first assertion reads `Err((true, _))`, red.
+    // neither walk settles it does a failed read say why, on the side that failed. Mutation: let a
+    // failed read decide at once, while the other walk can still settle it → the first
+    // assertion reads `Err(true)`, red.
     #[test]
     fn the_head_that_descends_is_found_whatever_the_other_history_cannot_read() {
         use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
