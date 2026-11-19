@@ -1460,9 +1460,14 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
 
     let (judged, source) = match judged {
         Some((judged, source)) => {
+            // What the ref and its copy name now is listed, never the head judged before they
+            // moved: writing that would set the ref back past them.
             if state.damage().as_ref() != Some(&judged.damage) || state.copy != judged.copy {
-                refuse_in(report, state, pass, "it changed while heal ran; run \"forklift heal\" again".to_string(),
-                    vec![Candidate { head: judged.head.clone(), source: source.to_string() }]);
+                let candidates = match choose_meta(state, tainted) {
+                    Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
+                    Err((_, candidates)) => candidates,
+                };
+                refuse_in(report, state, pass, "it changed while heal ran".to_string(), candidates);
                 return false;
             }
             (judged, source)
@@ -1550,8 +1555,9 @@ mod tests {
         let rebuilt = rebuild_redactions(&state, &[], Some(RedactionsJudged::Verified(judged, FROM_COPY)), &clean, Pass::AfterTaint, &mut report);
         assert!(!rebuilt && report.rebuilt.is_empty(), "{:?}", report.rebuilt);
         assert_eq!(report.refused.len(), 1);
-        assert_eq!(report.refused[0].reason, "it changed while heal ran; run \"forklift heal\" again");
-        assert_eq!(report.refused[0].candidates[0].head, chosen);
+        assert_eq!(report.refused[0].reason, "it changed while heal ran");
+        assert_eq!(report.refused[0].candidates.iter().map(|c| c.head.as_str()).collect::<Vec<_>>(), vec![older.as_str()],
+            "what the copy names now, never the head judged before it moved");
         assert_eq!(std::fs::read(&ref_path).unwrap(), b"not a head\n", "nothing was written");
     }
 }
