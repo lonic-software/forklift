@@ -35,6 +35,8 @@ const HUNK_LINES: usize = 40;
 /// The ticket the .forkliftignore drop waits on: a revision whose .forkliftignore predates the
 /// current dialect can be shifted onto but not away from. The drop goes when it closes.
 const IGNORE_TICKET: &str = "FORK-536";
+/// git's empty tree, which every repository resolves without holding it.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// What `proof-load replay` was asked to run.
 #[derive(Clone, Debug)]
@@ -334,13 +336,15 @@ impl Row {
 }
 
 /// One entry of replay-tickets.json: a cause entry covers every gap of its cause; a path entry
-/// covers one divergent path, or one row of a row-level kind, of one merge, while Forklift's file
-/// there stays the one it names.
+/// covers one divergent path of one merge, while Forklift's file there stays the one it names; a
+/// row entry covers one forklift-refused or error row of one merge, while the row's reason still
+/// holds the text it names.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Ticket {
     Cause(CauseTicket),
     Path(PathTicket),
+    Row(RowTicket),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -355,11 +359,23 @@ pub struct CauseTicket {
 pub struct PathTicket {
     /// The merge's original 40-hex commit id.
     pub merge: String,
-    /// Empty for a row-level kind.
     pub path: String,
     pub kind: Kind,
-    /// Forklift's file at the path: its 40-hex blob id, or "absent". Empty for a row-level kind.
+    /// Forklift's file at the path: its 40-hex blob id, or "absent".
     pub blob: String,
+    pub ticket: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowTicket {
+    /// The merge's original 40-hex commit id.
+    pub merge: String,
+    /// `forklift-refused` or `error`.
+    pub kind: Kind,
+    /// Text the row's reason contains, so the entry stops matching when the row fails for
+    /// another reason.
+    pub reason: String,
     pub ticket: String,
 }
 
@@ -376,12 +392,21 @@ pub fn check_tickets(tickets: &[Ticket]) -> Result<(), String> {
             Ticket::Cause(entry) => (&entry.ticket, None),
             Ticket::Path(entry) => (&entry.ticket, if !hex40(&entry.merge) {
                 Some(format!("merge {:?} is not a 40-hex commit id", entry.merge))
-            } else if entry.kind.row_level() && (!entry.path.is_empty() || !entry.blob.is_empty()) {
-                Some(format!("{} names a row, so its path and blob are empty", entry.kind.label()))
-            } else if !entry.kind.row_level() && entry.path.is_empty() {
+            } else if entry.kind.row_level() {
+                Some(format!("{} names a row, so it takes a row entry: merge, kind, reason and ticket", entry.kind.label()))
+            } else if entry.path.is_empty() {
                 Some(format!("{} names a path, and the entry gives none", entry.kind.label()))
-            } else if !entry.kind.row_level() && !hex40(&entry.blob) && entry.blob != PathState::ABSENT {
+            } else if !hex40(&entry.blob) && entry.blob != PathState::ABSENT {
                 Some(format!("blob {:?} is neither a 40-hex blob id nor \"absent\"", entry.blob))
+            } else {
+                None
+            }),
+            Ticket::Row(entry) => (&entry.ticket, if !hex40(&entry.merge) {
+                Some(format!("merge {:?} is not a 40-hex commit id", entry.merge))
+            } else if !entry.kind.row_level() {
+                Some(format!("{} names a path, so it takes a path entry: merge, path, kind, blob and ticket", entry.kind.label()))
+            } else if entry.reason.is_empty() {
+                Some("a row entry names text its row's reason contains, and this one gives none".to_string())
             } else {
                 None
             }),
@@ -424,7 +449,8 @@ pub struct Verdict {
 
 /// Judges `rows` against `tickets`. A divergent path fails without a path entry naming its merge,
 /// path, kind and Forklift's blob; a gap fails without a cause entry for its cause; a
-/// forklift-refused or error row fails without a path entry naming that row. No other row fails.
+/// forklift-refused or error row fails without a row entry naming its merge and kind and text its
+/// reason contains, and its paths, where it has any, are judged as well. Nothing else fails.
 pub fn judge(rows: &[Row], tickets: &[Ticket]) -> Verdict {
     let mut matched = vec![false; tickets.len()];
     let mut failures = Vec::new();
@@ -449,13 +475,13 @@ pub fn judge(rows: &[Row], tickets: &[Ticket]) -> Verdict {
             _ => None,
         };
         if let Some(kind) = row_kind {
-            if !find(&path_entry(&row.merge, "", kind, "")) {
+            let reason = row.reason.clone().unwrap_or_default();
+            if !find(&|ticket| matches!(ticket, Ticket::Row(entry) if entry.merge == row.merge && entry.kind == kind && reason.contains(&entry.reason))) {
                 failures.push(Failure {
                     merge: row.merge.clone(), path: String::new(), kind: kind.label().to_string(), blob: String::new(),
-                    reason: format!("a {} row no entry names", kind.label()),
+                    reason: format!("a {} row no entry names with this merge, kind and reason", kind.label()),
                 });
             }
-            continue;
         }
         for path in &row.paths {
             let (kind, found) = match path.difference {
@@ -590,6 +616,7 @@ impl ReplayReport {
                 let _ = match ticket {
                     Ticket::Cause(entry) => writeln!(out, "- cause {}, {}", entry.cause.label(), entry.ticket),
                     Ticket::Path(entry) => writeln!(out, "- {} {} {} {}, {}", entry.merge, entry.path, entry.kind.label(), entry.blob, entry.ticket),
+                    Ticket::Row(entry) => writeln!(out, "- {} {} {:?}, {}", entry.merge, entry.kind.label(), entry.reason, entry.ticket),
                 };
             }
         }
@@ -764,19 +791,37 @@ impl Tools<'_> {
         self.run(&self.forklift, arguments, &self.warehouse, self.environment, STEP_LIMIT, None)
     }
 
-    /// Puts each of `conflicted` back as `ours` has it, or removes it where `ours` has none, then
-    /// aborts the consolidate in progress. For an abort refused over the conflicted files'
-    /// content (FORK-540), so one refused abort does not leave every later row unable to shift.
+    /// Puts each of `conflicted` back as `ours` has it, its mode included, or removes it where
+    /// `ours` has none, then aborts the consolidate in progress. For an abort refused over the
+    /// conflicted files' content, so one refused abort does not leave every later row unable to
+    /// shift.
     fn settle(&self, ours: &str, conflicted: &BTreeSet<String>) -> Result<(), String> {
         for path in conflicted {
             let file = self.warehouse.join(path);
-            let shown = self.git(&["cat-file", "blob", &format!("{}:{}", ours, path)])?;
+            let cannot = |error: std::io::Error| format!("cannot put {} back: {}", file.display(), error);
+            let listed = self.git_ok(&["ls-tree", "-z", ours, "--", path])?;
+            let listed = String::from_utf8_lossy(&listed).into_owned();
+            let mode = listed.split(' ').next().filter(|mode| !mode.is_empty()).map(str::to_string);
             #[allow(clippy::disallowed_methods, reason = "a file of the harness's own warehouse, which nothing else holds open")]
-            let written = if shown.succeeded() { std::fs::write(&file, &shown.stdout) } else { std::fs::remove_file(&file) };
-            match written {
+            match std::fs::remove_file(&file) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("cannot put {} back: {}", file.display(), error)),
+                Err(error) => return Err(cannot(error)),
+            }
+            let Some(mode) = mode else { continue };
+            let content = self.git_ok(&["cat-file", "blob", &format!("{}:{}", ours, path)])?;
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).map_err(cannot)?;
+            }
+            match mode.as_str() {
+                #[cfg(unix)]
+                "120000" => std::os::unix::fs::symlink(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&content), &file).map_err(cannot)?,
+                _ => std::fs::write(&file, &content).map_err(cannot)?,
+            }
+            #[cfg(unix)]
+            if mode == "100755" {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).map_err(cannot)?;
             }
         }
         let aborted = self.forklift(&["--json", "abort", "--confirm"])?;
@@ -786,8 +831,11 @@ impl Tools<'_> {
         Ok(())
     }
 
-    /// Forklift's working tree as a git tree id, hashed through an index built from nothing, so
-    /// no stat cache from an earlier hash can stand in for a file's content.
+    /// Forklift's working tree as a git tree id: its files' bytes as they are, hashed through an
+    /// index built from nothing, so no stat cache from an earlier hash can stand in for a file's
+    /// content, and with attributes read from the empty tree and line-ending conversion off, so a
+    /// history's own .gitattributes does not rewrite what Forklift checked out before it is
+    /// compared.
     fn forklift_tree(&self) -> Result<String, String> {
         #[allow(clippy::disallowed_methods, reason = "the harness's own scratch index, which nothing else holds open")]
         match std::fs::remove_file(&self.index) {
@@ -799,7 +847,11 @@ impl Tools<'_> {
         environment.variables.insert("GIT_INDEX_FILE".to_string(), self.index.display().to_string());
         environment.variables.insert("GIT_WORK_TREE".to_string(), self.warehouse.display().to_string());
         let mirror = self.mirror.display().to_string();
-        let added = self.run(&self.git, &["--git-dir", &mirror, "add", "-A", "-f", "--", ".", ":(exclude).forklift"], &self.warehouse, &environment, STEP_LIMIT, None)?;
+        let raw = ["--attr-source", EMPTY_TREE, "-c", "core.autocrlf=false", "-c", "core.safecrlf=false"];
+        let mut arguments = vec!["--git-dir", mirror.as_str()];
+        arguments.extend_from_slice(&raw);
+        arguments.extend_from_slice(&["add", "-A", "-f", "--", ".", ":(exclude).forklift"]);
+        let added = self.run(&self.git, &arguments, &self.warehouse, &environment, STEP_LIMIT, None)?;
         if !added.succeeded() {
             return Err(said(&added));
         }
@@ -920,13 +972,98 @@ impl Trees<'_, '_> {
     }
 }
 
-/// Replays one merge, by its original id, into `row`. Err is an error row's reason.
+/// What a consolidate's report says: Ok(Ok(None)) a merge with no conflict, Ok(Ok(Some)) the
+/// paths it conflicted on, Ok(Err) a refusal; Err for a report the harness does not read, so an
+/// outcome it does not know, or a conflict that is not a path, is an error row and never a
+/// refusal or a dropped path.
+fn consolidate_said(succeeded: bool, document: &serde_json::Value) -> Result<Result<Option<BTreeSet<String>>, ()>, String> {
+    if !succeeded {
+        return Ok(Err(()));
+    }
+    match document["data"]["outcome"].as_str() {
+        Some("merged" | "fast_forward" | "up_to_date") => Ok(Ok(None)),
+        Some("conflicts") => {
+            let none = Vec::new();
+            let listed = match &document["data"]["conflicts"] {
+                serde_json::Value::Null => &none,
+                serde_json::Value::Array(listed) => listed,
+                other => return Err(format!("the consolidate's conflicts are {}, not a list of paths", other)),
+            };
+            let mut conflicted = BTreeSet::new();
+            for path in listed {
+                let serde_json::Value::String(path) = path else {
+                    return Err(format!("the consolidate listed a conflict that is not a path: {}", path));
+                };
+                conflicted.insert(path.clone());
+            }
+            Ok(Ok(Some(conflicted)))
+        }
+        _ => Err(format!("the consolidate succeeded with outcome {}, which the harness does not read", document["data"]["outcome"])),
+    }
+}
+
+/// What a replay leaves to clear once its row is compared.
+enum Leftover {
+    /// No consolidate is in progress.
+    Nothing,
+    /// A consolidate conflicted on these paths and is still in progress; the first parent's id.
+    Conflicted { ours: String, conflicted: BTreeSet<String> },
+    /// A consolidate was refused or reported what the harness does not read, and may have left a
+    /// merge in progress.
+    Unknown,
+}
+
+/// Replays one merge, by its original id, into `row`: compares it, then gets the warehouse out of
+/// the consolidate. Err is an error row's reason; the paths the comparison found stay on the row
+/// and are judged with it.
 fn replay(tools: &Tools, merge: &str, row: &mut Row) -> Result<(), String> {
+    let mut leftover = Leftover::Nothing;
+    let compared = compare(tools, merge, row, &mut leftover);
+    let cleared = match leftover {
+        Leftover::Nothing => Ok(()),
+        Leftover::Conflicted { ours, conflicted } => {
+            let aborted = tools.forklift(&["--json", "abort", "--confirm"])?;
+            if aborted.succeeded() {
+                Ok(())
+            } else {
+                let refused = format!("aborting the conflicted consolidate failed: {}", said(&aborted));
+                // The row is an error either way. Its conflicted files are put back as the first
+                // parent has them, the way out the refusal names, so the next row starts from a
+                // warehouse with no consolidate in progress.
+                Err(match settled(tools, &ours, &conflicted) {
+                    Ok(()) => refused,
+                    Err(unsettled) => format!("{}; putting the conflicted files back did not let it abort: {}", refused, unsettled),
+                })
+            }
+        }
+        // Whether anything is in progress is unknown; the probe after an error row, or the next
+        // row's shift, says so if this one leaves it behind.
+        Leftover::Unknown => { let _ = tools.forklift(&["--json", "abort", "--confirm"]); Ok(()) }
+    };
+    match (compared, cleared) {
+        (Ok(()), cleared) => cleared,
+        (Err(reason), Ok(())) => Err(reason),
+        (Err(reason), Err(cleared)) => Err(format!("{}; then {}", reason, cleared)),
+    }
+}
+
+/// The settle step, or a stand-in that leaves the warehouse as the refused abort did, for the test
+/// showing the run stops on a warehouse it cannot shift.
+fn settled(tools: &Tools, ours: &str, conflicted: &BTreeSet<String>) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::SKIP_SETTLE.with(std::cell::Cell::get) {
+        return Err("settling skipped by the test".to_string());
+    }
+    tools.settle(ours, conflicted)
+}
+
+/// Compares one merge's replay with git's, into `row`, recording in `leftover` what the
+/// consolidate left in progress.
+fn compare(tools: &Tools, merge: &str, row: &mut Row, leftover: &mut Leftover) -> Result<(), String> {
     let (ours, theirs, merged) = (branch(merge, "o"), branch(merge, "t"), branch(merge, "m"));
-    let ids = tools.git_line(&["rev-parse", "--verify", &format!("refs/heads/{}", ours)])?;
+    let our_id = tools.git_line(&["rev-parse", "--verify", &format!("refs/heads/{}", ours)])?;
     let their_id = tools.git_line(&["rev-parse", "--verify", &format!("refs/heads/{}", theirs)])?;
     let merge_id = tools.git_line(&["rev-parse", "--verify", &format!("refs/heads/{}", merged)])?;
-    let our_id = ids;
     let parents = tools.git_line(&["rev-list", "--parents", "-n", "1", &merge_id])?;
     let expected = format!("{} {} {}", merge_id, our_id, their_id);
     if parents != expected {
@@ -953,15 +1090,19 @@ fn replay(tools: &Tools, merge: &str, row: &mut Row) -> Result<(), String> {
         return Err(format!("the first parent's checkout is tree {}, not its git tree {}", checked_out, first_tree));
     }
     let consolidated = tools.forklift(&["--json", "consolidate", &theirs])?;
+    *leftover = Leftover::Unknown;
     let document = crate::runner::document(&consolidated.stdout);
     let outcome = document["data"]["outcome"].as_str().unwrap_or_default().to_string();
-    let forklift: Result<Merged, String> = match (consolidated.succeeded(), outcome.as_str()) {
-        (true, "merged" | "fast_forward" | "up_to_date") => Ok(Merged { conflicted: BTreeSet::new(), tree: tools.forklift_tree()? }),
-        (true, "conflicts") => {
-            let conflicted = document["data"]["conflicts"].as_array().into_iter().flatten().filter_map(|path| path.as_str().map(str::to_string)).collect();
+    let forklift: Result<Merged, String> = match consolidate_said(consolidated.succeeded(), &document)? {
+        Ok(None) => {
+            *leftover = Leftover::Nothing;
+            Ok(Merged { conflicted: BTreeSet::new(), tree: tools.forklift_tree()? })
+        }
+        Ok(Some(conflicted)) => {
+            *leftover = Leftover::Conflicted { ours: our_id.clone(), conflicted: conflicted.clone() };
             Ok(Merged { conflicted, tree: tools.forklift_tree()? })
         }
-        _ => Err(match &consolidated.failure {
+        Err(()) => Err(match &consolidated.failure {
             Some(failure) => format!("{}: {}", failure.code, failure.message),
             None => said(&consolidated),
         }),
@@ -974,25 +1115,6 @@ fn replay(tools: &Tools, merge: &str, row: &mut Row) -> Result<(), String> {
             return Err(format!("stocktake after the consolidate failed: {}", said(&stocktake)));
         }
         mismatch = record_mismatch(&outcome, &crate::runner::document(&stocktake.stdout));
-    }
-    match &forklift {
-        Ok(result) if !result.conflicted.is_empty() || outcome == "conflicts" => {
-            let aborted = tools.forklift(&["--json", "abort", "--confirm"])?;
-            if !aborted.succeeded() {
-                let refused = format!("aborting the conflicted consolidate failed: {}", said(&aborted));
-                // The row is an error either way. Its conflicted files are put back as the first
-                // parent has them, the way out the refusal names, so the next row starts from a
-                // warehouse with no consolidate in progress.
-                return Err(match tools.settle(&our_id, &result.conflicted) {
-                    Ok(()) => refused,
-                    Err(unsettled) => format!("{}; putting the conflicted files back did not let it abort: {}", refused, unsettled),
-                });
-            }
-        }
-        Ok(_) => {}
-        // A refusal may or may not have left a merge in progress; the next row's shift says so if
-        // this one leaves it behind.
-        Err(_) => { let _ = tools.forklift(&["--json", "abort", "--confirm"]); }
     }
 
     let (forklift, g) = match (forklift, g) {
@@ -1075,7 +1197,7 @@ fn replay(tools: &Tools, merge: &str, row: &mut Row) -> Result<(), String> {
 
 /// Runs a replay and writes replay.md and then replay.json under `options.out`, replay.json last,
 /// so a run that stopped leaves none. Refuses, writing neither, when it cannot build what it
-/// replays.
+/// replays, or when an error row leaves a warehouse that cannot shift.
 pub fn run(options: &ReplayOptions, progress: &dyn Fn(&str)) -> Result<ReplayReport, String> {
     let tickets = tickets()?;
     if options.sample == Some(0) {
@@ -1176,11 +1298,21 @@ pub fn run(options: &ReplayOptions, progress: &dyn Fn(&str)) -> Result<ReplayRep
     for (index, merge) in chosen.iter().enumerate() {
         let started = Instant::now();
         let mut row = Row::new(merge);
-        if let Err(reason) = replay(&tools, merge, &mut row) {
+        let failed = replay(&tools, merge, &mut row).err();
+        row.millis = started.elapsed().as_millis() as u64;
+        if let Some(reason) = failed {
             row.class = Class::Error;
             row.reason = Some(reason);
+            // An error row may have left the warehouse where no shift works, and then every later
+            // row would be an error for this row's reason. The run stops instead, naming it.
+            let probe = tools.forklift(&["--json", "shift", HEAD_BRANCH])?;
+            if !probe.succeeded() {
+                return Err(format!(
+                    "the warehouse cannot shift after merge {}'s error row, so no later row would replay: {}; the row: {}",
+                    merge, said(&probe), row.reason.as_deref().unwrap_or_default(),
+                ));
+            }
         }
-        row.millis = started.elapsed().as_millis() as u64;
         progress(&format!("{}/{} {} {}", index + 1, chosen.len(), merge, row.class.label()));
         rows.push(row);
     }
@@ -1209,6 +1341,12 @@ pub fn run(options: &ReplayOptions, progress: &dyn Fn(&str)) -> Result<ReplayRep
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Set by the test that shows a run stops on a warehouse it cannot shift: the settle
+        /// step is skipped, leaving the warehouse as the refused abort did.
+        pub(super) static SKIP_SETTLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     use crate::scrub::path_git;
 
     fn clean(value: &str) -> PathState {
@@ -1363,18 +1501,33 @@ mod tests {
         assert_eq!(verdict, Verdict { failures: Vec::new(), closable: vec![stale] });
     }
 
-    /// A forklift-refused or error row fails without a row entry of its own kind for its merge,
-    /// and passes with one; a both-refused row needs none.
+    fn row_entry(kind: Kind, reason: &str) -> Ticket {
+        Ticket::Row(RowTicket { merge: MERGE.to_string(), kind, reason: reason.to_string(), ticket: "FORK-540".to_string() })
+    }
+
+    /// A forklift-refused or error row fails without a row entry naming its merge, its kind and
+    /// text its reason contains, and passes with one; a both-refused row needs none; a row entry
+    /// covers none of the row's paths, which are judged as on any other row.
+    ///
+    /// Revert: match row entries on merge and kind alone → the entry naming another reason covers
+    /// the row.
     #[test]
     fn refused_and_error_rows_need_a_row_entry() {
         for (class, kind, other) in [(Class::ForkliftRefused, Kind::ForkliftRefused, Kind::Error), (Class::Error, Kind::Error, Kind::ForkliftRefused)] {
-            let rows = [row(class, Vec::new())];
-            let verdict = judge(&rows, &[entry("", other, "")]);
+            let rows = [Row { reason: Some("aborting failed: a conflict marker".to_string()), ..row(class, Vec::new()) }];
+            let verdict = judge(&rows, &[row_entry(other, "aborting failed")]);
             assert_eq!(verdict.failures.len(), 1, "{:?}", class);
             assert_eq!(verdict.failures[0].kind, kind.label());
-            assert!(judge(&rows, &[entry("", kind, "")]).failures.is_empty(), "{:?}", class);
+            let verdict = judge(&rows, &[row_entry(kind, "shift failed")]);
+            assert_eq!(verdict.failures.len(), 1, "another reason's entry covered the row: {:?}", class);
+            assert!(judge(&rows, &[row_entry(kind, "aborting failed")]).failures.is_empty(), "{:?}", class);
         }
         assert!(judge(&[row(Class::BothRefused, Vec::new())], &[]).failures.is_empty());
+
+        let divergent = path("f", BLOB, Difference::Divergence { subtype: Kind::SilentWrong });
+        let rows = [Row { reason: Some("aborting failed".to_string()), ..row(Class::Error, vec![divergent]) }];
+        let verdict = judge(&rows, &[row_entry(Kind::Error, "aborting failed")]);
+        assert_eq!(verdict.failures.iter().map(|failure| (failure.path.as_str(), failure.kind.as_str())).collect::<Vec<_>>(), [("f", "silent-wrong")]);
     }
 
     /// The tickets this build ships with parse and pass the check, and the check refuses every
@@ -1389,7 +1542,12 @@ mod tests {
             r#"[{"cause": "renames", "ticket": "FORK-1"}]"#,
             r#"[{"merge": "abc", "path": "f", "kind": "silent-wrong", "blob": "absent", "ticket": "FORK-1"}]"#,
             r#"[{"merge": "1111111111111111111111111111111111111111", "path": "f", "kind": "error", "blob": "", "ticket": "FORK-1"}]"#,
+            r#"[{"merge": "1111111111111111111111111111111111111111", "path": "", "kind": "error", "blob": "", "ticket": "FORK-1"}]"#,
             r#"[{"merge": "1111111111111111111111111111111111111111", "path": "", "kind": "silent-wrong", "blob": "absent", "ticket": "FORK-1"}]"#,
+            r#"[{"merge": "1111111111111111111111111111111111111111", "kind": "error", "reason": "", "ticket": "FORK-1"}]"#,
+            r#"[{"merge": "1111111111111111111111111111111111111111", "kind": "silent-wrong", "reason": "x", "ticket": "FORK-1"}]"#,
+            r#"[{"merge": "abc", "kind": "error", "reason": "x", "ticket": "FORK-1"}]"#,
+            r#"[{"merge": "1111111111111111111111111111111111111111", "kind": "error", "reason": "x", "ticket": "FORK-1", "path": ""}]"#,
             r#"[{"merge": "1111111111111111111111111111111111111111", "path": "f", "kind": "silent-wrong", "blob": "nope", "ticket": "FORK-1"}]"#,
             r#"[{"merge": "1111111111111111111111111111111111111111", "path": "f", "kind": "silent-wrong", "blob": "absent", "ticket": "BUG-1"}]"#,
         ];
@@ -1397,7 +1555,7 @@ mod tests {
             let parsed: Result<Vec<Ticket>, _> = serde_json::from_str(text);
             assert!(parsed.map_err(|error| error.to_string()).and_then(|tickets| check_tickets(&tickets)).is_err(), "{}", text);
         }
-        let accepted: Vec<Ticket> = serde_json::from_str(r#"[{"merge": "1111111111111111111111111111111111111111", "path": "", "kind": "forklift-refused", "blob": "", "ticket": "FORK-1"}]"#).unwrap();
+        let accepted: Vec<Ticket> = serde_json::from_str(r#"[{"merge": "1111111111111111111111111111111111111111", "kind": "forklift-refused", "reason": "refused", "ticket": "FORK-1"}]"#).unwrap();
         check_tickets(&accepted).unwrap();
     }
 
@@ -1487,6 +1645,85 @@ mod tests {
         assert_eq!(tools.forklift_tree().unwrap(), "b1ea253509c6004817f83cd7659ab4e6c38b2981");
         write("two\n");
         assert_eq!(tools.forklift_tree().unwrap(), "8f26825aadcd1e8217d7b7a489f13689fa1010d4", "the second hash read the first one's stat cache");
+    }
+
+    /// Forklift's tree is hashed from its files' bytes as they are: a .gitattributes in the tree
+    /// that marks a CRLF file as text, and core.autocrlf, both of which git's add would apply,
+    /// leave the file's blob as its bytes. The expected tree is built with hash-object
+    /// --no-filters and mktree, apart from the code under test.
+    ///
+    /// Revert: drop --attr-source → the CRLF file is hashed as LF and the tree differs.
+    #[test]
+    fn the_tree_is_hashed_without_attributes_or_line_ending_conversion() {
+        let (scratch, mut environment) = crate::history::tests::scratch("replay-no-filters");
+        environment.variables.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+        environment.variables.insert("GIT_CONFIG_KEY_0".to_string(), "core.autocrlf".to_string());
+        environment.variables.insert("GIT_CONFIG_VALUE_0".to_string(), "input".to_string());
+        let mirror = scratch.root().join("mirror.git");
+        git_in(scratch.root(), &["init", "-q", "--bare", &mirror.display().to_string()], &scratch, &environment);
+        let warehouse = scratch.work().join("warehouse");
+        std::fs::create_dir_all(&warehouse).unwrap();
+        std::fs::write(warehouse.join(".gitattributes"), "* text eol=lf\n").unwrap();
+        std::fs::write(warehouse.join("a"), "one\r\ntwo\r\n").unwrap();
+        let tools = Tools { forklift: path_git(), git: path_git(), mirror: mirror.clone(), warehouse: warehouse.clone(), index: scratch.tmp().join("replay.index"), scratch: &scratch, environment: &environment };
+        let mirror_text = mirror.display().to_string();
+        let blob = |name: &str| git_in(scratch.root(), &["--git-dir", &mirror_text, "hash-object", "-w", "--no-filters", &warehouse.join(name).display().to_string()], &scratch, &environment);
+        let listing = format!("100644 blob {}\t.gitattributes\n100644 blob {}\ta\n", blob(".gitattributes"), blob("a"));
+        let listing_path = scratch.tmp().join("listing");
+        std::fs::write(&listing_path, listing).unwrap();
+        let expected = String::from_utf8(tools.run(&path_git(), &["--git-dir", &mirror_text, "mktree"], scratch.root(), &environment, STEP_LIMIT, Some(&listing_path)).unwrap().stdout).unwrap();
+        assert_eq!(tools.forklift_tree().unwrap(), expected.trim(), "the CRLF file was hashed through the attributes or autocrlf");
+    }
+
+    /// A consolidate's report comes to a clean merge, its conflicted paths, or a refusal; an
+    /// outcome the harness does not know, and a conflict that is not a path, are errors, never a
+    /// refusal or a dropped path.
+    ///
+    /// Revert: read an unknown outcome as a refusal → the "rebased" case is Ok(Err).
+    #[test]
+    fn a_consolidate_report_it_cannot_read_is_an_error() {
+        let report = |outcome: serde_json::Value, conflicts: serde_json::Value| serde_json::json!({"data": {"outcome": outcome, "conflicts": conflicts}});
+        let null = serde_json::Value::Null;
+        assert_eq!(consolidate_said(true, &report("merged".into(), null.clone())), Ok(Ok(None)));
+        assert_eq!(consolidate_said(true, &report("up_to_date".into(), null.clone())), Ok(Ok(None)));
+        assert_eq!(consolidate_said(true, &report("conflicts".into(), serde_json::json!(["a", "b/c"]))), Ok(Ok(Some(BTreeSet::from(["a".to_string(), "b/c".to_string()])))));
+        assert_eq!(consolidate_said(false, &report("merged".into(), null.clone())), Ok(Err(())));
+        for (outcome, conflicts) in [("rebased".into(), null.clone()), (null.clone(), null.clone()), ("conflicts".into(), serde_json::json!(["a", 1])), ("conflicts".into(), serde_json::json!("a"))] {
+            let said = consolidate_said(true, &report(outcome, conflicts.clone()));
+            assert!(said.is_err(), "{:?} {:?}", conflicts, said);
+        }
+    }
+
+    /// The settle step puts each conflicted file back as the first parent has it, its mode and
+    /// any missing parent folder included, removes one the parent does not have, then aborts.
+    /// `true` stands in for Forklift, so the abort succeeds.
+    ///
+    /// Revert: write every file as a plain one → the executable is not executable.
+    #[cfg(unix)]
+    #[test]
+    fn settling_puts_files_back_with_their_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, environment) = crate::history::tests::scratch("replay-settle");
+        let source = scratch.root().join("source");
+        std::fs::create_dir_all(source.join("x")).unwrap();
+        let git = |arguments: &[&str]| git_in(&source, arguments, &scratch, &environment);
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(source.join("x/run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(source.join("x/run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("x/run.sh", source.join("l")).unwrap();
+        commit(&source, "base", &scratch, &environment);
+        let ours = git(&["rev-parse", "HEAD"]);
+        let warehouse = scratch.work().join("warehouse");
+        std::fs::create_dir_all(&warehouse).unwrap();
+        std::fs::write(warehouse.join("gone"), "conflicted\n").unwrap();
+        std::fs::write(warehouse.join("l"), "conflicted\n").unwrap();
+        let tools = Tools { forklift: PathBuf::from("/usr/bin/true"), git: path_git(), mirror: source.join(".git"), warehouse: warehouse.clone(), index: scratch.tmp().join("replay.index"), scratch: &scratch, environment: &environment };
+        let conflicted = BTreeSet::from(["x/run.sh".to_string(), "l".to_string(), "gone".to_string()]);
+        tools.settle(&ours, &conflicted).unwrap();
+        assert_eq!(std::fs::read(warehouse.join("x/run.sh")).unwrap(), b"#!/bin/sh\n");
+        assert_eq!(std::fs::metadata(warehouse.join("x/run.sh")).unwrap().permissions().mode() & 0o111, 0o111, "the executable was put back without its mode");
+        assert_eq!(std::fs::read_link(warehouse.join("l")).unwrap(), PathBuf::from("x/run.sh"));
+        assert!(!warehouse.join("gone").exists());
     }
 
     fn commit(source: &Path, message: &str, scratch: &Scratch, environment: &Environment) {
@@ -1591,16 +1828,56 @@ mod tests {
             assert_eq!(rows[merge]["class"], "agree", "{}: {}", merge, report.markdown());
         }
 
-        // Forklift's abort refuses over the conflicted .gitignore (FORK-540): an error row, and
+        // Forklift's abort refuses over the conflicted .gitignore: an error row, and
         // the one failure, since no entry names this merge. The rows above, all replayed after
         // it, are not errors, so the harness got the warehouse out of that consolidate.
         assert_eq!(rows[&ignored]["class"], "error", "{}", report.markdown());
         let reason = rows[&ignored]["reason"].as_str().unwrap();
         assert!(reason.starts_with("aborting the conflicted consolidate failed:") && reason.contains("unresolved conflict marker"), "{}", reason);
         assert!(!reason.contains("did not let it abort"), "{}", reason);
+        // The comparison ran before the abort was refused, so the row keeps what it found.
+        assert_eq!(rows[&ignored]["forklift_conflicts"], serde_json::json!([".gitignore"]), "{}", report.markdown());
         let failed: Vec<(&str, &str)> = written["verdict"]["failures"].as_array().unwrap().iter()
             .map(|failure| (failure["merge"].as_str().unwrap(), failure["kind"].as_str().unwrap())).collect();
         assert_eq!(failed, [(ignored.as_str(), "error")], "{}", report.markdown());
         assert!(report.failed());
+    }
+
+    /// A run stops, naming the merge, when an error row leaves a warehouse that cannot shift,
+    /// rather than going on to make every later row an error for the same reason. The fixture's
+    /// merge conflicts on .gitignore, Forklift's abort refuses over it, and the settle step is
+    /// skipped, so the consolidate stays in progress.
+    ///
+    /// Revert: skip the probe after an error row → the run returns its report.
+    #[test]
+    #[ignore = "needs PROOF_LOAD_FORKLIFT"]
+    fn a_run_stops_on_a_warehouse_it_cannot_shift() {
+        let forklift = PathBuf::from(std::env::var("PROOF_LOAD_FORKLIFT").expect("PROOF_LOAD_FORKLIFT"));
+        let (scratch, environment) = crate::history::tests::scratch("replay-wedged");
+        let source = scratch.root().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let git = |arguments: &[&str]| git_in(&source, arguments, &scratch, &environment);
+        let write = |name: &str, content: &str| std::fs::write(source.join(name), content).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        write(".gitignore", "a\n");
+        commit(&source, "ignore a", &scratch, &environment);
+        git(&["switch", "-q", "-c", "ignore"]);
+        write(".gitignore", "b\n");
+        commit(&source, "ignore b", &scratch, &environment);
+        git(&["switch", "-q", "main"]);
+        write(".gitignore", "c\n");
+        commit(&source, "ignore c", &scratch, &environment);
+        git(&["merge", "-q", "-s", "ours", "--no-edit", "ignore"]);
+        let ignored = git(&["rev-parse", "HEAD"]);
+
+        let out = scratch.root().join("out");
+        let options = ReplayOptions { source, reference: "HEAD".to_string(), out: out.clone(), forklift, git: path_git(), sample: None, seed: None };
+        SKIP_SETTLE.with(|skip| skip.set(true));
+        let stopped = run(&options, &|_| {});
+        SKIP_SETTLE.with(|skip| skip.set(false));
+        let reason = stopped.err().expect("the run went on past a warehouse it cannot shift");
+        assert!(reason.starts_with(&format!("the warehouse cannot shift after merge {}'s error row", ignored)), "{}", reason);
+        assert!(reason.contains("settling skipped by the test"), "{}", reason);
+        assert!(!out.join("replay.json").exists());
     }
 }

@@ -292,8 +292,9 @@ on error, so for now they report grades without failing a pull request.
   and the seed keep the sample fixed, so every entry for its merges was filed from one run. The seed
   moves once, by hand, to the run number (`${{ github.run_number }}`), the first time
   `replay-tickets.json` holds no entry for a merge of the seed-7 sample. From then on each run
-  takes a new sample, and a red names a merge no one has looked at. That is news about Forklift,
-  resolved like any other failure: an entry and its ticket.
+  takes a new sample, and a red names a merge no one has looked at. The runner's git is not pinned,
+  so a red can also come from a change of git rather than of Forklift; the report's header records
+  git's version. Either way it is resolved like any other failure: an entry and its ticket.
 - **`proof load perf`** runs `perf --shape small --reps 3 --gate self` on Linux, with a
   forklift-server, on every push to `main` and on a pull request that touches the code the timed
   binaries or the harness are built from (the forklift, forklift-core, forklift-server and
@@ -648,8 +649,8 @@ Before any merge is replayed, the history is rewritten once, and the header coun
 
 - **Gitlink entries** (submodules), which Forklift's import skips.
 - **Changes to `.forkliftignore` files.** A history's own `.forkliftignore` files can predate the
-  current ignore dialect, and Forklift cannot shift away from such a revision (FORK-536). Until that
-  ticket closes, the replay drops them, and the header names the ticket.
+  current ignore dialect, and Forklift cannot shift away from such a revision. Until that is fixed,
+  the replay drops them, and the header names the ticket for it.
 
 Forklift then imports the rewritten mirror once. Each merge M with parents P1 and P2 gets three
 branches, `m-<M>-o`, `m-<M>-t` and `m-<M>-m`, at P1, P2 and M. To replay M, the harness shifts to
@@ -660,8 +661,16 @@ fails either is an `error`:
 - the tree Forklift checks out for P1 is P1's git tree.
 
 Forklift's tree is hashed with git through a fresh index each time, so a stat cache left by an
-earlier hash never stands in for a file's content. A conflicted consolidate is aborted before the
-next row.
+earlier hash never stands in for a file's content. The hash reads attributes from the empty tree
+and turns line-ending conversion off, so a history's own `.gitattributes` does not rewrite the
+files Forklift checked out before they are compared.
+
+A consolidate that reports an outcome the harness does not know, or a conflict that is not a path,
+makes the row an `error`. Once a row is compared, a conflicted consolidate is aborted. When Forklift
+refuses the abort, the harness puts the conflicted files back as P1 has them and aborts again, and
+the row is an `error` that keeps the paths its comparison found. After any `error` row the harness
+shifts to the ref's branch; when that is refused too, no later row could replay, so the run stops
+with exit status 2, naming the row.
 
 ### Comparing with git
 
@@ -673,7 +682,9 @@ Each row has three of git's merges to compare with, all `git merge-tree --write-
 - **G0**, G1 on a single merge base, as Forklift merges. Where the two commits have several bases,
   git merges them into a virtual base first, while Forklift takes one. G0 is then G1 run against
   each base in turn, and the run that differs from Forklift's merge at the fewest paths is used,
-  the earliest listed base on a tie.
+  the earliest listed base on a tie. The harness cannot see which base Forklift took, so G0 is the
+  single-base merge closest to Forklift's: a `multi-base-gap` shows that some single base accounts
+  for Forklift's file, not that it is the base Forklift used.
 
 A path differs between two merges when:
 
@@ -687,8 +698,8 @@ Each differing path comes to one kind:
 | kind | Forklift against git | what it means |
 |---|---|---|
 | `divergence` | Forklift differs from G0 | Forklift's merge differs from git's merge of the same base with no renames. Its subtype says how. |
-| `rename-gap` | Forklift equals G0, and G differs from G1 | The difference is rename detection, which Forklift does not do (FORK-537). |
-| `multi-base-gap` | Forklift equals G0 and G equals G1, but G1 differs from G0 | The difference is the virtual base git builds from several bases (FORK-538). |
+| `rename-gap` | Forklift equals G0, and G differs from G1 | The difference is rename detection, which Forklift does not do. |
+| `multi-base-gap` | Forklift equals G0 and G equals G1, but G1 differs from G0 | The difference is the virtual base git builds from several bases. |
 
 A divergence has a subtype:
 
@@ -726,8 +737,10 @@ kinds of entry:
   that cause, wherever it shows;
 - a **path entry**, `{"merge", "path", "kind", "blob", "ticket"}`, covers one divergence: that merge
   (its full id), that path, that subtype, and that content of Forklift's file (its git blob id, or
-  `absent`). A `forklift-refused` or `error` row is covered by a path entry of that kind with an
-  empty path and blob.
+  `absent`);
+- a **row entry**, `{"merge", "kind", "reason", "ticket"}`, covers one `forklift-refused` or
+  `error` row: that merge, that kind, and a reason that contains the entry's `reason` text. When
+  the row fails for another reason, the entry stops matching.
 
 A path entry covers a path only when all four fields match. When Forklift's merge of that path
 changes, the entry stops matching and the run fails until someone looks.
@@ -736,12 +749,16 @@ The run fails on:
 
 - a divergence no path entry covers;
 - a gap whose cause has no entry;
-- a `forklift-refused` or `error` row with no entry.
+- a `forklift-refused` or `error` row with no row entry.
+
+An `error` or `forklift-refused` row's paths, where the comparison found any before the row
+failed, are judged as on any other row.
 
 A cause entry never covers a divergence. An entry that no row of the run matched is listed as
 possibly closable and never fails the run, so in a sampled run the entries of merges outside the
-sample are listed too. A test holds every entry to a `FORK-N` ticket, a full merge id, and a blob id
-or `absent`.
+sample are listed too. A test holds every entry to a `FORK-N` ticket and a full merge id, every path
+entry to a divergence kind and a blob id or `absent`, and every row entry to a row kind and a
+non-empty reason.
 
 A change that introduces a divergence on purpose adds its entry. The change that fixes it removes
 the entry.
@@ -767,4 +784,5 @@ the merge commit's file.
 
 `replay` exits 0 when the verdict failed nothing, and 1 when it failed. It exits 2 when the run
 could not go ahead: a non-empty output folder, a shallow or unreadable source, a ref that is not a
-commit, `--sample 0`, or a failed import, for example. A run that exits 2 writes no `replay.json`.
+commit, `--sample 0`, a failed import, or a warehouse that cannot shift after an `error` row, for
+example. A run that exits 2 writes no `replay.json`.
