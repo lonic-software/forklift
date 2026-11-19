@@ -1221,23 +1221,98 @@ fn a_copy_naming_a_parcel_that_fails_verification_is_refused_not_written() {
     assert!(!meta_path(&root, "tags").exists(), "nothing was written");
 }
 
-// Revert: refuse the office beside a damaged @redactions with the hand step heal gives
-// @redactions → the office's refusal tells the user to write it by hand.
+/// Remove `a.txt` from `main`, record a redaction of it as `main` held it, and return the
+/// `@redactions` head that made.
+fn redacted(area: &Area, root: &Path) -> String {
+    let leaked = head(root, "main");
+    area.run_ok(root, &["remove", "a.txt"]);
+    area.run_ok(root, &["stack", "-m", "drop a.txt"]);
+    area.run_ok(root, &["redact", "record", &format!("{}:a.txt", leaked), "-m", "leaked"]);
+    meta_head(root, "redactions").unwrap()
+}
+
+/// Lose meta pallet `pallet`'s ref, or damage it: its copy stands either way.
+fn break_meta(root: &Path, pallet: &str, lost: bool) {
+    match lost {
+        true => forklift_core::util::file_utils::remove_file(&meta_path(root, pallet)).unwrap(),
+        false => std::fs::write(meta_path(root, pallet), b"not a head\n").unwrap(),
+    }
+}
+
+fn sorted(mut rebuilt: Vec<(String, String, String)>) -> Vec<(String, String, String)> {
+    rebuilt.sort();
+    rebuilt
+}
+
+// Mutation: check @redactions' own rebuild against its ref as read (no chosen head passed to the
+// write) → the damaged ref fails the check and nothing is rebuilt, red. A lost ref reads as no
+// redactions, so that case stays green under this mutation until a lost meta ref reads loudly.
 #[test]
-fn a_lost_office_beside_a_lost_redactions_ref_waits_on_it() {
+fn a_lost_or_damaged_redactions_ref_is_rebuilt_from_its_copy_ahead_of_the_refs_checked_against_it() {
+    for lost in [false, true] {
+        let area = Area::new(if lost { "redactions-lost" } else { "redactions-damaged" });
+        let (root, _, second) = tagged(&area);
+        let redactions = redacted(&area, &root);
+        break_meta(&root, "redactions", lost);
+        forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+
+        let data = healed(&area, &root);
+        assert_eq!(sorted(rebuilt_meta(&data)), vec![
+            ("@redactions".to_string(), redactions.clone(), "the ref's copy".to_string()),
+            ("@tags".to_string(), second.clone(), "the ref's copy".to_string()),
+        ], "lost: {}: {}", lost, data);
+        assert_eq!(meta_head(&root, "redactions").as_deref(), Some(redactions.as_str()), "lost: {}", lost);
+        assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "lost: {}", lost);
+        assert_eq!(std::fs::read(meta_copy_path(&root, "redactions")).unwrap(), format!("{}\n", redactions).into_bytes());
+    }
+}
+
+// Mutations: verify the head chosen for @redactions against the office ref as read → in this
+// anchored warehouse the office reads as unborn or damaged, so both are refused, red; check the
+// office's write against the @redactions ref as read → the damaged ref fails it, red (a lost one
+// reads as no redactions, so that case stays green under it until a lost meta ref reads loudly).
+#[test]
+fn a_lost_or_damaged_office_beside_a_lost_or_damaged_redactions_ref_is_rebuilt_with_it() {
+    for lost in [false, true] {
+        let area = Area::new(if lost { "office-redactions-lost" } else { "office-redactions-damaged" });
+        let (root, _, _) = tagged(&area);
+        area.run_ok(&root, &["office", "enroll"]);
+        let redactions = redacted(&area, &root);
+        let office = meta_head(&root, "office").unwrap();
+        break_meta(&root, "office", lost);
+        break_meta(&root, "redactions", lost);
+
+        let data = healed(&area, &root);
+        assert_eq!(sorted(rebuilt_meta(&data)), vec![
+            ("@office".to_string(), office.clone(), "the ref's copy".to_string()),
+            ("@redactions".to_string(), redactions.clone(), "the ref's copy".to_string()),
+        ], "lost: {}: {}", lost, data);
+        assert_eq!(meta_head(&root, "office").as_deref(), Some(office.as_str()), "lost: {}", lost);
+        assert_eq!(meta_head(&root, "redactions").as_deref(), Some(redactions.as_str()), "lost: {}", lost);
+
+        // A second heal finds nothing to do.
+        assert!(rebuilt_meta(&healed(&area, &root)).is_empty(), "lost: {}", lost);
+    }
+}
+
+// Mutation: write the office beside a damaged @redactions with no head heal can verify, checked
+// against nothing → the office is rebuilt, red.
+#[test]
+fn a_lost_office_beside_a_redactions_ref_heal_cannot_verify_waits_on_it() {
     let area = Area::new("meta-office-waits");
     let (root, _, second) = tagged(&area);
     area.run_ok(&root, &["office", "enroll"]);
 
+    // A @tags parcel is no @redactions history.
     std::fs::create_dir_all(meta_copy_path(&root, "redactions").parent().unwrap()).unwrap();
     std::fs::write(meta_copy_path(&root, "redactions"), format!("{}\n", second)).unwrap();
     forklift_core::util::file_utils::remove_file(&meta_path(&root, "office")).unwrap();
 
     let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
     let message = refused["error"]["message"].as_str().unwrap();
-    assert!(message.contains("The ref of pallet \"@office\" was not rebuilt: heal rebuilds it only while the ref of pallet \"@redactions\" reads, and that is damaged too: set that first"), "{}", refused);
-    assert!(message.contains("The ref of pallet \"@redactions\" was not rebuilt: heal does not rebuild this ref"), "{}", refused);
-    assert!(!meta_path(&root, "office").exists(), "nothing was written");
+    assert!(message.contains("The ref of pallet \"@office\" was not rebuilt: it is checked against the redactions, and the ref of pallet \"@redactions\" is damaged too, with no head heal can verify: set that first"), "{}", refused);
+    assert!(message.contains(&format!("The ref of pallet \"@redactions\" was not rebuilt: parcel {} does not pass verification", second)), "{}", refused);
+    assert!(!meta_path(&root, "office").exists() && !meta_path(&root, "redactions").exists(), "nothing was written");
 }
 
 // Mutation: refuse only the office and @redactions themselves, not the refs judged against them →
@@ -1247,14 +1322,15 @@ fn a_meta_ref_beside_a_lost_redactions_ref_is_refused_naming_it() {
     let area = Area::new("meta-blocked");
     let (root, _, second) = tagged(&area);
 
-    // A lost @redactions: its copy stands, its ref does not.
+    // A lost @redactions: its copy stands, its ref does not, and it names a @tags parcel, which
+    // heal refuses as @redactions history.
     std::fs::create_dir_all(meta_copy_path(&root, "redactions").parent().unwrap()).unwrap();
     std::fs::write(meta_copy_path(&root, "redactions"), format!("{}\n", second)).unwrap();
     forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
 
     let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
     let message = refused["error"]["message"].as_str().unwrap();
-    assert!(message.contains("The ref of pallet \"@redactions\" was not rebuilt: heal does not rebuild this ref"), "{}", refused);
+    assert!(message.contains(&format!("The ref of pallet \"@redactions\" was not rebuilt: parcel {} does not pass verification", second)), "{}", refused);
     assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: it is verified against the office and checked against the redactions, and the ref of pallet \"@redactions\" is damaged too"), "{}", refused);
     assert!(meta_head(&root, "tags").is_none() && meta_head(&root, "redactions").is_none(), "nothing was written");
     assert_eq!(refused["error"]["next_step"], "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.", "{}", refused);

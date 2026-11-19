@@ -786,13 +786,16 @@ pub(crate) fn observe_trust_files() -> Result<(pallet_utils::TrustEntryState, pa
 /// never chooses the head.
 ///
 /// # Returns
-/// * `Ok(AnchorPrecondition::Files)` - Both files, as judged.
+/// * `Ok((AnchorPrecondition::Files, anchor))`
+///                                   - Both files, as judged, and the anchor that verified
+///                                     `head`, which what is judged beside the office is
+///                                     verified against.
 /// * `Err(String)`                   - Why the head is not written, as a refusal's reason:
 ///                                     neither file holds an anchor that verifies it; a newer
 ///                                     version wrote one; or a file, the served state or the
 ///                                     office chain could not be read, which says nothing of the
 ///                                     head.
-pub(crate) fn office_rebuild_anchor(head: &str) -> Result<pallet_utils::AnchorPrecondition, String> {
+pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorPrecondition, TrustAnchor), String> {
     let unjudged = |why: String| format!("parcel {} could not be verified against the anchor: {}", head, why.trim_end_matches('.'));
     let (trust, copy) = observe_trust_files().map_err(unjudged)?;
     let served = crate::util::tombstone_utils::served_state().map_err(unjudged)? != crate::util::tombstone_utils::ServedState::Never;
@@ -834,7 +837,7 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<pallet_utils::AnchorPr
         };
 
         match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served).map_err(unjudged)? {
-            true => return Ok(pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }),
+            true => return Ok((pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }, anchor)),
             false => said.push("holds an anchor it does not verify against"),
         }
     }
