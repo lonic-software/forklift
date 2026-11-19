@@ -284,26 +284,50 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
 
 /// [`load_parcel`], telling a store that cannot give the parcel's bytes (the outer error, with
 /// what the store's answer says of the parcel) from bytes that are not a parcel (the inner one).
-pub(crate) fn load_parcel_judged(hash: &str) -> Result<Result<Parcel, String>, (String, file_utils::ReadFault)> {
+pub(crate) fn load_parcel_judged(hash: &str) -> Result<Result<Parcel, NotAParcel>, (String, file_utils::ReadFault)> {
     let bytes = read_parcel_bytes_faulted(hash)?;
 
-    Ok(decode_parcel(hash, &bytes))
+    Ok(decode_parcel_judged(hash, &bytes))
 }
 
 /// [`load_parcel`], whose error says what it tells of the parcel: bytes that read but are not a
 /// parcel are [`file_utils::ReadFault::Content`], as the store's own verdicts are.
 pub(crate) fn load_parcel_faulted(hash: &str) -> Result<Parcel, (String, file_utils::ReadFault)> {
-    load_parcel_judged(hash)?.map_err(|error| (error, file_utils::ReadFault::Content))
+    load_parcel_judged(hash)?.map_err(|error| (error.into(), file_utils::ReadFault::Content))
+}
+
+/// Why object bytes that read whole are not a parcel ([`decode_parcel_judged`]): told from the
+/// one parse of those bytes, so a caller never reads the object again to learn which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotAParcel {
+    /// They are another kind of object, whole: the message names its type.
+    Other(String),
+
+    /// They are no object at all.
+    Malformed(String),
+}
+
+impl From<NotAParcel> for String {
+    fn from(refusal: NotAParcel) -> String {
+        match refusal {
+            NotAParcel::Other(message) | NotAParcel::Malformed(message) => message,
+        }
+    }
 }
 
 /// Decode a parcel's object bytes. A refusal names the parcel it came from, so a walk that meets a
 /// malformed one says which.
 pub(crate) fn decode_parcel(hash: &str, bytes: &[u8]) -> Result<Parcel, String> {
+    decode_parcel_judged(hash, bytes).map_err(String::from)
+}
+
+/// [`decode_parcel`], telling bytes that are another kind of object from bytes that are none.
+pub(crate) fn decode_parcel_judged(hash: &str, bytes: &[u8]) -> Result<Parcel, NotAParcel> {
     match parser::object::loose_object_parser::parse(bytes)
-        .map_err(|e| format!("Parcel {} could not be read: {}", hash, e))?
+        .map_err(|e| NotAParcel::Malformed(format!("Parcel {} could not be read: {}", hash, e)))?
     {
         ParsedObject::Parcel(parcel) => Ok(parcel),
-        other => Err(format!("Object {} is a {}, not a parcel.", hash, other.get_type())),
+        other => Err(NotAParcel::Other(format!("Object {} is a {}, not a parcel.", hash, other.get_type()))),
     }
 }
 

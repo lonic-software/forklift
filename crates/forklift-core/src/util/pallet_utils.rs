@@ -1728,11 +1728,16 @@ pub fn remove_damaged_meta_ref(name: &str,
     let mut removed = MetaRemoved::Nothing;
     if let RefDamage::Unreadable(_) = damage {
         let path = get_pallet_ref_path(PalletNamespace::Meta, name);
-        // An unlink that landed before a sync failed has removed the ref all the same.
-        unlink_ref(PalletNamespace::Meta, &path).map_err(|error| (RefUpdateError::Failed(error), match path.exists() {
-            true => MetaRemoved::Nothing,
-            false => MetaRemoved::Ref,
-        }))?;
+        // An unlink that landed before a sync failed has removed the ref all the same, so the
+        // ref read back decides; a read back that fails too says nothing of it, and the ref is
+        // taken to stand.
+        unlink_ref(PalletNamespace::Meta, &path).map_err(|error| match stands(&path) {
+            Ok(true) => (RefUpdateError::Failed(error), MetaRemoved::Nothing),
+            Ok(false) => (RefUpdateError::Failed(error), MetaRemoved::Ref),
+            Err(read) => (RefUpdateError::Failed(crate::error::append_to_message(error, &format!(
+                "Whether the ref of pallet \"{}\" still stands could not be read back ({}), so it is taken to stand.", name, read
+            ))), MetaRemoved::Nothing),
+        })?;
         removed = MetaRemoved::Ref;
     }
     if let MetaCopyState::Bytes(_) = copy {
@@ -1751,7 +1756,11 @@ pub fn remove_damaged_meta_ref(name: &str,
 /// Keep `bytes`, removed from a file of pallet `name`, in `kept`: a new file, or one that holds
 /// those bytes already, as a removal stopped before it finished leaves it.
 fn keep_removed(kept: &Path, bytes: &[u8], name: &str) -> Result<(), RefUpdateError> {
-    if kept.exists() {
+    // A file there whose state cannot be read may hold other bytes: it is never written over.
+    if stands(kept).map_err(|e| RefUpdateError::Failed(format!(
+        "Whether the file \"{}\" the ref of pallet \"{}\" was to be kept in already exists could not be read: {}",
+        kept.to_string_lossy(), name, e
+    )))? {
         if std::fs::read(kept).is_ok_and(|held| held == bytes) {
             return Ok(());
         }
@@ -1771,13 +1780,27 @@ fn keep_removed(kept: &Path, bytes: &[u8], name: &str) -> Result<(), RefUpdateEr
     Ok(())
 }
 
+/// Whether anything stands at `path`, links unfollowed: only the answer that nothing does reads as
+/// absent, so a read that fails is an error, never taken for an absence (as `Path::exists` takes
+/// it).
+fn stands(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Refuse with [`RefUpdateError::Moved`] unless the ref of `name` is damaged exactly as `damage`
 /// says: still absent, or still holding exactly those bytes.
 fn require_damage(namespace: PalletNamespace, name: &str, damage: &RefDamage) -> Result<(), RefUpdateError> {
     let path = get_pallet_ref_path(namespace, name);
 
     let holds = match damage {
-        RefDamage::Missing => !path.exists(),
+        // A ref whose state cannot be read is not known to be lost.
+        RefDamage::Missing => !stands(&path).map_err(|e| RefUpdateError::Failed(format!(
+            "Error while reading whether the ref of pallet \"{}\" stands: {}", name, e
+        )))?,
         RefDamage::Unreadable(bytes) => path.is_file() && std::fs::read(&path).map_err(|e| RefUpdateError::Failed(format!(
             "Error while reading the ref of pallet \"{}\": {}", name, e
         )))? == *bytes,
@@ -2885,6 +2908,31 @@ pub(crate) mod tests {
         let error = write_position_in(&dir, &position).unwrap_err();
         assert!(error.contains("could neither be written"), "{}", error);
         assert_eq!(decode_position(&std::fs::read(dir.join(FILE_NAME_POSITION)).unwrap()).ok(), Some(position));
+
+        let _ = file_utils::remove_dir_all(&dir);
+    }
+
+    // What a removal reads back to tell whether a file still stands: only the answer that nothing
+    // stands there is an absence; a read that itself fails is an error, never taken for one.
+    // Mutation: answer false for every error, as `Path::exists` does → the path under a file
+    // reads as gone, red.
+    #[test]
+    fn only_nothing_standing_reads_as_absent() {
+        let dir = std::env::temp_dir().join(format!("forklift-stands-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), b"bytes").unwrap();
+
+        assert_eq!(stands(&dir.join("file")).ok(), Some(true), "a file stands");
+        assert_eq!(stands(&dir.join("missing")).ok(), Some(false), "nothing stands at a free name");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("missing"), dir.join("dangling")).unwrap();
+            assert_eq!(stands(&dir.join("dangling")).ok(), Some(true), "a dangling link stands, unfollowed");
+            // A name under a file cannot be read (not a folder): no answer, not an absence.
+            let under = stands(&dir.join("file").join("ref"));
+            assert!(under.is_err(), "{:?}", under);
+        }
 
         let _ = file_utils::remove_dir_all(&dir);
     }

@@ -128,7 +128,7 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
         // told as unreadable too. An object that is there but is not a parcel is a verdict.
         let parcel = object_utils::load_parcel_judged(&cursor)
             .map_err(|(message, fault)| Unreadable(message, fault))?
-            .map_err(Inauthentic)?;
+            .map_err(|refusal| Inauthentic(refusal.into()))?;
 
         if cursor == anchor.genesis {
             break;

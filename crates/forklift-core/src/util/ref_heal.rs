@@ -551,15 +551,10 @@ fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
             Ok(Ok(_)) => parcels.push(hash),
             Err((_, ReadFault::Untold)) => untold.push(hash),
             Err((_, ReadFault::Content)) => unknown.push(hash),
-            Ok(Err(_)) => {
-                // Bytes that read whole: another kind of object drops out, and none at all is
-                // damage.
-                if object_utils::load_tree(&hash).is_err() && object_utils::load_blob(&hash).is_err()
-                    && object_utils::load_recipe(&hash).is_err() && object_utils::load_chunk(&hash).is_err()
-                {
-                    unknown.push(hash);
-                }
-            }
+            // Bytes that read whole, told from their one parse: another kind of object drops
+            // out, and none at all is damage.
+            Ok(Err(object_utils::NotAParcel::Other(_))) => {}
+            Ok(Err(object_utils::NotAParcel::Malformed(_))) => unknown.push(hash),
         }
     }
 
@@ -976,7 +971,9 @@ fn kept_path(stem: &str, held: Option<&[u8]>) -> std::path::PathBuf {
     let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
     let stem = stem.replace('/', "%2F");
     (0..).map(|n| folder.join(match n { 0 => stem.clone(), n => format!("{}.{}", stem, n) }))
-        .find(|path| !path.exists() || held.is_some_and(|bytes| std::fs::read(path).is_ok_and(|kept| kept == bytes)))
+        // A slot whose state cannot be read is taken as free, and keeping the bytes there then
+        // refuses it ([`pallet_utils`]'s keep reads it back), so it is never written over.
+        .find(|path| std::fs::symlink_metadata(path).is_err() || held.is_some_and(|bytes| std::fs::read(path).is_ok_and(|kept| kept == bytes)))
         .expect("an unbounded range always yields a free name")
 }
 
@@ -1873,9 +1870,10 @@ fn write_meta_rebuild(state: &MetaState,
             report.stopped = Some(error);
             return true;
         }
-        // A write the store refused (a read-only file system, a full disk) is as lasting as what
-        // could not be read; a precondition that moved is heal's own race.
-        Err(error @ RefUpdateError::Failed(_)) => (format!("the rebuild at {} was not written: {}", head, error), Owner::Unread(None)),
+        // A write that failed says nothing lasting of the ref: its error is any write path's
+        // text (a held lock, a momentary fault as much as a full disk), so heal is run again,
+        // which judges the ref afresh and refuses what it then cannot read as unread. A
+        // precondition that moved is heal's own race.
         Err(error) => (format!("the rebuild at {} was not written: {}", head, error), Owner::Again),
         Ok(()) => (format!("the rebuild at {} did not read back", head), Owner::Again),
     };
@@ -2099,6 +2097,9 @@ mod tests {
         let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
 
         assert_eq!(judge(vec![one.clone()], &clean), Salvage::Found(one.clone()));
+        // A whole object of another kind drops out, told from its one parse.
+        let blob = crate::util::gc_utils::tests::store_blob("not a parcel");
+        assert_eq!(judge(vec![one.clone(), blob], &clean), Salvage::Found(one.clone()));
         assert_eq!(judge(vec![one.clone(), two.clone()], &clean), Salvage::Ambiguous(vec![one.clone(), two.clone()], false));
 
         let tainted = Tainted { hashes: BTreeSet::from(["f".repeat(HASH_LENGTH)]), torn: false, unread: false };
