@@ -2926,11 +2926,11 @@ with the heads found for it, beside those already rebuilt; one after it names th
 refusal that stops either pass before it has judged every damaged metadata ref names the rest as
 not yet judged. A later `heal` judges them again.
 
-Beside a taint whose record is torn, every object counts as one the taint may have lost, so a
-metadata ref `heal` can rebuild only from what its bytes or its copy name is left each time, and
-the taint's rescan, which reads every ref, cannot finish past it: running `heal` again does not
-resolve either. Check that a head named for the ref is one this store holds, then write it
-into the ref's file by hand; `heal` does not verify a head written that way.
+Beside a taint whose record is torn, every object counts as one the taint may have lost. A
+metadata ref whose remaining bytes still name an object is then left each time, and the taint's
+rescan, which reads every ref, cannot finish past it, so running `heal` again resolves neither; the
+refusal says so. Check that a head named for the ref is one this store holds, then write it into
+the ref's file by hand; `heal` does not verify a head written that way.
 
 #### A damaged fetch scope
 

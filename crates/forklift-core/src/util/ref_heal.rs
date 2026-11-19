@@ -132,6 +132,10 @@ pub struct Repair {
     /// neither rebuilt, refused nor deferred.
     pub unjudged: Vec<String>,
 
+    /// Whether the meta pass judged beside a taint whose record is torn, or could not be read, so
+    /// that every object it salvaged counted as possibly lost.
+    pub torn: bool,
+
     /// What narrowed the evidence: a position, journal or marker that could not be read.
     pub notes: Vec<String>,
 
@@ -1137,6 +1141,8 @@ pub struct TrustStopped {
     pub refused: Vec<Refused>,
     /// Every other lost or damaged meta ref, as `@<name>`, which the pass stopped before judging.
     pub unjudged: Vec<String>,
+    /// Whether the pass judged beside a torn taint ([`Repair::torn`]).
+    pub torn: bool,
     /// What the pass noted before it stopped, the office step's among them.
     pub notes: Vec<String>,
 }
@@ -1202,8 +1208,9 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
     }
     // A pass that stopped, at the trust repair or inside step 3, names what it never judged.
     if trust.is_err() || report.stopped.is_some() {
-        report.unjudged = unjudged_in(&states, &report);
+        report.unjudged = unjudged_in(&mut report);
     }
+    report.torn = tainted.as_ref().is_some_and(|tainted| tainted.torn);
 
     match trust {
         Ok(trust) => Ok(MetaRepair { repair: report, trust }),
@@ -1214,7 +1221,7 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
             }
             Err(TrustStopped {
                 error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred),
-                refused: std::mem::take(&mut report.refused), unjudged: std::mem::take(&mut report.unjudged), notes,
+                refused: std::mem::take(&mut report.refused), unjudged: std::mem::take(&mut report.unjudged), torn: report.torn, notes,
             })
         }
     }
@@ -1222,13 +1229,16 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
 
 /// The lost or damaged meta refs, as `@<name>`, that `report` neither rebuilt, refused nor
 /// deferred: what a pass that stopped never judged. Read again, since step 3 judges from its own
-/// read; `states`, the pass's first read, stands in when that fails.
-fn unjudged_in(states: &[MetaState], report: &Repair) -> Vec<String> {
-    let now = meta_states(&mut Vec::new()).ok();
+/// read; what that read could not judge is noted into `report`.
+fn unjudged_in(report: &mut Repair) -> Vec<String> {
+    let mut notes = Vec::new();
+    let states = meta_states(&mut notes).unwrap_or_default();
+    for note in notes {
+        push_note(&mut report.notes, note);
+    }
     let judged = |wire: &str| report.rebuilt.iter().any(|rebuilt| rebuilt.pallet == wire)
         || report.refused.iter().chain(&report.deferred).any(|refused| refused.pallet == wire);
-    now.as_deref().unwrap_or(states).iter()
-        .filter(|state| state.damage().is_some()).map(MetaState::wire).filter(|wire| !judged(wire)).collect()
+    states.iter().filter(|state| state.damage().is_some()).map(MetaState::wire).filter(|wire| !judged(wire)).collect()
 }
 
 /// What step 1 of [`repair_meta`] judged of a damaged `@redactions` beside a damaged office, for

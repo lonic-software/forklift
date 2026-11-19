@@ -1443,14 +1443,14 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
 // after the taint → "resolved" red.
 #[test]
 fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once_it_is_resolved() {
-    for case in ["rebuilt", "deferred", "lost-deferred", "resolved"] {
+    for case in ["rebuilt", "deferred", "lost-deferred", "torn", "resolved"] {
         let area = Area::new(&format!("meta-taint-{}", case));
         let (root, _, second) = tagged(&area);
         let mut tainted = vec![second.clone()];
 
         // A parcel only `side` reaches, gone and recorded: no remote can give it back, so the
         // taint stands and the run stops there.
-        if case != "resolved" {
+        if case != "resolved" && case != "torn" {
             area.run_ok(&root, &["pallet", "create", "side"]);
             area.run_ok(&root, &["shift", "side"]);
             area.stack(&root, "d.txt", "side only");
@@ -1469,7 +1469,15 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
             _ => std::fs::write(meta_path(&root, "tags"), &second.as_bytes()[..32]).unwrap(),
         }
         let broken = std::fs::read(meta_path(&root, "tags")).ok();
-        plant_taint(&root, &tainted.iter().map(String::as_str).collect::<Vec<_>>());
+        match case {
+            // Bytes that are not UTF-8: a torn record, of which nothing is trusted.
+            "torn" => {
+                let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("taint-1-0"), [0xff, 0xfe, b'\n']).unwrap();
+            }
+            _ => plant_taint(&root, &tainted.iter().map(String::as_str).collect::<Vec<_>>()),
+        }
 
         if case == "resolved" {
             let data = healed(&area, &root);
@@ -1496,7 +1504,11 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
                 assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
             }
             _ => {
-                assert!(message.contains(left) && message.contains(&heads) && message.contains(again), "{}: {}", case, message);
+                let closing = match case {
+                    "torn" => "The durability taint's record is torn, so every object that ref names counts as possibly lost, and a later heal leaves it again; ",
+                    _ => again,
+                };
+                assert!(message.contains(left) && message.contains(&heads) && message.contains(closing), "{}: {}", case, message);
                 assert!(!message.contains("Rebuilt the ref of pallet \"@tags\""), "{}: {}", case, message);
                 assert_eq!(std::fs::read(meta_path(&root, "tags")).ok(), broken, "{}: the deferred ref is left as it was", case);
             }
