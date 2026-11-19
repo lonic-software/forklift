@@ -818,7 +818,9 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
         Ok(MetaCopyState::Other) if std::fs::symlink_metadata(&copy_path).is_ok_and(|metadata| metadata.is_dir()) => return Ok(None),
         Ok(MetaCopyState::Other) => (
             format!("something that is not a file stands at its copy's path (\"{}\")", shown),
-            "Replace what stands at the copy's path with the copy's file, or move it aside, then run the command again.",
+            // Moved aside, it would leave the ref and its copy both gone, read as never written.
+            "Replace what stands at the copy's path with the copy's file, or restore the ref's file from a backup, then \
+            run the command again.",
         ),
         Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => (format!("its copy (\"{}\") still stands", shown), HEAL_STEP),
         Ok(MetaCopyState::Bytes(_)) => (format!("its copy (\"{}\") stands but does not hold a parcel hash", shown), META_REF_HAND_STEP),
@@ -888,9 +890,9 @@ fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<
         PalletNamespace::Meta => {
             match read_file_state(&get_meta_copy_path(name)) {
                 Ok(MetaCopyState::Bytes(copy)) if parse_ref_bytes(&copy).is_some() => HEAL_STEP,
-                _ if crate::util::ref_heal::salvage_names_a_head(&bytes) => HEAL_STEP,
-                // A copy heal could rebuild from, once it reads.
+                // heal judges no ref whose copy it cannot read, whatever the ref's own bytes name.
                 Err(_) => COPY_READABLE_STEP,
+                _ if crate::util::ref_heal::salvage_names_a_head(&bytes) => HEAL_STEP,
                 _ => META_REF_HAND_STEP,
             }
         }
@@ -2969,6 +2971,7 @@ pub(crate) mod tests {
         // Revert: read a link at the copy path as no copy → the read is unborn, red.
         // Revert: read a folder at the ref's path as missing → the step is heal, red.
         // Revert: the hand step beside a damaged ref whose copy cannot be read → red.
+        // Revert: judge the ref's salvage ahead of a copy that cannot be read → the step is heal, red.
         #[cfg(unix)]
         #[test]
         fn a_missing_meta_ref_is_judged_by_what_stands_at_its_copy_and_its_path() {
@@ -2994,6 +2997,13 @@ pub(crate) mod tests {
             let (message, next) = step("tags");
             assert!(message.contains("is damaged"), "{}", message);
             assert!(next.starts_with("Make the copy and the folders on the way to it readable"), "{}", next);
+
+            // Even when its bytes name one parcel: heal does not judge the ref while its copy cannot be read.
+            let named = stub_parcel("named");
+            std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "tags"), &named.as_bytes()[..12]).unwrap();
+            assert!(crate::util::ref_heal::salvage_names_a_head(&named.as_bytes()[..12]), "the fixture's bytes salvage");
+            let (_, next) = step("tags");
+            assert!(next.starts_with("Make the copy and the folders on the way to it readable"), "{}", next);
             drop(_scope);
 
             // A link at the copy path is never followed: nothing writes one, so it is refused.
@@ -3008,7 +3018,7 @@ pub(crate) mod tests {
             assert!(list_pallets_in(PalletNamespace::Meta).unwrap().contains(&"tags".to_string()), "a link at the copy path is listed");
             let (message, next) = step("tags");
             assert!(message.contains("is lost: its file is missing, and something that is not a file stands at its copy's path"), "{}", message);
-            assert_eq!(next, "Replace what stands at the copy's path with the copy's file, or move it aside, then run the command again.");
+            assert_eq!(next, "Replace what stands at the copy's path with the copy's file, or restore the ref's file from a backup, then run the command again.");
             drop(_scope);
 
             // A folder at the ref's path beside a copy that names a head: moved aside, not healed.

@@ -119,8 +119,9 @@ does (the copy does not hold a parcel hash, and the damaged file names nothing, 
 that cannot be read, or is missing), and for a ref `heal` refuses, the next step is to restore the
 file from a backup, or write the head parcel's hash into it. A copy that cannot be read, a link at the
 copy's path, or something other than a file at the ref's path is refused too, naming it: make the copy
-and the folders on the way to it readable, replace the link with the copy's file, or move the thing
-aside, and run the command again.
+and the folders on the way to it readable, replace the link with the copy's file (moving it aside would
+leave the pallet reading as never written), or move aside what stands at the ref's path, and run the
+command again.
 
 A meta ref lost together with its copy leaves nothing that says the pallet was ever written, so it
 reads as empty, as one never written does: `tag list` then lists no tags, for example, and refuses
