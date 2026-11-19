@@ -533,13 +533,10 @@ fn salvage_owner(salvaged: &Result<Salvage, String>) -> Owner {
     }
 }
 
-/// Whether the step for a damaged meta ref whose copy names no head is `heal` rather than the
-/// ref's removal, by its `bytes`: when they name the one parcel heal rebuilds it at, or when heal
-/// refuses them as unread ([`salvage_owner`]), whose step heal itself names; the removal is the
-/// step only of a refusal that is the ref's own.
-pub(crate) fn salvage_step_is_heal(bytes: &[u8]) -> bool {
-    let salvaged = salvage(bytes, &Tainted::read(&mut Vec::new()));
-    matches!(salvaged, Ok(Salvage::Found(_))) || salvage_owner(&salvaged) != Owner::Own
+/// Whether a damaged ref's `bytes` name the one parcel heal rebuilds it at.
+#[cfg(test)]
+pub(crate) fn salvage_finds(bytes: &[u8]) -> bool {
+    matches!(salvage(bytes, &Tainted::read(&mut Vec::new())), Ok(Salvage::Found(_)))
 }
 
 /// The salvage among `matches`: the one readable parcel, unless another parcel also matches, or
@@ -2132,12 +2129,12 @@ mod tests {
     }
 
     // Mutation: count every salvage but Nothing → bytes naming only an unreadable object give
-    // heal a head, so a reader names `forklift heal`, which then refuses, red.
+    // heal a head, red.
     #[test]
     fn only_bytes_naming_one_parcel_give_heal_a_head() {
         let (_root, _scope) = scratch("ref-heal-salvage-names");
         let one = stub_parcel("1");
-        assert!(salvage_step_is_heal(&one.as_bytes()[..12]), "one parcel is a head");
+        assert!(salvage_finds(&one.as_bytes()[..12]), "one parcel is a head");
 
         // A file at an object's path that reads as no kind of object: an unknown match.
         let unreadable = format!("ab{}", "c".repeat(HASH_LENGTH - 2));
@@ -2147,7 +2144,7 @@ mod tests {
         std::fs::write(folder.join(file), b"not an object").unwrap();
         let judged = salvage(&unreadable.as_bytes()[..12], &Tainted::read(&mut Vec::new()));
         assert!(matches!(judged, Ok(Salvage::Unknown(_))), "{:?}", judged);
-        assert!(!salvage_step_is_heal(&unreadable.as_bytes()[..12]), "an unknown match is the ref's own refusal, whose step is its removal");
+        assert!(!salvage_finds(&unreadable.as_bytes()[..12]), "an unknown match is no head");
     }
 
     // A pack the store cannot list may hold what a damaged ref's bytes name, found or not, so the

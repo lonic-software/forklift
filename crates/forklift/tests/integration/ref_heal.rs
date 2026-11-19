@@ -1193,10 +1193,12 @@ fn tag_names(output: &Output) -> Vec<String> {
 }
 
 // A lost meta ref is refused where it is read, never read as unborn, while its copy stands. The
-// step names heal only when heal has a head to judge: a copy that parses; otherwise it names the
-// removal, which keeps the copy's bytes and leaves the pallet unborn. Mutations: read a missing
-// ref as unborn whatever its copy → `tag list` prints no tags, red; name heal for any copy → the
-// second case red; refuse with no copy → the third case red.
+// read names heal, which judges whose the refusal is: it rebuilds from a copy that parses, and
+// otherwise names the removal, which keeps the copy's bytes and leaves the pallet unborn. A read
+// never names the removal itself: only heal judges what admits it. Mutations: read a missing
+// ref as unborn whatever its copy → `tag list` prints no tags, red; have the read name the
+// removal for a copy that does not parse → the second case red; refuse with no copy → the
+// third case red.
 #[test]
 fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     let area = Area::new("meta-loud");
@@ -1213,13 +1215,16 @@ fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     healed(&area, &root);
     assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
 
-    // The copy does not parse: heal has nothing to rebuild from, so the step is the removal,
-    // which keeps the copy's bytes and leaves the pallet unborn, as a ref lost with its copy reads.
+    // The copy does not parse: the read names heal, which has nothing to rebuild from, so its
+    // step is the removal, which keeps the copy's bytes and leaves the pallet unborn, as a ref
+    // lost with its copy reads.
     forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
     std::fs::write(meta_copy_path(&root, "tags"), b"not a hash").unwrap();
     let refused = ref_damaged(&tag_list(&area, &root));
     assert!(refused["error"]["message"].as_str().unwrap().contains(") stands but does not hold a parcel hash. Nothing was changed."), "{}", refused);
-    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+    let judged = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    assert_eq!(judged["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", judged);
     let removed = area.run_ok(&root, &["--json", "heal", "--remove-ref", "@tags"]);
     let removed: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
     assert_eq!(removed["data"]["refs_removed"][0]["pallet"], "@tags", "{}", removed);
@@ -1237,7 +1242,7 @@ fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
 }
 
 // A damaged meta ref with no copy whose own bytes still name its head names heal, which rebuilds
-// it from them. Mutation: name heal only beside a copy that parses → the removal, red.
+// it from them. Mutation: have heal ignore what the ref's own bytes name → heal refuses, red.
 #[test]
 fn a_damaged_meta_ref_whose_bytes_salvage_names_heal_with_no_copy() {
     let area = Area::new("meta-salvage-step");
@@ -1256,10 +1261,12 @@ fn a_damaged_meta_ref_whose_bytes_salvage_names_heal_with_no_copy() {
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(head.as_str()));
     assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
 
-    // Bytes that name nothing, with no copy, leave heal nothing: the removal.
+    // Bytes that name nothing, with no copy, leave heal nothing: the read names heal, whose step
+    // is the removal.
     forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
     std::fs::write(meta_path(&root, "tags"), b"not a hash").unwrap();
-    assert_eq!(ref_damaged(&tag_list(&area, &root))["error"]["next_step"], "forklift heal --remove-ref @tags");
+    assert_eq!(ref_damaged(&tag_list(&area, &root))["error"]["next_step"], "forklift heal");
+    assert_eq!(ref_damaged(&area.run(&root, &["--json", "heal"]))["error"]["next_step"], "forklift heal --remove-ref @tags");
 }
 
 // A store sweep after a meta ref is lost refuses rather than delete the parcels only that ref

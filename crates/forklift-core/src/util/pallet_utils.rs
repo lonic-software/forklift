@@ -821,7 +821,8 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
             blocked_copy_step(name, "run the command again"),
         ),
         Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => (format!("its copy (\"{}\") still stands", shown), HEAL_STEP.to_string()),
-        Ok(MetaCopyState::Bytes(_)) => (format!("its copy (\"{}\") stands but does not hold a parcel hash", shown), meta_removal_step(name)),
+        // heal names the ref's removal only for a refusal of its own, which only heal judges.
+        Ok(MetaCopyState::Bytes(_)) => (format!("its copy (\"{}\") stands but does not hold a parcel hash", shown), HEAL_STEP.to_string()),
         // Whether the ref was lost or never written cannot be told until the copy reads.
         Err(error) => (
             format!("its copy (\"{}\") could not be read: {}", shown, error.trim_end_matches('.')),
@@ -869,8 +870,8 @@ const HEAL_STEP: &str = "forklift heal";
 const COPY_READABLE_STEP: &str = "Make the copy and the folders on the way to it readable, moving aside anything that \
     stands where one of those folders goes, then run the command again.";
 
-/// The step for a meta ref `heal` has nothing to rebuild from: heal refuses it as its own, and its
-/// removal is the way out (`heal --remove-ref`).
+/// The removal of meta ref `name` (`heal --remove-ref`): the step heal names for a refusal of the
+/// ref's own. Only heal names it, since only heal judges whose a refusal is; a read names heal.
 pub fn meta_removal_step(name: &str) -> String {
     format!("forklift heal --remove-ref {}", PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() }.to_wire())
 }
@@ -893,11 +894,12 @@ fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<
                 Ok(MetaCopyState::Bytes(copy)) if parse_ref_bytes(&copy).is_some() => HEAL_STEP.to_string(),
                 // heal judges no ref whose copy it cannot read, whatever the ref's own bytes name.
                 Err(_) => COPY_READABLE_STEP.to_string(),
-                // heal names the step of what its bytes name, or of what it could not read of them.
-                _ if crate::util::ref_heal::salvage_step_is_heal(&bytes) => HEAL_STEP.to_string(),
                 // The removal keeps the copy's bytes, which it cannot do for what is not a file.
                 Ok(copy) if copy_blocks(name, &copy) => blocked_copy_step(name, "run the command again"),
-                _ => meta_removal_step(name),
+                // Whose the refusal is, and so whether its step is the removal, rests on what
+                // heal judges: what the bytes name, the trust state, the other meta refs. Only
+                // heal judges that, so a read names heal, which names that step.
+                _ => HEAL_STEP.to_string(),
             }
         }
     };
@@ -3182,7 +3184,7 @@ pub(crate) mod tests {
             // Even when its bytes name one parcel: heal does not judge the ref while its copy cannot be read.
             let named = stub_parcel("named");
             std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "tags"), &named.as_bytes()[..12]).unwrap();
-            assert!(crate::util::ref_heal::salvage_step_is_heal(&named.as_bytes()[..12]), "the fixture's bytes salvage");
+            assert!(crate::util::ref_heal::salvage_finds(&named.as_bytes()[..12]), "the fixture's bytes salvage");
             let (_, next) = step("tags");
             assert!(next.starts_with("Make the copy and the folders on the way to it readable"), "{}", next);
             drop(_scope);
