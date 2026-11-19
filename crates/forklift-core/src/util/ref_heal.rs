@@ -1460,8 +1460,8 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
 
     let (judged, source) = match judged {
         Some((judged, source)) => {
-            // What the ref and its copy name now is listed, never the head judged before they
-            // moved: writing that would set the ref back past them.
+            // What the ref and its copy name now is listed, not what step 1 judged: a head judged
+            // before they moved could set the ref back past them.
             if state.damage().as_ref() != Some(&judged.damage) || state.copy != judged.copy {
                 let candidates = match choose_meta(state, tainted) {
                     Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
@@ -1557,7 +1557,7 @@ mod tests {
         assert_eq!(report.refused.len(), 1);
         assert_eq!(report.refused[0].reason, "it changed while heal ran");
         assert_eq!(report.refused[0].candidates.iter().map(|c| c.head.as_str()).collect::<Vec<_>>(), vec![older.as_str()],
-            "what the copy names now, never the head judged before it moved");
+            "what the copy names now, not what step 1 judged");
         assert_eq!(std::fs::read(&ref_path).unwrap(), b"not a head\n", "nothing was written");
     }
 }
