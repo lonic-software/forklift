@@ -842,12 +842,15 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                 }
                 // The first pass leaves a failed write to the second, which reports it.
                 Err(_) if pass == Pass::BeforeTaint => {}
-                Err(error) => report.refused.push(Refused {
-                    pallet: damaged.pallet.clone(),
-                    reason: format!("the rebuild at {} was not written: {}", head, error),
-                    candidates: listed(&evidence.candidates),
-                    meta: None,
-                }),
+                Err(error) => match read_back(PalletNamespace::User, &damaged.pallet, &head) {
+                    ReadBack::Landed => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
+                    read => report.refused.push(Refused {
+                        pallet: damaged.pallet.clone(),
+                        reason: unwritten_reason(&head, &error, &read),
+                        candidates: listed(&evidence.candidates),
+                        meta: None,
+                    }),
+                },
             },
         }
     }
@@ -2005,6 +2008,61 @@ fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String,
     }
 }
 
+/// What the ref of a pallet heal wrote at a head reads back as. A write can land and still report
+/// a failure (under a standing taint, its rename goes through and the taint is reported), so the
+/// ref, read as it stands, decides whether it landed.
+enum ReadBack {
+    /// The ref holds the head heal wrote.
+    Landed,
+    /// The ref reads, and holds no such head: missing, damaged, at another head, or not a file.
+    Elsewhere,
+    /// The ref could not be read: no answer on whether the write landed.
+    Unread(String),
+}
+
+impl ReadBack {
+    fn unread(&self) -> Option<String> {
+        match self {
+            ReadBack::Unread(why) => Some(why.clone()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`read_back`] answer [`ReadBack::Unread`], since no fixture fails the read of a ref
+    /// heal could judge right after its write failed.
+    static READ_BACK_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Read back the ref of pallet `name` after heal wrote it at `head`.
+fn read_back(namespace: PalletNamespace, name: &str, head: &str) -> ReadBack {
+    #[cfg(test)]
+    if READ_BACK_UNREAD.with(|unread| unread.get()) {
+        return ReadBack::Unread("the read was refused for the test".to_string());
+    }
+
+    match pallet_utils::read_file_state(&pallet_utils::get_pallet_ref_path(namespace, name)) {
+        Ok(pallet_utils::MetaCopyState::Bytes(bytes)) if pallet_utils::parse_ref_bytes(&bytes).as_deref() == Some(head) => ReadBack::Landed,
+        Ok(_) => ReadBack::Elsewhere,
+        Err(why) => ReadBack::Unread(why),
+    }
+}
+
+/// Why the rebuild at `head` whose write refused with `error` is refused, as its ref read back
+/// says: a write that failed may have landed, so one whose ref could not be read back is not
+/// said to be unwritten. A precondition that moved refused before anything was written.
+fn unwritten_reason(head: &str, error: &RefUpdateError, read: &ReadBack) -> String {
+    match (error, read) {
+        (RefUpdateError::Failed(_), ReadBack::Unread(why)) => format!(
+            "the rebuild at {} may have been written: the write reported {}, and its ref could not be read back: {}",
+            head, error, why
+        ),
+        _ => format!("the rebuild at {} was not written: {}", head, error),
+    }
+}
+
 /// Write the rebuild of damaged meta ref `state` at `head`, found at `source`, and report it,
 /// checked against the head `judged` chose for a damaged `@redactions` when there is one.
 ///
@@ -2020,13 +2078,10 @@ fn write_meta_rebuild(state: &MetaState,
     let damage = state.damage().expect("only a damaged ref is rebuilt");
     let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged);
 
-    // A write can land and still report a failure (under a standing taint, its rename goes
-    // through and the taint is reported), so the ref read back decides.
-    let read_back = pallet_utils::get_pallet_head_in(PalletNamespace::Meta, &state.name);
-    let landed = read_back.as_ref().is_ok_and(|found| found.as_deref() == Some(head.as_str()));
+    let read = read_back(PalletNamespace::Meta, &state.name, &head);
 
     let (reason, owner) = match written {
-        _ if landed => {
+        _ if matches!(read, ReadBack::Landed) => {
             report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
             return false;
         }
@@ -2043,10 +2098,10 @@ fn write_meta_rebuild(state: &MetaState,
         // Any other refusal may meet heal the same way on every rerun (a full disk, a folder it
         // may not write, a head the write itself refuses), so its way out is to settle why,
         // which a passing fault needs nothing for.
-        Err(error) => (format!("the rebuild at {} was not written: {}", head, error), Owner::Unwritten(None)),
+        Err(error) => (unwritten_reason(&head, &error, &read), Owner::Unwritten(None)),
         // Written, but its ref could not be read back: no answer on whether it landed.
-        Ok(()) if read_back.is_err() => (
-            format!("the rebuild at {} was written, but its ref could not be read back: {}", head, read_back.unwrap_err()),
+        Ok(()) if matches!(read, ReadBack::Unread(_)) => (
+            format!("the rebuild at {} was written, but its ref could not be read back: {}", head, read.unread().unwrap_or_default()),
             Owner::Unwritten(None),
         ),
         // Written, and the ref reads at another head: it moved under heal.
@@ -2614,6 +2669,19 @@ mod tests {
         assert!(removed.is_none(), "{:?}", removed);
         assert!(error.contains("was not removed: heal chose its head but could not write it"), "{}", error);
         assert!(copy_path.exists(), "nothing was removed");
+
+        // A write that failed may have landed: with its ref unread back, it is not said to be
+        // unwritten, and its way out stays settling why. Mutation: judge the reason without the
+        // read back → "was not written", red.
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        READ_BACK_UNREAD.with(|unread| unread.set(true));
+        let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+        READ_BACK_UNREAD.with(|unread| unread.set(false));
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+        assert!(tags.reason.contains(&format!("the rebuild at {} may have been written: the write reported", parcel)), "{:?}", tags);
+        assert!(tags.reason.contains("and its ref could not be read back: the read was refused for the test"), "{:?}", tags);
+        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
 
         let rebuilt = repair_meta(Pass::AfterTaint).unwrap().repair;
         assert!(rebuilt.refused.is_empty(), "{:?}", rebuilt.refused);
