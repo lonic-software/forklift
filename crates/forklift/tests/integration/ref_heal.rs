@@ -1506,6 +1506,48 @@ fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
     }
 }
 
+// A lost meta ref whose copy's head fails verification on a parcel the store holds damaged is the
+// ref's own refusal, and its removal is the step; on a parcel that cannot be read, the verdict says
+// nothing of the ref, so heal names itself again and the removal is refused. Mutations: read an
+// untold failure as the ref's own → "unreadable" next_step is the removal, red; read a content
+// failure as untold → "corrupt" next_step is "forklift heal", red.
+#[cfg(unix)]
+#[test]
+fn a_meta_head_failing_verification_is_the_refs_own_only_on_what_the_store_holds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for case in ["corrupt", "unreadable"] {
+        let area = Area::new(&format!("meta-verify-{}", case));
+        let (root, _, second) = tagged(&area);
+        forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+        let object = loose_object(&root, &second);
+        match case {
+            "corrupt" => {
+                forklift_core::util::file_utils::remove_file(&object).unwrap();
+                std::fs::write(&object, b"no object").unwrap();
+            }
+            _ => std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap(),
+        }
+
+        let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+        let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let said = text(&removal.stderr);
+        match case {
+            "corrupt" => {
+                assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @tags", "{}", refused);
+                assert!(removal.status.success(), "{}{}", text(&removal.stdout), said);
+            }
+            _ => {
+                assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+                assert!(!removal.status.success(), "{}", text(&removal.stdout));
+                assert!(said.contains("heal did not refuse it for a reason of its own"), "{}", said);
+                assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
+            }
+        }
+    }
+}
+
 // A meta ref heal chose no head for is still the office's refusal while the office is refused,
 // since its removal would be judged against no office. Mutation: keep the choice's own owner
 // beside a refused office → @tags is removed, red.
