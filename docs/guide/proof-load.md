@@ -665,17 +665,21 @@ earlier hash never stands in for a file's content. The hash reads attributes fro
 and turns line-ending conversion off, so a history's own `.gitattributes` does not rewrite the
 files Forklift checked out before they are compared.
 
-A consolidate that reports an outcome the harness does not know, or a conflict that is not a path,
-makes the row an `error`. Once a row is compared, a conflicted consolidate is aborted. When Forklift
-refuses the abort, the harness puts the conflicted files back as P1 has them and aborts again, and
-the row is an `error` that keeps the paths its comparison found. After any `error` row the harness
-shifts to the ref's branch; when that is refused too, no later row could replay, so the run stops
-with exit status 2, naming the row.
+A consolidate that reports an outcome the harness does not know, or conflicts that are not a list
+of paths, makes the row an `error`. Once a row is compared, a conflicted consolidate is aborted.
+When Forklift refuses the abort, the harness puts the conflicted files back as P1 has them and
+aborts again, and the row is an `error` that keeps the paths its comparison found. Where the
+comparison itself failed, its failure is the row's reason, and a failed clean-up after it is
+recorded apart, as `clearing`. After any `forklift-refused`, `both-refused` or `error` row the
+harness shifts to the ref's branch; when that is refused, no later row could replay, so the run
+stops with exit status 2, naming the row.
 
 ### Comparing with git
 
 Each row has three of git's merges to compare with, all `git merge-tree --write-tree` with
-`merge.conflictStyle=diff3`:
+`merge.conflictStyle=diff3`. Like the hash, every git command on the mirror reads attributes from
+the empty tree, so a `.gitattributes` in the history, such as a marker size or a merge driver, does
+not change git's merges, which Forklift's do not follow either:
 
 - **G**, git's own merge;
 - **G1**, the same with rename detection off (`-X no-renames`);
@@ -730,7 +734,7 @@ Each row comes to one class:
 
 ### Tickets and the verdict
 
-The tickets live in `crates/proof-load/replay-tickets.json`, built into the harness. It holds two
+The tickets live in `crates/proof-load/replay-tickets.json`, built into the harness. It holds three
 kinds of entry:
 
 - a **cause entry**, `{"cause": "rename" | "multi-base", "ticket": "FORK-N"}`, covers every gap of
@@ -740,7 +744,11 @@ kinds of entry:
   `absent`);
 - a **row entry**, `{"merge", "kind", "reason", "ticket"}`, covers one `forklift-refused` or
   `error` row: that merge, that kind, and a reason that contains the entry's `reason` text. When
-  the row fails for another reason, the entry stops matching.
+  the row fails for another reason, the entry stops matching. A failed clean-up recorded as
+  `clearing` is not part of the reason.
+
+A `record-mismatch` is about a row's whole tree, so its path entry gives an empty `path` and
+`blob`.
 
 A path entry covers a path only when all four fields match. When Forklift's merge of that path
 changes, the entry stops matching and the run fails until someone looks.
@@ -757,8 +765,8 @@ failed, are judged as on any other row.
 A cause entry never covers a divergence. An entry that no row of the run matched is listed as
 possibly closable and never fails the run, so in a sampled run the entries of merges outside the
 sample are listed too. A test holds every entry to a `FORK-N` ticket and a full merge id, every path
-entry to a divergence kind and a blob id or `absent`, and every row entry to a row kind and a
-non-empty reason.
+entry to a divergence kind with a path and a blob id or `absent` (a `record-mismatch` to an empty
+path and blob), and every row entry to a row kind and a non-empty reason.
 
 A change that introduces a divergence on purpose adds its entry. The change that fixes it removes
 the entry.
@@ -784,5 +792,5 @@ the merge commit's file.
 
 `replay` exits 0 when the verdict failed nothing, and 1 when it failed. It exits 2 when the run
 could not go ahead: a non-empty output folder, a shallow or unreadable source, a ref that is not a
-commit, `--sample 0`, a failed import, or a warehouse that cannot shift after an `error` row, for
-example. A run that exits 2 writes no `replay.json`.
+commit, `--sample 0`, a failed import, or a warehouse that cannot shift after a refused or `error`
+row, for example. A run that exits 2 writes no `replay.json`.

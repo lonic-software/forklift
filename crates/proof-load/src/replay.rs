@@ -55,7 +55,8 @@ pub struct ReplayOptions {
 }
 
 /// One kind of difference at a path, or of a row a ticket entry can name. The first five are the
-/// divergence subtypes; record-mismatch is the one a row has with an empty path.
+/// divergence subtypes, which path entries name; record-mismatch is the one a row has with an
+/// empty path and blob.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -74,9 +75,9 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Whether an entry of this kind names a row, with its path and blob empty.
+    /// Whether an entry of this kind names a row, by text its reason contains.
     pub fn row_level(self) -> bool {
-        matches!(self, Kind::RecordMismatch | Kind::ForkliftRefused | Kind::Error)
+        matches!(self, Kind::ForkliftRefused | Kind::Error)
     }
 
     pub fn label(self) -> &'static str {
@@ -323,6 +324,11 @@ pub struct Row {
     /// Why a row is an error, or what each tool said when it refused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// On an error row whose comparison failed, what getting the warehouse out of the consolidate
+    /// said when that failed too. A row entry is matched against `reason` alone, so an entry for a
+    /// refused abort does not cover a comparison that starts failing on the same merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clearing: Option<String>,
     pub millis: u64,
 }
 
@@ -330,7 +336,8 @@ impl Row {
     fn new(merge: &str) -> Row {
         Row {
             merge: merge.to_string(), class: Class::Error, bases: 0, single_base: None, forklift: String::new(), forklift_conflicts: Vec::new(),
-            git_conflicts: None, paths: Vec::new(), hunks: Vec::new(), hunks_left_out: 0, reason: None, millis: 0,
+            git_conflicts: None, paths: Vec::new(), hunks: Vec::new(), hunks_left_out: 0, reason: None, clearing: None,
+            millis: 0,
         }
     }
 }
@@ -383,9 +390,10 @@ fn hex40(text: &str) -> bool {
     text.len() == 40 && text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Refuses an entry no row could ever match: a path entry without a 40-hex merge, a row-level kind
-/// with a path or a blob, a path kind without a path or with a blob that is neither 40-hex nor
-/// "absent", and any ticket that is not a FORK ticket.
+/// Refuses an entry no row could ever match: an entry without a 40-hex merge, a path entry of a
+/// row-level kind, a record-mismatch with a path or a blob, another path kind without a path or
+/// with a blob that is neither 40-hex nor "absent", a row entry of a path kind or with no reason,
+/// and any ticket that is not a FORK ticket.
 pub fn check_tickets(tickets: &[Ticket]) -> Result<(), String> {
     for ticket in tickets {
         let (name, problem) = match ticket {
@@ -394,6 +402,8 @@ pub fn check_tickets(tickets: &[Ticket]) -> Result<(), String> {
                 Some(format!("merge {:?} is not a 40-hex commit id", entry.merge))
             } else if entry.kind.row_level() {
                 Some(format!("{} names a row, so it takes a row entry: merge, kind, reason and ticket", entry.kind.label()))
+            } else if entry.kind == Kind::RecordMismatch {
+                (!entry.path.is_empty() || !entry.blob.is_empty()).then(|| "record-mismatch is about a row's whole tree, so its path and blob are empty".to_string())
             } else if entry.path.is_empty() {
                 Some(format!("{} names a path, and the entry gives none", entry.kind.label()))
             } else if !hex40(&entry.blob) && entry.blob != PathState::ABSENT {
@@ -767,9 +777,11 @@ impl Tools<'_> {
         }.map_err(|error| error.to_string())
     }
 
-    /// git in the mirror; any exit status.
+    /// git in the mirror, with attributes read from the empty tree, so no history's
+    /// `.gitattributes` changes git's merges or diffs, as none changes Forklift's; any exit
+    /// status.
     fn git(&self, arguments: &[&str]) -> Result<Outcome, String> {
-        let mut full = vec!["--git-dir", self.mirror.to_str().ok_or("the mirror's path is not UTF-8")?];
+        let mut full = vec!["--git-dir", self.mirror.to_str().ok_or("the mirror's path is not UTF-8")?, "--attr-source", EMPTY_TREE];
         full.extend_from_slice(arguments);
         self.run(&self.git, &full, &self.mirror, self.environment, STEP_LIMIT, None)
     }
@@ -983,9 +995,7 @@ fn consolidate_said(succeeded: bool, document: &serde_json::Value) -> Result<Res
     match document["data"]["outcome"].as_str() {
         Some("merged" | "fast_forward" | "up_to_date") => Ok(Ok(None)),
         Some("conflicts") => {
-            let none = Vec::new();
             let listed = match &document["data"]["conflicts"] {
-                serde_json::Value::Null => &none,
                 serde_json::Value::Array(listed) => listed,
                 other => return Err(format!("the consolidate's conflicts are {}, not a list of paths", other)),
             };
@@ -1014,8 +1024,8 @@ enum Leftover {
 }
 
 /// Replays one merge, by its original id, into `row`: compares it, then gets the warehouse out of
-/// the consolidate. Err is an error row's reason; the paths the comparison found stay on the row
-/// and are judged with it.
+/// the consolidate. Err is an error row's reason: the comparison's failure where it failed, else
+/// the clean-up's. The paths the comparison found stay on the row and are judged with it.
 fn replay(tools: &Tools, merge: &str, row: &mut Row) -> Result<(), String> {
     let mut leftover = Leftover::Nothing;
     let compared = compare(tools, merge, row, &mut leftover);
@@ -1036,15 +1046,31 @@ fn replay(tools: &Tools, merge: &str, row: &mut Row) -> Result<(), String> {
                 })
             }
         }
-        // Whether anything is in progress is unknown; the probe after an error row, or the next
-        // row's shift, says so if this one leaves it behind.
+        // Whether anything is in progress is unknown; the probe after the row says so if this one
+        // leaves it behind.
         Leftover::Unknown => { let _ = tools.forklift(&["--json", "abort", "--confirm"]); Ok(()) }
     };
+    outcome(row, compared, cleared)
+}
+
+/// A row's result from its comparison's and its clean-up's: the comparison's failure is the
+/// reason, and a clean-up failure after it goes to `clearing`, apart from it.
+fn outcome(row: &mut Row, compared: Result<(), String>, cleared: Result<(), String>) -> Result<(), String> {
     match (compared, cleared) {
         (Ok(()), cleared) => cleared,
         (Err(reason), Ok(())) => Err(reason),
-        (Err(reason), Err(cleared)) => Err(format!("{}; then {}", reason, cleared)),
+        (Err(reason), Err(cleared)) => {
+            row.clearing = Some(cleared);
+            Err(reason)
+        }
     }
+}
+
+/// Whether a row of `class` is followed by a probe that the warehouse can still shift: one whose
+/// consolidate was refused, or which failed, may have left something in progress that the
+/// abort after it did not clear.
+fn probed(class: Class) -> bool {
+    matches!(class, Class::ForkliftRefused | Class::BothRefused | Class::Error)
 }
 
 /// The settle step, or a stand-in that leaves the warehouse as the refused abort did, for the test
@@ -1303,13 +1329,16 @@ pub fn run(options: &ReplayOptions, progress: &dyn Fn(&str)) -> Result<ReplayRep
         if let Some(reason) = failed {
             row.class = Class::Error;
             row.reason = Some(reason);
-            // An error row may have left the warehouse where no shift works, and then every later
-            // row would be an error for this row's reason. The run stops instead, naming it.
-            let probe = tools.forklift(&["--json", "shift", HEAD_BRANCH])?;
+        }
+        // A row whose consolidate was refused, or which failed, may have left the warehouse where
+        // no shift works, and then every later row would be an error for this row's reason. The
+        // run stops instead, naming it.
+        if probed(row.class) {
+            let probe = tools.forklift(&["--json", "shift", HEAD_BRANCH]).map_err(|error| format!("shifting after merge {}'s {} row: {}", merge, row.class.label(), error))?;
             if !probe.succeeded() {
                 return Err(format!(
-                    "the warehouse cannot shift after merge {}'s error row, so no later row would replay: {}; the row: {}",
-                    merge, said(&probe), row.reason.as_deref().unwrap_or_default(),
+                    "the warehouse cannot shift after merge {}'s {} row, so no later row would replay: {}; the row: {}",
+                    merge, row.class.label(), said(&probe), row.reason.as_deref().unwrap_or_default(),
                 ));
             }
         }
@@ -1550,6 +1579,9 @@ mod tests {
             r#"[{"merge": "1111111111111111111111111111111111111111", "kind": "error", "reason": "x", "ticket": "FORK-1", "path": ""}]"#,
             r#"[{"merge": "1111111111111111111111111111111111111111", "path": "f", "kind": "silent-wrong", "blob": "nope", "ticket": "FORK-1"}]"#,
             r#"[{"merge": "1111111111111111111111111111111111111111", "path": "f", "kind": "silent-wrong", "blob": "absent", "ticket": "BUG-1"}]"#,
+            r#"[{"merge": "1111111111111111111111111111111111111111", "path": "f", "kind": "record-mismatch", "blob": "", "ticket": "FORK-1"}]"#,
+            r#"[{"merge": "1111111111111111111111111111111111111111", "path": "", "kind": "record-mismatch", "blob": "absent", "ticket": "FORK-1"}]"#,
+            r#"[{"merge": "1111111111111111111111111111111111111111", "kind": "record-mismatch", "reason": "x", "ticket": "FORK-1"}]"#,
         ];
         for text in refused {
             let parsed: Result<Vec<Ticket>, _> = serde_json::from_str(text);
@@ -1557,6 +1589,44 @@ mod tests {
         }
         let accepted: Vec<Ticket> = serde_json::from_str(r#"[{"merge": "1111111111111111111111111111111111111111", "kind": "forklift-refused", "reason": "refused", "ticket": "FORK-1"}]"#).unwrap();
         check_tickets(&accepted).unwrap();
+
+        // A record-mismatch is a path row with an empty path and blob, so the entry that covers
+        // it is a path entry with both empty, which the check accepts and judge matches.
+        let accepted: Vec<Ticket> = serde_json::from_str(r#"[{"merge": "1111111111111111111111111111111111111111", "path": "", "kind": "record-mismatch", "blob": "", "ticket": "FORK-1"}]"#).unwrap();
+        check_tickets(&accepted).unwrap();
+        let mismatched = [row(Class::Divergent, vec![path("", "", Difference::Divergence { subtype: Kind::RecordMismatch })])];
+        assert_eq!(judge(&mismatched, &accepted), Verdict { failures: Vec::new(), closable: Vec::new() });
+        assert_eq!(judge(&mismatched, &[]).failures.len(), 1);
+    }
+
+    /// An error row whose comparison failed keeps that failure as its reason, and a clean-up
+    /// failure after it apart, so a row entry for the clean-up's refusal does not cover a
+    /// comparison that starts failing on the same merge; with only the clean-up failing, its
+    /// failure is the reason.
+    ///
+    /// Revert: join the two into the reason → the refused abort's entry covers the new failure.
+    #[test]
+    fn a_failed_comparison_is_not_covered_by_its_clean_up_entry() {
+        let refusal = "aborting the conflicted consolidate failed: has an unresolved conflict marker";
+        let entry = [row_entry(Kind::Error, "has an unresolved conflict marker")];
+        let mut both = row(Class::Error, Vec::new());
+        both.reason = outcome(&mut both, Err("stocktake failed".to_string()), Err(refusal.to_string())).err();
+        assert_eq!((both.reason.as_deref(), both.clearing.as_deref()), (Some("stocktake failed"), Some(refusal)));
+        assert_eq!(judge(&[both], &entry).failures.len(), 1, "the clean-up's entry covered a failed comparison");
+        let mut cleanup = row(Class::Error, Vec::new());
+        cleanup.reason = outcome(&mut cleanup, Ok(()), Err(refusal.to_string())).err();
+        assert_eq!(cleanup.clearing, None);
+        assert!(judge(&[cleanup], &entry).failures.is_empty());
+    }
+
+    /// The probe follows exactly the rows whose consolidate was refused or which failed: the
+    /// abort after them is not known to have cleared the warehouse.
+    ///
+    /// Revert: probe after error rows alone → a forklift-refused row is not probed.
+    #[test]
+    fn refused_and_error_rows_are_probed() {
+        let probed: Vec<&str> = Class::ALL.into_iter().filter(|class| probed(*class)).map(Class::label).collect();
+        assert_eq!(probed, ["both-refused", "forklift-refused", "error"]);
     }
 
     /// The sample is the first N of the merges in rev-list order, or of a splitmix64 Fisher-Yates
@@ -1675,9 +1745,41 @@ mod tests {
         assert_eq!(tools.forklift_tree().unwrap(), expected.trim(), "the CRLF file was hashed through the attributes or autocrlf");
     }
 
+    /// git's references merge without attributes, as Forklift does: a mirror whose HEAD has a
+    /// `.gitattributes` setting the conflicted file's marker size to 32 still gets seven-character
+    /// markers from G.
+    ///
+    /// Revert: drop --attr-source from the mirror's git → G's markers are 32 characters.
+    #[test]
+    fn git_merges_without_attributes() {
+        let (scratch, environment) = crate::history::tests::scratch("replay-merge-attributes");
+        let source = scratch.root().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let git = |arguments: &[&str]| git_in(&source, arguments, &scratch, &environment);
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(source.join("f"), "base\n").unwrap();
+        commit(&source, "base", &scratch, &environment);
+        git(&["switch", "-q", "-c", "o"]);
+        std::fs::write(source.join("f"), "ours\n").unwrap();
+        commit(&source, "ours", &scratch, &environment);
+        git(&["switch", "-q", "-c", "t", "main"]);
+        std::fs::write(source.join("f"), "theirs\n").unwrap();
+        commit(&source, "theirs", &scratch, &environment);
+        git(&["switch", "-q", "main"]);
+        std::fs::write(source.join(".gitattributes"), "f conflict-marker-size=32\n").unwrap();
+        commit(&source, "attributes", &scratch, &environment);
+        let mirror = scratch.root().join("mirror.git");
+        git(&["clone", "-q", "--mirror", &source.display().to_string(), &mirror.display().to_string()]);
+        let tools = Tools { forklift: path_git(), git: path_git(), mirror: mirror.clone(), warehouse: scratch.work().to_path_buf(), index: scratch.tmp().join("replay.index"), scratch: &scratch, environment: &environment };
+        let merged = tools.merge_tree("o", "t", &[]).unwrap().unwrap();
+        assert_eq!(merged.conflicted, BTreeSet::from(["f".to_string()]));
+        let text = git_in(scratch.root(), &["--git-dir", &mirror.display().to_string(), "cat-file", "-p", &format!("{}:f", merged.tree)], &scratch, &environment);
+        assert!(text.starts_with("<<<<<<< o\n"), "G's markers were sized by HEAD's attributes: {}", text);
+    }
+
     /// A consolidate's report comes to a clean merge, its conflicted paths, or a refusal; an
-    /// outcome the harness does not know, and a conflict that is not a path, are errors, never a
-    /// refusal or a dropped path.
+    /// outcome the harness does not know, a conflict list that is missing or not a list, and a
+    /// conflict that is not a path, are errors, never a refusal or a dropped path.
     ///
     /// Revert: read an unknown outcome as a refusal → the "rebased" case is Ok(Err).
     #[test]
@@ -1688,7 +1790,7 @@ mod tests {
         assert_eq!(consolidate_said(true, &report("up_to_date".into(), null.clone())), Ok(Ok(None)));
         assert_eq!(consolidate_said(true, &report("conflicts".into(), serde_json::json!(["a", "b/c"]))), Ok(Ok(Some(BTreeSet::from(["a".to_string(), "b/c".to_string()])))));
         assert_eq!(consolidate_said(false, &report("merged".into(), null.clone())), Ok(Err(())));
-        for (outcome, conflicts) in [("rebased".into(), null.clone()), (null.clone(), null.clone()), ("conflicts".into(), serde_json::json!(["a", 1])), ("conflicts".into(), serde_json::json!("a"))] {
+        for (outcome, conflicts) in [("rebased".into(), null.clone()), (null.clone(), null.clone()), ("conflicts".into(), serde_json::json!(["a", 1])), ("conflicts".into(), serde_json::json!("a")), ("conflicts".into(), null.clone())] {
             let said = consolidate_said(true, &report(outcome, conflicts.clone()));
             assert!(said.is_err(), "{:?} {:?}", conflicts, said);
         }
