@@ -1428,11 +1428,30 @@ pub enum MetaCheckError {
     /// build that knows it judges it.
     Newer(String),
 
+    /// What the checked parcels are checked against, the trust state, refuses as `gap` says,
+    /// while the store reads whole: no verdict on the parcels, and nothing a rerun or a reread
+    /// changes until that state is settled.
+    Trust(String, TrustGap),
+
     /// It says nothing of the checked parcels: the store could not be read (an environment error,
     /// a pack index heal rebuilds, an absence left undecided), or what they are checked against
-    /// (the office chain, the trust state, a trust or distrust boundary) does not verify or cannot
-    /// be resolved. Any error not stated as a verdict is this one.
+    /// (the office chain, a trust or distrust boundary) could not be read or resolved. Any error
+    /// not stated as a verdict is this one.
     Untold(String),
+}
+
+/// How the trust state a meta pallet is checked against refuses, read whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustGap {
+    /// The trust file holds an anchor, but the office is unborn.
+    OfficeUnborn,
+
+    /// The office exists, but no trust file holds its anchor.
+    AnchorLost,
+
+    /// The office chain reads whole but does not verify against the anchor: a signature or a
+    /// key proof that does not verify, or a parcel that oversteps its signer's privileges.
+    ChainRefused,
 }
 
 impl MetaCheckError {
@@ -1449,6 +1468,7 @@ impl MetaCheckError {
         match self {
             MetaCheckError::Content(message) => MetaCheckError::Content(rewrite(message)),
             MetaCheckError::Newer(message) => MetaCheckError::Newer(rewrite(message)),
+            MetaCheckError::Trust(message, gap) => MetaCheckError::Trust(rewrite(message), gap),
             MetaCheckError::Untold(message) => MetaCheckError::Untold(rewrite(message)),
         }
     }
@@ -1456,7 +1476,10 @@ impl MetaCheckError {
     /// The refusal, phrased for the user.
     pub fn message(&self) -> &str {
         match self {
-            MetaCheckError::Content(message) | MetaCheckError::Newer(message) | MetaCheckError::Untold(message) => message,
+            MetaCheckError::Content(message)
+            | MetaCheckError::Newer(message)
+            | MetaCheckError::Trust(message, _)
+            | MetaCheckError::Untold(message) => message,
         }
     }
 }
@@ -1470,7 +1493,10 @@ impl From<String> for MetaCheckError {
 impl From<MetaCheckError> for String {
     fn from(error: MetaCheckError) -> String {
         match error {
-            MetaCheckError::Content(message) | MetaCheckError::Newer(message) | MetaCheckError::Untold(message) => message,
+            MetaCheckError::Content(message)
+            | MetaCheckError::Newer(message)
+            | MetaCheckError::Trust(message, _)
+            | MetaCheckError::Untold(message) => message,
         }
     }
 }
@@ -1652,16 +1678,21 @@ pub fn verify_meta_update(pallet: &str,
     // The office and the trust state are not the pallet's own history, so their refusals say
     // nothing of its parcels.
     let office = match (anchor, office_head) {
-        (Some(anchor), Some(office_head)) => Some(audit_utils::verify_office_chain_memoized(anchor, office_head).map_err(String::from)?),
+        (Some(anchor), Some(office_head)) => Some(audit_utils::verify_office_chain_memoized(anchor, office_head).map_err(|error| match error {
+            audit_utils::OfficeChainError::Newer(message) => MetaCheckError::Newer(message),
+            audit_utils::OfficeChainError::Unreadable(message, _) => MetaCheckError::Untold(message),
+            audit_utils::OfficeChainError::Inauthentic(message)
+            | audit_utils::OfficeChainError::Unauthorized { message, .. } => MetaCheckError::Trust(message, TrustGap::ChainRefused),
+        })?),
         (None, None) => None,
-        (Some(_), None) => return Err(MetaCheckError::Untold(format!(
+        (Some(_), None) => return Err(MetaCheckError::Trust(format!(
             "@{} cannot be checked: trust is established but the office is unborn. Lift the \
             office before syncing it.",
             pallet
-        ))),
-        (None, Some(_)) => return Err(MetaCheckError::Untold(format!(
+        ), TrustGap::OfficeUnborn)),
+        (None, Some(_)) => return Err(MetaCheckError::Trust(format!(
             "@{} cannot be checked: the office exists but its trust anchor is missing.", pallet
-        ))),
+        ), TrustGap::AnchorLost)),
     };
 
     let boundary = anchor.map(|anchor| anchor.boundary.as_slice()).unwrap_or(&[]);

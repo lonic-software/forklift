@@ -1747,6 +1747,51 @@ fn a_meta_ref_refused_only_because_the_office_was_names_the_office_and_is_not_re
     assert!(!said.contains("With no remote that holds it"), "{}", said);
 }
 
+// A meta ref heal cannot verify because the office stands while no trust file holds its anchor
+// is refused as the trust state's, never as unread or its own: the removal names the lost
+// anchor's ways out, and taking the first of them (the trust file restored from a backup) lets a
+// later heal rebuild the ref. Mutation: read the lost anchor as unread → the removal names
+// "could not read", red.
+#[test]
+fn a_meta_ref_beside_a_lost_anchor_names_its_ways_out_and_is_rebuilt_once_the_trust_file_is_back() {
+    let area = Area::new("meta-lost-anchor");
+    let (root, _, second) = tagged(&area);
+    area.run_ok(&root, &["office", "enroll"]);
+    let tags = meta_head(&root, "tags").unwrap();
+    assert_eq!(tags, second);
+
+    let trust = root.join(".forklift").join("trust");
+    let backup = std::fs::read(&trust).expect("an enrolled warehouse has a trust file");
+    for file in [trust.clone(), root.join(".forklift").join("trust-copy")] {
+        if file.exists() {
+            forklift_core::util::file_utils::remove_file(&file).unwrap();
+        }
+    }
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+
+    let step = "Take one of the ways out the trust file's refusal names, then run \"forklift heal\" again.";
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    assert!(refused["error"]["message"].as_str().unwrap().contains("The ref of pallet \"@tags\" was not rebuilt"), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], step, "{}", refused);
+
+    let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    let said = text(&removal.stderr);
+    assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert!(said.contains("The ref of pallet \"@tags\" was not removed: the trust state it is verified against refuses"), "{}", said);
+    assert!(said.contains("trust was established here and its anchor was lost"), "{}", said);
+    assert!(said.contains("Restore the trust file from a backup if you have one."), "{}", said);
+    assert!(said.contains(step), "{}", said);
+    assert!(!said.contains("could not read"), "{}", said);
+    assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
+    assert!(!meta_path(&root, "tags").exists());
+
+    // The way out, performed: the trust file back from its backup, a later heal rebuilds @tags.
+    std::fs::write(&trust, &backup).unwrap();
+    let data = healed(&area, &root);
+    assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), tags.clone(), "the ref's copy".to_string())], "{}", data);
+    assert_eq!(meta_head(&root, "tags").as_deref(), Some(tags.as_str()));
+}
+
 /// Remove `a.txt` from `main`, record a redaction of it as `main` held it, and return the
 /// `@redactions` head that made.
 fn redacted(area: &Area, root: &Path) -> String {

@@ -651,13 +651,42 @@ pub enum TrustReadMode {
 
 /// The trust anchor and its bytes, read as `mode` says ([`TrustReadMode`]).
 pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, Vec<u8>)>, String> {
-    if let Some(bytes) = read_trust_anchor_bytes()? {
-        return decode_trust_file(&bytes).map(|anchor| Some((anchor, bytes)));
+    read_trust_anchor_judged(mode).map_err(String::from)
+}
+
+/// Why the trust anchor could not be read, by what that says of the trust state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrustReadError {
+    /// The trust state reads, and refuses: trust was established here and its anchor is lost, or
+    /// what stands at the trust file's path is not a file or does not parse. The refusal names
+    /// its ways out.
+    Refused(String),
+
+    /// The trust file reads whole but names a version this build does not know: a newer Forklift
+    /// may have written it.
+    Newer(String),
+
+    /// What the read needs (the trust file, its copy, the office's ref) could not be read.
+    Unread(String),
+}
+
+impl From<TrustReadError> for String {
+    fn from(error: TrustReadError) -> String {
+        match error {
+            TrustReadError::Refused(message) | TrustReadError::Newer(message) | TrustReadError::Unread(message) => message,
+        }
+    }
+}
+
+/// [`read_trust_anchor_in`], its refusal typed by what it says of the trust state.
+pub(crate) fn read_trust_anchor_judged(mode: TrustReadMode) -> Result<Option<(TrustAnchor, Vec<u8>)>, TrustReadError> {
+    if let Some(bytes) = read_trust_anchor_bytes_judged()? {
+        return decode_trust_file_judged(&bytes).map(|anchor| Some((anchor, bytes)));
     }
 
-    let copy = trust_copy_stands()?;
+    let copy = trust_copy_stands().map_err(TrustReadError::Unread)?;
     let office = match mode {
-        TrustReadMode::Checked if !copy => pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some(),
+        TrustReadMode::Checked if !copy => pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(TrustReadError::Unread)?.is_some(),
         _ => false,
     };
 
@@ -670,12 +699,12 @@ pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, 
     #[cfg(test)]
     tests::BEFORE_TRUST_REREAD.with(|seam| seam.take().map(|seam| seam()));
 
-    if let Some(bytes) = read_trust_anchor_bytes()? {
-        return decode_trust_file(&bytes).map(|anchor| Some((anchor, bytes)));
+    if let Some(bytes) = read_trust_anchor_bytes_judged()? {
+        return decode_trust_file_judged(&bytes).map(|anchor| Some((anchor, bytes)));
     }
 
     let (next_step, ways_out) = trust_remedy();
-    Err(CoreError::refusal(
+    Err(TrustReadError::Refused(CoreError::refusal(
         RefusalCode::TrustDamaged,
         format!(
             "The warehouse's trust file (\"{}\") is missing, but {}: trust was established here and \
@@ -688,7 +717,7 @@ pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, 
             ways_out
         ),
         next_step,
-    ).into())
+    ).into()))
 }
 
 /// The ways out of a trust anchor no repair restores.
@@ -702,15 +731,20 @@ pub const LOST_ANCHOR_WAYS_OUT: &str = "Restore the trust file from a backup if 
 /// Decode the trust file's `bytes`, refusing a file that does not parse as damaged. A file a newer
 /// version wrote is not damage, and is refused uncoded.
 fn decode_trust_file(bytes: &[u8]) -> Result<TrustAnchor, String> {
+    decode_trust_file_judged(bytes).map_err(String::from)
+}
+
+/// [`decode_trust_file`], its refusal typed: a newer version's, or a damaged file's.
+fn decode_trust_file_judged(bytes: &[u8]) -> Result<TrustAnchor, TrustReadError> {
     let decoded = std::str::from_utf8(bytes)
         .map_err(|e| TrustDecodeError::Damaged(format!("The trust file is not valid UTF-8: {}", e)))
         .and_then(parse_trust_anchor_classified);
 
     decoded.map_err(|error| match error {
-        TrustDecodeError::Newer(message) => message,
+        TrustDecodeError::Newer(message) => TrustReadError::Newer(message),
         TrustDecodeError::Damaged(why) => {
             let (next_step, ways_out) = trust_remedy();
-            CoreError::refusal(
+            TrustReadError::Refused(CoreError::refusal(
                 RefusalCode::TrustDamaged,
                 format!(
                     "{}. So the warehouse's trust file (\"{}\") is damaged, and its anchor cannot be read. \
@@ -718,7 +752,7 @@ fn decode_trust_file(bytes: &[u8]) -> Result<TrustAnchor, String> {
                     why.trim_end().trim_end_matches('.'), forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), ways_out
                 ),
                 next_step,
-            ).into()
+            ).into())
         }
     })
 }
@@ -743,10 +777,15 @@ fn trust_copy_stands() -> Result<bool, String> {
 ///                that reaches no file, a dangling one included); an uncoded error if it could not
 ///                be read.
 pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
+    read_trust_anchor_bytes_judged().map_err(String::from)
+}
+
+/// [`read_trust_anchor_bytes`], its refusal typed.
+fn read_trust_anchor_bytes_judged() -> Result<Option<Vec<u8>>, TrustReadError> {
     match read_trust_file(FILE_NAME_TRUST) {
         Ok(bytes) => Ok(bytes),
         // heal does not write over what stands there, so the next step is never heal's.
-        Err(TrustFileError::NotAFile(path)) => Err(CoreError::refusal(
+        Err(TrustFileError::NotAFile(path)) => Err(TrustReadError::Refused(CoreError::refusal(
             RefusalCode::TrustDamaged,
             format!(
                 "The warehouse's trust file (\"{}\") is not a file or a link to one, so its anchor \
@@ -755,8 +794,8 @@ pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
                 path, trust_remedy().1
             ),
             "",
-        ).into()),
-        Err(TrustFileError::Unreadable(why)) => Err(why),
+        ).into())),
+        Err(TrustFileError::Unreadable(why)) => Err(TrustReadError::Unread(why)),
     }
 }
 

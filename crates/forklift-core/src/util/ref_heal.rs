@@ -139,6 +139,12 @@ pub enum Owner {
     /// a build that reads it ([`newer_step`]).
     Newer,
 
+    /// The trust state it is verified against reads whole but refuses: the office stands while
+    /// no trust file holds its anchor, or the office chain does not verify against the anchor. No
+    /// verdict on the ref, and nothing a rerun changes until that is settled; the way out is the
+    /// step it carries, a command or sentences as [`meta_step`] returns them.
+    Trust(String),
+
     /// What heal needs to judge it could not be read, or its rebuild could not be written: no
     /// verdict on the ref, and not one a rerun alone changes. The way out is to settle what the
     /// refusal names ([`unread_step`]).
@@ -980,6 +986,7 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
             },
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
             Some(Owner::Newer) => return newer_step(),
+            Some(Owner::Trust(step)) => return step.clone(),
             Some(Owner::Unread) => return unread_step(&at.pallet),
             Some(Owner::Again) | None => break,
         }
@@ -1076,6 +1083,10 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
             "The ref of pallet \"{}\" was not removed: what heal needs to judge it is in a format this Forklift does not read ({}), \
             which is no verdict on the ref. {}",
             wire, refused.reason.trim_end_matches('.'), step_sentence(&newer_step())
+        )),
+        Owner::Trust(step) => return Err(format!(
+            "The ref of pallet \"{}\" was not removed: the trust state it is verified against refuses ({}), which is no verdict on the ref. {}",
+            wire, refused.reason.trim_end_matches('.'), step_sentence(step)
         )),
         Owner::Unread => return Err(format!(
             "The ref of pallet \"{}\" was not removed: heal could not read what it needs to judge it ({}), which is no verdict on the ref. {}",
@@ -1394,11 +1405,13 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
 /// # Returns
 /// * `Err((reason, owner))` - Why not, and whose refusal that is: the ref's own when `head` fails
 ///                            verification, [`Owner::OfficeUnborn`] when the office is unborn
-///                            beside an anchor, which refuses before `head` is read, and
-///                            [`Owner::Unread`] when the anchor or the office could not be read, or
-///                            the verification's refusal says nothing of `head`'s history.
+///                            beside an anchor, which refuses before `head` is read, the trust
+///                            read's owner ([`trust_read_owner`]) when the anchor could not be
+///                            read, else as [`verify_meta_against`] says; [`Owner::Unread`] when
+///                            the office could not be read.
 fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPreconditions, (String, Owner)> {
-    let anchor = crate::util::office_utils::read_trust_anchor_with_bytes().map_err(|error| (error, Owner::Unread))?;
+    let anchor = crate::util::office_utils::read_trust_anchor_judged(crate::util::office_utils::TrustReadMode::Checked)
+        .map_err(|error| { let owner = trust_read_owner(&error); (String::from(error), owner) })?;
     let office_head = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).map_err(|error| (error, Owner::Unread))?;
 
     // Said here rather than by the verifier, whose step (lift the office) is no step in a store
@@ -1430,12 +1443,28 @@ fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
     if let Some(cause) = blocking.first() {
         return Owner::Cascade(cause.clone());
     }
-    let anchor = crate::util::office_utils::read_trust_anchor_with_bytes();
+    let anchor = crate::util::office_utils::read_trust_anchor_judged(crate::util::office_utils::TrustReadMode::Checked);
     let office = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME);
     match (anchor, office) {
+        (Err(error), _) => trust_read_owner(&error),
         (Ok(Some(_)), Ok(None)) => Owner::OfficeUnborn,
         (Ok(_), Ok(_)) => Owner::Own,
-        _ => Owner::Unread,
+        (Ok(_), Err(_)) => Owner::Unread,
+    }
+}
+
+/// Whose a meta ref's refusal is when the trust anchor it is verified against could not be read:
+/// the trust state's when it reads and refuses (a lost anchor, a damaged trust file), whose
+/// refusal names its own ways out, so the step is a rerun when heal restores the trust file from
+/// its copy and otherwise taking one of them; a newer build's; or unread.
+fn trust_read_owner(error: &crate::util::office_utils::TrustReadError) -> Owner {
+    match error {
+        crate::util::office_utils::TrustReadError::Refused(_) => Owner::Trust(match crate::util::office_utils::trust_remedy().0 {
+            step if step.is_empty() => TRUST_REFUSED_STEP.to_string(),
+            step => step,
+        }),
+        crate::util::office_utils::TrustReadError::Newer(_) => Owner::Newer,
+        crate::util::office_utils::TrustReadError::Unread(_) => Owner::Unread,
     }
 }
 
@@ -1446,10 +1475,11 @@ fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
 /// * `Err((reason, owner))` - The ref's own refusal when the verdict is on `head`'s history (a rule
 ///                            it breaks, or a parcel of it the store decided is absent or holds
 ///                            damaged); [`Owner::Newer`] when what it needs is in a format this
-///                            build does not know; [`Owner::Unread`] when the refusal says nothing
-///                            of it.
+///                            build does not know; [`Owner::OfficeUnborn`] or [`Owner::Trust`]
+///                            when the trust state it is checked against refuses, read whole;
+///                            [`Owner::Unread`] when the refusal says nothing of it.
 fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::office_utils::TrustAnchor>, office_head: Option<&str>) -> Result<(), (String, Owner)> {
-    use crate::util::meta_tree::MetaCheckError;
+    use crate::util::meta_tree::{MetaCheckError, TrustGap};
 
     let Some(rules) = crate::util::meta_tree::meta_rules(name) else {
         return Err(("it is not a meta pallet heal has rules to verify against".to_string(), Owner::Own));
@@ -1461,11 +1491,38 @@ fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::offi
             let owner = match error {
                 MetaCheckError::Content(_) => Owner::Own,
                 MetaCheckError::Newer(_) => Owner::Newer,
+                MetaCheckError::Trust(_, TrustGap::OfficeUnborn) => Owner::OfficeUnborn,
+                MetaCheckError::Trust(_, TrustGap::AnchorLost) => Owner::Trust(trust_step(TrustGap::AnchorLost)),
+                MetaCheckError::Trust(_, TrustGap::ChainRefused) => Owner::Trust(trust_step(TrustGap::ChainRefused)),
                 MetaCheckError::Untold(_) => Owner::Unread,
             };
             (format!("parcel {} does not pass verification: {}", head, error.message().trim_end_matches('.')), owner)
         })
 }
+
+/// What settles the trust state `gap` that refuses a meta ref: for an unborn office, what brings
+/// it back; otherwise a rerun, when heal restores the trust file from its copy; failing that, for
+/// a lost anchor the ways out that hold on this root, and for a chain that does not verify,
+/// settling why, which nothing here can tell.
+fn trust_step(gap: crate::util::meta_tree::TrustGap) -> String {
+    use crate::util::meta_tree::TrustGap;
+
+    if gap == TrustGap::OfficeUnborn {
+        return crate::util::office_utils::office_unborn_step();
+    }
+    let (step, ways_out) = crate::util::office_utils::trust_remedy();
+    match (step.is_empty(), gap) {
+        (false, _) => step,
+        (true, TrustGap::AnchorLost) => ways_out.to_string(),
+        (true, TrustGap::ChainRefused | TrustGap::OfficeUnborn) => {
+            "Settle why the office pallet does not verify against the trust file's anchor, as the refusal says, then run \"forklift heal\" again.".to_string()
+        }
+    }
+}
+
+/// The step of a meta ref refused over a trust file that reads and refuses, whose refusal names
+/// the ways out: they are in the reason, so the step does not restate them.
+const TRUST_REFUSED_STEP: &str = "Take one of the ways out the trust file's refusal names, then run \"forklift heal\" again.";
 
 /// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs.
 fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>) {
