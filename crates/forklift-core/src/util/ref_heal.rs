@@ -6,7 +6,7 @@
 //! Two kinds of user ref, and nothing else: a ref file whose bytes the reader refuses (it does not
 //! hold a parcel hash), and a missing ref that some checkout still stands on with a base. A lost
 //! ref no checkout stands on cannot be told from a pallet that never existed, so it is not found.
-//! Meta refs are not judged here.
+//! Meta refs are judged by [`repair_meta`], from their copies.
 //!
 //! ## The evidence and the choice
 //!
@@ -871,6 +871,318 @@ fn admit_remove(pallet: &str, notes: &mut Vec<String>) -> Result<DamagedRef, Str
     }
 
     Ok(damaged)
+}
+
+/// A meta pallet's ref and its copy, as heal read them before any hold.
+struct MetaState {
+    name: String,
+
+    /// The ref file's bytes; `None` when nothing stands at the ref's path.
+    reference: Option<Vec<u8>>,
+
+    copy: pallet_utils::MetaCopyState,
+}
+
+impl MetaState {
+    fn wire(&self) -> String {
+        meta_wire(&self.name)
+    }
+
+    /// How the ref is damaged: lost beside a copy, or holding bytes that are not a head. `None`
+    /// for an intact ref, and for a pallet with neither a ref nor a copy, which is unborn.
+    fn damage(&self) -> Option<RefDamage> {
+        match &self.reference {
+            Some(bytes) if pallet_utils::parse_ref_bytes(bytes).is_some() => None,
+            Some(bytes) => Some(RefDamage::Unreadable(bytes.clone())),
+            None if self.copy == pallet_utils::MetaCopyState::Absent => None,
+            None => Some(RefDamage::Missing),
+        }
+    }
+
+    fn copy_head(&self) -> Option<String> {
+        match &self.copy {
+            pallet_utils::MetaCopyState::Bytes(bytes) => pallet_utils::parse_ref_bytes(bytes),
+            _ => None,
+        }
+    }
+}
+
+fn meta_wire(name: &str) -> String {
+    pallet_utils::PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() }.to_wire()
+}
+
+/// Every meta pallet with a ref or a copy, read without the ref lock. One whose ref or copy cannot
+/// be read is left out, with a note.
+fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
+    let mut names: BTreeSet<String> = pallet_utils::list_pallets_in(PalletNamespace::Meta)?.into_iter().collect();
+    names.extend(pallet_utils::list_meta_copies()?);
+
+    let mut states = Vec::new();
+
+    for name in names {
+        let path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, &name);
+
+        let reference = match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(metadata) if metadata.is_file() => match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    push_note(notes, format!("The ref of pallet \"{}\" could not be read to tell whether it is damaged: {}", meta_wire(&name), error));
+                    continue;
+                }
+            },
+            Ok(_) => {
+                push_note(notes, format!(
+                    "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it.",
+                    meta_wire(&name), path.to_string_lossy()
+                ));
+                continue;
+            }
+            Err(error) => {
+                push_note(notes, format!("The ref of pallet \"{}\" could not be read to tell whether it is damaged: {}", meta_wire(&name), error));
+                continue;
+            }
+        };
+
+        match pallet_utils::read_meta_copy_state(&name) {
+            Ok(copy) => states.push(MetaState { name, reference, copy }),
+            Err(error) => push_note(notes, format!(
+                "The copy of pallet \"{}\"'s ref could not be read, so heal did not judge that ref: {}", meta_wire(&name), error
+            )),
+        }
+    }
+
+    Ok(states)
+}
+
+/// The meta pallets whose ref is lost beside its copy or does not hold a head, as `@<name>`.
+///
+/// # Returns
+/// * `Err(String)` - If the meta refs or their copies could not be listed.
+pub fn detect_meta(notes: &mut Vec<String>) -> Result<Vec<String>, String> {
+    Ok(meta_states(notes)?.iter().filter(|state| state.damage().is_some()).map(MetaState::wire).collect())
+}
+
+/// Whether `head` is `ancestor` or descends from it along first parents.
+fn first_parent_descends(head: &str, ancestor: &str) -> Result<bool, String> {
+    let mut at = head.to_string();
+    let mut seen = BTreeSet::new();
+
+    loop {
+        if at == ancestor {
+            return Ok(true);
+        }
+
+        if !seen.insert(at.clone()) {
+            return Ok(false);
+        }
+
+        match object_utils::load_parcel(&at)?.parents.first() {
+            Some(parent) => at = parent.clone(),
+            None => return Ok(false),
+        }
+    }
+}
+
+const FROM_COPY: &str = "the ref's copy";
+
+/// The head a damaged meta ref is rebuilt at, and where it was found, or why none is.
+fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), (String, Vec<Candidate>)> {
+    let copy = state.copy_head();
+    let mut candidates: Vec<Candidate> = copy.iter()
+        .map(|head| Candidate { head: head.clone(), source: FROM_COPY.to_string() })
+        .collect();
+
+    let salvaged = match &state.reference {
+        Some(bytes) => salvage(bytes, tainted).map_err(|error| (
+            format!("what its own bytes name could not be looked up: {}", error.trim_end_matches('.')), candidates.clone()
+        ))?,
+        None => Salvage::Nothing,
+    };
+
+    match salvaged {
+        Salvage::Nothing => match copy {
+            Some(head) => Ok((head, FROM_COPY)),
+            None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates)),
+        },
+        Salvage::Found(salvaged) => {
+            candidates.push(Candidate { head: salvaged.clone(), source: Source::Salvage.describe() });
+
+            match copy {
+                None => Ok((salvaged, "what the ref's own bytes still name")),
+                Some(copy) if copy == salvaged => Ok((copy, FROM_COPY)),
+                // A copy a forward write left ahead of its ref is in this shape; one an interrupted
+                // re-genesis or a hand edit left need not be, and nothing proves it the newer.
+                Some(copy) => match first_parent_descends(&copy, &salvaged) {
+                    Ok(true) => Ok((copy, FROM_COPY)),
+                    Ok(false) => Err((format!(
+                        "its copy names {}, which does not descend along first parents from {}, what its own bytes name, so nothing proves either the newer",
+                        copy, salvaged
+                    ), candidates)),
+                    Err(error) => Err((format!(
+                        "whether its copy's head {} descends from {}, what its own bytes name, could not be told: {}",
+                        copy, salvaged, error.trim_end_matches('.')
+                    ), candidates)),
+                },
+            }
+        }
+        Salvage::Ambiguous(parcels, _) => {
+            candidates.extend(parcels.into_iter().map(|head| Candidate { head, source: Source::Salvage.describe() }));
+            Err(("its own bytes name one of several parcels, not which".to_string(), candidates))
+        }
+        Salvage::Unknown(why) => Err((why, candidates)),
+    }
+}
+
+/// Verify `head` as the whole history of meta pallet `name`, against the trust anchor and the
+/// office as they are now, and return the preconditions that pin both for the write.
+fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPreconditions, String> {
+    let Some(rules) = crate::util::meta_tree::meta_rules(name) else {
+        return Err("it is not a meta pallet heal has rules to verify against".to_string());
+    };
+
+    let anchor = crate::util::office_utils::read_trust_anchor_with_bytes()?;
+    let office_head = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME)?;
+
+    crate::util::meta_tree::verify_meta_update(
+        name, rules, crate::util::meta_tree::Admission::Audit, anchor.as_ref().map(|(anchor, _)| anchor),
+        office_head.as_deref(), None, head,
+    ).map_err(|why| format!("parcel {} does not pass verification: {}", head, why.trim_end_matches('.')))?;
+
+    Ok(pallet_utils::RefPreconditions {
+        office: pallet_utils::OfficePrecondition::At(office_head),
+        anchor: match anchor {
+            Some((_, bytes)) => pallet_utils::AnchorPrecondition::Bytes(bytes),
+            None => pallet_utils::AnchorPrecondition::Absent,
+        },
+        pallets: pallet_utils::PalletsPrecondition::NotConsumed,
+    })
+}
+
+/// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs.
+fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>) {
+    let reference = state.reference.as_deref().unwrap_or_default();
+
+    if let pallet_utils::MetaCopyState::Other = state.copy {
+        if pass == Pass::AfterTaint {
+            push_note(notes, format!(
+                "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), so the copy was not set to the ref's head {}; move it aside and run \"forklift heal\" again.",
+                state.wire(), pallet_utils::get_meta_copy_path(&state.name).to_string_lossy(), head
+            ));
+        }
+        return;
+    }
+
+    match pallet_utils::mend_meta_copy(&state.name, reference, &state.copy) {
+        Ok(pallet_utils::CopyMend::Mended) => push_note(notes, match state.copy_head() {
+            Some(other) => format!(
+                "The copy of pallet \"{}\"'s ref named {}, not the ref's head {}, as an interrupted write or a hand edit leaves it; it was set to the ref's head.",
+                state.wire(), other, head
+            ),
+            None => format!("The copy of pallet \"{}\"'s ref was lost or damaged; it was set to the ref's head {}.", state.wire(), head),
+        }),
+        // A taint still standing after the recovery is reported by the recovery.
+        Ok(pallet_utils::CopyMend::AfterTaint) => {}
+        Err(_) if pass == Pass::BeforeTaint => {}
+        Err(error) => push_note(notes, format!(
+            "The copy of pallet \"{}\"'s ref was not set to the ref's head {}: {}", state.wire(), head, error
+        )),
+    }
+}
+
+/// Run one repair pass over every meta ref: a ref that reads has a lost or differing copy set to
+/// it, and a lost or damaged ref other than the office's and `@redactions`' is rebuilt from its
+/// copy or its own bytes, while both of those read. A lost or damaged office or `@redactions` ref
+/// is refused, and so is every other damaged meta ref beside it, since each is verified against
+/// the office and checked against the redactions.
+///
+/// [`Pass::BeforeTaint`] refuses nothing and drops a write that failed, leaving both to
+/// [`Pass::AfterTaint`], which judges again.
+///
+/// # Returns
+/// * `Ok(Repair)`  - What it rebuilt, and in [`Pass::AfterTaint`] what it refused.
+/// * `Err(String)` - If the meta refs or their copies could not be listed.
+pub fn repair_meta(pass: Pass) -> Result<Repair, String> {
+    let mut report = Repair::default();
+    let states = meta_states(&mut report.notes)?;
+
+    let blocking: Vec<String> = states.iter()
+        .filter(|state| state.damage().is_some())
+        .filter(|state| [crate::util::office_utils::OFFICE_PALLET_NAME, crate::util::redaction_utils::REDACTIONS_PALLET_NAME].contains(&state.name.as_str()))
+        .map(MetaState::wire)
+        .collect();
+
+    let tainted = match states.iter().any(|state| state.damage().is_some()) {
+        true => Some(Tainted::read(&mut report.notes)),
+        false => None,
+    };
+
+    for state in &states {
+        let Some(damage) = state.damage() else {
+            if let Some(head) = state.reference.as_deref().and_then(pallet_utils::parse_ref_bytes) {
+                if state.copy != pallet_utils::MetaCopyState::Bytes(state.reference.clone().unwrap_or_default()) {
+                    mend_copy(state, &head, pass, &mut report.notes);
+                }
+            }
+            continue;
+        };
+
+        let mut refuse = |reason: String, candidates: Vec<Candidate>| if pass == Pass::AfterTaint {
+            report.refused.push(Refused { pallet: state.wire(), reason, candidates });
+        };
+
+        let choice = choose_meta(state, tainted.as_ref().expect("read when a ref is damaged"));
+
+        if blocking.contains(&state.wire()) {
+            let candidates = match choice {
+                Ok((head, source)) => vec![Candidate { head, source: source.to_string() }],
+                Err((_, candidates)) => candidates,
+            };
+            refuse("heal does not rebuild this ref; write the head it is to hold into the ref file by hand".to_string(), candidates);
+            continue;
+        }
+
+        let (head, source) = match choice {
+            Ok(chosen) => chosen,
+            Err((reason, candidates)) => {
+                refuse(reason, candidates);
+                continue;
+            }
+        };
+        let candidates = vec![Candidate { head: head.clone(), source: source.to_string() }];
+
+        if !blocking.is_empty() {
+            refuse(format!(
+                "it is verified against the office and checked against the redactions, and the ref of {} is damaged too: rebuild that first",
+                blocking.iter().map(|wire| format!("pallet \"{}\"", wire)).collect::<Vec<_>>().join(" and ")
+            ), candidates);
+            continue;
+        }
+
+        let preconditions = match verify_meta_head(&state.name, &head) {
+            Ok(preconditions) => preconditions,
+            Err(reason) => {
+                refuse(reason, candidates);
+                continue;
+            }
+        };
+
+        let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, &preconditions);
+
+        // A write can land and still report a failure (under a standing taint, its rename goes
+        // through and the taint is reported), so the ref read back decides.
+        let landed = pallet_utils::get_pallet_head_in(PalletNamespace::Meta, &state.name).ok().flatten().as_deref() == Some(head.as_str());
+
+        match written {
+            _ if landed => report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() }),
+            Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => return Err(error),
+            Err(_) if pass == Pass::BeforeTaint => {}
+            Err(error) => refuse(format!("the rebuild at {} was not written: {}", head, error), candidates),
+            Ok(()) => refuse(format!("the rebuild at {} did not read back", head), candidates),
+        }
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]

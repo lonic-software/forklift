@@ -408,6 +408,8 @@ fn a_damaged_tags_ref_does_not_stop_the_rebuild() {
     let tags = if tags.exists() { tags } else { root.join(".forklift").join("meta").join("tags") };
     assert!(tags.is_file(), "the fixture must find the @tags ref");
     std::fs::write(&tags, b"not a hash").unwrap();
+    // Without its copy, heal cannot rebuild @tags, so the walk meets it unreadable.
+    forklift_core::util::file_utils::remove_file(&root.join(".forklift").join("meta-copy").join("tags")).unwrap();
 
     let base = head(&root, "main");
     forklift_core::util::file_utils::remove_file(ref_path(&root, "main")).unwrap();
@@ -641,6 +643,8 @@ fn meta_history_is_refused_however_spelled_and_a_refusal_names_what_the_run_alre
     let tags = if tags.exists() { tags } else { root.join(".forklift").join("meta").join("tags") };
     assert!(tags.is_file(), "the fixture must find the @tags ref");
     std::fs::write(&tags, b"not a hash").unwrap();
+    // Without its copy, nothing names the head of @tags, so heal leaves it damaged.
+    forklift_core::util::file_utils::remove_file(&root.join(".forklift").join("meta-copy").join("tags")).unwrap();
     let partial = area.run(&root, &["heal", "--ref", &format!("side={}", side), "--ref", &format!("main={}", main)]);
     assert!(!partial.status.success(), "{}", text(&partial.stdout));
     let stderr = text(&partial.stderr);
@@ -1086,4 +1090,161 @@ fn garble_staged_shards(root: &Path) {
     for shard in &shards {
         std::fs::write(shard, b"not an inventory").unwrap();
     }
+}
+
+// A meta pallet's ref, and the copy every meta head write leaves beside it.
+
+fn meta_path(root: &Path, pallet: &str) -> PathBuf {
+    root.join(".forklift").join("meta").join(pallet)
+}
+
+fn meta_copy_path(root: &Path, pallet: &str) -> PathBuf {
+    root.join(".forklift").join("meta-copy").join(pallet)
+}
+
+fn meta_head(root: &Path, pallet: &str) -> Option<String> {
+    std::fs::read_to_string(meta_path(root, pallet)).ok().map(|bytes| bytes.trim_end().to_string())
+}
+
+/// A prepared warehouse with tag `v1`, then tag `v2`: `@tags` at H2, whose first parent is H1.
+/// Returns the warehouse, H1 and H2.
+fn tagged(area: &Area) -> (PathBuf, String, String) {
+    let root = area.warehouse();
+    area.run_ok(&root, &["tag", "create", "v1", "main"]);
+    let first = meta_head(&root, "tags").unwrap();
+    area.run_ok(&root, &["tag", "create", "v2", "main"]);
+    let second = meta_head(&root, "tags").unwrap();
+    (root, first, second)
+}
+
+/// The meta refs `data` says were rebuilt; an empty list is left out of the report.
+fn rebuilt_meta(data: &serde_json::Value) -> Vec<(String, String, String)> {
+    data["refs_rebuilt"].as_array().into_iter().flatten()
+        .filter(|rebuilt| rebuilt["pallet"].as_str().unwrap().starts_with('@'))
+        .map(|rebuilt| (rebuilt["pallet"].as_str().unwrap().to_string(), rebuilt["head"].as_str().unwrap().to_string(), rebuilt["source"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+// Mutations: drop the copy write from a forward meta write (so the copy stays at H1), or skip
+// the meta pass in heal → red.
+#[test]
+fn a_lost_meta_ref_is_rebuilt_from_its_copy() {
+    let area = Area::new("meta-lost");
+    let (root, _, second) = tagged(&area);
+
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+
+    let data = healed(&area, &root);
+    assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
+    assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), format!("{}\n", second).into_bytes());
+
+    let listed = text(&area.run_ok(&root, &["tag", "list"]).stdout);
+    assert!(listed.contains("v1") && listed.contains("v2"), "{}", listed);
+
+    // A second heal finds nothing to do.
+    assert!(rebuilt_meta(&healed(&area, &root)).is_empty());
+}
+
+// Mutation: prefer what the ref's bytes name over a copy descending from it → rebuilt at H1, red.
+#[test]
+fn a_damaged_meta_ref_takes_its_copy_when_the_copy_descends_from_what_its_bytes_name() {
+    let area = Area::new("meta-ahead");
+    let (root, first, second) = tagged(&area);
+
+    // The ref's bytes still name H1, by a prefix; the copy names H2, which descends from it.
+    std::fs::write(meta_path(&root, "tags"), &first.as_bytes()[..16]).unwrap();
+
+    let data = healed(&area, &root);
+    assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
+    assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
+}
+
+// Mutation: take the copy whatever it descends from → rebuilt at H1, red.
+#[test]
+fn a_copy_that_does_not_descend_from_what_the_ref_names_is_refused_with_both() {
+    let area = Area::new("meta-conflict");
+    let (root, first, second) = tagged(&area);
+
+    // The copy is put back at H1, which does not descend from H2, what the ref's bytes name.
+    std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", first)).unwrap();
+    std::fs::write(meta_path(&root, "tags"), &second.as_bytes()[..16]).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: its copy names") && message.contains(&first) && message.contains(&second), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.", "{}", refused);
+    assert_eq!(std::fs::read(meta_path(&root, "tags")).unwrap(), second.as_bytes()[..16].to_vec(), "the ref is left as it was");
+}
+
+// Mutation: skip the verification of the chosen head → the user parcel is written as @tags, red.
+#[test]
+fn a_copy_naming_a_parcel_that_fails_verification_is_refused_not_written() {
+    let area = Area::new("meta-unverified");
+    let (root, _, _) = tagged(&area);
+
+    // A user parcel is no @tags history.
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+    std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", head(&root, "main"))).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: parcel") && message.contains("does not pass verification"), "{}", refused);
+    assert!(!meta_path(&root, "tags").exists(), "nothing was written");
+}
+
+// Mutation: refuse only the office and @redactions themselves, not the refs judged against them →
+// @tags is rebuilt beside a lost @redactions, red.
+#[test]
+fn a_meta_ref_beside_a_lost_redactions_ref_is_refused_naming_it() {
+    let area = Area::new("meta-blocked");
+    let (root, _, second) = tagged(&area);
+
+    // A lost @redactions: its copy stands, its ref does not.
+    std::fs::create_dir_all(meta_copy_path(&root, "redactions").parent().unwrap()).unwrap();
+    std::fs::write(meta_copy_path(&root, "redactions"), format!("{}\n", second)).unwrap();
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("The ref of pallet \"@redactions\" was not rebuilt: heal does not rebuild this ref"), "{}", refused);
+    assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: it is verified against the office and checked against the redactions, and the ref of pallet \"@redactions\" is damaged too"), "{}", refused);
+    assert!(meta_head(&root, "tags").is_none() && meta_head(&root, "redactions").is_none(), "nothing was written");
+}
+
+// Mutation: skip the copy mend → the copy stays lost / at H1, red.
+#[test]
+fn a_lost_or_stale_copy_beside_an_intact_ref_is_mended() {
+    let area = Area::new("meta-mend");
+    let (root, first, second) = tagged(&area);
+    let bytes = format!("{}\n", second).into_bytes();
+
+    forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
+    let output = text(&area.run_ok(&root, &["heal"]).stdout);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), bytes, "{}", output);
+    assert!(output.contains("The copy of pallet \"@tags\"'s ref was lost or damaged; it was set to the ref's head"), "{}", output);
+
+    std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", first)).unwrap();
+    let output = text(&area.run_ok(&root, &["heal"]).stdout);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), bytes, "{}", output);
+    assert!(output.contains(&format!("The copy of pallet \"@tags\"'s ref named {}, not the ref's head {}", first, second)), "{}", output);
+    assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "the ref is not touched");
+}
+
+// The birth order: a folder planted at the copy's path fails the first write's copy, after its
+// ref landed. Reordering a birth to write the copy first leaves no ref, red.
+#[test]
+fn a_first_meta_write_whose_copy_failed_stands_and_heal_mends_the_copy() {
+    let area = Area::new("meta-birth");
+    let root = area.warehouse();
+    let planted = meta_copy_path(&root, "tags");
+    std::fs::create_dir_all(planted.join("in-the-way")).unwrap();
+
+    let output = area.run(&root, &["tag", "create", "v1", "main"]);
+    assert!(!output.status.success(), "the copy's error is returned: {}{}", text(&output.stdout), text(&output.stderr));
+    let landed = meta_head(&root, "tags").expect("the ref stands at the new head");
+
+    forklift_core::util::file_utils::remove_dir_all(&planted).unwrap();
+    area.run_ok(&root, &["heal"]);
+    assert_eq!(std::fs::read(&planted).unwrap(), format!("{}\n", landed).into_bytes());
 }

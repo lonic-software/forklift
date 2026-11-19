@@ -1344,7 +1344,7 @@ pub fn update_meta_pallet_head_served(name: &str,
                                       preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
     let served = crate::util::redaction_utils::Served::chain(served);
 
-    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served), None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served), None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head`] for a client adopting `served`, what the remote served for this user
@@ -1359,7 +1359,7 @@ pub fn adopt_pallet_head(name: &str,
                          new: &str,
                          served: crate::util::redaction_utils::Served,
                          preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served), None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served), None, None, WriteOrder::Forward)
 }
 
 /// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
@@ -1417,7 +1417,7 @@ pub fn update_pallet_head_in(
     new: &str,
     preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None, None, WriteOrder::Forward)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None, None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head_in`] for undo's put-back, which moves a ref back from the head its
@@ -1429,7 +1429,7 @@ pub(crate) fn put_back_pallet_head_in(
     expected: &str,
     new: &str,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, Some(expected), new, &RefPreconditions::NONE, None, None, None, None, WriteOrder::Backward)
+    update_pallet_head_checked(namespace, name, Some(expected), new, &RefPreconditions::NONE, None, None, None, None, None, WriteOrder::Backward)
 }
 
 /// Which way a head write moves its ref, which orders a meta ref's copy write against the ref
@@ -1448,7 +1448,7 @@ pub fn recreate_pallet_head(name: &str,
                             new: &str,
                             preconditions: &RefPreconditions,
                             tombstone: &str) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None, None, WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None, None, None, WriteOrder::Forward)
 }
 
 /// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
@@ -1465,7 +1465,7 @@ pub fn update_pallet_head_verified(
     verified: &VerifiedClosure,
     tombstone: Option<&str>,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None, None, WriteOrder::Forward)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None, None, None, WriteOrder::Forward)
 }
 
 /// How a user pallet's ref is damaged, as [`repair_pallet_head`] expects to find it.
@@ -1485,7 +1485,37 @@ pub enum RefDamage {
 /// redaction checks apply. `preconditions` pins the trust state `new` was verified against (a
 /// rebuilt head becomes a local head, which a take does not verify again).
 pub fn repair_pallet_head(name: &str, damage: &RefDamage, new: &str, preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, None, None, Some(damage), WriteOrder::Forward)
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, None, None, Some(damage), None, WriteOrder::Forward)
+}
+
+/// Set damaged meta pallet `name` to `new`: heal's rebuild of a meta ref that is missing or does
+/// not hold a hash, from its copy or from what its own bytes still name. The compare-and-set of
+/// [`repair_pallet_head`], which also expects the copy to still stand as `copy`, what heal judged:
+/// a meta write that landed since, which moves the copy first, is refused as moved. The redaction
+/// check applies; a meta pallet's history is verified by the caller, which pins the trust state it
+/// verified against in `preconditions`. The ref is written first and the copy only once the ref
+/// reads back at `new`, and a copy already holding those bytes is not written again, so a rebuild
+/// from the copy leaves it as it was.
+pub fn repair_meta_pallet_head(name: &str,
+                               damage: &RefDamage,
+                               copy: &MetaCopyState,
+                               new: &str,
+                               preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(PalletNamespace::Meta, name, None, new, preconditions, None, None, None, Some(damage), Some(copy), WriteOrder::Forward)
+}
+
+/// Refuse with [`RefUpdateError::Moved`] unless the copy of meta pallet `name` still stands as
+/// `judged`.
+fn require_copy(name: &str, judged: &MetaCopyState) -> Result<(), RefUpdateError> {
+    if read_copy_state_at(&get_meta_copy_path(name))? != *judged {
+        return Err(RefUpdateError::Moved(RefMoved {
+            reference: PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() },
+            expected: None,
+            found: get_pallet_head_in(PalletNamespace::Meta, name).ok().flatten(),
+        }));
+    }
+
+    Ok(())
 }
 
 /// Remove the unreadable ref of user pallet `name`, which must still hold exactly `bytes` inside
@@ -1602,10 +1632,12 @@ fn update_pallet_head_checked(
     acknowledged: Option<&str>,
     served: Option<crate::util::redaction_utils::Served>,
     damaged: Option<&RefDamage>,
+    copy: Option<&MetaCopyState>,
     order: WriteOrder,
 ) -> Result<(), RefUpdateError> {
     // A repair judges the write as a creation: nothing it replaces is a head.
     debug_assert!(damaged.is_none() || expected.is_none(), "a repair expects no head");
+    debug_assert!(copy.is_none() || (damaged.is_some() && namespace == PalletNamespace::Meta), "only a meta repair expects a copy");
 
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
@@ -1653,6 +1685,9 @@ fn update_pallet_head_checked(
         match damaged {
             Some(damage) => require_damage(namespace, name, damage)?,
             None => { require_head(namespace, name, expected)?; }
+        }
+        if let Some(copy) = copy {
+            require_copy(name, copy)?;
         }
         check_preconditions(&lock, preconditions)?;
 
@@ -2473,6 +2508,26 @@ pub fn list_meta_pallets() -> Result<Vec<String>, String> {
 pub fn list_pallets_in(namespace: PalletNamespace) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = Vec::new();
     let folder = get_namespace_folder(namespace);
+
+    if folder.is_dir() {
+        collect_pallet_names(&folder, "", &mut names)?;
+    }
+
+    names.sort();
+
+    Ok(names)
+}
+
+/// The names of the meta pallets whose ref has a copy file, sorted: a ref lost beside its copy is
+/// listed here, not by [`list_pallets_in`].
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The pallet names.
+/// * `Err(String)`     - If the copies' folder could not be read, or a file in it does not name a
+///                       valid pallet.
+pub fn list_meta_copies() -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    let folder = forklift_root().join(FOLDER_NAME_META_COPY_ROOT);
 
     if folder.is_dir() {
         collect_pallet_names(&folder, "", &mut names)?;
