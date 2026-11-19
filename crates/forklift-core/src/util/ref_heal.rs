@@ -1129,6 +1129,8 @@ pub struct TrustStopped {
     pub rebuilt: Vec<Rebuilt>,
     /// What [`Pass::BeforeTaint`] deferred before it stopped: the office, when it left that.
     pub deferred: Vec<Refused>,
+    /// What [`Pass::AfterTaint`] refused before it stopped: the office, when it refused that.
+    pub refused: Vec<Refused>,
     /// What the pass noted before it stopped, the office step's among them.
     pub notes: Vec<String>,
 }
@@ -1195,7 +1197,7 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
             if let Some(stopped) = report.stopped.take() {
                 notes.push(format!("The office pallet's ref was not rebuilt: {}", stopped.trim_end_matches('.')));
             }
-            return Err(TrustStopped { error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred), notes });
+            return Err(TrustStopped { error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred), refused: std::mem::take(&mut report.refused), notes });
         }
     };
 

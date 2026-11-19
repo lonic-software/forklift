@@ -1486,13 +1486,13 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
         assert_eq!(value["error"]["code"], "durability_taint", "{}: {}", case, value);
         let message = value["error"]["message"].as_str().unwrap();
         let rebuilt = format!("Rebuilt the ref of pallet \"@tags\" at {}, from the ref's copy.", second);
-        let left = "The ref of pallet \"@tags\" was left for the pass after the taint recovery, which did not judge it in this run: ";
+        let left = "The ref of pallet \"@tags\" was not rebuilt yet: ";
         let heads = format!("; candidates: {} (the ref's copy).", second);
-        let hand = "Heal judges it again once the taint is resolved; while the taint stands, a head written into the ref's file by hand settles it.";
+        let hand = "If the taint does not resolve, a candidate named can be written into its ref's file by hand";
 
         match case {
             "rebuilt" => {
-                assert!(message.contains(&rebuilt) && !message.contains("was left for the pass after"), "{}", message);
+                assert!(message.contains(&rebuilt) && !message.contains("was not rebuilt yet"), "{}", message);
                 assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
             }
             _ => {

@@ -7891,7 +7891,7 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
 
 /// A trust file or copy a newer version wrote is never judged past: the office is not rebuilt
 /// against the other file's anchor beside it, though that verifies, and the trust repair refuses
-/// the file.
+/// the file, naming the office left damaged.
 // Revert: judge only the file reached (read a newer trust file as one that does not parse and go
 // on to the copy; never look at a copy once the trust file serves) → the office is written beside
 // what only a newer version reads.
@@ -7907,7 +7907,11 @@ fn heal_does_not_rebuild_the_office_beside_a_trust_file_a_newer_version_wrote() 
 
         assert_ne!(refused.status.code(), Some(0), "{}: {}{}", newer, stdout(&refused), stderr(&refused));
         let value = json(&refused);
-        assert!(value["error"]["message"].as_str().unwrap().contains("version 999"), "{}: {}", newer, value);
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("version 999"), "{}: {}", newer, value);
+        // The office the pass before the taint left is named, though the trust repair stopped it.
+        assert!(message.contains("The ref of pallet \"@office\" was not rebuilt yet: "), "{}: {}", newer, value);
+        assert!(message.contains("This run stopped before judging that ref a second time"), "{}: {}", newer, value);
         assert!(!forklift.join("meta/office").exists(), "{}: the office was not rebuilt", newer);
     }
 }
