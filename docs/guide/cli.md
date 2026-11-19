@@ -2923,9 +2923,8 @@ One it cannot settle the first time, for example because its remaining bytes nam
 records, is left for the second. A refusal that stops the run before the second pass, such as a
 `durability_taint` refusal for a taint that still stands, names each metadata ref left that way,
 with the heads found for it, beside those already rebuilt; one after it names those it refused. A
-later `heal` judges them again, and while a durability taint stands, only once that taint is
-resolved. If the taint does not resolve, a head named can be written into the ref's file by hand;
-`heal` does not verify a head written that way.
+refusal that stops either pass before it has judged every damaged metadata ref names the rest as
+not yet judged. A later `heal` judges them again.
 
 #### A damaged fetch scope
 

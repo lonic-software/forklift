@@ -128,6 +128,10 @@ pub struct Repair {
     /// why and every head it found: a run that stops before that pass names them.
     pub deferred: Vec<Refused>,
 
+    /// The lost or damaged meta refs, as `@<name>`, that a meta pass which stopped never judged:
+    /// neither rebuilt, refused nor deferred.
+    pub unjudged: Vec<String>,
+
     /// What narrowed the evidence: a position, journal or marker that could not be read.
     pub notes: Vec<String>,
 
@@ -1131,6 +1135,8 @@ pub struct TrustStopped {
     pub deferred: Vec<Refused>,
     /// What [`Pass::AfterTaint`] refused before it stopped: the office, when it refused that.
     pub refused: Vec<Refused>,
+    /// Every other lost or damaged meta ref, as `@<name>`, which the pass stopped before judging.
+    pub unjudged: Vec<String>,
     /// What the pass noted before it stopped, the office step's among them.
     pub notes: Vec<String>,
 }
@@ -1197,15 +1203,30 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
             if let Some(stopped) = report.stopped.take() {
                 notes.push(format!("The office pallet's ref was not rebuilt: {}", stopped.trim_end_matches('.')));
             }
-            return Err(TrustStopped { error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred), refused: std::mem::take(&mut report.refused), notes });
+            let unjudged = unjudged_in(&states, &report);
+            return Err(TrustStopped {
+                error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred),
+                refused: std::mem::take(&mut report.refused), unjudged, notes,
+            });
         }
     };
 
     if report.stopped.is_none() {
         repair_other_meta(pass, office.is_some(), judged, &mut tainted, &mut report);
     }
+    if report.stopped.is_some() {
+        report.unjudged = unjudged_in(&states, &report);
+    }
 
     Ok(MetaRepair { repair: report, trust })
+}
+
+/// The lost or damaged meta refs among `states`, as `@<name>`, that `report` neither rebuilt,
+/// refused nor deferred: what a pass that stopped never judged.
+fn unjudged_in(states: &[MetaState], report: &Repair) -> Vec<String> {
+    let judged = |wire: &str| report.rebuilt.iter().any(|rebuilt| rebuilt.pallet == wire)
+        || report.refused.iter().chain(&report.deferred).any(|refused| refused.pallet == wire);
+    states.iter().filter(|state| state.damage().is_some()).map(MetaState::wire).filter(|wire| !judged(wire)).collect()
 }
 
 /// What step 1 of [`repair_meta`] judged of a damaged `@redactions` beside a damaged office, for

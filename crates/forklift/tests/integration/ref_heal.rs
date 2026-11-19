@@ -1488,7 +1488,7 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
         let rebuilt = format!("Rebuilt the ref of pallet \"@tags\" at {}, from the ref's copy.", second);
         let left = "The ref of pallet \"@tags\" was not rebuilt yet: ";
         let heads = format!("; candidates: {} (the ref's copy).", second);
-        let hand = "If the taint does not resolve, a candidate named can be written into its ref's file by hand";
+        let again = "This run stopped before judging that ref a second time; a later heal judges it again.";
 
         match case {
             "rebuilt" => {
@@ -1496,7 +1496,7 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
                 assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
             }
             _ => {
-                assert!(message.contains(left) && message.contains(&heads) && message.contains(hand), "{}: {}", case, message);
+                assert!(message.contains(left) && message.contains(&heads) && message.contains(again), "{}: {}", case, message);
                 assert!(!message.contains("Rebuilt the ref of pallet \"@tags\""), "{}: {}", case, message);
                 assert_eq!(std::fs::read(meta_path(&root, "tags")).ok(), broken, "{}: the deferred ref is left as it was", case);
             }

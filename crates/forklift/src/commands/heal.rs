@@ -143,7 +143,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // settle, or fails to write, the pass after the taint recovery judges again.
     let meta_first = ref_heal::repair_meta(Pass::BeforeTaint).map_err(|stopped| {
         let error = stopped.rebuilt.iter().fold(config_said(stopped.error), |error, rebuilt| forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt)));
-        let error = deferred_sentences(&stopped.deferred).iter().fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence));
+        let error = deferred_sentences(&stopped.deferred).iter().chain(&unjudged_sentences(&stopped.unjudged))
+            .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence));
         stopped.notes.iter().fold(error, |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))
     })?;
     let trust_repair = meta_first.trust;
@@ -155,7 +156,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let meta_rebuilt = meta_first.repair.rebuilt;
     // The damaged refs a refusal from here on names beside what was written: those the pass before
     // the taint left for the pass after it, until that pass has judged them; then those it refused.
-    let refs_left = std::cell::RefCell::new(RefsLeft::Deferred(meta_first.repair.deferred));
+    let refs_left = std::cell::RefCell::new(RefsLeft::Deferred(meta_first.repair.deferred, meta_first.repair.unjudged));
 
     // Every refusal from here on says what this run already wrote, the trust file and the meta
     // refs among it, and the refs it left damaged.
@@ -165,11 +166,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             None => config_said(error),
         };
         let error = meta_rebuilt.iter().fold(error, |error, rebuilt| forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt)));
-        match &*refs_left.borrow() {
-            RefsLeft::Deferred(deferred) => deferred_sentences(deferred).iter()
-                .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence)),
-            RefsLeft::Refused(refused) => refused_too(error, refused),
-        }
+        let (error, unjudged) = match &*refs_left.borrow() {
+            RefsLeft::Deferred(deferred, unjudged) => (deferred_sentences(deferred).iter()
+                .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence)), unjudged_sentences(unjudged)),
+            RefsLeft::Refused(refused, unjudged) => (refused_too(error, refused), unjudged_sentences(unjudged)),
+        };
+        unjudged.iter().fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence))
     };
 
     let record_rebuilt = sealed_utils::rebuild()
@@ -435,11 +437,11 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // The meta refs first, as before the taint: a user ref's rebuild reads the office.
     let meta_second = match ref_heal::repair_meta(Pass::AfterTaint) {
         Ok(meta) => {
-            refs_left.replace(RefsLeft::Refused(meta.repair.refused.clone()));
+            refs_left.replace(RefsLeft::Refused(meta.repair.refused.clone(), meta.repair.unjudged.clone()));
             meta
         }
         Err(stopped) => {
-            refs_left.replace(RefsLeft::Refused(stopped.refused));
+            refs_left.replace(RefsLeft::Refused(stopped.refused, stopped.unjudged));
             refs_rebuilt.extend(stopped.rebuilt);
             ref_notes.extend(stopped.notes);
             return Err(changed_after(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes));
@@ -469,7 +471,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     ref_notes.extend(second.notes);
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
-    refs_left.replace(RefsLeft::Refused(refs_refused.clone()));
+    refs_left.replace(RefsLeft::Refused(refs_refused.clone(), Vec::new()));
     if let Some(error) = second.stopped {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
@@ -1484,10 +1486,10 @@ fn candidates_clause(candidates: &[ref_heal::Candidate]) -> String {
 }
 
 /// The damaged refs a refusal names: those left for the meta pass after the taint recovery, until
-/// it has run; then those refused.
+/// it has run, then those refused; each beside the meta refs a pass that stopped never judged.
 enum RefsLeft {
-    Deferred(Vec<ref_heal::Refused>),
-    Refused(Vec<ref_heal::Refused>),
+    Deferred(Vec<ref_heal::Refused>, Vec<String>),
+    Refused(Vec<ref_heal::Refused>, Vec<String>),
 }
 
 /// Restore the checkout's scope from its copy, or set it to the paths `--scope` named.
@@ -1532,20 +1534,18 @@ fn deferred_sentences(deferred: &[ref_heal::Refused]) -> Vec<String> {
         refused.pallet, refused.reason.trim_end_matches('.'), candidates_clause(&refused.candidates)
     )).collect();
     if !sentences.is_empty() {
-        let one = deferred.len() == 1;
-        sentences.push(format!(
-            "This run stopped before judging {} a second time, after its taint recovery; a later heal judges {} again, \
-            and while a durability taint stands, only once that taint is resolved.",
-            if one { "that ref" } else { "those refs" }, if one { "it" } else { "them" }
-        ));
-        if deferred.iter().any(|refused| !refused.candidates.is_empty()) {
-            sentences.push(
-                "If the taint does not resolve, a candidate named can be written into its ref's file by hand; heal does not verify a head written that way."
-                    .to_string(),
-            );
-        }
+        sentences.push(match deferred.len() {
+            1 => "This run stopped before judging that ref a second time; a later heal judges it again.",
+            _ => "This run stopped before judging those refs a second time; a later heal judges them again.",
+        }.to_string());
     }
     sentences
+}
+
+/// The sentences a refusal carries for the lost or damaged meta refs `unjudged`, which a meta pass
+/// stopped before judging.
+fn unjudged_sentences(unjudged: &[String]) -> Vec<String> {
+    unjudged.iter().map(|pallet| format!("The ref of pallet \"{}\" is lost or damaged; this run stopped before judging it.", pallet)).collect()
 }
 
 fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {
@@ -2208,7 +2208,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deferred_sentences, ref_heal, unload_step_when};
+    use super::{deferred_sentences, ref_heal, unjudged_sentences, unload_step_when};
 
     #[test]
     fn a_refusal_names_each_meta_ref_left_for_after_the_taint_with_its_heads() {
@@ -2220,25 +2220,17 @@ mod tests {
         assert!(deferred_sentences(&[]).is_empty());
         assert_eq!(deferred_sentences(&[refused("@tags", &[("h1", "the ref's copy")])]), vec![
             "The ref of pallet \"@tags\" was not rebuilt yet: it waits; candidates: h1 (the ref's copy).".to_string(),
-            "This run stopped before judging that ref a second time, after its taint recovery; a later heal judges it again, \
-            and while a durability taint stands, only once that taint is resolved.".to_string(),
-            "If the taint does not resolve, a candidate named can be written into its ref's file by hand; heal does not verify \
-            a head written that way.".to_string(),
-        ]);
-        assert_eq!(deferred_sentences(&[refused("@kv", &[])]), vec![
-            "The ref of pallet \"@kv\" was not rebuilt yet: it waits; nothing names a head for it.".to_string(),
-            "This run stopped before judging that ref a second time, after its taint recovery; a later heal judges it again, \
-            and while a durability taint stands, only once that taint is resolved.".to_string(),
+            "This run stopped before judging that ref a second time; a later heal judges it again.".to_string(),
         ]);
         let two = deferred_sentences(&[refused("@kv", &[]), refused("@tags", &[("h1", "the ref's copy"), ("h2", "what the ref's own bytes still name")])]);
         assert_eq!(two, vec![
             "The ref of pallet \"@kv\" was not rebuilt yet: it waits; nothing names a head for it.".to_string(),
             "The ref of pallet \"@tags\" was not rebuilt yet: it waits; candidates: h1 (the ref's copy), h2 (what the ref's own \
             bytes still name).".to_string(),
-            "This run stopped before judging those refs a second time, after its taint recovery; a later heal judges them again, \
-            and while a durability taint stands, only once that taint is resolved.".to_string(),
-            "If the taint does not resolve, a candidate named can be written into its ref's file by hand; heal does not verify \
-            a head written that way.".to_string(),
+            "This run stopped before judging those refs a second time; a later heal judges them again.".to_string(),
+        ]);
+        assert_eq!(unjudged_sentences(&["@tags".to_string()]), vec![
+            "The ref of pallet \"@tags\" is lost or damaged; this run stopped before judging it.".to_string(),
         ]);
     }
 

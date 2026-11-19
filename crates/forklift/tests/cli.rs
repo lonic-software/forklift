@@ -7891,7 +7891,7 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
 
 /// A trust file or copy a newer version wrote is never judged past: the office is not rebuilt
 /// against the other file's anchor beside it, though that verifies, and the trust repair refuses
-/// the file, naming the office left damaged.
+/// the file, naming the office left damaged and the meta ref beside it it never judged.
 // Revert: judge only the file reached (read a newer trust file as one that does not parse and go
 // on to the copy; never look at a copy once the trust file serves) → the office is written beside
 // what only a newer version reads.
@@ -7900,6 +7900,9 @@ fn heal_does_not_rebuild_the_office_beside_a_trust_file_a_newer_version_wrote() 
     for newer in ["trust", "trust-copy"] {
         let (warehouse, _) = enrolled_warehouse(&format!("heal-office-newer-{}", newer));
         let forklift = warehouse.root.join(".forklift");
+        // A damaged tags ref beside it, which the pass that stopped at the trust repair never judged.
+        assert_success(&warehouse.run(&["tag", "create", "v1", "main"]));
+        std::fs::write(forklift.join("meta/tags"), b"not a head\n").unwrap();
         forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
         std::fs::write(forklift.join(newer), "version = 999\n").unwrap();
 
@@ -7912,6 +7915,7 @@ fn heal_does_not_rebuild_the_office_beside_a_trust_file_a_newer_version_wrote() 
         // The office the pass before the taint left is named, though the trust repair stopped it.
         assert!(message.contains("The ref of pallet \"@office\" was not rebuilt yet: "), "{}: {}", newer, value);
         assert!(message.contains("This run stopped before judging that ref a second time"), "{}: {}", newer, value);
+        assert!(message.contains("The ref of pallet \"@tags\" is lost or damaged; this run stopped before judging it."), "{}: {}", newer, value);
         assert!(!forklift.join("meta/office").exists(), "{}: the office was not rebuilt", newer);
     }
 }
