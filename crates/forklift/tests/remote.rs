@@ -5845,6 +5845,35 @@ fn a_lift_over_a_damaged_office_signature_on_the_server_names_its_operator() {
     assert!(!said.contains("server-root") && !said.contains("Restore the warehouse's objects"), "the server's fixed text, not its reader's: {}", value);
 }
 
+/// A lower over a metadata pallet whose ref is lost while its copy stands refuses as ref_damaged,
+/// naming heal, and adopts nothing: the remote's head is never taken for a pallet never written.
+// Revert: read a lost meta ref as unborn → lower adopts the remote's @tags head and succeeds, red.
+#[test]
+fn a_lower_over_a_lost_meta_ref_refuses_and_adopts_nothing() {
+    let area = TestArea::new("lower-lost-meta");
+    let server = Server::start(&area, None);
+    std::fs::create_dir_all(area.path("w")).unwrap();
+    assert_success(&area.forklift("w", &["prepare"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
+    area.write_file("w/app.txt", "v1\n");
+    assert_success(&area.forklift("w", &["load", "."]));
+    assert_success(&area.forklift("w", &["stack", "-m", "first"]));
+    assert_success(&area.forklift("w", &["office", "enroll"]));
+    assert_success(&area.forklift("w", &["tag", "create", "v1", "main"]));
+    assert_success(&area.forklift("w", &["config", "set", "remote.url", &server.url]));
+    assert_success(&area.forklift("w", &["lift"]));
+    forklift_core::util::file_utils::remove_file(area.path("w/.forklift/meta/tags")).unwrap();
+
+    let lowered = area.forklift("w", &["--json", "lower"]);
+
+    assert_eq!(lowered.status.code(), Some(53), "{}{}", stdout(&lowered), stderr(&lowered));
+    let value = json_of(&lowered);
+    assert_eq!(value["error"]["code"], "ref_damaged", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift heal", "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("\"@tags\""), "{}", value);
+    assert!(!area.path("w/.forklift/meta/tags").exists(), "lower must not adopt the remote's head");
+}
+
 /// A lift from a warehouse whose office ref is lost beside its trust file refuses as ref_damaged
 /// before it uploads anything, its copy lost or not: a fresh remote is left with no trust anchor, rather than one with
 /// no office behind it. Lower is the way out it names only where the remote holds the office.
