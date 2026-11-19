@@ -2069,8 +2069,8 @@ mod tests {
         };
         let state = MetaState { name: "tags".to_string(), reference: None, copy: pallet_utils::MetaCopyState::Bytes(b"x\n".to_vec()) };
         let rows = [
-            ("a concrete step", format!("parcel p does not pass verification: {}", framed("forklift store verify")), Some("forklift store verify")),
-            ("heal first, then a concrete one", format!("{} and {}", framed("forklift heal"), framed("forklift store verify")), Some("forklift store verify")),
+            ("a concrete step", format!("parcel p does not pass verification: {}", framed("Restore the parcel from a backup")), Some("Restore the parcel from a backup")),
+            ("heal first, then a concrete one", format!("{} and {}", framed("forklift heal"), framed("Restore the parcel from a backup")), Some("Restore the parcel from a backup")),
             ("only heal", format!("parcel p does not pass verification: {}", framed("forklift heal")), None),
             ("no frame", "the office could not be read".to_string(), None),
         ];
@@ -2079,7 +2079,7 @@ mod tests {
             refuse_in(&mut report, &state, Pass::AfterTaint, reason, Vec::new(), Owner::Unread(None));
             let refused = &report.refused[0];
             assert_eq!(refused.meta.as_ref().unwrap().owner, Owner::Unread(step.map(str::to_string)), "{}", row);
-            assert!(!refused.reason.contains("forklift store verify") && !refused.reason.contains("forklift heal"), "{}: {}", row, refused.reason);
+            assert!(!refused.reason.contains("Restore the parcel from a backup") && !refused.reason.contains("forklift heal"), "{}: {}", row, refused.reason);
 
             let expected = step.map_or_else(|| unread_step("@tags"), str::to_string);
             assert_eq!(meta_step(refused, &report.refused), expected, "{}", row);

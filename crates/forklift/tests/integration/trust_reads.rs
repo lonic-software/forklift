@@ -18,9 +18,10 @@ const DIRS: &[&str] = &["crates/forklift/src", "crates/forklift-core/src", "crat
 /// entry read over that), by file and function, once per call.
 const BYTE_READS: &[(&str, &str)] = &[
     // The read layer itself: the file before the witnesses are read, and again after one stood;
-    // and the coded byte read over the raw one.
-    ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_in"),
-    ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_in"),
+    // the coded byte read over the raw one; and its String form over the typed one.
+    ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_judged"),
+    ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_judged"),
+    ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_bytes_judged"),
     ("crates/forklift-core/src/util/office_utils.rs", "read_trust_anchor_bytes"),
     // An install compares the bytes it would write and reads its own write back; it never reads
     // a missing file as permission to sign.
@@ -87,12 +88,13 @@ fn words(line: &str) -> impl Iterator<Item = &str> {
 }
 
 /// The production callers of the byte read and the constructions of the adoption read are
-/// exactly the listed ones. Revert: call `read_trust_anchor_bytes` from another production
+/// exactly the listed ones. Revert: call `read_trust_anchor_bytes` (or its typed form) from another production
 /// function, or pass `TrustReadMode::Adopt` from another caller, and this fails naming it.
 #[test]
 fn every_trust_read_that_can_skip_the_witnesses_is_listed() {
     let byte_reads = production_sites(DIRS, |line| {
-        usize::from(calls(line, "read_trust_anchor_bytes")) + usize::from(calls(line, "read_trust_file"))
+        usize::from(calls(line, "read_trust_anchor_bytes")) + usize::from(calls(line, "read_trust_anchor_bytes_judged"))
+            + usize::from(calls(line, "read_trust_file"))
             + usize::from(calls(line, "read_trust_entry"))
     });
     let adopts = production_sites(DIRS, adoptions);
