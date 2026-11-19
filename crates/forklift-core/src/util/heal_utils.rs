@@ -826,6 +826,16 @@ mod tests {
         }
     }
 
+    /// A meta ref's copy is written only under the ref lock, so heal re-stages it under the lock
+    /// too; an object is not.
+    /// Revert: drop the meta-copy arm → the copy reads as unguarded → red.
+    #[test]
+    fn a_meta_refs_copy_is_restaged_under_the_ref_lock() {
+        assert!(is_ref_lock_guarded(Path::new("meta-copy/tags")));
+        assert!(is_ref_lock_guarded(Path::new("meta/tags")));
+        assert!(!is_ref_lock_guarded(Path::new("objects/ab/cdef")));
+    }
+
     #[test]
     fn heal_if_tainted_is_a_cheap_ok_when_nothing_is_recorded() {
         let _serial = lock_activation();
