@@ -764,6 +764,27 @@ impl Tools<'_> {
         self.run(&self.forklift, arguments, &self.warehouse, self.environment, STEP_LIMIT, None)
     }
 
+    /// Puts each of `conflicted` back as `ours` has it, or removes it where `ours` has none, then
+    /// aborts the consolidate in progress. For an abort refused over the conflicted files'
+    /// content (FORK-540), so one refused abort does not leave every later row unable to shift.
+    fn settle(&self, ours: &str, conflicted: &BTreeSet<String>) -> Result<(), String> {
+        for path in conflicted {
+            let file = self.warehouse.join(path);
+            let shown = self.git(&["cat-file", "blob", &format!("{}:{}", ours, path)])?;
+            let written = if shown.succeeded() { std::fs::write(&file, &shown.stdout) } else { std::fs::remove_file(&file) };
+            match written {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot put {} back: {}", file.display(), error)),
+            }
+        }
+        let aborted = self.forklift(&["--json", "abort", "--confirm"])?;
+        if !aborted.succeeded() {
+            return Err(said(&aborted));
+        }
+        Ok(())
+    }
+
     /// Forklift's working tree as a git tree id, hashed through an index built from nothing, so
     /// no stat cache from an earlier hash can stand in for a file's content.
     fn forklift_tree(&self) -> Result<String, String> {
@@ -956,7 +977,14 @@ fn replay(tools: &Tools, merge: &str, row: &mut Row) -> Result<(), String> {
         Ok(result) if !result.conflicted.is_empty() || outcome == "conflicts" => {
             let aborted = tools.forklift(&["--json", "abort", "--confirm"])?;
             if !aborted.succeeded() {
-                return Err(format!("aborting the conflicted consolidate failed: {}", said(&aborted)));
+                let refused = format!("aborting the conflicted consolidate failed: {}", said(&aborted));
+                // The row is an error either way. Its conflicted files are put back as the first
+                // parent has them, the way out the refusal names, so the next row starts from a
+                // warehouse with no consolidate in progress.
+                return Err(match tools.settle(&our_id, &result.conflicted) {
+                    Ok(()) => refused,
+                    Err(unsettled) => format!("{}; putting the conflicted files back did not let it abort: {}", refused, unsettled),
+                });
             }
         }
         Ok(_) => {}
@@ -1467,8 +1495,8 @@ mod tests {
     /// counterfactual named by the git merge that shows it: a merge where one side renames a file
     /// the other edits is a rename gap; a criss-cross merge whose virtual base merges clean and
     /// whose single bases conflict is a multi-base gap; a merge of two edits to different lines,
-    /// and the criss-cross's own two merges, agree. Every first parent's checkout matches its
-    /// tree, so no row is an error.
+    /// and the criss-cross's own two merges, agree; a merge conflicted on `.gitignore`, replayed
+    /// first, is an error row whose consolidate the harness still gets out of.
     #[test]
     #[ignore = "needs PROOF_LOAD_FORKLIFT"]
     fn a_constructed_history_comes_to_its_classes() {
@@ -1524,12 +1552,25 @@ mod tests {
         git(&["merge", "-q", "--no-ff", "--no-edit", "lines"]);
         let plain = git(&["rev-parse", "HEAD"]);
 
+        // HEAD's merge, so it is replayed first and the five above come after it.
+        write(".gitignore", "a\n");
+        commit(&source, "ignore a", &scratch, &environment);
+        git(&["switch", "-q", "-c", "ignore"]);
+        write(".gitignore", "b\n");
+        commit(&source, "ignore b", &scratch, &environment);
+        git(&["switch", "-q", "main"]);
+        write(".gitignore", "c\n");
+        commit(&source, "ignore c", &scratch, &environment);
+        git(&["merge", "-q", "-s", "ours", "--no-edit", "ignore"]);
+        let ignored = git(&["rev-parse", "HEAD"]);
+
         let out = scratch.root().join("out");
         let options = ReplayOptions { source, reference: "HEAD".to_string(), out: out.clone(), forklift, git: path_git(), sample: None, seed: None };
         let report = run(&options, &|_| {}).unwrap();
         let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("replay.json")).unwrap()).unwrap();
         let rows: BTreeMap<String, &serde_json::Value> = written["rows"].as_array().unwrap().iter().map(|row| (row["merge"].as_str().unwrap().to_string(), row)).collect();
-        assert_eq!(rows.len(), 5, "{}", report.markdown());
+        assert_eq!(rows.len(), 6, "{}", report.markdown());
+        assert_eq!(written["rows"][0]["merge"], ignored.as_str(), "{}", report.markdown());
         let paths = |merge: &str| rows[merge]["paths"].as_array().unwrap().iter()
             .map(|path| format!("{} {} {}", path["path"].as_str().unwrap(), path["kind"].as_str().unwrap(), path["direction"].as_str().unwrap_or("-")))
             .collect::<Vec<_>>();
@@ -1546,7 +1587,17 @@ mod tests {
         for merge in [&plain, &p2, &q2] {
             assert_eq!(rows[merge]["class"], "agree", "{}: {}", merge, report.markdown());
         }
-        assert!(written["verdict"]["failures"].as_array().unwrap().is_empty(), "{}", report.markdown());
-        assert!(!report.failed());
+
+        // Forklift's abort refuses over the conflicted .gitignore (FORK-540): an error row, and
+        // the one failure, since no entry names this merge. The rows above, all replayed after
+        // it, are not errors, so the harness got the warehouse out of that consolidate.
+        assert_eq!(rows[&ignored]["class"], "error", "{}", report.markdown());
+        let reason = rows[&ignored]["reason"].as_str().unwrap();
+        assert!(reason.starts_with("aborting the conflicted consolidate failed:") && reason.contains("unresolved conflict marker"), "{}", reason);
+        assert!(!reason.contains("did not let it abort"), "{}", reason);
+        let failed: Vec<(&str, &str)> = written["verdict"]["failures"].as_array().unwrap().iter()
+            .map(|failure| (failure["merge"].as_str().unwrap(), failure["kind"].as_str().unwrap())).collect();
+        assert_eq!(failed, [(ignored.as_str(), "error")], "{}", report.markdown());
+        assert!(report.failed());
     }
 }

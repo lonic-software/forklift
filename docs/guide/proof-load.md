@@ -264,7 +264,7 @@ HTTP exchange) and `server-writes.json`, and on Linux the strace traces.
 
 ## 9. How CI runs it
 
-Four workflows run Proof Load, all outside `ci passed`. The two that run fault scenarios continue
+Four workflows run Proof Load, all outside `ci passed`. The jobs that run fault scenarios continue
 on error, so for now they report grades without failing a pull request.
 
 - **`proof load`** runs on every pull request, once per OS, against forklift and forklift-server
@@ -273,6 +273,17 @@ on error, so for now they report grades without failing a pull request.
   CI could make one, it adds a capped volume (a tmpfs on Linux, a RAM disk on macOS) and a folding
   volume (vfat on Linux, exFAT on macOS). `report.md` is added to the job summary, and the JSON
   files, `report.md` and the traces are uploaded.
+- **`proof load replay`**, a second job of the same workflow, runs `replay --ref ${{ github.sha }}`
+  on Linux on every pull request, over Forklift's own history and every one of its merges. On a
+  pull request, `github.sha` is the merge commit that would land it, so that merge is a row too: a
+  difference the pull request introduces shows on that pull request. That merge's id changes on
+  every push, so no path entry can name it. A divergence there is resolved by changing the branch,
+  or by merging the base into it, which makes the merge a commit of the branch with an id an entry
+  can name. Its run step does not continue on error, so a failed verdict fails the job.
+  `replay.md` is added to the job summary, and `replay.md` and `replay.json` are uploaded. The job
+  is only as sensitive as the history is to merges: of the 290 merges replayed when it was added,
+  240 were fast-forwards for Forklift, 45 were real merges and 5 conflicted, and the replay took
+  110 s on macOS release.
 - **`proof load history`** runs weekly on Linux with `--history-from .`, over Forklift's own history.
 - **`proof load perf`** runs `perf --shape small --reps 3 --gate self` on Linux, with a
   forklift-server, on every push to `main` and on a pull request that touches the code the timed
@@ -592,3 +603,159 @@ slower than the other's slowest is clear. One where the ranges overlap is likely
 2 when the run could not go ahead, such as over a non-empty output folder, an unknown shape, both
 `--shape` and `--history-from`, `--gate all` with `--history-from`, a history it cannot mirror or
 read, a side branch the history does not have, or a subject that could not be built. A run that exits 2 writes no `perf.json`.
+
+## 12. Replaying merges
+
+`proof-load replay` replays the two-parent merges of a real git history in Forklift and sets each
+beside git's merge of the same two commits. Like `perf`, it is a separate command from `run` and
+faults nothing. `run` asks whether Forklift keeps what it wrote; `replay` asks whether Forklift's
+merge of two real commits is the merge git would have made.
+
+```sh
+cargo build --release -p forklift -p proof-load
+target/release/proof-load replay --source . --out ../replay-out \
+  --forklift target/release/forklift --git "$(command -v git)"
+```
+
+- `--source` is the git repository whose merges are replayed. It is only read, and a shallow
+  repository is refused. The harness mirrors it into the output folder first and works on the
+  mirror.
+- `--ref` is the commit whose history is replayed: any revision git resolves to a commit, such as a
+  branch, a tag, a commit id or a detached `HEAD`. It defaults to `HEAD`. The mirror is left holding
+  one branch at that commit, so the import reads that history and nothing else.
+- `--out` is an empty or new folder for the scratch area and the report.
+- `--forklift` and `--git` name the two binaries by path.
+- `--sample N` replays the first N merges only. Without it, every merge is replayed.
+- `--seed S` shuffles the merges with that seed before the sample is taken, using the same
+  generator as the fault seeds. Without it, the merges keep `git rev-list --merges` order, newest
+  first.
+
+Each tool runs in the scrubbed environment of section 1. Merges of more than two parents are counted
+in the header and not replayed.
+
+### How a merge is replayed
+
+Before any merge is replayed, the history is rewritten once, and the header counts what was dropped:
+
+- **Gitlink entries** (submodules), which Forklift's import skips.
+- **Changes to `.forkliftignore` files.** A history's own `.forkliftignore` files can predate the
+  current ignore dialect, and Forklift cannot shift away from such a revision (FORK-536). Until that
+  ticket closes, the replay drops them, and the header names the ticket.
+
+Forklift then imports the rewritten mirror once. Each merge M with parents P1 and P2 gets three
+branches, `m-<M>-o`, `m-<M>-t` and `m-<M>-m`, at P1, P2 and M. To replay M, the harness shifts to
+P1's branch and consolidates P2's. Before it compares anything it checks two things, and a row that
+fails either is an `error`:
+
+- the rewritten M still has P1 and P2 as its parents;
+- the tree Forklift checks out for P1 is P1's git tree.
+
+Forklift's tree is hashed with git through a fresh index each time, so a stat cache left by an
+earlier hash never stands in for a file's content. A conflicted consolidate is aborted before the
+next row.
+
+### Comparing with git
+
+Each row has three of git's merges to compare with, all `git merge-tree --write-tree` with
+`merge.conflictStyle=diff3`:
+
+- **G**, git's own merge;
+- **G1**, the same with rename detection off (`-X no-renames`);
+- **G0**, G1 on a single merge base, as Forklift merges. Where the two commits have several bases,
+  git merges them into a virtual base first, while Forklift takes one. G0 is then G1 run against
+  each base in turn, and the run that differs from Forklift's merge at the fewest paths is used,
+  the earliest listed base on a tie.
+
+A path differs between two merges when:
+
+- it is conflicted in one and not the other;
+- or it is clean in both, with different content or present in one only;
+- or it is conflicted in both, and the files still differ once the labels after the conflict
+  markers are taken out.
+
+Each differing path comes to one kind:
+
+| kind | Forklift against git | what it means |
+|---|---|---|
+| `divergence` | Forklift differs from G0 | Forklift's merge differs from git's merge of the same base with no renames. Its subtype says how. |
+| `rename-gap` | Forklift equals G0, and G differs from G1 | The difference is rename detection, which Forklift does not do (FORK-537). |
+| `multi-base-gap` | Forklift equals G0 and G equals G1, but G1 differs from G0 | The difference is the virtual base git builds from several bases (FORK-538). |
+
+A divergence has a subtype:
+
+| subtype | what it means |
+|---|---|
+| `silent-wrong` | Both merged clean, to different content. |
+| `forklift-clean-git-conflicted` | Forklift merged clean where git conflicted. The path row's `equals_committed` says whether Forklift's file is the one the merge commit holds. |
+| `forklift-extra-conflict` | Forklift conflicted where git merged clean. |
+| `conflict-content` | Both conflicted, and the files differ outside the labels. |
+| `record-mismatch` | Forklift merged or fast-forwarded, and a stocktake right after it reports changes. This checks Forklift against itself, once per row, with no path. |
+
+A gap path also has a direction: `forklift-conflicted` or `forklift-clean`.
+
+### Classes
+
+Each row comes to one class:
+
+| class | what it means |
+|---|---|
+| `agree` | No path differs, Forklift merged clean, and its tree is the merge commit's. |
+| `hand-edited` | No path differs and Forklift merged clean, but the merge commit holds another tree: whoever made it changed it after merging. |
+| `agree-conflicted` | No path differs, and both tools conflicted, on the same paths with the same content. |
+| `gap` | At least one path differs, and every one is a gap. |
+| `divergent` | At least one path is a divergence. |
+| `both-refused` | The two commits have no merge base, and neither tool merged them. |
+| `forklift-refused` | Forklift refused where git merged. |
+| `error` | The row could not be replayed or compared: a self-check above failed, a tool failed, or git refused where Forklift merged. |
+
+### Tickets and the verdict
+
+The tickets live in `crates/proof-load/replay-tickets.json`, built into the harness. It holds two
+kinds of entry:
+
+- a **cause entry**, `{"cause": "rename" | "multi-base", "ticket": "FORK-N"}`, covers every gap of
+  that cause, wherever it shows;
+- a **path entry**, `{"merge", "path", "kind", "blob", "ticket"}`, covers one divergence: that merge
+  (its full id), that path, that subtype, and that content of Forklift's file (its git blob id, or
+  `absent`). A `forklift-refused` or `error` row is covered by a path entry of that kind with an
+  empty path and blob.
+
+A path entry covers a path only when all four fields match. When Forklift's merge of that path
+changes, the entry stops matching and the run fails until someone looks.
+
+The run fails on:
+
+- a divergence no path entry covers;
+- a gap whose cause has no entry;
+- a `forklift-refused` or `error` row with no entry.
+
+A cause entry never covers a divergence. An entry that no row of the run matched is listed as
+possibly closable and never fails the run, so in a sampled run the entries of merges outside the
+sample are listed too. A test holds every entry to a `FORK-N` ticket, a full merge id, and a blob id
+or `absent`.
+
+A change that introduces a divergence on purpose adds its entry. The change that fixes it removes
+the entry.
+
+### Reading replay.md
+
+`replay.md` is for reading, and `replay.json` holds the same report for programs, under its own
+format number. `replay.md` has:
+
+1. **Header**: the source, the ref and the commit it resolved to, the sample and the seed, the merge
+   counts, what the rewrite dropped, the tools, the platform, and the import and replay times.
+2. **Classes**: the number of rows in each class.
+3. **Verdict**: every failure, with its merge, path, kind, blob and reason, then the possibly
+   closable entries.
+4. **Rows other than agree**: each row's merge-base count, what each tool came to, its differing
+   paths, and up to 5 hunks.
+
+A hunk is the first `-U3` hunk of the diff between Forklift's file and git's, cut at 40 lines.
+Divergences come before gaps, and the row says how many paths it left out. A divergence is shown
+against G0 and a gap against G. Where both files are conflicted, the diff is taken with the labels
+removed, so the hunk shows the line they differ on. A `silent-wrong` path also gets a hunk against
+the merge commit's file.
+
+`replay` exits 0 when the verdict failed nothing, and 1 when it failed. It exits 2 when the run
+could not go ahead: a non-empty output folder, a shallow or unreadable source, a ref that is not a
+commit, `--sample 0`, or a failed import, for example. A run that exits 2 writes no `replay.json`.

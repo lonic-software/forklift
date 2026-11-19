@@ -1,5 +1,8 @@
 [
   {"cause": "rename", "ticket": "FORK-537"},
   {"cause": "multi-base", "ticket": "FORK-538"},
-  {"merge": "ccb2c0fb411a35e485d24c5c891794fb11d76a10", "path": "docs/PERFORMANCE_BACKLOG.md", "kind": "conflict-content", "blob": "832f8bcbb0c6c53e68b281e07c0c38a0949e47a3", "ticket": "FORK-539"}
+  {"merge": "ccb2c0fb411a35e485d24c5c891794fb11d76a10", "path": "docs/PERFORMANCE_BACKLOG.md", "kind": "conflict-content", "blob": "832f8bcbb0c6c53e68b281e07c0c38a0949e47a3", "ticket": "FORK-539"},
+  {"merge": "907c416534dbf110a4659b64ae65806f2b1e8d4d", "path": "setup.c", "kind": "conflict-content", "blob": "33d70988f8190b5c4cbb6e7d721f08ec33d61515", "ticket": "FORK-539"},
+  {"merge": "e63e62171b489dad8ae9d8bd4675b1938bff92c8", "path": "po/bg.po", "kind": "conflict-content", "blob": "8335309a59bae0def6d617cd9e449021ffbe0a01", "ticket": "FORK-539"},
+  {"merge": "9ed2574798a216becf7ae9c94baa237d27edffc0", "path": "", "kind": "error", "blob": "", "ticket": "FORK-540"}
 ]
