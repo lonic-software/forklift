@@ -2475,6 +2475,13 @@ A command not listed here either reports only the generic human-message shape `{
             "null"
           ]
         },
+        "pallets_unread": {
+          "description": "The pallets whose ref could not be read, so whether their history reaches any of them\ncould not be told.",
+          "items": {
+            "$ref": "#/$defs/UnreadPallet"
+          },
+          "type": "array"
+        },
         "staged": {
           "description": "When `staged_only`, this checkout's staged paths whose content is among them.",
           "items": {
@@ -2966,6 +2973,24 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "required": [
         "checkout",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "UnreadPallet": {
+      "description": "A pallet whose ref could not be read.",
+      "properties": {
+        "pallet": {
+          "description": "The pallet's wire name (`@<name>` for a metadata pallet).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why its ref could not be read.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
         "reason"
       ],
       "type": "object"
