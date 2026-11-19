@@ -461,8 +461,18 @@ fn is_hex(byte: u8) -> bool {
 fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     let run = bytes.iter().take_while(|byte| is_hex(**byte)).count();
     // A pack the store cannot list may hold a match, found or not, so no answer stands beside it.
+    // What the packs cannot list is read once, at the first lookup, for every prefix the bytes
+    // are looked up by; bytes that name no prefix never read it.
+    let unlisted = std::cell::OnceCell::new();
     let matching = |prefix: &str| -> Result<Result<Vec<String>, Salvage>, String> {
-        if let Some(why) = crate::util::pack_utils::prefix_unlisted_reason(prefix)? {
+        let packs = match unlisted.get() {
+            Some(packs) => packs,
+            None => {
+                let read = crate::util::pack_utils::unlisted_packs()?;
+                unlisted.get_or_init(|| read)
+            }
+        };
+        if let Some(why) = packs.reason_for(prefix) {
             return Ok(Err(Salvage::Untold(format!(
                 "what its bytes name cannot be looked up in full, since {}", why
             ))));
@@ -2127,7 +2137,7 @@ mod tests {
 
     // A pack the store cannot list may hold what a damaged ref's bytes name, found or not, so the
     // answer is untold rather than a verdict that admits the ref's removal. Mutations: have
-    // prefix_unlisted_reason answer None → the orphan beside a loose parcel salvages Found, red;
+    // reason_for answer None → the orphan beside a loose parcel salvages Found, red;
     // count a match whose read said nothing of it as unknown → judge says Unknown, red.
     #[test]
     fn a_pack_the_store_cannot_list_leaves_what_a_refs_bytes_name_untold() {
