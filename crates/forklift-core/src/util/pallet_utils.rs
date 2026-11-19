@@ -2816,6 +2816,28 @@ pub(crate) mod tests {
             assert_eq!(copy_state("tags"), ref_bytes(&h2));
         }
 
+        /// A meta ref's repair is a compare-and-set on its copy as well as its ref: a copy that
+        /// moved since heal judged it leaves the ref unwritten, and an unmoved one lets it land.
+        /// Revert: drop the copy check → the ref is written beside the moved copy → red.
+        #[test]
+        fn a_meta_repair_refuses_when_the_copy_moved_since_it_was_judged() {
+            let (_root, _scope) = scratch("meta-repair-copy-moved");
+            let (h1, h2) = (stub_parcel("h1"), stub_parcel("h2"));
+            write("tags", None, &h1).unwrap();
+            file_utils::remove_file(get_pallet_ref_path(PalletNamespace::Meta, "tags")).unwrap();
+            let judged = copy_state("tags");
+            assert_eq!(judged, ref_bytes(&h1));
+
+            set_copy("tags", &h2);
+            let moved = repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE);
+            assert!(matches!(moved, Err(RefUpdateError::Moved(_))), "{:?}", moved);
+            assert_eq!(head("tags"), None, "the ref must stay lost");
+
+            set_copy("tags", &h1);
+            repair_meta_pallet_head("tags", &RefDamage::Missing, &judged, &h1, &RefPreconditions::NONE).unwrap();
+            assert_eq!(head("tags").as_deref(), Some(h1.as_str()));
+        }
+
         /// A birth writes the ref first: a copy that cannot be written fails the write with the
         /// ref born at the new head.
         /// Revert: write the copy first on a birth → the ref is never written → red.

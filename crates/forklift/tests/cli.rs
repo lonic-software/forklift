@@ -7782,9 +7782,10 @@ fn heal_restores_a_lost_trust_file_from_its_copy_and_signing_resumes() {
     assert!(sidecar.exists(), "the stack after heal is signed");
 }
 
-/// A client whose trust file and office ref are both lost, with the copy standing, gets its trust
-/// file back from the copy, which is left as it was; what refuses next is the missing office,
-/// never the trust.
+/// A client whose trust file and office ref are both lost, with the copies standing, gets its trust
+/// file back from the copy, which is left as it was; the office ref, which heal does not rebuild,
+/// is refused as ref_damaged with the hand fix, and what refuses next is the missing office, never
+/// the trust.
 // Revert: require a copy that verifies beside an unborn office → heal writes nothing, and stack
 // refuses trust_damaged.
 #[test]
@@ -7797,10 +7798,12 @@ fn heal_restores_the_trust_file_beside_a_lost_office_from_its_copy() {
 
     let healed = warehouse.run(&["--json", "heal"]);
 
-    assert_eq!(healed.status.code(), Some(0), "{}{}", stdout(&healed), stderr(&healed));
+    assert_eq!(healed.status.code(), Some(53), "{}{}", stdout(&healed), stderr(&healed));
     let value = json(&healed);
-    assert_eq!(value["data"]["trust_restored"]["written"], "trust", "{}", value);
-    let notes = value["data"]["notes"].to_string();
+    assert_eq!(value["error"]["code"], "ref_damaged", "{}", value);
+    assert_eq!(value["error"]["details"]["refs_refused"][0]["pallet"], "@office", "{}", value);
+    assert_eq!(value["error"]["details"]["trust_restored"]["written"], "trust", "{}", value);
+    let notes = value["error"]["details"]["notes"].to_string();
     assert!(notes.contains("The office pallet is unborn beside a trust file"), "{}", notes);
     assert!(notes.contains("by hand") && notes.contains("re-admits any key revoked"), "no remote: the hand fix: {}", notes);
     assert_eq!(std::fs::read(forklift.join("trust")).unwrap(), anchor);

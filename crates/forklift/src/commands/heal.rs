@@ -406,14 +406,6 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 error = forklift_core::error::append_to_message(error,
                     "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.");
             }
-            if let Ok(damaged) = ref_heal::detect_meta(&mut Vec::new()) {
-                if !damaged.is_empty() {
-                    error = forklift_core::error::append_to_message(error, &format!(
-                        "The ref of {} is lost or damaged too; heal judges it again once the taint is resolved.",
-                        damaged.iter().map(|wire| format!("pallet \"{}\"", wire)).collect::<Vec<_>>().join(", ")
-                    ));
-                }
-            }
             return Err(match operation_utils::read() {
                 Ok(Some(operation)) => forklift_core::error::append_to_message(error, &format!(
                     "An interrupted {} also stands in this bay; heal finishes or undoes it once the \
