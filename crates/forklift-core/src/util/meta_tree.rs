@@ -351,8 +351,10 @@ pub trait PalletRules {
     fn knows_schema(&self, schema: &str) -> bool;
 
     /// The pallet's own rules over one parcel's changes (who may write what, what may never
-    /// change). Runs after the substrate's own checks have passed.
-    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String>;
+    /// change). Runs after the substrate's own checks have passed. A rule the read content breaks
+    /// is a [`MetaCheckError::Content`]; a store read that failed keeps what its read said (read
+    /// cells through [`read_checked_cell`] and [`read_checked_cell_in`]).
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), MetaCheckError>;
 
     /// The cell path a resolution names, from how the operator spells it (`lower --keep`).
     fn resolution_path(&self, spelled: &str) -> Result<String, String> {
@@ -795,9 +797,9 @@ fn load_level_checked(path: &str, hash: &str, strict: bool) -> Result<Level, Met
 }
 
 /// The level beneath an entry: its tree's, or nothing for a cell or an absence.
-fn level_of(path: &str,
-            entry: &Entry,
-            load: &mut dyn FnMut(&str, &str) -> Result<Level, String>) -> Result<Level, String> {
+fn level_of<E>(path: &str,
+               entry: &Entry,
+               load: &mut dyn FnMut(&str, &str) -> Result<Level, E>) -> Result<Level, E> {
     match entry {
         Entry::Tree(hash) => load(path, hash),
         _ => Ok(Level::new()),
@@ -810,12 +812,17 @@ fn union_names<'a>(levels: &[&'a Level]) -> BTreeSet<&'a String> {
 
 /// The value at a path in a cells tree.
 fn resolve_entry(cells: Option<&str>, path: &str) -> Result<Entry, String> {
+    resolve_entry_checked(cells, path).map_err(String::from)
+}
+
+/// [`resolve_entry`], whose error says whether it is a verdict on the tree.
+fn resolve_entry_checked(cells: Option<&str>, path: &str) -> Result<Entry, MetaCheckError> {
     let mut current = normalize(root_entry(cells));
     let mut walked = String::new();
 
     for component in path.split('/').filter(|component| !component.is_empty()) {
         current = match &current {
-            Entry::Tree(hash) => load_level(&walked, hash, false)?
+            Entry::Tree(hash) => load_level_checked(&walked, hash, false)?
                 .remove(component)
                 .unwrap_or(Entry::Absent),
             _ => Entry::Absent,
@@ -831,11 +838,11 @@ fn resolve_entry(cells: Option<&str>, path: &str) -> Result<Entry, String> {
 /// Every cell path whose blob differs between `before` and `after`, at cell granularity: a
 /// subtree with the same hash on both sides is never descended into. A cell replaced by a
 /// subtree (or the reverse) is the cell's removal plus every cell of the subtree.
-fn diff_entries(path: &str,
-                before: Entry,
-                after: Entry,
-                load: &mut dyn FnMut(&str, &str) -> Result<Level, String>,
-                out: &mut Vec<CellChange>) -> Result<(), String> {
+fn diff_entries<E>(path: &str,
+                   before: Entry,
+                   after: Entry,
+                   load: &mut dyn FnMut(&str, &str) -> Result<Level, E>,
+                   out: &mut Vec<CellChange>) -> Result<(), E> {
     let before = normalize(before);
     let after = normalize(after);
 
@@ -1185,10 +1192,30 @@ pub fn read_cell_blob(blob: &str, rules: &dyn PalletRules) -> Result<CellRead, S
 
 /// The cell at a path in a `cells/` tree read with [`cells_at`], or `None` when none is there.
 pub fn read_cell_in(cells: Option<&str>, path: &str, rules: &dyn PalletRules) -> Result<Option<CellRead>, String> {
-    match resolve_entry(cells, path)? {
-        Entry::Blob(blob) => Ok(Some(classify_cell(&object_utils::load_blob(&blob)?.content, rules))),
+    read_checked_cell_in(cells, path, rules).map_err(String::from)
+}
+
+/// [`read_cell_in`] for a [`PalletRules::check`]: a failed read keeps what the store's answer
+/// says of the object, and bytes that read but are not a tree or a blob are a verdict.
+pub fn read_checked_cell_in(cells: Option<&str>,
+                            path: &str,
+                            rules: &dyn PalletRules) -> Result<Option<CellRead>, MetaCheckError> {
+    match resolve_entry_checked(cells, path)? {
+        Entry::Blob(blob) => {
+            let blob = object_utils::load_blob_faulted(&blob).map_err(MetaCheckError::of_read)?;
+
+            Ok(Some(classify_cell(&blob.content, rules)))
+        }
         _ => Ok(None),
     }
+}
+
+/// A changed cell's envelope for a [`PalletRules::check`]: a failed read keeps what the store's
+/// answer says of the blob, and a blob that is not a cell is a verdict.
+pub fn read_checked_cell(blob: &str) -> Result<CellEnvelope, MetaCheckError> {
+    let blob = object_utils::load_blob_faulted(blob).map_err(MetaCheckError::of_read)?;
+
+    parse_cell(&blob.content).map_err(MetaCheckError::Content)
 }
 
 /// One parcel that changed a cell, as [`cell_history`] reports it.
@@ -1405,10 +1432,18 @@ pub enum MetaCheckError {
 
 impl MetaCheckError {
     /// A failed object read, as what the store's answer says of the object.
-    fn of_read((message, fault): (String, file_utils::ReadFault)) -> MetaCheckError {
+    pub(crate) fn of_read((message, fault): (String, file_utils::ReadFault)) -> MetaCheckError {
         match fault {
             file_utils::ReadFault::Content => MetaCheckError::Content(message),
             file_utils::ReadFault::Untold => MetaCheckError::Untold(message),
+        }
+    }
+
+    /// The same refusal, its message rewritten and its verdict kept.
+    pub fn map_message(self, rewrite: impl FnOnce(String) -> String) -> MetaCheckError {
+        match self {
+            MetaCheckError::Content(message) => MetaCheckError::Content(rewrite(message)),
+            MetaCheckError::Untold(message) => MetaCheckError::Untold(rewrite(message)),
         }
     }
 
@@ -1555,25 +1590,13 @@ pub fn verify_meta_content(pallet: &str,
 
         // The walk's own refusals are verdicts on the tree; a level that failed to load keeps
         // what its read said.
-        let mut untold = None;
         diff_entries(
             "",
             root_entry(parent_cells.as_deref()),
             root_entry(spine.cells.as_deref()),
-            &mut |path, hash| load_level_checked(path, hash, true).map_err(|error| {
-                if let MetaCheckError::Untold(_) = error {
-                    untold = Some(());
-                }
-                String::from(error)
-            }),
+            &mut |path, hash| load_level_checked(path, hash, true),
             &mut changes,
-        ).map_err(|why| {
-            let error = format!("Parcel {} on @{} is malformed: {}", hash, pallet, why);
-            match untold {
-                Some(()) => MetaCheckError::Untold(error),
-                None => Content(error),
-            }
-        })?;
+        ).map_err(|error| error.map_message(|why| format!("Parcel {} on @{} is malformed: {}", hash, pallet, why)))?;
 
         for change in &changes {
             let Some(after) = &change.after else { continue };
@@ -1600,7 +1623,7 @@ pub fn verify_meta_content(pallet: &str,
             cells: spine.cells.as_deref(),
             changes: &changes,
             admission,
-        }).map_err(|why| Content(format!("Parcel {} on @{} breaks a rule of the pallet: {}", hash, pallet, why)))?;
+        }).map_err(|error| error.map_message(|why| format!("Parcel {} on @{} breaks a rule of the pallet: {}", hash, pallet, why)))?;
 
         parent_spine = Some(spine);
     }
@@ -2364,9 +2387,9 @@ mod tests {
             schema == TEXT
         }
 
-        fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+        fn check(&self, change: &ParcelChange<'_>) -> Result<(), MetaCheckError> {
             match change.changes.iter().find(|c| c.path.starts_with("locked/") && c.before.is_some()) {
-                Some(locked) => Err(format!("{} is locked once set", locked.path)),
+                Some(locked) => Err(MetaCheckError::Content(format!("{} is locked once set", locked.path))),
                 None => Ok(()),
             }
         }

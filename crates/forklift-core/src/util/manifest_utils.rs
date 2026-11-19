@@ -16,6 +16,7 @@
 use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::meta_tree::{
+    MetaCheckError, MetaCheckError::Content,
     self, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange,
 };
 use crate::util::office_utils::{self, OfficeState};
@@ -386,39 +387,39 @@ impl PalletRules for ManifestRules {
         ManifestKind::of_schema(schema).is_some()
     }
 
-    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), MetaCheckError> {
         let owner = operator_leaf(change.attribution.operator());
 
         for cell in change.changes {
-            let path = parse_cell_path(&cell.path)?;
+            let path = parse_cell_path(&cell.path).map_err(Content)?;
 
             if path.owner != owner {
-                return Err(format!(
+                return Err(Content(format!(
                     "the cell at {} sits under another operator's directory, so only they may write or remove it",
                     cell.path
-                ));
+                )));
             }
 
             let Some(after) = &cell.after else { continue };
-            let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
+            let envelope = meta_tree::read_checked_cell(after)?;
             let kind = ManifestKind::parse(path.kind).ok();
 
             // An approval is the writer's directory itself, whatever schema it carries.
             if kind == Some(ManifestKind::Approval) && path.id.is_some() {
-                return Err(format!("the approval at {} is not at its signer's own path", cell.path));
+                return Err(Content(format!("the approval at {} is not at its signer's own path", cell.path)));
             }
 
             let Some(schema_kind) = ManifestKind::of_schema(&envelope.schema) else { continue };
 
             if kind != Some(schema_kind) {
-                return Err(format!(
+                return Err(Content(format!(
                     "the cell at {} holds a {} entry under the {} directory",
                     cell.path, schema_kind.as_str(), path.kind
-                ));
+                )));
             }
 
             let entry = parse_value(path.subject, schema_kind, &envelope.value)
-                .map_err(|why| format!("the value at {} {}", cell.path, why))?;
+                .map_err(|why| Content(format!("the value at {} {}", cell.path, why)))?;
 
             let expected = match schema_kind {
                 ManifestKind::Approval => None,
@@ -426,7 +427,7 @@ impl PalletRules for ManifestRules {
             };
 
             if path.id != expected.as_deref() {
-                return Err(format!("the entry at {} is not at the id its content derives", cell.path));
+                return Err(Content(format!("the entry at {} is not at the id its content derives", cell.path)));
             }
         }
 

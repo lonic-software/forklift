@@ -18,6 +18,7 @@
 use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::meta_tree::{
+    MetaCheckError, MetaCheckError::Content,
     self, CellEnvelope, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange,
 };
 use crate::util::office_utils::{self, OfficeState, Role};
@@ -148,12 +149,12 @@ impl PalletRules for TagsRules {
         schema == TAG_SCHEMA
     }
 
-    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), MetaCheckError> {
         for cell in change.changes {
-            validate_tag_name(&cell.path)?;
+            validate_tag_name(&cell.path).map_err(Content)?;
 
             if cell.before.is_some() {
-                return Err(format!("the tag {} already exists, and a tag is never changed or removed", cell.path));
+                return Err(Content(format!("the tag {} already exists, and a tag is never changed or removed", cell.path)));
             }
 
             let Some(after) = &cell.after else { continue };
@@ -163,14 +164,14 @@ impl PalletRules for TagsRules {
                     .is_some_and(|user| matches!(user.role, Role::Admin));
 
                 if !is_admin {
-                    return Err(format!("the tag {} is signed by {}, who is not an admin", cell.path, operator));
+                    return Err(Content(format!("the tag {} is signed by {}, who is not an admin", cell.path, operator)));
                 }
             }
 
-            let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
+            let envelope = meta_tree::read_checked_cell(after)?;
 
             if envelope.schema == TAG_SCHEMA {
-                parse_value(&cell.path, &envelope.value).map_err(|why| format!("the tag {} {}", cell.path, why))?;
+                parse_value(&cell.path, &envelope.value).map_err(|why| Content(format!("the tag {} {}", cell.path, why)))?;
             }
         }
 

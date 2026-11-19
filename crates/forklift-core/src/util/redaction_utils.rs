@@ -23,6 +23,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::object_type::ObjectType;
 use crate::model::operator::Operator;
 use crate::util::meta_tree::{
+    MetaCheckError, MetaCheckError::Content,
     self, CellEnvelope, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange,
 };
 use crate::util::office_utils::{self, OfficeState, Role};
@@ -183,16 +184,16 @@ impl PalletRules for RedactionsRules {
         schema == REDACTION_SCHEMA
     }
 
-    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), MetaCheckError> {
         for cell in change.changes {
-            validate_redacted_hash(&cell.path)?;
+            validate_redacted_hash(&cell.path).map_err(Content)?;
 
             if cell.before.is_some() {
-                return Err(format!(
+                return Err(Content(format!(
                     "the redaction of {} already exists, and a redaction is never changed or \
                     removed",
                     cell.path
-                ));
+                )));
             }
 
             let Some(after) = &cell.after else { continue };
@@ -202,18 +203,18 @@ impl PalletRules for RedactionsRules {
                     .is_some_and(|user| matches!(user.role, Role::Admin));
 
                 if !is_admin {
-                    return Err(format!(
+                    return Err(Content(format!(
                         "the redaction of {} is signed by {}, who is not an admin",
                         cell.path, operator
-                    ));
+                    )));
                 }
             }
 
-            let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
+            let envelope = meta_tree::read_checked_cell(after)?;
 
             if envelope.schema == REDACTION_SCHEMA {
                 parse_value(&cell.path, &envelope.value)
-                    .map_err(|why| format!("the redaction of {} {}", cell.path, why))?;
+                    .map_err(|why| Content(format!("the redaction of {} {}", cell.path, why)))?;
             }
         }
 
