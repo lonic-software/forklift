@@ -1231,8 +1231,8 @@ fn a_lost_or_stale_copy_beside_an_intact_ref_is_mended() {
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "the ref is not touched");
 }
 
-// The birth order: a folder planted at the copy's path fails the first write's copy, after its
-// ref landed. Reordering a birth to write the copy first leaves no ref, red.
+// A folder planted at the copy's path fails the first write's copy, after its ref landed.
+// Mutation: skip the copy mend → the copy stays absent, red.
 #[test]
 fn a_first_meta_write_whose_copy_failed_stands_and_heal_mends_the_copy() {
     let area = Area::new("meta-birth");
@@ -1247,4 +1247,22 @@ fn a_first_meta_write_whose_copy_failed_stands_and_heal_mends_the_copy() {
     forklift_core::util::file_utils::remove_dir_all(&planted).unwrap();
     area.run_ok(&root, &["heal"]);
     assert_eq!(std::fs::read(&planted).unwrap(), format!("{}\n", landed).into_bytes());
+}
+
+// `--ref` checks the parcel it is given against every meta pallet's history, so the meta refs are
+// rebuilt before it. Mutation: drop the meta pass ahead of `--ref` → @tags is still damaged when
+// main's parcel is checked against it, and that check is skipped with a note, red.
+#[test]
+fn a_damaged_meta_ref_is_rebuilt_before_ref_checks_a_parcel_against_it() {
+    let area = Area::new("meta-before-ref");
+    let (root, _, second) = tagged(&area);
+    let main = head(&root, "main");
+    std::fs::write(ref_path(&root, "main"), &main.as_bytes()[..20]).unwrap();
+    std::fs::write(meta_path(&root, "tags"), &second.as_bytes()[..32]).unwrap();
+
+    let output = area.run_ok(&root, &["heal", "--ref", &format!("main={}", main)]);
+    let said = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(!said.contains("is history of meta pallet"), "{}", said);
+    assert_eq!(head(&root, "main"), main);
+    assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
 }

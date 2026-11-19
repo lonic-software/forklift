@@ -1153,7 +1153,7 @@ pub fn repair_meta(pass: Pass) -> Result<Repair, String> {
 
         if !blocking.is_empty() {
             refuse(format!(
-                "it is verified against the office and checked against the redactions, and the ref of {} is damaged too: rebuild that first",
+                "it is verified against the office and checked against the redactions, and the ref of {} is damaged too: set that first",
                 blocking.iter().map(|wire| format!("pallet \"{}\"", wire)).collect::<Vec<_>>().join(" and ")
             ), candidates);
             continue;
