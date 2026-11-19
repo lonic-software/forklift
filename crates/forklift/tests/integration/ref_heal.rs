@@ -1389,6 +1389,7 @@ fn a_damaged_meta_ref_beside_a_blocked_copy_path_has_one_way_out() {
     let area = Area::new("meta-copy-blocked");
     let (root, _, _) = tagged(&area);
     let copy = meta_copy_path(&root, "tags");
+    let copy_bytes = std::fs::read(&copy).unwrap();
     std::fs::write(meta_path(&root, "tags"), b"not a hash").unwrap();
     forklift_core::util::file_utils::remove_file(&copy).unwrap();
     std::os::unix::fs::symlink(root.join("nowhere"), &copy).unwrap();
@@ -1411,6 +1412,13 @@ fn a_damaged_meta_ref_beside_a_blocked_copy_path_has_one_way_out() {
     assert!(!read.status.success());
     let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
     assert_eq!(read["error"]["next_step"], next_step.replace("run \"forklift heal\" again", "run the command again"), "{}", read);
+
+    // The named way out: the copy's file back at its path, heal rebuilds the ref from it.
+    forklift_core::util::file_utils::remove_file(&copy).unwrap();
+    std::fs::write(&copy, &copy_bytes).unwrap();
+    let data = healed(&area, &root);
+    assert_eq!(rebuilt_meta(&data).len(), 1, "{}", data);
+    assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1", "v2"]);
 }
 
 // A removal of a meta ref heal did not judge says why from that pallet's own note, never
@@ -1437,8 +1445,15 @@ fn a_meta_removal_heal_did_not_judge_says_why_from_that_pallets_own_note() {
     let said = text(&tags.stderr);
     assert!(!tags.status.success(), "{}", text(&tags.stdout));
     assert!(said.contains("Heal did not judge the ref of pallet \"@tags\", for what the note says, so it was not removed"), "{}", said);
-    assert!(said.contains("The copy of pallet \"@tags\"'s ref could not be read"), "{}", said);
+    assert_eq!(said.matches("The copy of pallet \"@tags\"'s ref could not be read").count(), 1, "said once: {}", said);
     assert!(meta_path(&root, "tags").exists(), "nothing was removed");
+
+    // The named step: with what the note names settled, the removal runs, and judges the ref.
+    std::fs::write(meta_path(&root, "tags"), b"not a hash").unwrap();
+    let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    assert!(text(&removal.stderr).contains("The ref of pallet \"@tags\" reads, so there is nothing to remove."), "{}", text(&removal.stderr));
+    assert!(text(&removal.stderr).contains("Rebuilt the ref of pallet \"@tags\""), "{}", text(&removal.stderr));
+    assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1", "v2"]);
 }
 
 // The removal of a meta ref heal refuses as its own, with no taint standing; and refused, writing

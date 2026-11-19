@@ -1081,7 +1081,10 @@ fn not_judged(name: &str, wire: &str, unjudged: &[String], notes: &mut Vec<Strin
         ),
         None if said.is_empty() => format!("Pallet \"{}\" has neither a ref nor a copy, so it reads as unborn and there is nothing to remove.", wire),
         None => {
-            notes.extend(said);
+            // Heal's own pass may have noted it already.
+            for note in said {
+                push_note(notes, note);
+            }
             format!(
                 "Heal did not judge the ref of pallet \"{}\", for what the note says, so it was not removed: what cannot be read cannot be kept. \
                 Settle what the note names, then run the command again.",
