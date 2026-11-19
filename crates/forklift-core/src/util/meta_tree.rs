@@ -1086,17 +1086,16 @@ fn read_pallet_spine(pallet: &str, parcel_hash: &str, expected: MetaKind) -> Res
 
     let spine = match read_spine(&parcel.tree_hash)? {
         Ok(spine) => spine,
-        // The shape an older forklift wrote, told apart from every other: no build reads it, a
-        // newer one included, so it is a verdict on the pallet and upgrading leads nowhere.
+        // The spine is the envelope every build finds its format marker in, so a newer format
+        // stays inside it: a tree that is no spine, or an older forklift's shape with no marker,
+        // is a verdict on the pallet (no build reads it), never a newer build's.
         Err(SpineFault::NoFormat) => return Err(MetaCheckError::Content(format!(
             "The meta pallet @{} has no format marker at {}: it was written by an older forklift, \
             and this one cannot read it.",
             pallet, parcel_hash
         ))),
-        // The spine is read before its format marker is, so no format this build knows vouches
-        // for it: a tree it cannot read as one is no verdict, as bytes it cannot parse are not.
-        Err(SpineFault::Malformed(why)) => return Err(MetaCheckError::Newer(format!(
-            "The meta pallet @{} at {} is not laid out as any spine this build of Forklift knows: {}.", pallet, parcel_hash, why
+        Err(SpineFault::Malformed(why)) => return Err(MetaCheckError::Content(format!(
+            "The meta pallet @{} is malformed at {}: {}.", pallet, parcel_hash, why
         ))),
     };
 
@@ -1602,13 +1601,12 @@ pub fn verify_meta_content(pallet: &str,
 
         let spine = match read_spine(&parcel.tree_hash)? {
             Ok(spine) => spine,
-            // As `read_pallet_spine` judges them: an older forklift's shape is a verdict, a tree
-            // laid out as no spine this build knows is not.
+            // Verdicts, as `read_pallet_spine` judges them: a newer format stays inside the spine.
             Err(SpineFault::NoFormat) => return Err(Content(format!(
                 "Parcel {} on @{} has no format marker.", hash, pallet
             ))),
-            Err(SpineFault::Malformed(why)) => return Err(MetaCheckError::Newer(format!(
-                "Parcel {} on @{} is not laid out as any spine this build of Forklift knows: {}.", hash, pallet, why
+            Err(SpineFault::Malformed(why)) => return Err(Content(format!(
+                "Parcel {} on @{} is malformed: {}.", hash, pallet, why
             ))),
         };
 
@@ -3576,13 +3574,14 @@ mod tests {
         // the pallet's own is.
         let typed = |head: &str| verify_meta_content(PALLET, &TestRules, Some(&office), &[], Admission::Admit, None, head).unwrap_err();
         assert!(matches!(typed(&newer), MetaCheckError::Newer(_)), "{:?}", typed(&newer));
-        // An older forklift's shape, with no marker, is a verdict: no build reads it, so an
-        // upgrade leads nowhere. A tree laid out as no spine this build knows is not.
+        // A newer format stays inside the spine every build finds its marker in, so an older
+        // forklift's shape with no marker, and a tree that is no spine, are verdicts: an
+        // upgrade would lead nowhere.
         let older = stack_meta_parcel(tree(&[]), Vec::new(), &actor("alice"), "join", Some(&alice.signer())).unwrap();
         assert!(matches!(typed(&older), MetaCheckError::Content(_)), "older: {:?}", typed(&older));
         let unknown_tree = tree(&[(".forklift", b(&blob("1")))]);
         let unknown = stack_meta_parcel(unknown_tree, Vec::new(), &actor("alice"), "unknown", Some(&alice.signer())).unwrap();
-        assert!(matches!(typed(&unknown), MetaCheckError::Newer(_)), "unknown spine: {:?}", typed(&unknown));
+        assert!(matches!(typed(&unknown), MetaCheckError::Content(_)), "no spine: {:?}", typed(&unknown));
         // So is a signature in a version this build does not read; one in the version it reads
         // that does not parse is a verdict.
         let signed = forge(&[], &kv(), root.as_deref(), &alice.signer());
