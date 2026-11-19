@@ -1605,46 +1605,66 @@ fn only_pack(root: &Path) -> PathBuf {
     packs[0].with_extension("")
 }
 
-// A lost meta ref whose copy's head sits only in a pack whose data file is lost beside its index
-// is no verdict on the ref: the head is unread, never decided absent. The refusal's reason carries
-// no frame of the read error's own step, the removal is refused, and once the data file is back
-// heal rebuilds the ref. An index lost beside its data file is heal's own to settle: it rebuilds the index, then
-// the ref, in one run.
-// Mutations: read pack damage as the store's verdict → next_step is the removal, red; keep the read
-// error's frame in the reason → the reason names a step of its own, red.
+// A lost meta ref whose copy's head sits only in a pack the store cannot read in full is no
+// verdict on the ref: the head is unread, never decided absent. An index lost beside its data file
+// is heal's own to settle: it rebuilds the index, then the ref, in one run. A data file lost, or one
+// heal cannot read beside a lost index, leaves the head unread: the refusal's reason carries no
+// frame of the read error's own step, the removal is refused, and once the file reads again heal
+// rebuilds the ref.
+// Mutations: read pack damage or an unindexed data file as the store's verdict → the removal is
+// admitted, red; keep the read error's frame in the reason → it names "forklift heal", red.
 #[test]
 fn a_meta_head_in_a_pack_the_store_cannot_read_in_full_is_unread() {
-    for case in ["index lost", "data lost"] {
+    let cases: &[&str] = if cfg!(unix) { &["index lost", "data lost", "data unreadable"] } else { &["index lost", "data lost"] };
+    for case in cases.iter().copied() {
         let area = Area::new(&format!("meta-pack-{}", case.replace(' ', "-")));
         let (root, _, second) = tagged(&area);
         area.run_ok(&root, &["store", "compact", "--all"]);
         assert!(!loose_object(&root, &second).exists(), "the head is packed");
         let pack = only_pack(&root);
-        let moved = match case {
-            "index lost" => pack.with_extension("idx"),
-            _ => pack.with_extension("pack"),
-        };
         let saved = area.base.join("saved");
-        forklift_core::util::file_utils::rename(&moved, &saved).unwrap();
+        match case {
+            "index lost" => forklift_core::util::file_utils::rename(&pack.with_extension("idx"), &saved).unwrap(),
+            "data lost" => forklift_core::util::file_utils::rename(&pack.with_extension("pack"), &saved).unwrap(),
+            // An index lost beside a data file heal cannot read: the index cannot be rebuilt, so
+            // whether the head is in it stays undecided.
+            _ => {
+                forklift_core::util::file_utils::rename(&pack.with_extension("idx"), &saved).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(pack.with_extension("pack"), std::fs::Permissions::from_mode(0o000)).unwrap();
+                }
+            }
+        }
         forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
 
-        if case == "data lost" {
-            // The lost pack holds the warehouse's history too, so heal refuses on the lost
-            // objects first; the ref's refusal stands beside it.
+        if case != "index lost" {
+            // The pack holds the warehouse's history too, so heal refuses on the lost objects
+            // first; the ref's refusal stands beside it.
             let output = area.run(&root, &["--json", "heal"]);
-            assert_eq!(output.status.code(), Some(58), "{}{}", text(&output.stdout), text(&output.stderr));
+            let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+            match case {
+                "data lost" => forklift_core::util::file_utils::rename(&saved, &pack.with_extension("pack")).unwrap(),
+                _ => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(pack.with_extension("pack"), std::fs::Permissions::from_mode(0o644)).unwrap();
+                    }
+                }
+            }
+            assert_eq!(output.status.code(), Some(58), "{}: {}{}", case, text(&output.stdout), text(&output.stderr));
             let refused: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             let refs = refused["error"]["details"]["refs_refused"].as_array().unwrap();
-            assert_eq!(refs.len(), 1, "{}", refused);
-            assert_eq!(refs[0]["pallet"], "@tags", "{}", refused);
+            assert_eq!(refs.len(), 1, "{}: {}", case, refused);
+            assert_eq!(refs[0]["pallet"], "@tags", "{}: {}", case, refused);
             let reason = refs[0]["reason"].as_str().unwrap();
-            assert!(reason.contains(&format!("Object {} cannot be read", second)), "{}", refused);
-            assert!(!reason.contains("Next step"), "{}", refused);
-            let removal = area.run(&root, &["heal", "--remove-ref", "@tags"]);
-            assert!(!removal.status.success(), "{}", text(&removal.stdout));
-            assert!(text(&removal.stderr).contains("heal could not read what it needs to judge it"), "{}", text(&removal.stderr));
+            assert!(reason.contains(&format!("parcel {} does not pass verification: ", second)), "{}: {}", case, refused);
+            assert!(!reason.contains("forklift heal"), "{}: {}", case, refused);
+            assert!(!removal.status.success(), "{}: {}", case, text(&removal.stdout));
+            assert!(text(&removal.stderr).contains("heal could not read what it needs to judge it"), "{}: {}", case, text(&removal.stderr));
             assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
-            forklift_core::util::file_utils::rename(&saved, &moved).unwrap();
         }
         assert_eq!(rebuilt_meta(&healed(&area, &root)), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", case);
         assert_eq!(tag_names(&tag_list(&area, &root)).len(), 2, "{}", case);
