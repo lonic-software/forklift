@@ -1350,7 +1350,7 @@ fn sorted(mut rebuilt: Vec<(String, String, String)>) -> Vec<(String, String, St
 // read, so that case is red too.
 #[test]
 fn a_lost_or_damaged_redactions_ref_is_rebuilt_from_its_copy_ahead_of_the_refs_checked_against_it() {
-    for lost in [false, true] {
+    for lost in [true, false] {
         let area = Area::new(if lost { "redactions-lost" } else { "redactions-damaged" });
         let (root, _, second) = tagged(&area);
         let redactions = redacted(&area, &root);
@@ -1374,7 +1374,7 @@ fn a_lost_or_damaged_redactions_ref_is_rebuilt_from_its_copy_ahead_of_the_refs_c
 // refused where it is read, red in both cases.
 #[test]
 fn a_lost_or_damaged_office_beside_a_lost_or_damaged_redactions_ref_is_rebuilt_with_it() {
-    for lost in [false, true] {
+    for lost in [true, false] {
         let area = Area::new(if lost { "office-redactions-lost" } else { "office-redactions-damaged" });
         let (root, _, _) = tagged(&area);
         area.run_ok(&root, &["office", "enroll"]);
