@@ -141,7 +141,10 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
     let mut previous_state: Option<OfficeState> = None;
 
     for hash in &chain {
-        let (shaped, state) = crate::util::office_utils::check_office_parcel_shape(hash).map_err(Inauthentic)?;
+        let (shaped, state) = crate::util::office_utils::check_office_parcel_shape_faulted(hash).map_err(|error| match error {
+            crate::util::office_utils::OfficeShapeError::NotOffice(message) => Inauthentic(message),
+            crate::util::office_utils::OfficeShapeError::Unread(message, fault) => Unreadable(message, fault),
+        })?;
 
         if *hash == anchor.genesis && !shaped.parents.is_empty() {
             return Err(Inauthentic(format!(

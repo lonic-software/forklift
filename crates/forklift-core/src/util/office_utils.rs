@@ -1154,10 +1154,43 @@ pub fn collect_trust_pin_roots(policy: TrustPinReadPolicy) -> Result<TrustPinRoo
 /// * `Ok((Parcel, OfficeState))` - The parcel and the state its records hold.
 /// * `Err(String)`               - The refusal, or why an object could not be read.
 pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<(Parcel, OfficeState), String> {
-    let parcel = object_utils::load_parcel(office_parcel_hash)?;
+    check_office_parcel_shape_faulted(office_parcel_hash).map_err(String::from)
+}
+
+/// Why [`check_office_parcel_shape_faulted`] refused.
+#[derive(Debug)]
+pub(crate) enum OfficeShapeError {
+    /// What the store gave is not of office shape, or a record in it does not parse: a verdict
+    /// on the parcel.
+    NotOffice(String),
+
+    /// An object could not be read, with what the store's answer says of it.
+    Unread(String, crate::util::file_utils::ReadFault),
+}
+
+impl From<(String, crate::util::file_utils::ReadFault)> for OfficeShapeError {
+    fn from((message, fault): (String, crate::util::file_utils::ReadFault)) -> OfficeShapeError {
+        OfficeShapeError::Unread(message, fault)
+    }
+}
+
+impl From<OfficeShapeError> for String {
+    fn from(error: OfficeShapeError) -> String {
+        match error {
+            OfficeShapeError::NotOffice(message) | OfficeShapeError::Unread(message, _) => message,
+        }
+    }
+}
+
+/// [`check_office_parcel_shape`], telling a refusal of what the store gave from a read it could
+/// not make.
+pub(crate) fn check_office_parcel_shape_faulted(office_parcel_hash: &str) -> Result<(Parcel, OfficeState), OfficeShapeError> {
+    use OfficeShapeError::NotOffice;
+
+    let parcel = object_utils::load_parcel_faulted(office_parcel_hash)?;
 
     if parcel.parents.len() > 1 {
-        return Err(not_office_shape(office_parcel_hash, &format!("has {} parents", parcel.parents.len())));
+        return Err(NotOffice(not_office_shape(office_parcel_hash, &format!("has {} parents", parcel.parents.len()))));
     }
 
     let mut tree_hash = parcel.tree_hash.clone();
@@ -1167,19 +1200,19 @@ pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<(Parcel, Of
         (TREE_NAME_FORKLIFT, &[TREE_NAME_TRACKED][..]),
         (TREE_NAME_TRACKED, &[TREE_NAME_USERS, TREE_NAME_KEYS][..]),
     ] {
-        let tree = object_utils::load_tree(&tree_hash)?;
+        let tree = object_utils::load_tree_faulted(&tree_hash)?;
 
         if let Some((file, _)) = tree.get_files().next() {
-            return Err(not_office_shape(office_parcel_hash, &format!("holds a file {} in {}", file, at)));
+            return Err(NotOffice(not_office_shape(office_parcel_hash, &format!("holds a file {} in {}", file, at))));
         }
 
         if let Some((other, _)) = tree.get_subtrees().find(|(name, _)| !expected.contains(&name.as_str())) {
-            return Err(not_office_shape(office_parcel_hash, &format!("holds a folder {} in {}", other, at)));
+            return Err(NotOffice(not_office_shape(office_parcel_hash, &format!("holds a folder {} in {}", other, at))));
         }
 
         for wanted in expected {
             let Some((_, subtree)) = tree.get_subtrees().find(|(name, _)| name == wanted) else {
-                return Err(not_office_shape(office_parcel_hash, &format!("has no folder {} in {}", wanted, at)));
+                return Err(NotOffice(not_office_shape(office_parcel_hash, &format!("has no folder {} in {}", wanted, at))));
             };
 
             tree_hash = subtree.hash.clone();
@@ -1187,7 +1220,7 @@ pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<(Parcel, Of
     }
 
     // What `users` and `keys` hold: only record files, named for what they hold.
-    let state = read_office_state_of(office_parcel_hash)?;
+    let state = read_office_state_of_faulted(office_parcel_hash)?;
 
     Ok((parcel, state))
 }
@@ -1300,7 +1333,7 @@ fn load_object_classified<T>(
     }
 }
 
-/// [`resolve_subtree`], classified the same way [`load_object_classified`] classifies a single
+/// [`resolve_subtree_faulted`], classified the same way [`load_object_classified`] classifies a single
 /// object load — each tree along `path` is read through the one classified read, so an absent one
 /// is [`OfficeReadErrorKind::AbsentObject`] by construction (from
 /// [`file_utils::StoreReadOutcome::Absent`]), never guessed from a deeper loader's error text.
@@ -1817,12 +1850,9 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
 
     match crate::util::audit_utils::verify_office_chain_memoized(&anchor, office_head) {
         Ok(_) => Ok(TrustJudged::Usable),
-        // A parcel the store cannot give says nothing of the anchor; nor does a coded refusal met
-        // past the walk, such as a key object that does not read.
+        // An object the store could not give keeps what its read said; every other refusal is
+        // the walk's verdict on what it read.
         Err(crate::util::audit_utils::OfficeChainError::Unreadable(why, fault)) => Err((why, fault)),
-        Err(refused) if crate::error::frames_in(refused.message()).next().is_some() => {
-            Err((refused.message().to_string(), crate::util::file_utils::ReadFault::Untold))
-        }
         Err(_) => Ok(TrustJudged::Unverified(anchor)),
     }
 }
@@ -2636,12 +2666,20 @@ pub fn read_office_state_and_head() -> Result<(OfficeState, Option<String>), Str
 /// * `Ok(OfficeState)` - The state.
 /// * `Err(String)`     - If an object or record could not be read.
 pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, String> {
-    let tree_hash = object_utils::load_parcel(office_parcel_hash)?.tree_hash;
+    read_office_state_of_faulted(office_parcel_hash).map_err(String::from)
+}
+
+/// [`read_office_state_of`], telling records that are not an office's from a read it could not
+/// make.
+fn read_office_state_of_faulted(office_parcel_hash: &str) -> Result<OfficeState, OfficeShapeError> {
+    use OfficeShapeError::NotOffice;
+
+    let tree_hash = object_utils::load_parcel_faulted(office_parcel_hash)?.tree_hash;
 
     let mut users: Vec<UserRecord> = Vec::new();
     let mut keys: Vec<KeyRecord> = Vec::new();
 
-    let Some(tracked) = resolve_subtree(
+    let Some(tracked) = resolve_subtree_faulted(
         office_parcel_hash, &tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED],
     )? else {
         return Ok(OfficeState { users, keys });
@@ -2651,55 +2689,57 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
     // such records.
     if let Some((name, _)) = tracked.get_files()
         .find(|(name, _)| name.as_str() == TREE_NAME_USERS || name.as_str() == TREE_NAME_KEYS) {
-        return Err(file_in_place_of_folder(
+        return Err(NotOffice(file_in_place_of_folder(
             office_parcel_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, name.as_str()],
-        ));
+        )));
     }
 
     for (name, item) in tracked.get_subtrees() {
-        let subtree = object_utils::load_tree(&item.hash)?;
+        let subtree = object_utils::load_tree_faulted(&item.hash)?;
 
         if name == TREE_NAME_USERS || name == TREE_NAME_KEYS {
             if let Some((nested, _)) = subtree.get_subtrees().next() {
-                return Err(format!(
+                return Err(NotOffice(format!(
                     "The office parcel {} holds a folder {}/{}, but {}/ holds only record files. \
                     Forklift never writes a folder there, so this office may have been tampered with.",
                     office_parcel_hash, name, nested, name
-                ));
+                )));
             }
         }
 
         // A record that cannot be loaded or does not parse is named by parcel and file, as a
-        // misfiled one is.
-        let unreadable = |file_name: &str, error: String| format!(
-            "The office parcel {} holds a record {}/{} that cannot be read: {}",
-            office_parcel_hash, name, file_name, error
-        );
-        let unparseable = |file_name: &str, error: String| format!(
+        // misfiled one is; one the store could not give keeps what its read said.
+        let unreadable = |file_name: &str, (error, fault): (String, crate::util::file_utils::ReadFault)| {
+            OfficeShapeError::Unread(format!(
+                "The office parcel {} holds a record {}/{} that cannot be read: {}",
+                office_parcel_hash, name, file_name, error
+            ), fault)
+        };
+        let unparseable = |file_name: &str, error: String| NotOffice(format!(
             "The office parcel {} holds a record {}/{} that does not parse: {}",
             office_parcel_hash, name, file_name, error
-        );
+        ));
 
         match name.as_str() {
             TREE_NAME_USERS => {
                 for (file_name, file) in subtree.get_files() {
-                    let toml = load_record(&file.hash).map_err(|e| unreadable(file_name, e))?;
+                    let toml = load_record_faulted(&file.hash).map_err(|e| unreadable(file_name, e))?;
                     let user = parse_user_record(&toml).map_err(|e| unparseable(file_name, e))?;
                     verify_record_file_name(
                         office_parcel_hash, TREE_NAME_USERS, file_name,
                         &user_record_file_name(&user), &format!("user {}", user.identifier),
-                    )?;
+                    ).map_err(NotOffice)?;
                     users.push(user);
                 }
             }
             TREE_NAME_KEYS => {
                 for (file_name, file) in subtree.get_files() {
-                    let toml = load_record(&file.hash).map_err(|e| unreadable(file_name, e))?;
+                    let toml = load_record_faulted(&file.hash).map_err(|e| unreadable(file_name, e))?;
                     let key = parse_key_record(&toml).map_err(|e| unparseable(file_name, e))?;
                     verify_record_file_name(
                         office_parcel_hash, TREE_NAME_KEYS, file_name,
                         &key_record_file_name(&key), &format!("key {}", key.key_id),
-                    )?;
+                    ).map_err(NotOffice)?;
                     keys.push(key);
                 }
             }
@@ -2874,13 +2914,14 @@ fn store_record(toml: &str) -> Result<String, String> {
     Ok(object.hash)
 }
 
-/// Load one record blob as a string.
-fn load_record(hash: &str) -> Result<String, String> {
-    String::from_utf8(object_utils::load_blob(hash)?.content)
-        .map_err(|_| format!("The metadata record {} is not valid UTF-8.", hash))
+/// Load one record blob as a string. The error says what it tells of the record: a blob that is
+/// not UTF-8 is [`ReadFault::Content`](crate::util::file_utils::ReadFault::Content).
+fn load_record_faulted(hash: &str) -> Result<String, (String, crate::util::file_utils::ReadFault)> {
+    String::from_utf8(object_utils::load_blob_faulted(hash)?.content)
+        .map_err(|_| (format!("The metadata record {} is not valid UTF-8.", hash), crate::util::file_utils::ReadFault::Content))
 }
 
-/// [`load_record`]'s bytes-in-hand sibling — parses a record blob's content as a string from an
+/// [`load_record_faulted`]'s bytes-in-hand sibling — parses a record blob's content as a string from an
 /// already-in-hand classified read's bytes, rather than triggering a second, independent read of
 /// the same hash. See [`object_utils::parse_local_tree_bytes`]'s own doc comment for why
 /// [`load_object_classified`] needs this shape.
@@ -2892,16 +2933,16 @@ fn parse_record_bytes(hash: &str, bytes: &[u8]) -> Result<String, String> {
 /// Resolve a chain of subtree names from a root tree.
 ///
 /// # Returns
-/// * `Ok(Some(TreeItem))` - The resolved (loaded) subtree.
-/// * `Ok(None)`           - If a component does not exist.
-/// * `Err(String)`        - If a tree object could not be loaded, or a component is a file.
-fn resolve_subtree(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str])
-    -> Result<Option<TreeItem>, String> {
-    let mut current = object_utils::load_tree(root_tree_hash)?;
+/// * `Ok(Some(TreeItem))`    - The resolved (loaded) subtree.
+/// * `Ok(None)`              - If a component does not exist.
+/// * `Err(OfficeShapeError)` - If a tree object could not be loaded, or a component is a file.
+fn resolve_subtree_faulted(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str])
+    -> Result<Option<TreeItem>, OfficeShapeError> {
+    let mut current = object_utils::load_tree_faulted(root_tree_hash)?;
 
     for (depth, component) in path.iter().enumerate() {
         if current.get_files().any(|(name, _)| name == component) {
-            return Err(file_in_place_of_folder(office_parcel_hash, &path[..=depth]));
+            return Err(OfficeShapeError::NotOffice(file_in_place_of_folder(office_parcel_hash, &path[..=depth])));
         }
 
         let subtree_hash = current.get_subtrees()
@@ -2909,7 +2950,7 @@ fn resolve_subtree(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str]
             .map(|(_, item)| item.hash.clone());
 
         match subtree_hash {
-            Some(hash) => current = object_utils::load_tree(&hash)?,
+            Some(hash) => current = object_utils::load_tree_faulted(&hash)?,
             None => return Ok(None),
         }
     }
