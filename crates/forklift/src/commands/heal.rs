@@ -411,6 +411,13 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 error = forklift_core::error::append_to_message(error,
                     "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.");
             }
+            // The meta refs the pass before the taint rebuilt are named above. What it left is
+            // judged by the pass after the taint, which this run does not reach.
+            if let Ok(damaged) = ref_heal::detect_meta(&mut Vec::new()) {
+                if let Some(line) = meta_waiting_sentence(&damaged) {
+                    error = forklift_core::error::append_to_message(error, &line);
+                }
+            }
             return Err(match operation_utils::read() {
                 Ok(Some(operation)) => forklift_core::error::append_to_message(error, &format!(
                     "An interrupted {} also stands in this bay; heal finishes or undoes it once the \
@@ -1499,6 +1506,20 @@ fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
     sentence
 }
 
+/// The sentence a taint refusal carries for the meta refs `damaged` (as `@<name>`) still lost or
+/// damaged, or `None` for none.
+fn meta_waiting_sentence(damaged: &[String]) -> Option<String> {
+    let named = damaged.iter().map(|wire| format!("\"{}\"", wire)).collect::<Vec<_>>();
+    match named.as_slice() {
+        [] => None,
+        [one] => Some(format!("The ref of pallet {} is lost or damaged too; heal judges it again once the taint is resolved.", one)),
+        [rest @ .., last] => Some(format!(
+            "The refs of pallets {} and {} are lost or damaged too; heal judges them again once the taint is resolved.",
+            rest.join(", "), last
+        )),
+    }
+}
+
 fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {
     format!("Rebuilt the ref of pallet \"{}\" at {}, from {}.", rebuilt.pallet, rebuilt.head, rebuilt.source)
 }
@@ -2159,7 +2180,27 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::unload_step_when;
+    use super::{meta_waiting_sentence, unload_step_when};
+
+    #[test]
+    fn a_taint_refusal_names_every_meta_ref_left_waiting_once() {
+        let wires = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(meta_waiting_sentence(&[]), None);
+        assert_eq!(
+            meta_waiting_sentence(&wires(&["@tags"])).as_deref(),
+            Some("The ref of pallet \"@tags\" is lost or damaged too; heal judges it again once the taint is resolved.")
+        );
+        assert_eq!(
+            meta_waiting_sentence(&wires(&["@kv", "@tags"])).as_deref(),
+            Some("The refs of pallets \"@kv\" and \"@tags\" are lost or damaged too; heal judges them again once the taint \
+            is resolved.")
+        );
+        assert_eq!(
+            meta_waiting_sentence(&wires(&["@haul", "@kv", "@tags"])).as_deref(),
+            Some("The refs of pallets \"@haul\", \"@kv\" and \"@tags\" are lost or damaged too; heal judges them again once \
+            the taint is resolved.")
+        );
+    }
 
     #[test]
     fn the_unload_step_quotes_each_path_or_lists_them_behind_a_placeholder() {

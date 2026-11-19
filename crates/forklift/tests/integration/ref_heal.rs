@@ -1422,3 +1422,75 @@ fn a_damaged_meta_ref_is_rebuilt_before_ref_checks_a_parcel_against_it() {
     assert_eq!(head(&root, "main"), main);
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
 }
+
+/// Plant a complete taint in the warehouse at `root` recording the loose files of `hashes`, as a
+/// crash before their writes were synced leaves it.
+fn plant_taint(root: &Path, hashes: &[&str]) {
+    let dir = forklift_core::util::taint_utils::taint_dir_path_under(root);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = hashes.iter().map(|hash| format!("objects/{}/{}", &hash[..2], &hash[2..]));
+    std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
+}
+
+/// A meta ref and a taint. Lost beside a copy that verifies, the ref is rebuilt before the taint
+/// recovery, and a refusal there names the rebuild. Damaged so that what its own bytes name is an
+/// object the taint records, it waits: a refusal there says it is judged again once the taint is
+/// resolved, and when the recovery resolves the taint, the pass after it rebuilds the ref.
+// Mutations: drop the waiting line → "deferred" red; read a write that landed under the taint and
+// reported its error as not landed → "rebuilt" red (written, never named); skip the meta pass
+// after the taint → "resolved" red.
+#[test]
+fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once_it_is_resolved() {
+    for case in ["rebuilt", "deferred", "resolved"] {
+        let area = Area::new(&format!("meta-taint-{}", case));
+        let (root, _, second) = tagged(&area);
+        let mut tainted = vec![second.clone()];
+
+        // A parcel only `side` reaches, gone and recorded: no remote can give it back, so the
+        // taint stands and the run stops there.
+        if case != "resolved" {
+            area.run_ok(&root, &["pallet", "create", "side"]);
+            area.run_ok(&root, &["shift", "side"]);
+            area.stack(&root, "d.txt", "side only");
+            area.run_ok(&root, &["shift", "main"]);
+            let side = head(&root, "side");
+            forklift_core::util::file_utils::remove_file(&loose_object(&root, &side)).unwrap();
+            tainted.push(side);
+        }
+
+        match case {
+            "rebuilt" => break_meta(&root, "tags", true),
+            _ => std::fs::write(meta_path(&root, "tags"), &second.as_bytes()[..32]).unwrap(),
+        }
+        let broken = std::fs::read(meta_path(&root, "tags")).ok();
+        plant_taint(&root, &tainted.iter().map(String::as_str).collect::<Vec<_>>());
+
+        if case == "resolved" {
+            let data = healed(&area, &root);
+            assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
+            assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
+            let listed = text(&area.run_ok(&root, &["tag", "list"]).stdout);
+            assert!(listed.contains("v1") && listed.contains("v2"), "{}", listed);
+            continue;
+        }
+
+        let output = area.run(&root, &["--json", "heal"]);
+        assert_eq!(output.status.code(), Some(21), "{}: {}{}", case, text(&output.stdout), text(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "durability_taint", "{}: {}", case, value);
+        let message = value["error"]["message"].as_str().unwrap();
+        let rebuilt = format!("Rebuilt the ref of pallet \"@tags\" at {}, from the ref's copy.", second);
+        let waiting = "The ref of pallet \"@tags\" is lost or damaged too; heal judges it again once the taint is resolved.";
+
+        match case {
+            "rebuilt" => {
+                assert!(message.contains(&rebuilt) && !message.contains("lost or damaged too"), "{}", message);
+                assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
+            }
+            _ => {
+                assert!(message.contains(waiting) && !message.contains("Rebuilt the ref of pallet \"@tags\""), "{}", message);
+                assert_eq!(std::fs::read(meta_path(&root, "tags")).ok(), broken, "the deferred ref is left as it was");
+            }
+        }
+    }
+}

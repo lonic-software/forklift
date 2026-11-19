@@ -966,6 +966,14 @@ fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
     Ok(states)
 }
 
+/// The meta pallets whose ref is lost beside its copy or does not hold a head, as `@<name>`.
+///
+/// # Returns
+/// * `Err(String)` - If the meta refs or their copies could not be listed.
+pub fn detect_meta(notes: &mut Vec<String>) -> Result<Vec<String>, String> {
+    Ok(meta_states(notes)?.iter().filter(|state| state.damage().is_some()).map(MetaState::wire).collect())
+}
+
 /// Whether `head` is `ancestor` or descends from it along first parents.
 fn first_parent_descends(head: &str, ancestor: &str) -> Result<bool, String> {
     let mut at = head.to_string();
