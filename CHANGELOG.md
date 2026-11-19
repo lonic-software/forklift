@@ -54,7 +54,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   where what it needs is in a format this Forklift does not know (an object, a record or a signature
   a newer version wrote), upgrading; and where the trust state refuses, `heal` again when it restores
   the trust file from its copy, else a way out of that refusal (a lost anchor's, or one the trust
-  file's own refusal names) or settling why the office does not verify. A command that reads a damaged metadata
+  file's own refusal names) or settling why the office does not verify. A parcel of its history
+  written unsigned after trust (its cells name the operator that wrote it) is a reason of the ref's
+  own; one whose signature is lost, there or on the office pallet, refuses as `signature_missing`
+  (exit 71), naming a backup or a fresh clone. A command that reads a damaged metadata
   ref never names the removal: it names `forklift heal`, or, where `heal` would not judge the ref
   (its copy cannot be read, or something that is not a file stands at the ref's or the copy's path),
   the step that lets it. A removal stopped after the ref went still reports it, and a rerun

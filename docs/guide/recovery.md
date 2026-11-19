@@ -766,7 +766,8 @@ a remote, the damage is in the server's store: ask its operator.
 
 ### `signature_missing` (exit 71)
 
-A parcel stacked after trust was established carries no signature. A lost signature and a stripped
+A parcel stacked after trust was established, or a parcel of the office pallet, carries no
+signature. A lost signature and a stripped
 one look alike, so the warehouse may have been tampered with. As for `signature_damaged`, restore the
 objects from a backup or clone again from a remote you trust. Signing the parcel now would not tell
 you who stacked it.
