@@ -228,6 +228,10 @@ enum Salvage {
 
     /// A match whose kind cannot be read, or that is tainted.
     Unknown(String),
+
+    /// A match whose kind cannot be read, where the store's read said nothing of the object: it
+    /// could not be consulted, or left the answer undecided. A later heal may read it.
+    Untold(String),
 }
 
 /// Everything the warehouse says about one pallet's head.
@@ -414,7 +418,7 @@ fn gather(damaged: &DamagedRef, tainted: &Tainted, notes: &mut Vec<String>) -> E
         match salvage(bytes, tainted) {
             Ok(Salvage::Nothing) => {}
             Ok(Salvage::Found(head)) => evidence.candidates.push((head, Source::Salvage)),
-            Ok(Salvage::Unknown(reason)) => evidence.salvage_unknown = Some(reason),
+            Ok(Salvage::Unknown(reason) | Salvage::Untold(reason)) => evidence.salvage_unknown = Some(reason),
             Ok(Salvage::Ambiguous(parcels, dropped)) => {
                 evidence.salvage_unknown = Some(format!("its bytes match more than one parcel: {}", parcels.join(", ")));
                 evidence.salvage_ambiguous = parcels;
@@ -480,8 +484,11 @@ pub(crate) fn salvage_names_a_head(bytes: &[u8]) -> bool {
 /// (the bytes then still name a head, only not which). A
 /// match that reads as a tree, blob, recipe or chunk is not a parcel and drops out.
 fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
+    use crate::util::file_utils::{StoreReadOutcome, Unreadable};
+
     let mut parcels = Vec::new();
     let mut unknown = Vec::new();
+    let mut untold = Vec::new();
 
     for hash in matches {
         if tainted.covers(&hash) {
@@ -491,12 +498,23 @@ fn judge(matches: Vec<String>, tainted: &Tainted) -> Salvage {
         } else if object_utils::load_tree(&hash).is_err() && object_utils::load_blob(&hash).is_err()
             && object_utils::load_recipe(&hash).is_err() && object_utils::load_chunk(&hash).is_err()
         {
-            unknown.push(hash);
+            // Bytes the store holds damaged, or decided are gone, are a verdict on the object; a
+            // read that could not consult the store, or left it undecided, says nothing of it.
+            match crate::util::file_utils::read_object_classified(&hash) {
+                Err(_) | Ok(StoreReadOutcome::Unverifiable(_, Unreadable::Other)) => untold.push(hash),
+                Ok(_) => unknown.push(hash),
+            }
         }
     }
 
     if parcels.len() > 1 {
-        return Salvage::Ambiguous(parcels, !unknown.is_empty());
+        return Salvage::Ambiguous(parcels, !unknown.is_empty() || !untold.is_empty());
+    }
+
+    if let Some(hash) = untold.first() {
+        return Salvage::Untold(format!(
+            "what its bytes name may be object {}, which the store could not be read for", hash
+        ));
     }
 
     if let Some(hash) = unknown.first() {
@@ -936,8 +954,8 @@ pub fn remove_damaged_meta_ref(wire: &str, judged: &[Refused], unjudged: &[Strin
         .ok_or_else(|| format!("\"{}\" is not a meta pallet this version of Forklift knows, so there is no ref of it to remove.", wire))?;
 
     // Under a taint, heal's verdict may rest on a parcel the recovery brings back, since meta
-    // verification fails alike on a parcel it cannot load and on a rule; and the kept bytes'
-    // write would return the taint's error after landing.
+    // verification holds a parcel the store decided is absent against the ref as its own; and the
+    // kept bytes' write would return the taint's error after landing.
     let first = "run \"forklift heal\" first, without --remove-ref, and remove it only if that refuses it naming the removal";
     match crate::util::taint_utils::read_taints(&forklift_root()) {
         Ok(taints) if taints.recorded.is_empty() && !taints.torn => {}
@@ -1245,6 +1263,7 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
             Err(("its own bytes name one of several parcels, not which".to_string(), candidates, Owner::Own))
         }
         Salvage::Unknown(why) => Err((why, candidates, Owner::Own)),
+        Salvage::Untold(why) => Err((why, candidates, Owner::Again)),
     }
 }
 
@@ -1255,7 +1274,8 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
 /// * `Err((reason, owner))` - Why not, and whose refusal that is: the ref's own when `head` fails
 ///                            verification, [`Owner::OfficeUnborn`] when the office is unborn
 ///                            beside an anchor, which refuses before `head` is read, and
-///                            [`Owner::Again`] when the anchor or the office could not be read.
+///                            [`Owner::Again`] when the anchor or the office could not be read, or
+///                            the verification's refusal says nothing of `head`'s history.
 fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPreconditions, (String, Owner)> {
     let anchor = crate::util::office_utils::read_trust_anchor_with_bytes().map_err(|error| (error, Owner::Again))?;
     let office_head = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).map_err(|error| (error, Owner::Again))?;
@@ -1266,7 +1286,7 @@ fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPrecondit
         return Err(("the trust file holds this warehouse's anchor, but the office pallet is unborn, so nothing a meta pallet holds can be verified".to_string(), Owner::OfficeUnborn));
     }
 
-    verify_meta_against(name, head, anchor.as_ref().map(|(anchor, _)| anchor), office_head.as_deref()).map_err(|reason| (reason, Owner::Own))?;
+    verify_meta_against(name, head, anchor.as_ref().map(|(anchor, _)| anchor), office_head.as_deref())?;
 
     Ok(pallet_utils::RefPreconditions {
         office: pallet_utils::OfficePrecondition::At(office_head),
@@ -1300,14 +1320,27 @@ fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
 
 /// Verify `head` as the whole history of meta pallet `name`, against `anchor` and the office at
 /// `office_head` (`None`: no anchor, or an unborn office).
-fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::office_utils::TrustAnchor>, office_head: Option<&str>) -> Result<(), String> {
+///
+/// # Returns
+/// * `Err((reason, owner))` - The ref's own refusal when the verdict is on `head`'s history (a rule
+///                            it breaks, or a parcel of it the store decided is absent or holds
+///                            damaged); [`Owner::Again`] when the refusal says nothing of it.
+fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::office_utils::TrustAnchor>, office_head: Option<&str>) -> Result<(), (String, Owner)> {
+    use crate::util::meta_tree::MetaCheckError;
+
     let Some(rules) = crate::util::meta_tree::meta_rules(name) else {
-        return Err("it is not a meta pallet heal has rules to verify against".to_string());
+        return Err(("it is not a meta pallet heal has rules to verify against".to_string(), Owner::Own));
     };
 
     crate::util::meta_tree::verify_meta_update(name, rules, crate::util::meta_tree::Admission::Audit, anchor, office_head, None, head)
         .map(|_| ())
-        .map_err(|why| format!("parcel {} does not pass verification: {}", head, why.trim_end_matches('.')))
+        .map_err(|error| {
+            let owner = match error {
+                MetaCheckError::Content(_) => Owner::Own,
+                MetaCheckError::Untold(_) => Owner::Again,
+            };
+            (format!("parcel {} does not pass verification: {}", head, error.message().trim_end_matches('.')), owner)
+        })
 }
 
 /// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs.
@@ -1547,9 +1580,9 @@ fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &T
                 Ok((chosen, chosen_source)) => {
                     match verify_meta_against(crate::util::redaction_utils::REDACTIONS_PALLET_NAME, &chosen, Some(&judged_anchor), Some(&head)) {
                         Ok(()) => Ok((judged_redactions(redactions, chosen), chosen_source)),
-                        Err(reason) => Err(refused(
+                        Err((reason, owner)) => Err(refused(
                             "with no head heal can verify",
-                            (reason, vec![Candidate { head: chosen, source: chosen_source.to_string() }], Owner::Own),
+                            (reason, vec![Candidate { head: chosen, source: chosen_source.to_string() }], owner),
                         )),
                     }
                 }

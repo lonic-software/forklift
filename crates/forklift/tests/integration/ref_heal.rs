@@ -1356,7 +1356,8 @@ fn a_meta_ref_heal_refuses_as_its_own_is_removed_with_no_taint_standing() {
                 std::fs::write(meta_copy_path(&root, "tags"), b"not a hash").unwrap();
                 plant_taint(&root, &[&"ab".repeat(32)]);
             }
-            // No copy, and the ref's bytes a prefix of a head whose object loads as none.
+            // No copy, and the ref's bytes a prefix of a head whose loose object is corrupt: a
+            // verdict of the store, unlike a read it could not make, so the salvage is unknown.
             _ => {
                 forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
                 std::fs::write(meta_path(&root, "tags"), &tags.as_bytes()[..12]).unwrap();
@@ -1526,8 +1527,11 @@ fn a_lost_or_damaged_office_beside_a_lost_or_damaged_redactions_ref_is_rebuilt_w
     }
 }
 
-// Mutation: write the office beside a damaged @redactions with no head heal can verify, checked
-// against nothing → the office is rebuilt, red.
+// In both, the step is @redactions' removal, which the office's refusal waits on: never heal
+// again, which would refuse alike. Mutations: write the office beside a damaged @redactions with no
+// head heal can verify, checked against nothing → the office is rebuilt, red; judge @redactions
+// through choice_owner where the office's rebuild judges it → a mutual cascade, "forklift heal",
+// red.
 #[test]
 fn a_lost_office_beside_a_redactions_ref_heal_cannot_verify_waits_on_it() {
     let area = Area::new("meta-office-waits");
@@ -1543,6 +1547,7 @@ fn a_lost_office_beside_a_redactions_ref_heal_cannot_verify_waits_on_it() {
     let message = refused["error"]["message"].as_str().unwrap();
     assert!(message.contains("The ref of pallet \"@office\" was not rebuilt: it is checked against the redactions, and the ref of pallet \"@redactions\" is damaged too, with no head heal can verify: set that first"), "{}", refused);
     assert!(message.contains(&format!("The ref of pallet \"@redactions\" was not rebuilt: parcel {} does not pass verification", second)), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @redactions", "{}", refused);
     assert!(!meta_path(&root, "office").exists() && !meta_path(&root, "redactions").exists(), "nothing was written");
 
     // Nothing names a @redactions head at all: no head was chosen, so none was verified.
@@ -1551,6 +1556,7 @@ fn a_lost_office_beside_a_redactions_ref_heal_cannot_verify_waits_on_it() {
     let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
     let message = refused["error"]["message"].as_str().unwrap();
     assert!(message.contains("The ref of pallet \"@office\" was not rebuilt: it is checked against the redactions, and the ref of pallet \"@redactions\" is damaged too, and heal chose no head for it: set that first"), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], "forklift heal --remove-ref @redactions", "{}", refused);
     assert!(!meta_path(&root, "office").exists(), "nothing was written");
 }
 

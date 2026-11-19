@@ -50,7 +50,7 @@ use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustA
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::sign_utils::ParcelSignature;
 use crate::util::{
-    haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, redaction_utils,
+    file_utils, haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, redaction_utils,
     sign_utils, tag_utils,
 };
 
@@ -570,6 +570,12 @@ impl From<String> for ReplayError {
     }
 }
 
+impl From<MetaCheckError> for ReplayError {
+    fn from(error: MetaCheckError) -> Self {
+        ReplayError::Refused(error.into())
+    }
+}
+
 /// One edit to a meta pallet's state.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CellEdit {
@@ -756,24 +762,30 @@ fn store_level(level: &Level) -> Result<String, String> {
 /// plain cell blob. `strict` (the content check) also refuses an explicit empty subtree, which
 /// a writer must prune instead.
 fn load_level(path: &str, hash: &str, strict: bool) -> Result<Level, String> {
-    let tree = object_utils::load_tree(hash)?;
+    load_level_checked(path, hash, strict).map_err(String::from)
+}
+
+/// [`load_level`], whose error says whether it is a verdict on the tree.
+fn load_level_checked(path: &str, hash: &str, strict: bool) -> Result<Level, MetaCheckError> {
+    let tree = object_utils::load_tree_faulted(hash).map_err(MetaCheckError::of_read)?;
     let mut level = Level::new();
+    let at = |name: &str, why: String| MetaCheckError::Content(format!("At {}: {}", join(path, name), why));
 
     for (name, item) in tree.get_subtrees() {
-        validate_component(name).map_err(|why| format!("At {}: {}", join(path, name), why))?;
+        validate_component(name).map_err(|why| at(name, why))?;
 
         if strict && item.hash == empty_tree_hash() {
-            return Err(format!("{} is an empty subtree, which must be pruned instead.", join(path, name)));
+            return Err(MetaCheckError::Content(format!("{} is an empty subtree, which must be pruned instead.", join(path, name))));
         }
 
         level.insert(name.clone(), Entry::Tree(item.hash.clone()));
     }
 
     for (name, item) in tree.get_files() {
-        validate_component(name).map_err(|why| format!("At {}: {}", join(path, name), why))?;
+        validate_component(name).map_err(|why| at(name, why))?;
 
         if item.item_type != DirEntryType::Normal {
-            return Err(format!("{} is a {:?} entry, not a cell.", join(path, name), item.item_type));
+            return Err(MetaCheckError::Content(format!("{} is a {:?} entry, not a cell.", join(path, name), item.item_type)));
         }
 
         level.insert(name.clone(), Entry::Blob(item.hash.clone()));
@@ -990,8 +1002,8 @@ enum SpineFault {
     Malformed(String),
 }
 
-fn read_spine(tree_hash: &str) -> Result<Result<Spine, SpineFault>, String> {
-    let root = object_utils::load_tree(tree_hash)?;
+fn read_spine(tree_hash: &str) -> Result<Result<Spine, SpineFault>, MetaCheckError> {
+    let root = object_utils::load_tree_faulted(tree_hash).map_err(MetaCheckError::of_read)?;
 
     // An older forklift's meta parcel held its records under `.forklift/tracked/`, or nothing
     // at all for a join. Only those shapes read as older; any other tree is a corrupt spine.
@@ -1004,12 +1016,12 @@ fn read_spine(tree_hash: &str) -> Result<Result<Spine, SpineFault>, String> {
     let Some(forklift) = subtree_named(&root, TREE_NAME_FORKLIFT) else {
         return no_spine();
     };
-    let forklift = object_utils::load_tree(&forklift)?;
+    let forklift = object_utils::load_tree_faulted(&forklift).map_err(MetaCheckError::of_read)?;
 
     let Some(tracked) = subtree_named(&forklift, TREE_NAME_TRACKED) else {
         return no_spine();
     };
-    let tracked = object_utils::load_tree(&tracked)?;
+    let tracked = object_utils::load_tree_faulted(&tracked).map_err(MetaCheckError::of_read)?;
 
     let Some((_, format)) = tracked.get_files().find(|(name, _)| name.as_str() == ENTRY_NAME_FORMAT) else {
         if subtree_named(&tracked, ENTRY_NAME_FORMAT).is_some() {
@@ -1062,19 +1074,19 @@ fn entry_count(tree: &TreeItem) -> usize {
 
 /// Read a parcel's spine as a pallet of the expected kind, refusing the whole pallet loudly on
 /// anything this build cannot read. It never falls back.
-fn read_pallet_spine(pallet: &str, parcel_hash: &str, expected: MetaKind) -> Result<Spine, String> {
-    let parcel = object_utils::load_parcel(parcel_hash)?;
+fn read_pallet_spine(pallet: &str, parcel_hash: &str, expected: MetaKind) -> Result<Spine, MetaCheckError> {
+    let parcel = object_utils::load_parcel_faulted(parcel_hash).map_err(MetaCheckError::of_read)?;
 
     let spine = match read_spine(&parcel.tree_hash)? {
         Ok(spine) => spine,
-        Err(SpineFault::NoFormat) => return Err(format!(
+        Err(SpineFault::NoFormat) => return Err(MetaCheckError::Content(format!(
             "The meta pallet @{} has no format marker at {}: it was written by an older forklift, \
             and this one cannot read it.",
             pallet, parcel_hash
-        )),
-        Err(SpineFault::Malformed(why)) => return Err(format!(
+        ))),
+        Err(SpineFault::Malformed(why)) => return Err(MetaCheckError::Content(format!(
             "The meta pallet @{} is malformed at {}: {}.", pallet, parcel_hash, why
-        )),
+        ))),
     };
 
     check_format(pallet, parcel_hash, &spine, expected)?;
@@ -1082,18 +1094,18 @@ fn read_pallet_spine(pallet: &str, parcel_hash: &str, expected: MetaKind) -> Res
     Ok(spine)
 }
 
-fn check_format(pallet: &str, parcel_hash: &str, spine: &Spine, expected: MetaKind) -> Result<(), String> {
-    match parse_format(&object_utils::load_blob(&spine.format)?.content) {
+fn check_format(pallet: &str, parcel_hash: &str, spine: &Spine, expected: MetaKind) -> Result<(), MetaCheckError> {
+    match parse_format(&object_utils::load_blob_faulted(&spine.format).map_err(MetaCheckError::of_read)?.content) {
         FormatRead::Known(kind) if kind == expected => Ok(()),
-        FormatRead::Known(kind) => Err(format!(
+        FormatRead::Known(kind) => Err(MetaCheckError::Content(format!(
             "The meta pallet @{} holds {} metadata at {}, not {}.",
             pallet, kind.as_str(), parcel_hash, expected.as_str()
-        )),
-        FormatRead::Unknown(marker) => Err(format!(
+        ))),
+        FormatRead::Unknown(marker) => Err(MetaCheckError::Content(format!(
             "The meta pallet @{} is in the format \"{}\" at {}, which this forklift does not know: \
             it was written by a newer forklift.",
             pallet, marker, parcel_hash
-        )),
+        ))),
     }
 }
 
@@ -1373,6 +1385,58 @@ pub fn stack_meta_edits(pallet: &str,
     Ok(Some(parcel))
 }
 
+/// Why the content check refused: a verdict on the checked parcels' own history, or a refusal
+/// that says nothing of them. An error the check does not classify converts as the second, so
+/// only what is stated as a verdict is told as one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetaCheckError {
+    /// The checked parcels break a rule, or the store decided one of theirs (a parcel, a tree or
+    /// a cell they hold) is absent or holds it damaged.
+    Content(String),
+
+    /// It says nothing of the checked parcels: the store could not be read, a signature could not
+    /// be read, or what they are checked against (the office chain, the trust state, a trust or
+    /// distrust boundary) does not verify or cannot be resolved.
+    Untold(String),
+}
+
+impl MetaCheckError {
+    /// A failed object read, as what the store's answer says of the object.
+    fn of_read((message, fault): (String, file_utils::ReadFault)) -> MetaCheckError {
+        match fault {
+            file_utils::ReadFault::Content => MetaCheckError::Content(message),
+            file_utils::ReadFault::Untold => MetaCheckError::Untold(message),
+        }
+    }
+
+    /// The refusal, phrased for the user.
+    pub fn message(&self) -> &str {
+        match self {
+            MetaCheckError::Content(message) | MetaCheckError::Untold(message) => message,
+        }
+    }
+}
+
+impl From<String> for MetaCheckError {
+    fn from(message: String) -> MetaCheckError {
+        MetaCheckError::Untold(message)
+    }
+}
+
+impl From<MetaCheckError> for String {
+    fn from(error: MetaCheckError) -> String {
+        match error {
+            MetaCheckError::Content(message) | MetaCheckError::Untold(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for MetaCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// The content check: every parcel from `old_head` (exclusive; `None` checks from the root) to
 /// `new_head` must
 ///
@@ -1396,13 +1460,17 @@ pub fn stack_meta_edits(pallet: &str,
 ///
 /// `old_head` is a head that already passed this check. A writer checking the parcel it just
 /// signed passes an empty `legacy_boundary`: nothing it stacks under an office is pre-trust.
+///
+/// A refusal is [`MetaCheckError::Content`] only where it is a verdict on the parcels checked.
 pub fn verify_meta_content(pallet: &str,
                            rules: &dyn PalletRules,
                            office: Option<&OfficeState>,
                            legacy_boundary: &[String],
                            admission: Admission,
                            old_head: Option<&str>,
-                           new_head: &str) -> Result<(), String> {
+                           new_head: &str) -> Result<(), MetaCheckError> {
+    use MetaCheckError::Content;
+
     let mut chain: Vec<(String, Parcel)> = Vec::new();
     let mut cursor = new_head.to_string();
 
@@ -1411,14 +1479,14 @@ pub fn verify_meta_content(pallet: &str,
             break;
         }
 
-        let parcel = object_utils::load_parcel(&cursor)?;
+        let parcel = object_utils::load_parcel_faulted(&cursor).map_err(MetaCheckError::of_read)?;
 
         if parcel.parents.len() > 1 {
-            return Err(format!(
+            return Err(Content(format!(
                 "Parcel {} on @{} has {} parents. A meta pallet is linear: every parcel has at \
                 most one parent.",
                 cursor, pallet, parcel.parents.len()
-            ));
+            )));
         }
 
         let parent = parcel.parents.first().cloned();
@@ -1426,10 +1494,10 @@ pub fn verify_meta_content(pallet: &str,
 
         match parent {
             Some(parent) => cursor = parent,
-            None if old_head.is_some() => return Err(format!(
+            None if old_head.is_some() => return Err(Content(format!(
                 "The new @{} head {} does not descend from the current head {}.",
                 pallet, new_head, old_head.unwrap()
-            )),
+            ))),
             None => break,
         }
     }
@@ -1459,21 +1527,21 @@ pub fn verify_meta_content(pallet: &str,
 
         let spine = match read_spine(&parcel.tree_hash)? {
             Ok(spine) => spine,
-            Err(SpineFault::NoFormat) => return Err(format!(
+            Err(SpineFault::NoFormat) => return Err(Content(format!(
                 "Parcel {} on @{} has no format marker.", hash, pallet
-            )),
-            Err(SpineFault::Malformed(why)) => return Err(format!(
+            ))),
+            Err(SpineFault::Malformed(why)) => return Err(Content(format!(
                 "Parcel {} on @{} is malformed: {}.", hash, pallet, why
-            )),
+            ))),
         };
 
         if let Some(parent) = &parent_spine {
             if parent.format != spine.format {
-                return Err(format!(
+                return Err(Content(format!(
                     "Parcel {} on @{} changes the pallet's format marker. A meta pallet keeps \
                     its format for its whole history.",
                     hash, pallet
-                ));
+                )));
             }
         }
 
@@ -1482,27 +1550,42 @@ pub fn verify_meta_content(pallet: &str,
         let parent_cells = parent_spine.as_ref().and_then(|parent| parent.cells.clone());
         let mut changes = Vec::new();
 
+        // The walk's own refusals are verdicts on the tree; a level that failed to load keeps
+        // what its read said.
+        let mut untold = None;
         diff_entries(
             "",
             root_entry(parent_cells.as_deref()),
             root_entry(spine.cells.as_deref()),
-            &mut |path, hash| load_level(path, hash, true),
+            &mut |path, hash| load_level_checked(path, hash, true).map_err(|error| {
+                if let MetaCheckError::Untold(_) = error {
+                    untold = Some(());
+                }
+                String::from(error)
+            }),
             &mut changes,
-        ).map_err(|why| format!("Parcel {} on @{} is malformed: {}", hash, pallet, why))?;
+        ).map_err(|why| {
+            let error = format!("Parcel {} on @{} is malformed: {}", hash, pallet, why);
+            match untold {
+                Some(()) => MetaCheckError::Untold(error),
+                None => Content(error),
+            }
+        })?;
 
         for change in &changes {
             let Some(after) = &change.after else { continue };
 
-            let envelope = parse_cell(&object_utils::load_blob(after)?.content).map_err(|why| format!(
+            let cell = object_utils::load_blob_faulted(after).map_err(MetaCheckError::of_read)?;
+            let envelope = parse_cell(&cell.content).map_err(|why| Content(format!(
                 "Parcel {} on @{} writes a malformed cell at {}: {}.", hash, pallet, change.path, why
-            ))?;
+            )))?;
 
             if envelope.stamp != stamp {
-                return Err(format!(
+                return Err(Content(format!(
                     "Parcel {} on @{} writes the cell {} stamped {}, but the parcel is {}. A \
                     parcel may only write cells stamped with its own writer.",
                     hash, pallet, change.path, describe_stamp(&envelope.stamp), describe_writer(&attribution)
-                ));
+                )));
             }
         }
 
@@ -1514,7 +1597,7 @@ pub fn verify_meta_content(pallet: &str,
             cells: spine.cells.as_deref(),
             changes: &changes,
             admission,
-        }).map_err(|why| format!("Parcel {} on @{} breaks a rule of the pallet: {}", hash, pallet, why))?;
+        }).map_err(|why| Content(format!("Parcel {} on @{} breaks a rule of the pallet: {}", hash, pallet, why)))?;
 
         parent_spine = Some(spine);
     }
@@ -1533,18 +1616,20 @@ pub fn verify_meta_update(pallet: &str,
                           anchor: Option<&TrustAnchor>,
                           office_head: Option<&str>,
                           old_head: Option<&str>,
-                          new_head: &str) -> Result<Option<OfficeState>, String> {
+                          new_head: &str) -> Result<Option<OfficeState>, MetaCheckError> {
+    // The office and the trust state are not the pallet's own history, so their refusals say
+    // nothing of its parcels.
     let office = match (anchor, office_head) {
-        (Some(anchor), Some(office_head)) => Some(audit_utils::verify_office_chain_memoized(anchor, office_head)?),
+        (Some(anchor), Some(office_head)) => Some(audit_utils::verify_office_chain_memoized(anchor, office_head).map_err(String::from)?),
         (None, None) => None,
-        (Some(_), None) => return Err(format!(
+        (Some(_), None) => return Err(MetaCheckError::Untold(format!(
             "@{} cannot be checked: trust is established but the office is unborn. Lift the \
             office before syncing it.",
             pallet
-        )),
-        (None, Some(_)) => return Err(format!(
+        ))),
+        (None, Some(_)) => return Err(MetaCheckError::Untold(format!(
             "@{} cannot be checked: the office exists but its trust anchor is missing.", pallet
-        )),
+        ))),
     };
 
     let boundary = anchor.map(|anchor| anchor.boundary.as_slice()).unwrap_or(&[]);
@@ -1570,16 +1655,17 @@ impl<'b> LegacyHistory<'b> {
     }
 
     /// Refuse the unsigned parcel `hash` unless the boundary reaches it.
-    fn require(&mut self, pallet: &str, hash: &str) -> Result<(), String> {
+    fn require(&mut self, pallet: &str, hash: &str) -> Result<(), MetaCheckError> {
+        // A walk that cannot resolve the boundary says nothing of the parcel.
         if self.reaches(pallet, hash)? {
             return Ok(());
         }
 
-        Err(format!(
+        Err(MetaCheckError::Content(format!(
             "Parcel {} on @{} carries no signature and was stacked after trust was established. \
             Every meta parcel stacked under an office must be signed by a key of the office.",
             hash, pallet
-        ))
+        )))
     }
 
     /// Whether the boundary reaches the parcel `hash`. A walk that crossed an absent reference
@@ -1639,13 +1725,13 @@ pub fn holds_unvouched_parcels(pallet: &str,
 
 /// Rule (b) for a store that never enrolled: the parcel carries no signature, and its Author and
 /// Stack actions — every action it has — name one operator, who it is attributed to.
-fn declared_attribution<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Result<Attribution<'p>, String> {
+fn declared_attribution<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Result<Attribution<'p>, MetaCheckError> {
     if sign_utils::load_raw_parcel_signature(hash)?.is_some() {
-        return Err(format!(
+        return Err(MetaCheckError::Content(format!(
             "Parcel {} on @{} is signed, but this warehouse has no office to verify a key against. \
             Until trust is established, a meta parcel carries no signature.",
             hash, pallet
-        ));
+        )));
     }
 
     declared_operator(pallet, hash, parcel)
@@ -1653,18 +1739,18 @@ fn declared_attribution<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Res
 
 /// An unsigned parcel's attribution: the one operator its Author and Stack actions — every
 /// action it has — name.
-fn declared_operator<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Result<Attribution<'p>, String> {
+fn declared_operator<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Result<Attribution<'p>, MetaCheckError> {
     let authored = parcel.actions.iter().any(|action| matches!(action.action, ParcelActionType::Author));
     let stacked = parcel.actions.iter().any(|action| matches!(action.action, ParcelActionType::Stack));
     let identifier = parcel.actions.first().map(|action| action.operator.identifier.as_str()).unwrap_or("");
 
     if identifier.is_empty() || !authored || !stacked
         || parcel.actions.iter().any(|action| action.operator.identifier != identifier) {
-        return Err(format!(
+        return Err(MetaCheckError::Content(format!(
             "Parcel {} on @{} carries no signature, and its Author and Stack actions do not name \
             one operator, so it cannot be attributed to anyone.",
             hash, pallet
-        ));
+        )));
     }
 
     Ok(Attribution::Declared(identifier))
@@ -1693,8 +1779,11 @@ fn describe_writer(attribution: &Attribution) -> String {
 fn verify_meta_signature<'o>(pallet: &str,
                              hash: &str,
                              office: &'o OfficeState,
-                             distrust_boundaries: &mut DistrustBoundaryMemo) -> Result<Option<&'o KeyRecord>, String> {
-    match audit_utils::classify_signature_trust(hash, office)? {
+                             distrust_boundaries: &mut DistrustBoundaryMemo) -> Result<Option<&'o KeyRecord>, MetaCheckError> {
+    // A signature or a boundary the store cannot give says nothing of the parcel; only what
+    // reads is judged, as the office chain's walk judges its own.
+    sign_utils::load_raw_parcel_signature(hash)?;
+    match audit_utils::classify_signature_trust(hash, office).map_err(MetaCheckError::Content)? {
         SignatureTrust::Verified { key_id } => {
             Ok(Some(office.find_key(&key_id).expect("classify_signature_trust found this key")))
         }
@@ -1707,29 +1796,29 @@ fn verify_meta_signature<'o>(pallet: &str,
             }
 
             if let Some(missing) = distrust_boundaries.unresolved_head(key)? {
-                return Err(format!(
+                return Err(MetaCheckError::Untold(format!(
                     "Parcel {} on @{} is signed with revoked key {}: this store cannot resolve \
                     the revocation's distrust boundary (boundary parcel {} is not present \
                     locally), so it cannot tell whether this parcel predates the revocation. \
                     Verify against a store with the full history.",
                     hash, pallet, key_id, missing
-                ));
+                )));
             }
 
-            Err(format!(
+            Err(MetaCheckError::Content(format!(
                 "Parcel {} on @{} is signed with key {}, which is revoked, and the parcel is \
                 outside the revocation's distrust boundary. The key's holder kept signing after \
                 the revocation, or the warehouse has been tampered with.",
                 hash, pallet, key_id
-            ))
+            )))
         }
 
         SignatureTrust::Unsigned => Ok(None),
 
-        SignatureTrust::UnknownKey { key_id } => Err(format!(
+        SignatureTrust::UnknownKey { key_id } => Err(MetaCheckError::Content(format!(
             "Parcel {} on @{} is signed with key {}, which the office does not track.",
             hash, pallet, key_id
-        )),
+        ))),
     }
 }
 
@@ -2397,7 +2486,7 @@ mod tests {
     }
 
     fn verify(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content(PALLET, &TestRules, Some(office), &[], Admission::Admit, old_head, new_head)
+        verify_meta_content(PALLET, &TestRules, Some(office), &[], Admission::Admit, old_head, new_head).map_err(String::from)
     }
 
     fn write(office: &OfficeState, key: &Key, edits: &[CellEdit]) -> Result<Option<String>, String> {
@@ -3191,7 +3280,7 @@ mod tests {
 
     /// The content check of a warehouse that never enrolled: no office.
     fn verify_unenrolled(old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content(PALLET, &TestRules, None, &[], Admission::Admit, old_head, new_head)
+        verify_meta_content(PALLET, &TestRules, None, &[], Admission::Admit, old_head, new_head).map_err(String::from)
     }
 
     #[test]
@@ -3226,7 +3315,7 @@ mod tests {
         let alice = Key::new("alice", 1);
         let office = office(&[&alice.record]);
         let under = |boundary: &[String], old: Option<&str>, new: &str| {
-            verify_meta_content(PALLET, &TestRules, Some(&office), boundary, Admission::Admit, old, new)
+            verify_meta_content(PALLET, &TestRules, Some(&office), boundary, Admission::Admit, old, new).map_err(String::from)
         };
 
         let first = forge_unsigned(&[], cells(&[("x", &declared_cell("alice", "1"))]).as_deref(), "alice");
@@ -3857,7 +3946,7 @@ mod tests {
                    admission: Admission,
                    old_head: Option<&str>,
                    new_head: &str) -> Result<(), String> {
-        verify_meta_content("tags", &tag_utils::TagsRules, Some(office), &[], admission, old_head, new_head)
+        verify_meta_content("tags", &tag_utils::TagsRules, Some(office), &[], admission, old_head, new_head).map_err(String::from)
     }
 
     #[test]
@@ -3905,7 +3994,7 @@ mod tests {
         let office = office_with_roles(&[(&alice, office_utils::Role::Admin), (&bob, office_utils::Role::Writer)]);
         let verify = |admission, old: Option<&str>, new: &str| verify_meta_content(
             "redactions", &redaction_utils::RedactionsRules, Some(&office), &[], admission, old, new,
-        );
+        ).map_err(String::from);
         let (first, second) = ("ab".repeat(32), "cd".repeat(32));
 
         let head = redactions_parcel(None, &alice, &[set(&first, &redaction_cell(alice.id(), "leaked"))]);
@@ -3990,6 +4079,9 @@ mod tests {
         let error = verify_meta_content(
             "tags", &tag_utils::TagsRules, Some(&office), &boundary, Admission::Admit, Some(&legacy), &signed,
         ).unwrap_err();
+        // A rule the parcel breaks is a verdict on it.
+        assert!(matches!(error, MetaCheckError::Content(_)), "{:?}", error);
+        let error = String::from(error);
         assert!(error.contains("v1.1") && error.contains("not an admin"), "{}", error);
     }
 
@@ -4058,7 +4150,7 @@ mod tests {
     }
 
     fn verify_manifest(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content("manifest", &manifest_utils::ManifestRules, Some(office), &[], Admission::Admit, old_head, new_head)
+        verify_meta_content("manifest", &manifest_utils::ManifestRules, Some(office), &[], Admission::Admit, old_head, new_head).map_err(String::from)
     }
 
     #[test]
@@ -4151,7 +4243,7 @@ mod tests {
     }
 
     fn verify_haul(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content("haul", &haul_utils::HaulRules, Some(office), &[], Admission::Admit, old_head, new_head)
+        verify_meta_content("haul", &haul_utils::HaulRules, Some(office), &[], Admission::Admit, old_head, new_head).map_err(String::from)
     }
 
     fn proposal(opener: &str) -> haul_utils::Opened {

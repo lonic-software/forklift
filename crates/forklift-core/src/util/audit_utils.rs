@@ -26,8 +26,10 @@ pub enum OfficeChainError {
     /// proof-of-possession, its endorsement, its chain to the identity root).
     Inauthentic(String),
     /// A parcel of the chain, or its signature, could not be read from the store. That says
-    /// nothing of whether the chain is authentic, only that it cannot be told.
-    Unreadable(String),
+    /// nothing of whether the chain is authentic, only that it cannot be told. The fault says
+    /// whether the store decided the parcel is absent or damaged, or said nothing of it; a
+    /// signature that does not read is always told as saying nothing.
+    Unreadable(String, crate::util::file_utils::ReadFault),
     /// Every parcel up to `parcel` is authentic, but `parcel` breaks key permanence, exceeds
     /// its signer's privileges, or adds a key for another user endorsed by a non-admin.
     Unauthorized {
@@ -43,7 +45,7 @@ impl OfficeChainError {
     pub fn message(&self) -> &str {
         match self {
             OfficeChainError::Inauthentic(message)
-            | OfficeChainError::Unreadable(message)
+            | OfficeChainError::Unreadable(message, _)
             | OfficeChainError::Unauthorized { message, .. } => message,
         }
     }
@@ -99,7 +101,7 @@ impl From<OfficeChainError> for String {
 /// * `Err(OfficeChainError::Inauthentic(_))`  - If the chain does not reach the genesis, or
 ///                                              a parcel fails its shape, signature or
 ///                                              endorsement checks.
-/// * `Err(OfficeChainError::Unreadable(_))`   - If a parcel or its signature cannot be read
+/// * `Err(OfficeChainError::Unreadable(..))`  - If a parcel or its signature cannot be read
 ///                                              from the store.
 /// * `Err(OfficeChainError::Unauthorized{..})` - If, before any inauthentic parcel, a parcel
 ///                                              breaks key permanence, exceeds its signer's
@@ -116,7 +118,9 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
 
         // Read before the genesis is recognised, so that a genesis the store cannot give is
         // told as unreadable too. An object that is there but is not a parcel is a verdict.
-        let parcel = object_utils::load_parcel_judged(&cursor).map_err(Unreadable)?.map_err(Inauthentic)?;
+        let parcel = object_utils::load_parcel_judged(&cursor)
+            .map_err(|(message, fault)| Unreadable(message, fault))?
+            .map_err(Inauthentic)?;
 
         if cursor == anchor.genesis {
             break;
@@ -151,7 +155,7 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
 
         // A signature the store cannot give is unreadable, not a verdict: only what reads is
         // judged below.
-        sign_utils::load_raw_parcel_signature(hash).map_err(Unreadable)?;
+        sign_utils::load_raw_parcel_signature(hash).map_err(|message| Unreadable(message, crate::util::file_utils::ReadFault::Untold))?;
         verify_one_signature(hash, lookup_state, "office parcel").map_err(Inauthentic)?;
 
         // A revoked key must not extend the office chain: the signer has to be
@@ -1047,7 +1051,7 @@ pub fn verified_local_office() -> Result<VerifiedOffice, String> {
 /// command left as it was.
 pub fn office_chain_refusal(refused: OfficeChainError, closing: &str) -> String {
     match refused {
-        OfficeChainError::Unreadable(why) => why,
+        OfficeChainError::Unreadable(why, _) => why,
         refused if crate::error::frames_in(refused.message()).next().is_some() => String::from(refused),
         refused => {
             let refused = String::from(refused);
@@ -1143,7 +1147,7 @@ pub fn classify_office_lift_refusal(error: OfficeChainError, held_head: Option<&
     match error {
         // A lift that leaves a parcel of its chain unreadable did not bring it: the lift is the
         // input at fault, as it is for an inauthentic chain.
-        OfficeChainError::Inauthentic(message) | OfficeChainError::Unreadable(message) => OfficeLiftRefusal::Unprocessable(message),
+        OfficeChainError::Inauthentic(message) | OfficeChainError::Unreadable(message, _) => OfficeLiftRefusal::Unprocessable(message),
         OfficeChainError::Unauthorized { parcel, message } => {
             if held_head.map_or(false, |head| office_history_holds(head, &parcel)) {
                 OfficeLiftRefusal::Unprocessable(format!(
@@ -4380,7 +4384,7 @@ mod tests {
         match verify_office_chain(anchor, head) {
             Err(OfficeChainError::Inauthentic(message)) => message,
             Err(OfficeChainError::Unauthorized { message, .. }) => panic!("refused as unauthorized: {}", message),
-            Err(OfficeChainError::Unreadable(message)) => panic!("refused as unreadable: {}", message),
+            Err(OfficeChainError::Unreadable(message, _)) => panic!("refused as unreadable: {}", message),
             Ok(_) => panic!("the chain at {} must be refused", head),
         }
     }

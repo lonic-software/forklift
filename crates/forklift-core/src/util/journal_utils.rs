@@ -700,7 +700,7 @@ pub(crate) fn trust_preconditions_saying(refused: &str, head: &str, closing: &st
     // A trust file heal can restore is refused as that, not as an office that fails its anchor.
     // Any other refusal, coded or not, says what was refused and what was left as it was.
     let office_state = audit_utils::verify_office_chain(&anchor, &office_head).map_err(|e| {
-        let anchored = !matches!(e, audit_utils::OfficeChainError::Unreadable(_))
+        let anchored = !matches!(e, audit_utils::OfficeChainError::Unreadable(..))
             && crate::error::frames_in(e.message()).next().is_none();
         let why = String::from(e);
         anchored.then(|| office_utils::unverified_trust_refusal(&format!("{} {}", refused, why), closing))

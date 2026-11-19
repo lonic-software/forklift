@@ -236,17 +236,23 @@ impl std::ops::Deref for ParcelBytes {
 /// caller), this takes a plain direct read with no `Rc` allocation at all: zero-cost outside
 /// `compact`'s reachability phase, not just zero *reuse*.
 fn read_parcel_bytes(hash: &str) -> Result<ParcelBytes, String> {
+    read_parcel_bytes_faulted(hash).map_err(|(error, _)| error)
+}
+
+/// [`read_parcel_bytes`], whose error also says what the store's answer tells of the parcel.
+fn read_parcel_bytes_faulted(hash: &str) -> Result<ParcelBytes, (String, file_utils::ReadFault)> {
+    let faulted = |(error, cause)| (error, file_utils::ReadFault::of(cause));
     let memo_active = PARCEL_BYTES_MEMO.with(|memo| memo.borrow().is_some());
 
     if !memo_active {
-        return Ok(ParcelBytes::Owned(file_utils::retrieve_object_by_hash_uncached(hash)?));
+        return Ok(ParcelBytes::Owned(file_utils::retrieve_object_by_hash_uncached_classified(hash).map_err(faulted)?));
     }
 
     if let Some(hit) = PARCEL_BYTES_MEMO.with(|memo| memo.borrow().as_ref().and_then(|c| c.get(hash).cloned())) {
         return Ok(ParcelBytes::Shared(hit));
     }
 
-    let bytes = std::rc::Rc::new(file_utils::retrieve_object_by_hash_uncached(hash)?);
+    let bytes = std::rc::Rc::new(file_utils::retrieve_object_by_hash_uncached_classified(hash).map_err(faulted)?);
 
     PARCEL_BYTES_MEMO.with(|memo| {
         if let Some(cache) = memo.borrow_mut().as_mut() {
@@ -276,12 +282,18 @@ pub fn load_parcel(hash: &str) -> Result<Parcel, String> {
     decode_parcel(hash, &bytes)
 }
 
-/// [`load_parcel`], telling a store that cannot give the parcel's bytes (the outer error) from
-/// bytes that are not a parcel (the inner one): the first says nothing of what the parcel holds.
-pub(crate) fn load_parcel_judged(hash: &str) -> Result<Result<Parcel, String>, String> {
-    let bytes = read_parcel_bytes(hash)?;
+/// [`load_parcel`], telling a store that cannot give the parcel's bytes (the outer error, with
+/// what the store's answer says of the parcel) from bytes that are not a parcel (the inner one).
+pub(crate) fn load_parcel_judged(hash: &str) -> Result<Result<Parcel, String>, (String, file_utils::ReadFault)> {
+    let bytes = read_parcel_bytes_faulted(hash)?;
 
     Ok(decode_parcel(hash, &bytes))
+}
+
+/// [`load_parcel`], whose error says what it tells of the parcel: bytes that read but are not a
+/// parcel are [`file_utils::ReadFault::Content`], as the store's own verdicts are.
+pub(crate) fn load_parcel_faulted(hash: &str) -> Result<Parcel, (String, file_utils::ReadFault)> {
+    load_parcel_judged(hash)?.map_err(|error| (error, file_utils::ReadFault::Content))
 }
 
 /// Decode a parcel's object bytes. A refusal names the parcel it came from, so a walk that meets a
@@ -352,13 +364,21 @@ fn tree_parse_cache_put(hash: &str, tree: std::sync::Arc<TreeItem>, weight: usiz
 /// * `Ok((TreeItem, usize))` - The parsed tree and its raw (pre-parse) object byte length.
 /// * `Err(String)`           - If the object does not exist, could not be parsed, or is not a tree.
 fn parse_tree_uncached(hash: &str) -> Result<(TreeItem, usize), String> {
+    parse_tree_uncached_faulted(hash).map_err(|(error, _)| error)
+}
+
+/// [`parse_tree_uncached`], whose error says what it tells of the tree: bytes that read but do not
+/// parse as a tree are [`file_utils::ReadFault::Content`].
+fn parse_tree_uncached_faulted(hash: &str) -> Result<(TreeItem, usize), (String, file_utils::ReadFault)> {
     // Only the parse borrows the bytes, so take the shared `Arc` — a byte-cache hit is a pointer
     // clone under its lock, not a copy of the whole tree object.
-    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+    let bytes = file_utils::retrieve_object_by_hash_shared_classified(hash)
+        .map_err(|(error, cause)| (error, file_utils::ReadFault::of(cause)))?;
+    let content = |error: String| (error, file_utils::ReadFault::Content);
 
-    let tree = match parser::object::loose_object_parser::parse(&bytes)? {
+    let tree = match parser::object::loose_object_parser::parse(&bytes).map_err(content)? {
         ParsedObject::Tree(tree) => tree,
-        other => return Err(format!("Object {} is a {}, not a tree.", hash, other.get_type())),
+        other => return Err(content(format!("Object {} is a {}, not a tree.", hash, other.get_type()))),
     };
 
     Ok((tree, bytes.len()))
@@ -419,12 +439,17 @@ pub fn load_tree_shared(hash: &str) -> Result<std::sync::Arc<TreeItem>, String> 
 /// * `Ok(TreeItem)` - The parsed tree.
 /// * `Err(String)`  - If the object does not exist, could not be parsed, or is not a tree.
 pub fn load_tree(hash: &str) -> Result<TreeItem, String> {
+    load_tree_faulted(hash).map_err(|(error, _)| error)
+}
+
+/// [`load_tree`], whose error says what it tells of the tree, as [`parse_tree_uncached_faulted`]'s.
+pub(crate) fn load_tree_faulted(hash: &str) -> Result<TreeItem, (String, file_utils::ReadFault)> {
     if let Some(tree) = tree_parse_cache_get(hash) {
         // The single clone an owned caller needs happens here, *outside* the cache lock.
         return Ok((*tree).clone());
     }
 
-    Ok(parse_tree_uncached(hash)?.0)
+    Ok(parse_tree_uncached_faulted(hash)?.0)
 }
 
 /// Load and parse the blob object with the given hash from the object store.
@@ -436,13 +461,21 @@ pub fn load_tree(hash: &str) -> Result<TreeItem, String> {
 /// * `Ok(Blob)`    - The parsed blob.
 /// * `Err(String)` - If the object does not exist, could not be parsed, or is not a blob.
 pub fn load_blob(hash: &str) -> Result<Blob, String> {
+    load_blob_faulted(hash).map_err(|(error, _)| error)
+}
+
+/// [`load_blob`], whose error says what it tells of the blob: bytes that read but do not parse as
+/// a blob are [`file_utils::ReadFault::Content`].
+pub(crate) fn load_blob_faulted(hash: &str) -> Result<Blob, (String, file_utils::ReadFault)> {
     // Borrow-only (the parse), so share the cached `Arc` — the win the read cache exists for on a
     // reconstruction-heavy walk (`blame`/`diff`/`export`) that reloads the same blobs and bases.
-    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+    let bytes = file_utils::retrieve_object_by_hash_shared_classified(hash)
+        .map_err(|(error, cause)| (error, file_utils::ReadFault::of(cause)))?;
+    let content = |error: String| (error, file_utils::ReadFault::Content);
 
-    match parser::object::loose_object_parser::parse(&bytes)? {
+    match parser::object::loose_object_parser::parse(&bytes).map_err(content)? {
         ParsedObject::Blob(blob) => Ok(blob),
-        other => Err(format!("Object {} is a {}, not a blob.", hash, other.get_type())),
+        other => Err(content(format!("Object {} is a {}, not a blob.", hash, other.get_type()))),
     }
 }
 

@@ -2481,6 +2481,12 @@ pub fn retrieve_object_by_hash_uncached(hash: &str) -> Result<Vec<u8>, String> {
     read_object_uncached(hash)
 }
 
+/// [`retrieve_object_by_hash_uncached`], whose error also carries what [`read_object_as_classified`]
+/// says of the failure.
+pub(crate) fn retrieve_object_by_hash_uncached_classified(hash: &str) -> Result<Vec<u8>, (String, Option<Unreadable>)> {
+    read_object_as_classified(hash, Absence::History)
+}
+
 /// Retrieve an object by a hash the caller was handed, such as one a user typed, rather than one
 /// history reached. It reads as [`retrieve_object_by_hash`] does, cache refill and refusals
 /// included, except for an absence nothing accounts for: the store simply not holding the hash
@@ -2525,6 +2531,27 @@ pub(crate) enum StoreReadOutcome {
     /// ordinary read a caller makes runs outside one.) The [`Unreadable`] says whether
     /// `forklift heal` can act on it.
     Unverifiable(String, Unreadable),
+}
+
+/// What a failed read says of the object it was asked for, to a check that judges that object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFault {
+    /// The store decided the object is absent, or holds it damaged: a verdict on the object.
+    Content,
+    /// The read says nothing of the object: the store could not be consulted, an index of another
+    /// format version or a base read failed some other way, or the absence was left undecided or
+    /// is a redaction's or a withholding's.
+    Untold,
+}
+
+impl ReadFault {
+    /// What a failure whose cause [`read_object_as_classified`] gives as `cause` says.
+    pub(crate) fn of(cause: Option<Unreadable>) -> ReadFault {
+        match cause {
+            None | Some(Unreadable::PackDamage | Unreadable::LooseCorrupt | Unreadable::RecordDamage) => ReadFault::Content,
+            Some(Unreadable::Other) => ReadFault::Untold,
+        }
+    }
 }
 
 /// Why an [`StoreReadOutcome::Unverifiable`] read failed, as far as `forklift heal` is concerned:
