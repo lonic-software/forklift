@@ -126,7 +126,9 @@ or because the office is unborn beside the trust file: it names what to settle f
 copy's path, or something other than a file at the ref's path is refused too, naming it: make the copy
 and the folders on the way to it readable, replace the link with the copy's file (moving it aside would
 leave the pallet reading as never written), or move aside what stands at the ref's path, and run the
-command again.
+command again. While a link or anything else that is neither a file nor a folder stands at the copy's
+path, nothing can be kept from it, so beside a damaged ref `heal` and the removal name that same way
+out instead of the removal.
 
 A meta ref lost together with its copy leaves nothing that says the pallet was ever written, so it
 reads as empty, as one never written does: `tag list` then lists no tags, for example, and refuses

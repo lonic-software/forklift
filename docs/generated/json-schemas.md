@@ -2772,12 +2772,19 @@ A command not listed here either reports only the generic human-message shape `{
     "Removed": {
       "description": "A ref `--remove-ref` removed, and where its bytes were kept.",
       "properties": {
-        "kept": {
-          "description": "The files the removed bytes were kept in: the ref's, then, for a meta pallet, its copy's.\nA meta ref that was lost keeps only its copy's.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
+        "kept_copy": {
+          "description": "For a meta pallet, the file its removed copy's bytes were kept in; `None` when it had no\ncopy, or the copy was not removed. Always `None` for a user pallet, which has no copy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kept_ref": {
+          "description": "The file the removed ref's bytes were kept in; `None` for a meta ref that was lost, which\nheld none.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "pallet": {
           "description": "The pallet.",
@@ -2786,7 +2793,8 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "required": [
         "pallet",
-        "kept"
+        "kept_ref",
+        "kept_copy"
       ],
       "type": "object"
     },

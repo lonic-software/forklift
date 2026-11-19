@@ -47,8 +47,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   and says what it costs. The removal keeps the ref's and the copy's bytes under
   `.forklift/removed-refs` and leaves the pallet empty. It refuses while a durability taint stands,
   and for a ref that waits on the office's or `@redactions`' refusal, or on an unborn office, it
-  names that step instead. `--json`: each `refs_removed` entry's `kept` is now a list of files
-  (schema 61).
+  names that step instead. A removal stopped after the ref went still reports it, and a rerun
+  keeps the bytes in the same file. `--json`: each `refs_removed` entry's `kept` is replaced by
+  `kept_ref` and `kept_copy`, each the file one role's bytes were kept in, or null (schema 61).
 
 ### Changed
 

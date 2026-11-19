@@ -87,8 +87,11 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 
 **Schema 61** (current): `heal --remove-ref` takes a metadata pallet (`@<name>`) that `heal`
 refused for a reason of its own, and removes its ref and its copy. Each `refs_removed` entry's
-`kept` is now a list of the files the removed bytes were kept in: the ref's, then, for a metadata
-pallet, its copy's (a lost ref keeps only its copy's). A metadata ref `heal` has nothing to
+`kept` is replaced by `kept_ref`, the file the removed ref's bytes were kept in (null for a lost
+metadata ref, which held none), and `kept_copy`, the file a metadata pallet's removed copy's
+bytes were kept in (null when it had no copy, or the copy was not removed, and always null for a
+user pallet). A removal that stopped after the ref went fails, and the error's message says what it
+removed and where the bytes were kept. A metadata ref `heal` has nothing to
 rebuild from names `forklift heal --remove-ref @<name>` as its `next_step`, where it used to name
 restoring the file by hand.
 
