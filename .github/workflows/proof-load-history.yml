@@ -95,9 +95,9 @@ jobs:
   # commit, replayed through Forklift and compared with git's. The pin and the seed keep the sample
   # the same from run to run, so its run step does not continue on error: a red comes from a change
   # in Forklift, or in the runner's git, which is not pinned (the report's header records its
-  # version). Either is resolved by an entry in crates/proof-load/replay-tickets.json and its ticket. The
-  # seed moves to the run number, by hand and once, the first time no entry is keyed to a merge of
-  # the seed-7 sample; the guide's replay section says so.
+  # version). Either is resolved by an entry in crates/proof-load/replay-tickets.json and its
+  # ticket. The seed moves to the run number, by hand and once, the first time no entry is keyed to
+  # a merge of the seed-7 sample; the guide's replay section says so.
   replay-git:
     name: proof load replay git
     runs-on: ubuntu-latest
