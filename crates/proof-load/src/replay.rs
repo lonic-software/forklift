@@ -1875,7 +1875,7 @@ mod tests {
         SKIP_SETTLE.with(|skip| skip.set(true));
         let stopped = run(&options, &|_| {});
         SKIP_SETTLE.with(|skip| skip.set(false));
-        let reason = stopped.err().expect("the run went on past a warehouse it cannot shift");
+        let reason = stopped.expect_err("the run went on past a warehouse it cannot shift");
         assert!(reason.starts_with(&format!("the warehouse cannot shift after merge {}'s error row", ignored)), "{}", reason);
         assert!(reason.contains("settling skipped by the test"), "{}", reason);
         assert!(!out.join("replay.json").exists());
