@@ -334,7 +334,7 @@ pub struct Row {
 
 impl Row {
     /// The row's reason and, apart from it, a failed clean-up's, as replay.md lists them.
-    fn said(&self) -> String {
+    fn reasons(&self) -> String {
         let mut out = String::new();
         if let Some(reason) = &self.reason {
             out.push_str(&format!("- reason: {}\n", reason));
@@ -670,7 +670,7 @@ impl ReplayReport {
                 Some(conflicts) if conflicts.is_empty() => "clean".to_string(),
                 Some(conflicts) => format!("conflicted on {}", conflicts.join(", ")),
             });
-            out.push_str(&row.said());
+            out.push_str(&row.reasons());
             if !row.paths.is_empty() {
                 out.push_str("\n| path | kind | direction or subtype | blob |\n|---|---|---|---|\n");
                 for path in &row.paths {
@@ -1357,7 +1357,7 @@ pub fn run(options: &ReplayOptions, progress: &dyn Fn(&str)) -> Result<ReplayRep
         // no shift works, and then every later row would be an error for this row's reason. The
         // run stops instead, naming it.
         if probed(row.class) {
-            let probe = tools.forklift(&["--json", "shift", HEAD_BRANCH]).map_err(|error| format!("shifting after merge {}'s {} row: {}", merge, row.class.label(), error))?;
+            let probe = tools.forklift(&["--json", "shift", HEAD_BRANCH]).map_err(|error| row.stopped(&error))?;
             if !probe.succeeded() {
                 return Err(row.stopped(&said(&probe)));
             }
@@ -1648,13 +1648,13 @@ mod tests {
         let mut both = row(Class::Error, Vec::new());
         both.reason = Some("stocktake failed".to_string());
         both.clearing = Some("aborting the conflicted consolidate failed: a marker".to_string());
-        assert_eq!(both.said(), "- reason: stocktake failed\n- clearing: aborting the conflicted consolidate failed: a marker\n");
+        assert_eq!(both.reasons(), "- reason: stocktake failed\n- clearing: aborting the conflicted consolidate failed: a marker\n");
         assert_eq!(
             both.stopped("`shift` exited 1"),
             "the warehouse cannot shift after merge 1111111111111111111111111111111111111111's error row, so no later row would replay: `shift` exited 1; the row: stocktake failed; its clean-up: aborting the conflicted consolidate failed: a marker",
         );
         both.clearing = None;
-        assert_eq!(both.said(), "- reason: stocktake failed\n");
+        assert_eq!(both.reasons(), "- reason: stocktake failed\n");
     }
 
     /// The probe follows exactly the rows whose consolidate was refused or which failed: the
