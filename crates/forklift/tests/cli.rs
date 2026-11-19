@@ -7889,23 +7889,49 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
     assert!(!forklift.join("meta/office").exists(), "nothing was written");
 }
 
-/// A trust file a newer version wrote is never judged past: the office is not rebuilt against
-/// the copy's anchor beside it, though that verifies, and the trust repair refuses the file.
-// Revert: read a newer trust file as one that does not parse, and go on to the copy → the
-// office is written from the copy's anchor.
+/// A trust file or copy a newer version wrote is never judged past: the office is not rebuilt
+/// against the other file's anchor beside it, though that verifies, and the trust repair refuses
+/// the file.
+// Revert: judge only the file reached (read a newer trust file as one that does not parse and go
+// on to the copy; never look at a copy once the trust file serves) → the office is written beside
+// what only a newer version reads.
 #[test]
-fn heal_does_not_rebuild_the_office_past_a_trust_file_a_newer_version_wrote() {
-    let (warehouse, _) = enrolled_warehouse("heal-office-newer-trust");
+fn heal_does_not_rebuild_the_office_beside_a_trust_file_a_newer_version_wrote() {
+    for newer in ["trust", "trust-copy"] {
+        let (warehouse, _) = enrolled_warehouse(&format!("heal-office-newer-{}", newer));
+        let forklift = warehouse.root.join(".forklift");
+        forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
+        std::fs::write(forklift.join(newer), "version = 999\n").unwrap();
+
+        let refused = warehouse.run(&["--json", "heal"]);
+
+        assert_ne!(refused.status.code(), Some(0), "{}: {}{}", newer, stdout(&refused), stderr(&refused));
+        let value = json(&refused);
+        assert!(value["error"]["message"].as_str().unwrap().contains("version 999"), "{}: {}", newer, value);
+        assert!(!forklift.join("meta/office").exists(), "{}: the office was not rebuilt", newer);
+    }
+}
+
+/// An office chain the store cannot give is no verdict on the anchor: the rebuild is refused as
+/// unverifiable, never as a head neither file verifies, and nothing is written.
+// Revert: read an unreadable chain as "does not verify" → heal refuses with the verification
+// message.
+#[test]
+fn heal_does_not_rebuild_an_office_whose_chain_the_store_cannot_give() {
+    let (warehouse, _) = enrolled_warehouse("heal-office-unreadable");
     let forklift = warehouse.root.join(".forklift");
+    let office = office_head(&warehouse);
     forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
-    std::fs::write(forklift.join("trust"), "version = 999\n").unwrap();
+    forklift_core::util::file_utils::remove_file(forklift.join(loose_object_relative_path(&office))).unwrap();
 
     let refused = warehouse.run(&["--json", "heal"]);
 
     assert_ne!(refused.status.code(), Some(0), "{}{}", stdout(&refused), stderr(&refused));
     let value = json(&refused);
-    assert!(value["error"]["message"].as_str().unwrap().contains("version 999"), "{}", value);
-    assert!(!forklift.join("meta/office").exists(), "the office was not rebuilt");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} could not be verified against the anchor: ", office)), "{}", value);
+    assert!(!message.contains("does not verify as the office's history"), "{}", value);
+    assert!(!forklift.join("meta/office").exists(), "nothing was written");
 }
 
 /// An office whose copy is ahead of what its damaged ref's bytes still name, along first parents,

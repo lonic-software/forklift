@@ -798,7 +798,20 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<pallet_utils::AnchorPr
     let served = crate::util::tombstone_utils::served_state().map_err(unjudged)? != crate::util::tombstone_utils::ServedState::Never;
     let mut said = Vec::new();
 
+    // What a newer version wrote is that version's to judge, the file not reached included: an
+    // office written beside it would stand where only that version reads the anchor.
     for (entry, name) in [(&trust, FILE_NAME_TRUST), (&copy, FILE_NAME_TRUST_COPY)] {
+        if let pallet_utils::TrustEntryState::Bytes(bytes) = entry {
+            if newer_refusal_in(bytes).is_some() {
+                return Err(format!(
+                    "\"{}\" was written by a newer version of Forklift, so heal does not verify the office against it",
+                    forklift_root().join(name).to_string_lossy()
+                ));
+            }
+        }
+    }
+
+    for entry in [&trust, &copy] {
         let bytes = match entry {
             pallet_utils::TrustEntryState::Absent => {
                 said.push("is lost");
@@ -813,12 +826,8 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<pallet_utils::AnchorPr
 
         let anchor = match std::str::from_utf8(bytes).map(parse_trust_anchor_classified) {
             Ok(Ok(anchor)) => anchor,
-            // What a newer version wrote is that version's to judge.
-            Ok(Err(TrustDecodeError::Newer(_))) => return Err(format!(
-                "\"{}\" was written by a newer version of Forklift, so heal does not verify the office against it",
-                forklift_root().join(name).to_string_lossy()
-            )),
-            Ok(Err(TrustDecodeError::Damaged(_))) | Err(_) => {
+            // A newer version's file refused above.
+            Ok(Err(_)) | Err(_) => {
                 said.push("does not read as an anchor");
                 continue;
             }

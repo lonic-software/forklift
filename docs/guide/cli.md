@@ -2903,7 +2903,9 @@ pallet's history, against the office, before it is written. A copy that is lost 
 head beside a ref that reads is set to the ref's head, with a `Note:`.
 
 The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the
-trust file or, when that file is lost or does not verify it, of the trust file's copy. Then `heal`
+trust file or, when that file is lost, is not a file, does not read as an anchor or does not
+verify it, of the trust file's copy. `heal` does not rebuild it while either file was written by a
+newer version of Forklift, or while the office's history cannot be read from the store. Then `heal`
 restores a lost trust file from its copy, as it does beside an intact office, and only then
 rebuilds the other metadata refs, which are verified against both. `heal` does not rebuild the
 redactions' ref (`@redactions`). Every other metadata pallet is checked against it, so while it is
