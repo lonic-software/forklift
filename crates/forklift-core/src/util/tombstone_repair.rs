@@ -98,7 +98,7 @@ impl Repaired {
         }
 
         for note in &self.refs_unread {
-            lines.push(format!("Kept the history of a ref that does not read: {}", note));
+            lines.push(format!("Kept the history of a ref, or of a ref's copy, that does not read: {}", note));
         }
 
         if let Some(reason) = &self.journals_unread {
@@ -364,8 +364,9 @@ struct LostParcels {
     unheld: BTreeSet<String>,
     /// Those of them no other one names as a parent: the lost tips.
     tips: Vec<String>,
-    /// A note for each pallet ref that did not read: what only it reaches is unheld too, and kept,
-    /// so that heal, which a damaged list refuses, can rebuild it once the list is repaired.
+    /// A note for each pallet ref, or meta ref's copy, that did not read: what only it reaches is
+    /// unheld too, and kept, so that heal, which a damaged list refuses, can rebuild it once the
+    /// list is repaired.
     refs_unread: Vec<String>,
 }
 

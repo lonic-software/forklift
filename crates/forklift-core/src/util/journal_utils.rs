@@ -2361,7 +2361,7 @@ mod tests {
 
     /// Undo's put-back is a backward write: a meta ref goes back before its copy is written, so a
     /// copy that cannot be written leaves the ref at undo's target, never at the head the
-    /// operation left, and the undo stands (the copy is left at the newer head for heal to mend).
+    /// operation left, and the undo stands (the copy is left at the newer head, for the copy mend).
     /// Revert: put the refs back in the forward order → the copy write fails first and @office
     /// stays at the operation's head → red. Revert: fail the put-back on the copy's error → undo
     /// rolls back and errs → red.

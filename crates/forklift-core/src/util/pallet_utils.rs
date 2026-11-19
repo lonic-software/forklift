@@ -1981,7 +1981,10 @@ pub(crate) fn update_pallet_head_locked(
 ///   folder, so a copy written after it could outlive it across a power cut. The copy is then left
 ///   at its prior head, the newer one. Once the ref write returned Ok the put-back has happened,
 ///   so a copy write that fails after it fails nothing: the copy stays at its prior head, the
-///   newer one, as after an error, and heal mends it to the ref.
+///   newer one, as after an error, until the copy mend ([`mend_meta_copy`]) sets it to the ref.
+///   A birth's copy failure, by contrast, is returned: a put-back's caller undoes the rest of its
+///   operation on an error, which would leave the undo half applied, while a birth's caller only
+///   reports it.
 #[allow(clippy::too_many_arguments)]
 fn write_head_locked(
     lock: &crate::util::lock_utils::RefLock,
@@ -2135,7 +2138,7 @@ pub enum CopyMend {
     /// The copy now holds the ref's bytes.
     Mended,
 
-    /// A taint record stands, so nothing was written: the copy is left for heal to mend once its
+    /// A taint record stands, so nothing was written: the copy is left to be mended once
     /// taint recovery has resolved every record.
     AfterTaint,
 }

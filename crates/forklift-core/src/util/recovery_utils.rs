@@ -1586,7 +1586,7 @@ struct WalkRoots {
 ///
 /// A meta ref that reads also yields its copy's head, in every mode, when the copy parses and
 /// names another head: a crash or a failed restore can leave the copy ahead of its ref, and its
-/// head must outlive the grace period until heal mends the copy. A copy that does not parse adds
+/// head must outlive the grace period until the copy is mended. A copy that does not parse adds
 /// nothing and fails nothing; one that cannot be read is an error under `FailClosed` and a note
 /// under `Tolerate`, as a ref is. The copy of a ref that does not read is not consulted here.
 fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<String>) -> Result<(Vec<String>, Vec<String>), String> {
@@ -6227,7 +6227,7 @@ mod tests {
 
     /// A meta ref's copy left ahead of its intact ref (a crash or a failed restore between the
     /// two writes) has its head rooted beside the ref's, in GC's fail-closed read too, so the
-    /// head outlives the grace period until heal mends the copy.
+    /// head outlives the grace period until the copy is mended.
     /// Revert: yield only the ref's own head → H2 is not among the meta heads → red.
     #[test]
     fn a_copy_left_ahead_of_its_ref_roots_its_head() {
