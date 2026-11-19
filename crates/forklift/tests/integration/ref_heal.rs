@@ -1385,7 +1385,7 @@ fn a_meta_removal_stopped_after_the_ref_says_what_it_removed_and_a_rerun_keeps_t
 // Mutation: name the removal whatever stands at the copy's path → next_step is the removal, red.
 #[cfg(unix)]
 #[test]
-fn a_lost_meta_ref_beside_a_blocked_copy_path_has_one_way_out() {
+fn a_damaged_meta_ref_beside_a_blocked_copy_path_has_one_way_out() {
     let area = Area::new("meta-copy-blocked");
     let (root, _, _) = tagged(&area);
     let copy = meta_copy_path(&root, "tags");
