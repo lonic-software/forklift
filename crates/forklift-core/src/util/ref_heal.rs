@@ -919,11 +919,16 @@ fn meta_wire(name: &str) -> String {
     pallet_utils::PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() }.to_wire()
 }
 
-/// Every meta pallet with a ref or a copy, read without the ref lock. One whose ref or copy cannot
-/// be read is left out, with a note.
+/// Every meta pallet this forklift knows that has something at its ref or its copy, read without
+/// the ref lock. The names are looked up, never the folders listed, so a stray file in either is
+/// neither a pallet nor a reason to stop. One whose ref or copy cannot be read is left out, with a
+/// note, and so is one with no ref and something other than a file at its copy, which names no
+/// head and so leaves the pallet unborn.
 fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
-    let mut names: BTreeSet<String> = pallet_utils::list_pallets_in(PalletNamespace::Meta)?.into_iter().collect();
-    names.extend(pallet_utils::list_meta_copies());
+    let present = |path: std::path::PathBuf| !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    let names = crate::util::meta_tree::META_PALLET_NAMES.iter()
+        .filter(|name| present(pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, name)) || present(pallet_utils::get_meta_copy_path(name)))
+        .map(|name| name.to_string());
 
     let mut states = Vec::new();
 
@@ -947,6 +952,10 @@ fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
         };
 
         match pallet_utils::read_meta_copy_state(&name) {
+            Ok(pallet_utils::MetaCopyState::Other) if reference.is_none() => push_note(notes, format!(
+                "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), which has no ref, so heal took the pallet as never written.",
+                meta_wire(&name), pallet_utils::get_meta_copy_path(&name).to_string_lossy()
+            )),
             Ok(copy) => states.push(MetaState { name, reference, copy }),
             Err(error) => push_note(notes, format!(
                 "The copy of pallet \"{}\"'s ref could not be read, so heal did not judge that ref: {}", meta_wire(&name), error

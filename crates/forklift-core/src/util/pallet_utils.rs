@@ -2521,22 +2521,6 @@ pub fn list_pallets_in(namespace: PalletNamespace) -> Result<Vec<String>, String
     Ok(names)
 }
 
-/// The names of the meta pallets this forklift knows that have something at their copy path,
-/// sorted: a ref lost beside its copy is listed here, not by [`list_pallets_in`]. Only the known
-/// names are looked up, never the folder listed, so a stray file in it is neither a pallet nor a
-/// reason to fail. Something there that cannot be told present or absent is listed, for its reader
-/// to report.
-pub fn list_meta_copies() -> Vec<String> {
-    let mut names: Vec<String> = crate::util::meta_tree::META_PALLET_NAMES.iter()
-        .filter(|name| !matches!(std::fs::symlink_metadata(get_meta_copy_path(name)), Err(e) if e.kind() == std::io::ErrorKind::NotFound))
-        .map(|name| name.to_string())
-        .collect();
-
-    names.sort();
-
-    names
-}
-
 /// Every born pallet across *both* namespaces, as `(ref, head)` pairs. This is the full
 /// reachable-ref set: use it wherever the whole warehouse matters and meta pallets must
 /// not be forgotten — GC roots, bundle contents, the re-genesis boundary, the handshake.

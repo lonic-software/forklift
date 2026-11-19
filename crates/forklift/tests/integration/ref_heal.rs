@@ -1138,6 +1138,12 @@ fn a_lost_meta_ref_is_rebuilt_from_its_copy() {
     // heal refuses it, red.
     std::fs::write(meta_copy_path(&root, "Tags~"), b"stray").unwrap();
     std::fs::write(meta_copy_path(&root, "tags.bak"), format!("{}\n", second)).unwrap();
+    // And in the refs' folder: a stray there is no pallet to mend a copy for. Mutation: take the
+    // names from the refs' folder → heal writes a copy for it, red.
+    std::fs::write(meta_path(&root, "tags.orig"), format!("{}\n", second)).unwrap();
+    // A folder at an unborn pallet's copy names no head: the pallet stays unborn. Mutation: judge
+    // it as a lost ref → refused, red.
+    std::fs::create_dir_all(meta_copy_path(&root, "kv").join("in-the-way")).unwrap();
 
     let data = healed(&area, &root);
     assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
@@ -1146,6 +1152,9 @@ fn a_lost_meta_ref_is_rebuilt_from_its_copy() {
 
     let listed = text(&area.run_ok(&root, &["tag", "list"]).stdout);
     assert!(listed.contains("v1") && listed.contains("v2"), "{}", listed);
+
+    assert!(!meta_copy_path(&root, "tags.orig").exists(), "a stray ref gets no copy");
+    assert!(meta_head(&root, "kv").is_none(), "@kv stays unborn");
 
     // A second heal finds nothing to do.
     assert!(rebuilt_meta(&healed(&area, &root)).is_empty());
@@ -1180,6 +1189,20 @@ fn a_copy_that_does_not_descend_from_what_the_ref_names_is_refused_with_both() {
     assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: its copy names") && message.contains(&first) && message.contains(&second), "{}", refused);
     assert_eq!(refused["error"]["next_step"], "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.", "{}", refused);
     assert_eq!(std::fs::read(meta_path(&root, "tags")).unwrap(), second.as_bytes()[..16].to_vec(), "the ref is left as it was");
+
+    // Beside a refused user ref, which nothing about @tags blocks, --ref is the step. Mutation:
+    // name the hand step for any refused meta ref → red.
+    area.run_ok(&root, &["pallet", "create", "side"]);
+    area.run_ok(&root, &["shift", "side"]);
+    area.stack(&root, "s.txt", "side");
+    area.run_ok(&root, &["shift", "main"]);
+    area.stack(&root, "m.txt", "main");
+    let side = head(&root, "side");
+    forklift_core::util::file_utils::remove_file(root.join(".forklift").join("journal.json")).unwrap();
+    std::fs::write(ref_path(&root, "main"), &side.as_bytes()[..20]).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    assert_eq!(refused["error"]["next_step"], "forklift heal --ref main=<parcel>", "{}", refused);
 }
 
 // Mutation: skip the verification of the chosen head → the user parcel is written as @tags, red.

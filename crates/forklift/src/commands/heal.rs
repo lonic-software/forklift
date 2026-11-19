@@ -429,14 +429,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
     if let Some(error) = meta_second.stopped {
-        return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
+        return Err(refused_too(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &meta_second.refused));
     }
 
     let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
     if let Some(error) = second.stopped {
-        return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
+        return Err(refused_too(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &second.refused));
     }
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
@@ -1404,11 +1404,16 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
         lines.push(format!("{}.", unfinished.trim_end_matches('.')));
     }
 
-    // A meta ref, which --ref does not set, is set only by hand, and first: a user ref's rebuild,
-    // --ref's among them, is verified against the office and checked against the redactions.
-    let next_step = match report.refs_refused.iter().any(|refused| refused.pallet.starts_with('@')) {
-        true => "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.".to_string(),
-        false => format!("forklift heal --ref {}=<parcel>", report.refs_refused.first().map_or("<pallet>", |refused| refused.pallet.as_str())),
+    // A meta ref, which --ref does not set, is set only by hand. The office's and @redactions' come
+    // first, since a user ref's rebuild, --ref's among them, is verified against the one and
+    // checked against the other; any other meta ref's waits behind a user ref's --ref.
+    let hand = "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.".to_string();
+    let gating = [forklift_core::util::office_utils::OFFICE_PALLET_NAME, forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME]
+        .map(|name| format!("@{}", name));
+    let next_step = match report.refs_refused.iter().find(|refused| !refused.pallet.starts_with('@')) {
+        _ if report.refs_refused.iter().any(|refused| gating.contains(&refused.pallet)) => hand,
+        Some(user) => format!("forklift heal --ref {}=<parcel>", user.pallet),
+        None => hand,
     };
 
     CoreError::refusal_with_details(
@@ -1417,6 +1422,13 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
         next_step,
         serde_json::json!(report),
     )
+}
+
+/// `error`, with a line for each ref the pass refused before it stopped.
+fn refused_too(error: String, refused: &[ref_heal::Refused]) -> String {
+    refused.iter().fold(error, |error, refused| forklift_core::error::append_to_message(
+        error, &format!("The ref of pallet \"{}\" was not rebuilt either: {}.", refused.pallet, refused.reason)
+    ))
 }
 
 /// Restore the checkout's scope from its copy, or set it to the paths `--scope` named.
