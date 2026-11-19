@@ -2902,9 +2902,13 @@ changes nothing and refuses with `ref_damaged`, naming both. The head chosen mus
 pallet's history, against the office, before it is written. A copy that is lost or names another
 head beside a ref that reads is set to the ref's head, with a `Note:`.
 
-`heal` does not rebuild the office's ref (`@office`) or the redactions' (`@redactions`). Every
-other metadata pallet is checked against both, so while either is damaged, `heal` refuses every
-damaged metadata ref, listing the head each copy names. Write the head into the file by hand.
+The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the
+trust file or, when that file is lost or does not verify it, of the trust file's copy. Then `heal`
+restores a lost trust file from its copy, as it does beside an intact office, and only then
+rebuilds the other metadata refs, which are verified against both. `heal` does not rebuild the
+redactions' ref (`@redactions`). Every other metadata pallet is checked against it, so while it is
+damaged, or while the office's ref is damaged and was not rebuilt, `heal` refuses every damaged
+metadata ref, listing the head each copy names. Write the head into the file by hand.
 
 #### A damaged fetch scope
 

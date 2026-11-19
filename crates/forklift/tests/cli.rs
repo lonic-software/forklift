@@ -7805,7 +7805,17 @@ fn rebuilt_refs(value: &serde_json::Value) -> Vec<(String, String)> {
 // taint recovery.
 #[test]
 fn heal_rebuilds_a_lost_office_and_then_restores_the_trust_file_from_its_copy() {
-    for damaged in [false, true] {
+    office_and_anchor_heal(false);
+}
+
+#[test]
+fn heal_rebuilds_a_damaged_office_and_then_restores_the_trust_file_from_its_copy() {
+    office_and_anchor_heal(true);
+}
+
+/// The two cases above: the office ref lost, or `damaged` to bytes that name no head.
+fn office_and_anchor_heal(damaged: bool) {
+    {
         let name = if damaged { "heal-damaged-office-lost-anchor" } else { "heal-lost-office-lost-anchor" };
         let (warehouse, anchor) = enrolled_warehouse(name);
         let forklift = warehouse.root.join(".forklift");
