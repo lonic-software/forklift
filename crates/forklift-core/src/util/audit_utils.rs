@@ -30,9 +30,10 @@ pub enum OfficeChainError {
     /// whether the store decided about the parcel (absent, damaged, another kind of object), or
     /// said nothing of it; a signature the store cannot give is told as saying nothing.
     Unreadable(String, crate::util::file_utils::ReadFault),
-    /// A parcel's signature reads but does not decode in the version it names: the store holds
-    /// that signature damaged, while the parcel it signs may be whole. No verdict on the chain's
-    /// history (a damaged version byte reads as any version), and one a restored signature mends.
+    /// A parcel's signature reads but does not decode in the version it names, or decodes in a form
+    /// no check can run on (not 64 bytes): the store holds that signature damaged, while the parcel
+    /// it signs may be whole. No verdict on the chain's history (a damaged version byte reads as
+    /// any version), and one a restored signature mends.
     SignatureDamaged(String),
     /// A signature of the chain, a parcel of it or an object a parcel holds, reads whole but in a
     /// version or form this build does not know, so a newer Forklift may have written it: no
@@ -113,7 +114,8 @@ impl From<OfficeChainError> for String {
 ///                                              endorsement checks.
 /// * `Err(OfficeChainError::Unreadable(..))`  - If a parcel or its signature cannot be read
 ///                                              from the store.
-/// * `Err(OfficeChainError::SignatureDamaged(_))` - If a signature reads but is damaged.
+/// * `Err(OfficeChainError::SignatureDamaged(_))` - If a signature reads but is damaged, or is
+///                                              in a form no check can run on.
 /// * `Err(OfficeChainError::Newer(_))`        - If a signature names a version this build does
 ///                                              not know, or a parcel of the chain, or an object
 ///                                              it holds, reads whole but this build cannot
@@ -192,7 +194,10 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
             sign_utils::SignatureDecode::Newer(message) => Newer(message),
             sign_utils::SignatureDecode::Damaged(message) => SignatureDamaged(message),
         })?;
-        verify_signature_of(hash, signature.as_ref(), lookup_state, "office parcel").map_err(Inauthentic)?;
+        verify_signature_of(hash, signature.as_ref(), lookup_state, "office parcel").map_err(|refused| match refused {
+            SignatureCheckError::Refused(message) => Inauthentic(message),
+            SignatureCheckError::Unchecked(message) => SignatureDamaged(message),
+        })?;
 
         // A revoked key must not extend the office chain: the signer has to be
         // active in the state the signature is checked against.
@@ -1779,7 +1784,7 @@ fn verify_self_service_change(previous: &OfficeState,
 pub fn verify_one_signature(parcel_hash: &str,
                             state: &OfficeState,
                             kind: &str) -> Result<(), String> {
-    verify_signature_of(parcel_hash, sign_utils::load_parcel_signature(parcel_hash)?.as_ref(), state, kind)
+    Ok(verify_signature_of(parcel_hash, sign_utils::load_parcel_signature(parcel_hash)?.as_ref(), state, kind)?)
 }
 
 /// [`verify_one_signature`] of the signature `signature` already read for `parcel_hash` (`None`:
@@ -1787,31 +1792,57 @@ pub fn verify_one_signature(parcel_hash: &str,
 pub(crate) fn verify_signature_of(parcel_hash: &str,
                                   signature: Option<&sign_utils::ParcelSignature>,
                                   state: &OfficeState,
-                                  kind: &str) -> Result<(), String> {
-    let signature = signature.ok_or(format!("The {} {} carries no signature.", kind, parcel_hash))?;
+                                  kind: &str) -> Result<(), SignatureCheckError> {
+    use SignatureCheckError::{Refused, Unchecked};
+
+    let signature = signature.ok_or(Refused(format!("The {} {} carries no signature.", kind, parcel_hash)))?;
 
     let key = state.find_key(&signature.key_id)
-        .ok_or(format!(
+        .ok_or(Refused(format!(
             "The {} {} is signed with key {}, which is not tracked (at that point) in \
             the office.",
             kind, parcel_hash, signature.key_id
-        ))?;
+        )))?;
 
     let is_valid = sign_utils::verify_parcel_signature(
         &key.public_key,
         parcel_hash,
         &signature.signature
-    )?;
+    ).map_err(|why| Unchecked(format!(
+        "The signature of {} {} cannot be checked against key {}: {}",
+        kind, parcel_hash, signature.key_id, why
+    )))?;
 
     if !is_valid {
-        return Err(format!(
+        return Err(Refused(format!(
             "The signature of {} {} does not verify against key {}. The warehouse may \
             have been tampered with.",
             kind, parcel_hash, signature.key_id
-        ));
+        )));
     }
 
     Ok(())
+}
+
+/// Why [`verify_signature_of`] refused a parcel's signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SignatureCheckError {
+    /// It was checked and refused: there is none, its key is not tracked, or it does not verify
+    /// against its key. A verdict on the parcel.
+    Refused(String),
+
+    /// It decodes, but neither it nor its key is in a form a check can run on (a signature not 64
+    /// bytes, a key that is no Ed25519 key): no verdict on the parcel, as a damaged signature is
+    /// none.
+    Unchecked(String),
+}
+
+impl From<SignatureCheckError> for String {
+    fn from(error: SignatureCheckError) -> String {
+        match error {
+            SignatureCheckError::Refused(message) | SignatureCheckError::Unchecked(message) => message,
+        }
+    }
 }
 
 /// Refuse a first trust anchor whose `adopts` names history the warehouse does not completely
@@ -4440,6 +4471,28 @@ mod tests {
             Err(OfficeChainError::SignatureDamaged(message)) => panic!("refused as a damaged signature: {}", message),
             Err(OfficeChainError::Newer(message)) => panic!("refused as newer: {}", message),
             Ok(_) => panic!("the chain at {} must be refused", head),
+        }
+    }
+
+    // An office parcel's signature that decodes but is in a form no check can run on is no verdict
+    // on the chain, as a damaged one is none: the store holds the parcel whole. Mutation: read it as
+    // the walk's refusal (`Unchecked` → `Inauthentic`) → "short" is inauthentic, red.
+    #[test]
+    fn an_office_signature_no_check_can_run_on_is_no_verdict_on_the_chain() {
+        let fixture = PrivilegeFixture::new("office-signature-unchecked");
+        let (_, head) = fixture.admit("bob@x", Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
+        let path = sign_utils::get_signature_path(&head).unwrap();
+        let signed = std::fs::read(&path).unwrap();
+        // Version 1, the key id, then a one-byte length and the 64-byte signature.
+        assert_eq!(signed[signed.len() - 65], 64, "{:?}", signed);
+        let short = [signed[..signed.len() - 65].to_vec(), vec![63], vec![7; 63]].concat();
+        file_utils::write_file_atomically(&path, &short).unwrap();
+
+        match verify_office_chain(&fixture.anchor, &head) {
+            Err(OfficeChainError::SignatureDamaged(message)) => {
+                assert!(message.contains(&head) && message.contains("cannot be checked against key"), "{}", message)
+            }
+            other => panic!("a signature no check can run on is no verdict: {:?}", other.map(|_| ())),
         }
     }
 
