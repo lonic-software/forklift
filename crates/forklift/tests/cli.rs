@@ -7897,7 +7897,7 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
     forklift_core::util::file_utils::remove_file(forklift.join("trust-copy")).unwrap();
     let value = json(&warehouse.run(&["--json", "heal"]));
     let message = value["error"]["message"].as_str().unwrap();
-    assert!(message.contains(&format!("parcel {} could not be verified as the office's history, since the trust files are damaged: the trust file (\"", main)), "{}", value);
+    assert!(message.contains(&format!("parcel {} could not be verified as the office's history: the trust file (\"", main)), "{}", value);
     assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\"") && message.contains("\") is lost"), "{}", value);
     assert_ne!(value["error"]["next_step"], "forklift heal --remove-ref @office", "{}", value);
     assert!(!forklift.join("meta/office").exists(), "nothing was written");
