@@ -319,7 +319,11 @@ pub(crate) fn plan_tags<'a>(repo: &GitRepo,
         let (tagger, signer) = match (&attributed.signer, office) {
             (None, _) => (attributed.tagger.as_str(), None),
             (Some(_), Err(why)) => {
-                skipped.push(skip(format!("the office that names its tagger could not be read: {}", why)));
+                // A refusal carries its code and step in a frame; the reason is prose.
+                skipped.push(skip(format!(
+                    "the office that names its tagger could not be read: {}",
+                    forklift_core::error::CoreError::from(why.to_string())
+                )));
                 continue;
             }
             (Some(signer), Ok(office)) => match office.find_key(signer) {

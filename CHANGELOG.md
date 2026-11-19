@@ -47,6 +47,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   writes the same bytes to `.forklift/meta-copy/<name>`, under the same lock, in the order that
   leaves the copy at the newer head if the write is interrupted. Beside a ref that reads, garbage
   collection keeps the head the copy names as well as the ref's own.
+- **A lost metadata pallet ref is refused where it is read, not read as empty.** A ref under
+  `.forklift/meta/` whose file is missing while its copy stands now refuses as `ref_damaged`
+  (exit 53) in every command that reads it, listings included, where it read as a pallet never
+  written: `tag list` printed no tags, `lower` took the remote's head as a first adoption, and
+  garbage collection held nothing for it. The next step names `forklift heal` when the copy holds a
+  parcel hash, or a damaged ref's own bytes name one parcel, and the hand fix otherwise; a copy
+  that cannot be read, or a link at its path, is refused, naming what to make readable or replace. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
+  report names each pallet whose ref could not be read (`pallets_unread` in `--json`) instead of
+  leaving it out, and no longer says no pallet's history reaches the objects while one is named (`--json`
+  schema 60).
 - **A killed process no longer leaves a lock to remove by hand.** The bay's lock, the object
   store's lock and a served warehouse's `serve.lock` are now kernel locks, released when the
   process holding them ends, however it ends. A `forklift-server` that crashed or was killed

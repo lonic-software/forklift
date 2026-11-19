@@ -6233,13 +6233,16 @@ fn export_git_leaves_tags_out_when_the_office_cannot_name_their_tagger() {
     assert_eq!(damaged["skipped_tags"].as_array().unwrap().len(), 1, "{}", damaged);
     let skipped = &damaged["skipped_tags"][0];
     assert_eq!(skipped["name"], "v1");
-    assert!(skipped["reason"].as_str().unwrap().contains("the office that names its tagger could not be read"),
-        "{}", damaged);
+    let reason = skipped["reason"].as_str().unwrap();
+    assert!(reason.contains("the office that names its tagger could not be read: The ref of pallet \"@office\""), "{}", damaged);
+    assert!(!reason.contains('\u{1f}'), "the reason must not carry the refusal's frame: {}", damaged);
     assert!(damaged.get("unreadable_tags").is_none(), "{}", damaged);
     let human = stdout(&warehouse.run(&["git", "export", warehouse.root.join("damaged-human").to_str().unwrap()]));
     assert!(human.contains("warning: tag \"v1\" was not exported: the office"), "{}", human);
 
+    // An office never written: neither the ref nor its copy stands.
     forklift_core::util::file_utils::remove_file(&office_head).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift").join("meta-copy").join("office")).unwrap();
     let unborn = export("unborn");
     assert_eq!(unborn["tags"], serde_json::json!(["pre"]));
     assert_eq!(unborn["skipped_tags"].as_array().unwrap().len(), 1, "{}", unborn);
@@ -7799,10 +7802,8 @@ fn rebuilt_refs(value: &serde_json::Value) -> Vec<(String, String)> {
 /// file's copy, and then its trust file back from that copy, which is left as it was. Signing
 /// resumes.
 // Revert: judge the office against the trust file's anchor alone, never its copy's → the office
-// is not rebuilt ahead of the trust repair. The damaged office: repair_trust cannot
-// read it, so neither file is restored and heal refuses. The lost office: it reads unborn, so the
-// trust file is restored beside it with the unborn-office note, and the office only after the
-// taint recovery.
+// is not rebuilt ahead of the trust repair, so the office or the trust file is not back as this
+// test expects, red.
 #[test]
 fn heal_rebuilds_a_lost_office_and_then_restores_the_trust_file_from_its_copy() {
     office_and_anchor_heal(false);
@@ -7850,8 +7851,8 @@ fn office_and_anchor_heal(damaged: bool) {
 /// A lost office ref beside an intact trust file is rebuilt from its copy. The write pins the
 /// anchor, never the office, whose ref is the loss being healed.
 // Revert: pin the office write to the office head it rebuilds (OfficePrecondition::At) → the lost
-// ref reads unborn under the lock, the write is refused as the office moved, and heal refuses
-// the office.
+// ref does not read as that head under the lock, the write is refused, and heal refuses the
+// office.
 #[test]
 fn heal_rebuilds_a_lost_office_ref_from_its_copy() {
     let (warehouse, _) = enrolled_warehouse("heal-lost-office");
@@ -8037,14 +8038,18 @@ fn damaged_trust_refuses_with_its_code_and_names_heal_where_heal_mends() {
             let anchor = foreign_anchor.clone();
             Box::new(move |w| std::fs::write(w.root.join(".forklift/trust"), &anchor).unwrap())
         }, &["stack", "-m", "r"], 69, "trust_damaged", "forklift heal", "does not verify the office pallet, but its copy does"),
-        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+        // Its copy stands, so heal rebuilds it, verified against the trust file.
+        ("office ref lost beside its copy", Box::new(move |w| lose(w, "meta/office")),
+            &["stack", "-m", "r"], 53, "ref_damaged", "forklift heal", "is lost: its file is missing, and its copy"),
+        ("office ref and copy lost", Box::new(move |w| { lose(w, "meta/office"); lose(w, "meta-copy/office"); }),
             &["stack", "-m", "r"], 53, "ref_damaged", "", "by hand"),
-        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+        ("office ref and copy lost", Box::new(move |w| { lose(w, "meta/office"); lose(w, "meta-copy/office"); }),
             &["audit"], 53, "ref_damaged", "", "the office pallet is unborn"),
-        ("office ref lost", Box::new(move |w| lose(w, "meta/office")),
+        ("office ref and copy lost", Box::new(move |w| { lose(w, "meta/office"); lose(w, "meta-copy/office"); }),
             &["office", "enroll"], 53, "ref_damaged", "", "the office pallet is unborn"),
-        ("office ref lost, a remote configured", Box::new(move |w| {
+        ("office ref and copy lost, a remote configured", Box::new(move |w| {
             lose(w, "meta/office");
+            lose(w, "meta-copy/office");
             assert_success(&w.run(&["config", "set", "remote.url", "http://127.0.0.1:9"]));
         }), &["stack", "-m", "r"], 53, "ref_damaged", "", "If the configured remote holds this warehouse's office pallet"),
         ("head signature garbled", Box::new(|w| std::fs::write(sidecar_of_head(w), b"xx").unwrap()),
@@ -8132,7 +8137,9 @@ fn undoing_a_delete_over_a_damaged_office_signature_names_what_was_refused() {
 #[test]
 fn an_enrollment_stopped_before_the_office_names_a_way_out_that_works() {
     let (warehouse, _) = enrolled_warehouse("enroll-stopped");
+    // The ref's copy is written with the ref, so neither stands.
     forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/meta/office")).unwrap();
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/meta-copy/office")).unwrap();
 
     let refused = warehouse.run(&["--json", "office", "enroll"]);
 
@@ -9072,7 +9079,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 59);
+    assert_eq!(value["schema"], 60);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -9114,7 +9121,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 59);
+    assert_eq!(value["schema"], 60);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -9173,7 +9180,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 59);
+    assert_eq!(value["schema"], 60);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -9381,7 +9388,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 59,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 60,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);

@@ -4580,9 +4580,7 @@ mod tests {
         let _fixture = PrivilegeFixture::new("first-serve-anchor-before-office");
         let forklift = crate::globals::forklift_root();
         file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), &anchor_bytes()).unwrap();
-        file_utils::remove_file(crate::util::pallet_utils::get_pallet_ref_path(
-            crate::util::pallet_utils::PalletNamespace::Meta, crate::util::office_utils::OFFICE_PALLET_NAME,
-        )).unwrap();
+        unborn_office();
 
         assert!(crate::util::tombstone_utils::mark_served(true).unwrap());
 
@@ -4657,7 +4655,7 @@ mod tests {
         name: &'static str,
         trust: Option<Vec<u8>>,
         copy: Option<Vec<u8>>,
-        /// The office pallet's ref is removed: its head reads unborn.
+        /// The office pallet's ref and its copy are removed: its head reads unborn.
         unborn: bool,
         code: Option<crate::error::RefusalCode>,
         says: &'static str,
@@ -4763,11 +4761,16 @@ mod tests {
         (read(crate::util::office_utils::FILE_NAME_TRUST), read(crate::util::office_utils::FILE_NAME_TRUST_COPY))
     }
 
-    /// Remove the office pallet's ref, so its head reads unborn.
+    /// Remove the office pallet's ref and its copy, so its head reads unborn: a ref missing beside
+    /// its copy reads as lost.
     fn unborn_office() {
         file_utils::remove_file(crate::util::pallet_utils::get_pallet_ref_path(
             crate::util::pallet_utils::PalletNamespace::Meta, crate::util::office_utils::OFFICE_PALLET_NAME,
         )).unwrap();
+        let copy = crate::util::pallet_utils::get_meta_copy_path(crate::util::office_utils::OFFICE_PALLET_NAME);
+        if copy.exists() {
+            file_utils::remove_file(&copy).unwrap();
+        }
     }
 
     /// Serve the fixture's root for the first time, over its settled anchor and an equal copy.

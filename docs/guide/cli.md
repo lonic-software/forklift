@@ -2902,6 +2902,11 @@ changes nothing and refuses with `ref_damaged`, naming both. The head chosen mus
 pallet's history, against the office, before it is written. A copy that is lost or names another
 head beside a ref that reads is set to the ref's head, with a `Note:`.
 
+Until then, every other command that reads such a ref refuses with `ref_damaged` (exit 53) rather
+than read it as a pallet never written, and names `forklift heal` when the copy holds a parcel hash,
+or the damaged file names one parcel. A ref lost together with its copy leaves
+nothing to tell it from one never written, and reads as empty.
+
 The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the
 trust file or, when that file is lost, is not a file, does not read as an anchor or does not
 verify it, of the trust file's copy. `heal` does not rebuild it while either file was written by a

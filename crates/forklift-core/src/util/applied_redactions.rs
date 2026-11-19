@@ -184,8 +184,8 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
 
     // A byte flipped to another hex digit leaves a whole line naming a hash no redaction names,
     // which would hold that content as redacted. A redaction's cell is never removed, so every
-    // applied hash is a cell's path. With `@redactions` unread, or reading as no cell at all,
-    // which its lost ref reads as too, every whole line is kept.
+    // applied hash is a cell's path. With `@redactions` unread (its lost ref among them), or
+    // reading as no cell at all, every whole line is kept.
     let hashes: Vec<String> = match redactions {
         Ok(read) if !read.redactions.is_empty() || !read.unreadable.is_empty() => {
             let named: BTreeSet<&str> = read.redactions.iter().map(|attributed| attributed.redaction.hash.as_str())
