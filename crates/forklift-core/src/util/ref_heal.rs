@@ -1069,8 +1069,10 @@ fn not_judged(name: &str, wire: &str, unjudged: &[String], notes: &mut Vec<Strin
             wire
         );
     }
-    let mut said = Vec::new();
-    let state = meta_states(&mut said).unwrap_or_default().into_iter().find(|state| state.name == name);
+    // Only a note of this pallet's own says why it was not judged; another's says nothing of it.
+    let mut skipped = Vec::new();
+    let state = meta_states_skipping(&mut skipped).unwrap_or_default().into_iter().find(|state| state.name == name);
+    let said: Vec<String> = skipped.into_iter().filter(|(skipped, _)| skipped == name).map(|(_, note)| note).collect();
     match state {
         Some(state) if state.damage().is_none() => format!("The ref of pallet \"{}\" reads, so there is nothing to remove.", wire),
         Some(_) => format!(
@@ -1081,8 +1083,8 @@ fn not_judged(name: &str, wire: &str, unjudged: &[String], notes: &mut Vec<Strin
         None => {
             notes.extend(said);
             format!(
-                "Heal could not read the ref of pallet \"{}\" or its copy, as the note says, so it did not judge that ref, and what cannot be read \
-                cannot be kept: the ref was not removed. Settle what the note names, then run the command again.",
+                "Heal did not judge the ref of pallet \"{}\", for what the note says, so it was not removed: what cannot be read cannot be kept. \
+                Settle what the note names, then run the command again.",
                 wire
             )
         }
@@ -1180,6 +1182,16 @@ fn meta_wire(name: &str) -> String {
 /// note, and so is one with no ref and something other than a file at its copy, which names no
 /// head and so leaves the pallet unborn.
 fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
+    let mut skipped = Vec::new();
+    let states = meta_states_skipping(&mut skipped);
+    for (_, note) in skipped {
+        push_note(notes, note);
+    }
+    states
+}
+
+/// [`meta_states`], each pallet left out in `skipped` with its note, by name.
+fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaState>, String> {
     let present = |path: std::path::PathBuf| !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     let names = crate::util::meta_tree::META_PALLET_NAMES.iter()
         .filter(|name| present(pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, name)) || present(pallet_utils::get_meta_copy_path(name)))
@@ -1194,27 +1206,27 @@ fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
             Ok(pallet_utils::MetaCopyState::Absent) => None,
             Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => Some(bytes),
             Ok(pallet_utils::MetaCopyState::Other) => {
-                push_note(notes, format!(
+                skipped.push((name.clone(), format!(
                     "Something that is not a file stands at the ref of pallet \"{}\" (\"{}\"), so heal did not judge it.",
                     meta_wire(&name), path.to_string_lossy()
-                ));
+                )));
                 continue;
             }
             Err(error) => {
-                push_note(notes, format!("The ref of pallet \"{}\" could not be read to tell whether it is damaged: {}", meta_wire(&name), error));
+                skipped.push((name.clone(), format!("The ref of pallet \"{}\" could not be read to tell whether it is damaged: {}", meta_wire(&name), error)));
                 continue;
             }
         };
 
         match pallet_utils::read_meta_copy_state(&name) {
-            Ok(pallet_utils::MetaCopyState::Other) if reference.is_none() => push_note(notes, format!(
+            Ok(pallet_utils::MetaCopyState::Other) if reference.is_none() => skipped.push((name.clone(), format!(
                 "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), which has no ref: it names no head, so heal did not judge that ref.",
                 meta_wire(&name), pallet_utils::get_meta_copy_path(&name).to_string_lossy()
-            )),
+            ))),
             Ok(copy) => states.push(MetaState { name, reference, copy }),
-            Err(error) => push_note(notes, format!(
+            Err(error) => skipped.push((name.clone(), format!(
                 "The copy of pallet \"{}\"'s ref could not be read, so heal did not judge that ref: {}", meta_wire(&name), error
-            )),
+            ))),
         }
     }
 

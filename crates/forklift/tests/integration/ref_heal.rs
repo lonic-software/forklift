@@ -1413,6 +1413,34 @@ fn a_lost_meta_ref_beside_a_blocked_copy_path_has_one_way_out() {
     assert_eq!(read["error"]["next_step"], next_step.replace("run \"forklift heal\" again", "run the command again"), "{}", read);
 }
 
+// A removal of a meta ref heal did not judge says why from that pallet's own note, never
+// another's. Mutation: read any note as this pallet's → @kv is told heal could not judge it, red.
+#[cfg(unix)]
+#[test]
+fn a_meta_removal_heal_did_not_judge_says_why_from_that_pallets_own_note() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("meta-remove-not-judged");
+    let (root, _, _) = tagged(&area);
+    let copy = meta_copy_path(&root, "tags");
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let unborn = area.run(&root, &["heal", "--remove-ref", "@kv"]);
+    let tags = area.run(&root, &["heal", "--remove-ref", "@tags"]);
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let said = text(&unborn.stderr);
+    assert!(!unborn.status.success(), "{}", text(&unborn.stdout));
+    assert!(said.contains("Pallet \"@kv\" has neither a ref nor a copy, so it reads as unborn and there is nothing to remove."), "{}", said);
+    assert!(!said.contains("did not judge the ref of pallet \"@kv\""), "{}", said);
+
+    let said = text(&tags.stderr);
+    assert!(!tags.status.success(), "{}", text(&tags.stdout));
+    assert!(said.contains("Heal did not judge the ref of pallet \"@tags\", for what the note says, so it was not removed"), "{}", said);
+    assert!(said.contains("The copy of pallet \"@tags\"'s ref could not be read"), "{}", said);
+    assert!(meta_path(&root, "tags").exists(), "nothing was removed");
+}
+
 // The removal of a meta ref heal refuses as its own, with no taint standing; and refused, writing
 // nothing, while a taint stands. Mutations: drop the taint condition from the meta admission →
 // "tainted" red (the kept bytes land, and the write reports the taint); refuse a meta ref whose
