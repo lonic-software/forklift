@@ -728,13 +728,9 @@ pub const LOST_ANCHOR_WAYS_OUT: &str = "Restore the trust file from a backup if 
     here: run \"forklift prepare\" in another folder, which starts without this warehouse's history, and \
     enroll there.";
 
-/// Decode the trust file's `bytes`, refusing a file that does not parse as damaged. A file a newer
-/// version wrote is not damage, and is refused uncoded.
-fn decode_trust_file(bytes: &[u8]) -> Result<TrustAnchor, String> {
-    decode_trust_file_judged(bytes).map_err(String::from)
-}
-
-/// [`decode_trust_file`], its refusal typed: a newer version's, or a damaged file's.
+/// Decode the trust file's `bytes`, refusing a file that does not parse as damaged
+/// ([`TrustReadError::Refused`], coded). A file a newer version wrote is not damage, and is refused
+/// uncoded ([`TrustReadError::Newer`]).
 fn decode_trust_file_judged(bytes: &[u8]) -> Result<TrustAnchor, TrustReadError> {
     let decoded = std::str::from_utf8(bytes)
         .map_err(|e| TrustDecodeError::Damaged(format!("The trust file is not valid UTF-8: {}", e)))

@@ -893,7 +893,8 @@ fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<
                 Ok(MetaCopyState::Bytes(copy)) if parse_ref_bytes(&copy).is_some() => HEAL_STEP.to_string(),
                 // heal judges no ref whose copy it cannot read, whatever the ref's own bytes name.
                 Err(_) => COPY_READABLE_STEP.to_string(),
-                _ if crate::util::ref_heal::salvage_names_a_head(&bytes) => HEAL_STEP.to_string(),
+                // heal names the step of what its bytes name, or of what it could not read of them.
+                _ if crate::util::ref_heal::salvage_step_is_heal(&bytes) => HEAL_STEP.to_string(),
                 // The removal keeps the copy's bytes, which it cannot do for what is not a file.
                 Ok(copy) if copy_blocks(name, &copy) => blocked_copy_step(name, "run the command again"),
                 _ => meta_removal_step(name),
@@ -3133,7 +3134,7 @@ pub(crate) mod tests {
             // Even when its bytes name one parcel: heal does not judge the ref while its copy cannot be read.
             let named = stub_parcel("named");
             std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "tags"), &named.as_bytes()[..12]).unwrap();
-            assert!(crate::util::ref_heal::salvage_names_a_head(&named.as_bytes()[..12]), "the fixture's bytes salvage");
+            assert!(crate::util::ref_heal::salvage_step_is_heal(&named.as_bytes()[..12]), "the fixture's bytes salvage");
             let (_, next) = step("tags");
             assert!(next.starts_with("Make the copy and the folders on the way to it readable"), "{}", next);
             drop(_scope);

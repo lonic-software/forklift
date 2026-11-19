@@ -146,9 +146,11 @@ pub enum Owner {
     Trust(String),
 
     /// What heal needs to judge it could not be read, or its rebuild could not be written: no
-    /// verdict on the ref, and not one a rerun alone changes. The way out is to settle what the
-    /// refusal names ([`unread_step`]).
-    Unread,
+    /// verdict on the ref, and not one a rerun alone changes. The way out is the step the read's
+    /// own refusal named, when it named one other than heal itself (a command or sentences as
+    /// [`meta_step`] returns them), else to settle what the refusal names ([`unread_step`]).
+    /// Producers pass `None`; [`refuse_in`] lifts the step out of the reason.
+    Unread(Option<String>),
 
     /// Its files moved while heal ran: a later heal judges it again.
     Again,
@@ -503,11 +505,25 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     Ok(judge(matches, tainted))
 }
 
-/// Whether a damaged ref's `bytes` name the one parcel `heal` rebuilds it at. Bytes that name one
-/// of several parcels, one that is tainted or cannot be read, or that could not be looked up,
-/// leave heal refusing, so they do not count.
-pub(crate) fn salvage_names_a_head(bytes: &[u8]) -> bool {
-    matches!(salvage(bytes, &Tainted::read(&mut Vec::new())), Ok(Salvage::Found(_)))
+/// Whose heal's refusal of a meta ref is when the salvage of its bytes, `salvaged`, names no head
+/// it takes and no copy does either: the ref's own when the store's answer is a verdict (nothing,
+/// several parcels, a match it decided is unknown), unread when the store said nothing (a match or
+/// a pack it could not read, a lookup that failed). A found head refuses only through what
+/// follows (its verification), so it is the ref's own here.
+fn salvage_owner(salvaged: &Result<Salvage, String>) -> Owner {
+    match salvaged {
+        Ok(Salvage::Found(_) | Salvage::Nothing | Salvage::Ambiguous(..) | Salvage::Unknown(_)) => Owner::Own,
+        Ok(Salvage::Untold(_)) | Err(_) => Owner::Unread(None),
+    }
+}
+
+/// Whether the step for a damaged meta ref whose copy names no head is `heal` rather than the
+/// ref's removal, by its `bytes`: when they name the one parcel heal rebuilds it at, or when heal
+/// refuses them as unread ([`salvage_owner`]), whose step heal itself names; the removal is the
+/// step only of a refusal that is the ref's own.
+pub(crate) fn salvage_step_is_heal(bytes: &[u8]) -> bool {
+    let salvaged = salvage(bytes, &Tainted::read(&mut Vec::new()));
+    matches!(salvaged, Ok(Salvage::Found(_))) || salvage_owner(&salvaged) != Owner::Own
 }
 
 /// The salvage among `matches`: the one readable parcel, unless another parcel also matches, or
@@ -987,7 +1003,8 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
             Some(Owner::Newer) => return newer_step(),
             Some(Owner::Trust(step)) => return step.clone(),
-            Some(Owner::Unread) => return unread_step(&at.pallet),
+            Some(Owner::Unread(Some(step))) => return step.clone(),
+            Some(Owner::Unread(None)) => return unread_step(&at.pallet),
             Some(Owner::Again) | None => break,
         }
     }
@@ -1088,9 +1105,9 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
             "The ref of pallet \"{}\" was not removed: the trust state it is verified against refuses ({}), which is no verdict on the ref. {}",
             wire, refused.reason.trim_end_matches('.'), step_sentence(step)
         )),
-        Owner::Unread => return Err(format!(
+        Owner::Unread(step) => return Err(format!(
             "The ref of pallet \"{}\" was not removed: heal could not read what it needs to judge it ({}), which is no verdict on the ref. {}",
-            wire, refused.reason.trim_end_matches('.'), unread_step(wire)
+            wire, refused.reason.trim_end_matches('.'), step.as_deref().map_or_else(|| unread_step(wire), step_sentence)
         )),
         Owner::Again => return Err(format!(
             "The ref of pallet \"{}\" was not removed: heal did not refuse it for a reason of its own ({}). Run \"forklift heal\" again.",
@@ -1353,16 +1370,18 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
         .collect();
 
     let salvaged = match &state.reference {
-        Some(bytes) => salvage(bytes, tainted).map_err(|error| (
-            format!("what its own bytes name could not be looked up: {}", error.trim_end_matches('.')), candidates.clone(), Owner::Unread
-        ))?,
-        None => Salvage::Nothing,
+        Some(bytes) => salvage(bytes, tainted),
+        None => Ok(Salvage::Nothing),
     };
+    let unchosen = salvage_owner(&salvaged);
+    let salvaged = salvaged.map_err(|error| (
+        format!("what its own bytes name could not be looked up: {}", error.trim_end_matches('.')), candidates.clone(), unchosen.clone()
+    ))?;
 
     match salvaged {
         Salvage::Nothing => match copy {
             Some(head) => Ok((head, FROM_COPY)),
-            None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates, Owner::Own)),
+            None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates, unchosen)),
         },
         Salvage::Found(salvaged) => {
             candidates.push(Candidate { head: salvaged.clone(), source: Source::Salvage.describe() });
@@ -1385,17 +1404,16 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
                         copy, salvaged, error.trim_end_matches('.')
                     ), candidates, match fault {
                         crate::util::file_utils::ReadFault::Content => Owner::Own,
-                        crate::util::file_utils::ReadFault::Untold => Owner::Unread,
+                        crate::util::file_utils::ReadFault::Untold => Owner::Unread(None),
                     })),
                 },
             }
         }
         Salvage::Ambiguous(parcels, _) => {
             candidates.extend(parcels.into_iter().map(|head| Candidate { head, source: Source::Salvage.describe() }));
-            Err(("its own bytes name one of several parcels, not which".to_string(), candidates, Owner::Own))
+            Err(("its own bytes name one of several parcels, not which".to_string(), candidates, unchosen))
         }
-        Salvage::Unknown(why) => Err((why, candidates, Owner::Own)),
-        Salvage::Untold(why) => Err((why, candidates, Owner::Unread)),
+        Salvage::Unknown(why) | Salvage::Untold(why) => Err((why, candidates, unchosen)),
     }
 }
 
@@ -1412,7 +1430,7 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
 fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPreconditions, (String, Owner)> {
     let anchor = crate::util::office_utils::read_trust_anchor_judged(crate::util::office_utils::TrustReadMode::Checked)
         .map_err(|error| { let owner = trust_read_owner(&error); (String::from(error), owner) })?;
-    let office_head = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).map_err(|error| (error, Owner::Unread))?;
+    let office_head = pallet_utils::get_meta_pallet_head(crate::util::office_utils::OFFICE_PALLET_NAME).map_err(|error| (error, Owner::Unread(None)))?;
 
     // Said here rather than by the verifier, whose step (lift the office) is no step in a store
     // that lacks its office.
@@ -1449,7 +1467,7 @@ fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
         (Err(error), _) => trust_read_owner(&error),
         (Ok(Some(_)), Ok(None)) => Owner::OfficeUnborn,
         (Ok(_), Ok(_)) => Owner::Own,
-        (Ok(_), Err(_)) => Owner::Unread,
+        (Ok(_), Err(_)) => Owner::Unread(None),
     }
 }
 
@@ -1464,7 +1482,7 @@ fn trust_read_owner(error: &crate::util::office_utils::TrustReadError) -> Owner 
             step => step,
         }),
         crate::util::office_utils::TrustReadError::Newer(_) => Owner::Newer,
-        crate::util::office_utils::TrustReadError::Unread(_) => Owner::Unread,
+        crate::util::office_utils::TrustReadError::Unread(_) => Owner::Unread(None),
     }
 }
 
@@ -1494,7 +1512,7 @@ fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::offi
                 MetaCheckError::Trust(_, TrustGap::OfficeUnborn) => Owner::OfficeUnborn,
                 MetaCheckError::Trust(_, TrustGap::AnchorLost) => Owner::Trust(trust_step(TrustGap::AnchorLost)),
                 MetaCheckError::Trust(_, TrustGap::ChainRefused) => Owner::Trust(trust_step(TrustGap::ChainRefused)),
-                MetaCheckError::Untold(_) => Owner::Unread,
+                MetaCheckError::Untold(_) => Owner::Unread(None),
             };
             (format!("parcel {} does not pass verification: {}", head, error.message().trim_end_matches('.')), owner)
         })
@@ -1745,7 +1763,7 @@ fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &T
             let owner = match refusal {
                 crate::util::office_utils::AnchorRefusal::Own => Owner::Own,
                 crate::util::office_utils::AnchorRefusal::Newer => Owner::Newer,
-                crate::util::office_utils::AnchorRefusal::Unread => Owner::Unread,
+                crate::util::office_utils::AnchorRefusal::Unread => Owner::Unread(None),
             };
             refuse_in(report, state, pass, reason, candidates(), owner);
             return None;
@@ -1806,9 +1824,17 @@ fn judged_redactions(state: &MetaState, head: String) -> crate::util::redaction_
 /// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`]; the pass
 /// before the taint recovery defers it to that pass instead.
 fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String, candidates: Vec<Candidate>, owner: Owner) {
+    // The refusal's step is its owner's (meta_step), so every frame keeps only its message. An
+    // unread one's way out is the first step a frame of its reason names other than heal itself
+    // (the very command that refused), carried as the owner's step.
+    let owner = match owner {
+        Owner::Unread(None) => Owner::Unread(crate::error::frames_in(&reason)
+            .map(|(_, _, step)| step.trim())
+            .find(|step| !step.is_empty() && *step != "forklift heal")
+            .map(str::to_string)),
+        owner => owner,
+    };
     let meta = MetaVerdict { owner, damage: state.damage().expect("only a damaged meta ref is refused"), copy: state.copy.clone() };
-    // A read error's frame names its own step ("forklift heal", the very command that refused);
-    // the refusal's step is its owner's (meta_step), so the frame keeps only its message.
     let reason = crate::error::frames_without_steps(&reason);
     let refused = Refused { pallet: state.wire(), reason, candidates, meta: Some(meta) };
     match pass {
@@ -1849,7 +1875,7 @@ fn write_meta_rebuild(state: &MetaState,
         }
         // A write the store refused (a read-only file system, a full disk) is as lasting as what
         // could not be read; a precondition that moved is heal's own race.
-        Err(error @ RefUpdateError::Failed(_)) => (format!("the rebuild at {} was not written: {}", head, error), Owner::Unread),
+        Err(error @ RefUpdateError::Failed(_)) => (format!("the rebuild at {} was not written: {}", head, error), Owner::Unread(None)),
         Err(error) => (format!("the rebuild at {} was not written: {}", head, error), Owner::Again),
         Ok(()) => (format!("the rebuild at {} did not read back", head), Owner::Again),
     };
@@ -2023,6 +2049,37 @@ mod tests {
     use super::*;
     use crate::util::pallet_utils::tests::{scratch, stub_parcel};
 
+    // An unread refusal's way out is the step its read named, when that is not heal itself: it
+    // reaches meta_step and the removal's refusal, and leaves the reason, so no message restates
+    // its step. Mutations: keep `None` in refuse_in → the step falls back to "Settle what heal could
+    // not read", red; take any frame's step → the heal-only row names "forklift heal", red.
+    #[test]
+    fn an_unread_refusal_names_the_step_its_read_named_other_than_heal() {
+        let (_root, _scope) = scratch("ref-heal-unread-step");
+        let framed = |step: &str| -> String {
+            crate::error::CoreError::refusal(crate::error::RefusalCode::TrustDamaged, "the store could not give it", step).into()
+        };
+        let state = MetaState { name: "tags".to_string(), reference: None, copy: pallet_utils::MetaCopyState::Bytes(b"x\n".to_vec()) };
+        let rows = [
+            ("a concrete step", format!("parcel p does not pass verification: {}", framed("forklift store verify")), Some("forklift store verify")),
+            ("heal first, then a concrete one", format!("{} and {}", framed("forklift heal"), framed("forklift store verify")), Some("forklift store verify")),
+            ("only heal", format!("parcel p does not pass verification: {}", framed("forklift heal")), None),
+            ("no frame", "the office could not be read".to_string(), None),
+        ];
+        for (row, reason, step) in rows {
+            let mut report = Repair::default();
+            refuse_in(&mut report, &state, Pass::AfterTaint, reason, Vec::new(), Owner::Unread(None));
+            let refused = &report.refused[0];
+            assert_eq!(refused.meta.as_ref().unwrap().owner, Owner::Unread(step.map(str::to_string)), "{}", row);
+            assert!(!refused.reason.contains("forklift store verify") && !refused.reason.contains("forklift heal"), "{}: {}", row, refused.reason);
+
+            let expected = step.map_or_else(|| unread_step("@tags"), str::to_string);
+            assert_eq!(meta_step(refused, &report.refused), expected, "{}", row);
+            let removal = remove_meta_ref("@tags", &report.refused, &[], &mut Vec::new(), &mut None).unwrap_err();
+            assert!(removal.contains("heal could not read what it needs to judge it") && removal.ends_with(&step_sentence(&expected)), "{}: {}", row, removal);
+        }
+    }
+
     // What lets a meta removal reuse a kept slot holding its bytes: no user pallet can be named
     // `@…`, and no meta name has a dot, so `@<name>.<n>` and `@<name>.copy` are that pallet's own.
     #[test]
@@ -2054,7 +2111,7 @@ mod tests {
     fn only_bytes_naming_one_parcel_give_heal_a_head() {
         let (_root, _scope) = scratch("ref-heal-salvage-names");
         let one = stub_parcel("1");
-        assert!(salvage_names_a_head(&one.as_bytes()[..12]), "one parcel is a head");
+        assert!(salvage_step_is_heal(&one.as_bytes()[..12]), "one parcel is a head");
 
         // A file at an object's path that reads as no kind of object: an unknown match.
         let unreadable = format!("ab{}", "c".repeat(HASH_LENGTH - 2));
@@ -2064,7 +2121,7 @@ mod tests {
         std::fs::write(folder.join(file), b"not an object").unwrap();
         let judged = salvage(&unreadable.as_bytes()[..12], &Tainted::read(&mut Vec::new()));
         assert!(matches!(judged, Ok(Salvage::Unknown(_))), "{:?}", judged);
-        assert!(!salvage_names_a_head(&unreadable.as_bytes()[..12]), "an unreadable match is no head heal takes");
+        assert!(!salvage_step_is_heal(&unreadable.as_bytes()[..12]), "an unknown match is the ref's own refusal, whose step is its removal");
     }
 
     // A pack the store cannot list may hold what a damaged ref's bytes name, found or not, so the
@@ -2111,6 +2168,16 @@ mod tests {
             let why = untold(bytes);
             assert!(why.contains(data.file_name().unwrap().to_str().unwrap()), "{}", why);
         }
+
+        // A reader of a meta ref whose bytes salvage that way names heal, which names what it
+        // could not read, never the removal heal refuses as unread. Mutation: name the removal
+        // for every salvage but a found one → the step is "forklift heal --remove-ref @tags", red.
+        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, "tags");
+        std::fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
+        std::fs::write(&ref_path, &one.as_bytes()[..12]).unwrap();
+        let read = pallet_utils::get_meta_pallet_head("tags").unwrap_err();
+        let step = crate::error::frames_in(&read).next().map(|(_, _, step)| step.to_string());
+        assert_eq!(step.as_deref(), Some("forklift heal"), "{}", read);
     }
 
     // A head in a format this build does not know reads whole and is no verdict on the ref: a
