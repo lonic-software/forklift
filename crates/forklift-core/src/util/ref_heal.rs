@@ -152,6 +152,13 @@ pub enum Owner {
     /// Producers pass `None`; [`refuse_in`] lifts the step out of the reason.
     Unread(Option<String>),
 
+    /// Heal chose its head but could not write the rebuild, or could not read the ref back after
+    /// writing it: no verdict on the ref. A rerun mends a passing fault and meets a lasting one
+    /// again, so the way out is the step the write's own refusal named, when it named one other
+    /// than heal itself, else to settle why it failed ([`unwritten_step`]). Producers pass
+    /// `None`; [`refuse_in`] lifts the step out of the reason.
+    Unwritten(Option<String>),
+
     /// Its files moved while heal ran: a later heal judges it again.
     Again,
 }
@@ -1023,6 +1030,8 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
             Some(Owner::Trust(step)) => return step.clone(),
             Some(Owner::Unread(Some(step))) => return step.clone(),
             Some(Owner::Unread(None)) => return unread_step(&at.pallet),
+            Some(Owner::Unwritten(Some(step))) => return step.clone(),
+            Some(Owner::Unwritten(None)) => return unwritten_step(&at.pallet),
             Some(Owner::Again) | None => break,
         }
     }
@@ -1033,6 +1042,12 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
 /// the same, so the step is to settle what its refusal names first.
 pub fn unread_step(wire: &str) -> String {
     format!("Settle what heal could not read for {}, as its refusal says, then run \"forklift heal\" again.", wire)
+}
+
+/// The way out of meta ref `wire`'s refusal heal could not write the rebuild for: a rerun meets a
+/// lasting fault again, so the step is to settle why it failed first.
+pub fn unwritten_step(wire: &str) -> String {
+    format!("Settle why heal could not write the ref of {}, as its refusal says, then run \"forklift heal\" again.", wire)
 }
 
 /// The way out of a meta ref's refusal over what a newer Forklift may have written: a build that
@@ -1126,6 +1141,10 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
         Owner::Unread(step) => return Err(format!(
             "The ref of pallet \"{}\" was not removed: heal could not read what it needs to judge it ({}), which is no verdict on the ref. {}",
             wire, refused.reason.trim_end_matches('.'), step.as_deref().map_or_else(|| unread_step(wire), step_sentence)
+        )),
+        Owner::Unwritten(step) => return Err(format!(
+            "The ref of pallet \"{}\" was not removed: heal chose its head but could not write it ({}), which is no verdict on the ref. {}",
+            wire, refused.reason.trim_end_matches('.'), step.as_deref().map_or_else(|| unwritten_step(wire), step_sentence)
         )),
         Owner::Again => return Err(format!(
             "The ref of pallet \"{}\" was not removed: heal did not refuse it for a reason of its own ({}). Run \"forklift heal\" again.",
@@ -1840,17 +1859,23 @@ fn judged_redactions(state: &MetaState, head: String) -> crate::util::redaction_
     }
 }
 
+/// The first step a frame of `reason` names other than heal itself, the command that refused.
+fn lifted_step(reason: &str) -> Option<String> {
+    crate::error::frames_in(reason)
+        .map(|(_, _, step)| step.trim())
+        .find(|step| !step.is_empty() && *step != "forklift heal")
+        .map(str::to_string)
+}
+
 /// Refuse meta ref `state` for `reason`, listing `candidates`: in [`Pass::AfterTaint`]; the pass
 /// before the taint recovery defers it to that pass instead.
 fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String, candidates: Vec<Candidate>, owner: Owner) {
     // The refusal's step is its owner's (meta_step), so every frame keeps only its message. An
     // unread one's way out is the first step a frame of its reason names other than heal itself
-    // (the very command that refused), carried as the owner's step.
+    // (the very command that refused), carried as the owner's step; so is an unwritten one's.
     let owner = match owner {
-        Owner::Unread(None) => Owner::Unread(crate::error::frames_in(&reason)
-            .map(|(_, _, step)| step.trim())
-            .find(|step| !step.is_empty() && *step != "forklift heal")
-            .map(str::to_string)),
+        Owner::Unread(None) => Owner::Unread(lifted_step(&reason)),
+        Owner::Unwritten(None) => Owner::Unwritten(lifted_step(&reason)),
         owner => owner,
     };
     let meta = MetaVerdict { owner, damage: state.damage().expect("only a damaged meta ref is refused"), copy: state.copy.clone() };
@@ -1879,7 +1904,8 @@ fn write_meta_rebuild(state: &MetaState,
 
     // A write can land and still report a failure (under a standing taint, its rename goes
     // through and the taint is reported), so the ref read back decides.
-    let landed = pallet_utils::get_pallet_head_in(PalletNamespace::Meta, &state.name).ok().flatten().as_deref() == Some(head.as_str());
+    let read_back = pallet_utils::get_pallet_head_in(PalletNamespace::Meta, &state.name);
+    let landed = read_back.as_ref().is_ok_and(|found| found.as_deref() == Some(head.as_str()));
 
     let (reason, owner) = match written {
         _ if landed => {
@@ -1892,11 +1918,20 @@ fn write_meta_rebuild(state: &MetaState,
             report.stopped = Some(error);
             return true;
         }
-        // A write that failed says nothing lasting of the ref: its error is any write path's
-        // text (a held lock, a momentary fault as much as a full disk), so heal is run again,
-        // which judges the ref afresh and refuses what it then cannot read as unread. A
-        // precondition that moved is heal's own race.
-        Err(error) => (format!("the rebuild at {} was not written: {}", head, error), Owner::Again),
+        // A precondition that moved is heal's own race: a later heal judges the ref afresh.
+        Err(error @ (RefUpdateError::Moved(_) | RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved
+            | RefUpdateError::PalletsMoved { .. } | RefUpdateError::WitnessMoved { .. })) =>
+            (format!("the rebuild at {} was not written: {}", head, error), Owner::Again),
+        // Any other refusal may meet heal the same way on every rerun (a full disk, a folder it
+        // may not write, a head the write itself refuses), so its way out is to settle why,
+        // which a passing fault needs nothing for.
+        Err(error) => (format!("the rebuild at {} was not written: {}", head, error), Owner::Unwritten(None)),
+        // Written, but its ref could not be read back: no answer on whether it landed.
+        Ok(()) if read_back.is_err() => (
+            format!("the rebuild at {} was written, but its ref could not be read back: {}", head, read_back.unwrap_err()),
+            Owner::Unwritten(None),
+        ),
+        // Written, and the ref reads at another head: it moved under heal.
         Ok(()) => (format!("the rebuild at {} did not read back", head), Owner::Again),
     };
 
@@ -2274,6 +2309,48 @@ mod tests {
             assert!(error.contains("was not removed"), "{}: {}", case, error);
             assert_eq!(std::fs::read(&ref_path).unwrap(), reference, "{}: nothing was removed", case);
         }
+    }
+
+    // A rebuild heal chose but could not write is no verdict on the ref, and a lasting fault
+    // meets every rerun the same way: its step is to settle why, never heal again alone, and its
+    // removal refuses. Once settled, heal rebuilds it. Mutation: file a failed write as `Again`
+    // → the step is "forklift heal", red; as the ref's own → the removal runs, red.
+    #[cfg(unix)]
+    #[test]
+    fn a_meta_rebuild_heal_cannot_write_names_settling_why_and_is_not_removed() {
+        use crate::util::tag_utils::TAGS_PALLET_NAME;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_root, _scope) = scratch("ref-heal-unwritten");
+        let tree = crate::util::meta_tree::store_meta_tree(b"forklift-meta 1 tags", None).unwrap();
+        let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+        let parcel = crate::util::meta_tree::stack_meta_parcel(tree, Vec::new(), &operator, "tags", None).unwrap();
+        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
+        let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
+        for path in [&ref_path, &copy_path] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&copy_path, format!("{}\n", parcel)).unwrap();
+        // The ref is lost beside a copy that names its head, in a folder heal may not write.
+        let folder = ref_path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+        assert!(tags.reason.contains(&format!("the rebuild at {} was not written", parcel)), "{:?}", tags);
+        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+        assert_eq!(meta_step(tags, &refused), "Settle why heal could not write the ref of @tags, as its refusal says, then run \"forklift heal\" again.");
+
+        let mut notes = Vec::new();
+        let (error, removed) = remove_damaged_meta_ref("@tags", &refused, &[], &mut notes).unwrap_err();
+        assert!(removed.is_none(), "{:?}", removed);
+        assert!(error.contains("was not removed: heal chose its head but could not write it"), "{}", error);
+        assert!(copy_path.exists(), "nothing was removed");
+
+        let rebuilt = repair_meta(Pass::AfterTaint).unwrap().repair;
+        assert!(rebuilt.refused.is_empty(), "{:?}", rebuilt.refused);
+        assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(parcel.as_str()));
     }
 
     /// Record an unsigned redaction of a blob of `content`, and return the `@redactions` head.

@@ -1803,9 +1803,18 @@ fn require_damage(namespace: PalletNamespace, name: &str, damage: &RefDamage) ->
         RefDamage::Missing => !stands(&path).map_err(|e| RefUpdateError::Failed(format!(
             "Error while reading whether the ref of pallet \"{}\" stands: {}", name, e
         )))?,
-        RefDamage::Unreadable(bytes) => path.is_file() && std::fs::read(&path).map_err(|e| RefUpdateError::Failed(format!(
-            "Error while reading the ref of pallet \"{}\": {}", name, e
-        )))? == *bytes,
+        // Nor is one whose state cannot be read known to have moved: a stat that fails is no
+        // answer, and filed as moved it would be judged again into the same failure.
+        RefDamage::Unreadable(bytes) => match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => std::fs::read(&path).map_err(|e| RefUpdateError::Failed(format!(
+                "Error while reading the ref of pallet \"{}\": {}", name, e
+            )))? == *bytes,
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(RefUpdateError::Failed(format!(
+                "Error while reading whether the ref of pallet \"{}\" stands: {}", name, e
+            ))),
+        },
     };
 
     if !holds {
@@ -2480,7 +2489,12 @@ pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState
         Ok(metadata) if metadata.is_file() => Some(std::fs::read(&path).map_err(|e| format!(
             "Error while reading the ref of pallet \"{}\": {}", reference.to_wire(), e
         ))?),
-        _ => None,
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // A stat that fails says nothing of the ref, so it is no move.
+        Err(e) => return Err(RefUpdateError::Failed(format!(
+            "Error while reading whether the ref of pallet \"{}\" stands: {}", reference.to_wire(), e
+        ))),
     };
 
     if found.as_deref() != Some(judged_ref) {
@@ -3287,6 +3301,31 @@ pub(crate) mod tests {
             assert!(written.is_err(), "the ref write returns the taint's error");
             assert_eq!(head("office").as_deref(), Some(h1.as_str()), "the ref write lands");
             assert_eq!(copy_state("office"), ref_bytes(&h2), "the copy must stay at the newer head");
+        }
+
+        /// A ref whose state cannot be read has not moved: a stat that fails is a failure, never
+        /// a move, since a move is judged again and would meet the same failure. So for the
+        /// check a rebuild or removal makes, and for the mend.
+        /// Revert: read a failed stat as no file → `Ok(false)` / `Moved`, red.
+        #[cfg(unix)]
+        #[test]
+        fn a_ref_whose_state_cannot_be_read_has_not_moved() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let (_root, _scope) = scratch("meta-ref-stat-fails");
+            let h1 = stub_parcel("h1");
+            write("tags", None, &h1).unwrap();
+            let bytes = format!("{}\n", h1).into_bytes();
+            let folder = get_pallet_ref_path(PalletNamespace::Meta, "tags").parent().unwrap().to_path_buf();
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let stands = meta_ref_stands_as("tags", &RefDamage::Unreadable(bytes.clone()), &ref_bytes(&h1));
+            let mended = mend_meta_copy("tags", &bytes, &ref_bytes(&h1));
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(matches!(&stands, Err(RefUpdateError::Failed(message)) if message.contains("Error while reading whether the ref of pallet \"tags\" stands")), "{:?}", stands);
+            assert!(matches!(&mended, Err(RefUpdateError::Failed(message)) if message.contains("Error while reading whether the ref of pallet \"@tags\" stands")), "{:?}", mended);
+
+            // Readable again, the same check holds: the domain was the stat alone.
+            assert_eq!(meta_ref_stands_as("tags", &RefDamage::Unreadable(bytes.clone()), &ref_bytes(&h1)), Ok(true));
         }
 
         /// The mend re-reads the ref under the hold, and writes nothing when the ref moved since
