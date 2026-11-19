@@ -7856,6 +7856,27 @@ fn heal_rebuilds_a_lost_office_ref_from_its_copy() {
     assert_success(&warehouse.run(&["audit"]));
 }
 
+/// A lost office ref whose copy names a parcel that is no office history the anchor verifies is
+/// refused, and nothing is written.
+// Revert: skip the office chain's verification against the anchor → the user parcel is written as
+// the office.
+#[test]
+fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
+    let (warehouse, _) = enrolled_warehouse("heal-office-unverified");
+    let forklift = warehouse.root.join(".forklift");
+    let main = std::fs::read_to_string(forklift.join("pallets/main")).unwrap().trim_end().to_string();
+    forklift_core::util::file_utils::remove_file(forklift.join("meta/office")).unwrap();
+    std::fs::write(forklift.join("meta-copy/office"), format!("{}\n", main)).unwrap();
+
+    let refused = warehouse.run(&["--json", "heal"]);
+
+    assert_eq!(refused.status.code(), Some(53), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json(&refused);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} does not verify as the office's history against the anchor of the trust file", main)), "{}", value);
+    assert!(!forklift.join("meta/office").exists(), "nothing was written");
+}
+
 /// An office whose copy is ahead of what its damaged ref's bytes still name, along first parents,
 /// is rebuilt at the copy's head: a forward write moves the copy first.
 // Revert: prefer what the ref's bytes name over a copy descending from it → rebuilt at H1.
