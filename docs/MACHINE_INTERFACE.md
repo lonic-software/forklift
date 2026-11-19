@@ -241,8 +241,9 @@ file. A remote sends it as a 503 naming its operator's `forklift heal`, which th
 retry; the AWS head answers a frame-free 500 instead. `objects_lost` (exit 58), from `heal` only:
 after every repair the run could make, objects that history still reaches cannot be read from this
 store. `details` is the whole heal report, with `objects_lost` carrying the `absent` and
-`unreadable` counts, up to 20 `hashes` (each a `hash` and a `reason`), and the `pallets` whose
-history reaches them. `next_step` is to restore from a backup or clone afresh, to re-create the
+`unreadable` counts, up to 20 `hashes` (each a `hash` and a `reason`), the `pallets` whose
+history reaches them, and in `pallets_unread` each pallet whose ref could not be read (a `pallet`
+and a `reason`), whose history may reach them too. `next_step` is to restore from a backup or clone afresh, to re-create the
 warehouse when another build's index is in the pack folder, or `forklift heal` when another process
 held the store and the indexes were not rebuilt. A heal whose reachability walk cannot finish exits
 non-zero without claiming anything lost.
