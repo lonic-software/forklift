@@ -1679,14 +1679,13 @@ fn removed_sentence(removed: &ref_heal::Removed) -> String {
         None => format!("the lost ref of pallet \"{}\"", removed.pallet),
     };
     match removed.kind {
-        ref_heal::RemovedKind::Meta(verdict) => format!(
-            "Removed {}{}, which heal refused as its own: {}. The pallet now reads empty, and what only it reached is no longer held by any pallet.",
+        ref_heal::RemovedKind::Meta => format!(
+            "Removed {}{}, which nothing names a head for. The pallet now reads empty, and what only it reached is no longer held by any pallet.",
             ref_said,
             match &removed.kept_copy {
                 Some(kept) => format!(", and its copy, keeping the copy's bytes in \"{}\"", kept),
                 None => String::new(),
-            },
-            verdict.describe()
+            }
         ),
         ref_heal::RemovedKind::User => format!(
             "Removed the unreadable ref of pallet \"{}\", keeping its bytes in \"{}\"; what only it reached is no longer held by any pallet.",

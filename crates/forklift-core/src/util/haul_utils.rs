@@ -480,7 +480,7 @@ fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option
 fn newer_or_content(read: &CellRead, why: String) -> MetaCheckError {
     match read {
         CellRead::Unknown { .. } => MetaCheckError::Newer(why),
-        CellRead::Malformed(_) => MetaCheckError::Verdict(crate::util::ref_heal::Verdict::Malformed, why),
+        CellRead::Malformed(_) => MetaCheckError::Verdict(why),
         CellRead::Readable(_) => broken(why),
     }
 }
@@ -1265,7 +1265,7 @@ mod tests {
         let cells = meta_tree::apply_edits(None, &[CellEdit::Set { path: "h1/opened".to_string(), blob: blob.hash.clone() }]).unwrap();
 
         match opened_in(cells.as_deref(), "h1", &HaulRules) {
-            Err(MetaCheckError::Verdict(crate::util::ref_heal::Verdict::Malformed, why)) =>
+            Err(MetaCheckError::Verdict(why)) =>
                 assert_eq!(why, "the proposal at h1/opened cannot be read by this forklift"),
             other => panic!("expected a malformed history, got {:?}", other.map(|_| ()).map_err(String::from)),
         }

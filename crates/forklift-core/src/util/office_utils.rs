@@ -21,7 +21,6 @@ use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
 use crate::util::{alias_utils, file_utils, object_utils, pallet_utils, sign_utils, toml_spelling};
-use crate::util::ref_heal::Verdict;
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError};
 
 /// The name of the office meta pallet — the tracked-metadata pallet holding users and
@@ -877,11 +876,11 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
         // verify the head.
         match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served) {
             Ok(true) => return Ok((pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }, anchor)),
-            Ok(false) => said.push((UNVERIFIED_ANCHOR.to_string(), AnchorRefusal::Own(Verdict::AnchorRefused))),
-            Err(ChainUnjudged::Unread(why, crate::util::audit_utils::ChainFault::Decided(decided))) => said.push((format!(
+            Ok(false) => said.push((UNVERIFIED_ANCHOR.to_string(), AnchorRefusal::Refused)),
+            Err(ChainUnjudged::Unread(why, crate::util::audit_utils::ChainFault::Decided(_))) => said.push((format!(
                 "holds an anchor whose chain to the head the store holds damaged or absent ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
-            ), AnchorRefusal::Own(Verdict::Object(decided)))),
+            ), AnchorRefusal::Refused)),
             Err(ChainUnjudged::SignatureDamaged(why)) => said.push((format!(
                 "holds an anchor whose chain to the head crosses a damaged signature ({})",
                 crate::error::frames_without_steps(&why).trim_end_matches('.')
@@ -902,13 +901,13 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
     // the one that would have verified it. One a newer version may read is that version's to
     // judge, before what could not be read.
     let refusal = match said.as_slice() {
-        [(_, AnchorRefusal::Own(verdict)), (_, AnchorRefusal::Own(_))] => AnchorRefusal::Own(*verdict),
+        [(_, AnchorRefusal::Refused), (_, AnchorRefusal::Refused)] => AnchorRefusal::Refused,
         _ if said.iter().any(|(_, whose)| *whose == AnchorRefusal::Newer) => AnchorRefusal::Newer,
         _ => AnchorRefusal::Unread,
     };
     let trust_path = forklift_root().join(FILE_NAME_TRUST);
     let copy_path = forklift_root().join(FILE_NAME_TRUST_COPY);
-    Err((match matches!(refusal, AnchorRefusal::Own(_)) {
+    Err((match refusal == AnchorRefusal::Refused {
         true => format!(
             "parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
             head, trust_path.to_string_lossy(), said[0].0, copy_path.to_string_lossy(), said[1].0
@@ -923,9 +922,9 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
 /// Whose an [`office_rebuild_anchor`] refusal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnchorRefusal {
-    /// The head's own, as the verdict says: both files hold an anchor and neither verifies it (its
-    /// chain reads and does not reach the head, or the store decided about a parcel of that chain).
-    Own(Verdict),
+    /// Both files hold an anchor and neither verifies the head (its chain reads and does not reach
+    /// the head, or the store decided about a parcel of that chain).
+    Refused,
 
     /// A newer version may judge it: it wrote a file, or a signature of a file's chain to the
     /// head, in a version this build does not know.

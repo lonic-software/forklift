@@ -7887,18 +7887,21 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
     assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"", main)), "{}", value);
     assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\""), "{}", value);
     assert_eq!(message.matches("\") holds an anchor it does not verify against").count(), 2, "both files judged: {}", value);
-    assert_eq!(value["error"]["next_step"], "forklift heal --remove-ref @office", "{}", value);
+    // Both anchors refuse a head the copy names: the step is to restore the office by hand.
+    let restore = "Restore the ref of @office and its copy from a backup, or write the hash of the head parcel it should hold into the ref's file, then run \"forklift heal\" again.";
+    assert_eq!(value["error"]["next_step"], restore, "{}", value);
     assert!(!forklift.join("meta/office").exists(), "nothing was written");
 
     // With the trust copy lost, the file that might have verified the head is gone: the refusal
-    // is the trust files' damage, never the head's own, so the removal is no step.
-    // Revert: own the head when any file holds an anchor that does not verify it → the removal
-    // is the step, red.
+    // is the trust files' damage, never a verdict on the head, so restoring it by hand is no step.
+    // Revert: read any file holding an anchor that does not verify the head as a verdict → the
+    // restore is the step, red.
     forklift_core::util::file_utils::remove_file(forklift.join("trust-copy")).unwrap();
     let value = json(&warehouse.run(&["--json", "heal"]));
     let message = value["error"]["message"].as_str().unwrap();
     assert!(message.contains(&format!("parcel {} could not be verified as the office's history: the trust file (\"", main)), "{}", value);
     assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\"") && message.contains("\") is lost"), "{}", value);
+    assert_ne!(value["error"]["next_step"], restore, "{}", value);
     assert_ne!(value["error"]["next_step"], "forklift heal --remove-ref @office", "{}", value);
     assert!(!forklift.join("meta/office").exists(), "nothing was written");
 }
@@ -7940,11 +7943,11 @@ fn heal_does_not_rebuild_the_office_beside_a_trust_file_a_newer_version_wrote() 
 // message.
 #[test]
 fn heal_does_not_rebuild_an_office_whose_chain_the_store_cannot_give() {
-    // A chain parcel the store decided is absent is the head's own refusal, so its removal is the
-    // step; one whose file could not be read says nothing of the head, so the step is to settle
-    // the read, and once the file reads again heal rebuilds the office.
-    // Mutations: own every unreadable chain → "unreadable" next_step is the removal, red; own none
-    // → "absent" next_step is the settle step, red.
+    // A chain parcel the store decided is absent is a verdict on a head the copy names, so the step
+    // is to restore the office by hand; one whose file could not be read says nothing of the head,
+    // so the step is to settle the read, and once the file reads again heal rebuilds the office.
+    // Mutations: read every unreadable chain as a verdict → "unreadable" next_step is the restore,
+    // red; read none as one → "absent" next_step is the settle step, red.
     let cases: &[&str] = if cfg!(unix) { &["absent", "unreadable"] } else { &["absent"] };
     for case in cases {
         let (warehouse, _) = enrolled_warehouse(&format!("heal-office-{}", case));
@@ -7974,7 +7977,7 @@ fn heal_does_not_rebuild_an_office_whose_chain_the_store_cannot_give() {
         let value = json(&refused);
         let message = value["error"]["message"].as_str().unwrap();
         let (said, chain, step) = match *case {
-            "absent" => ("does not verify as the office's history against an anchor heal can read", "whose chain to the head the store holds damaged or absent", "forklift heal --remove-ref @office".to_string()),
+            "absent" => ("does not verify as the office's history against an anchor heal can read", "whose chain to the head the store holds damaged or absent", "Restore the ref of @office and its copy from a backup, or write the hash of the head parcel it should hold into the ref's file, then run \"forklift heal\" again.".to_string()),
             _ => ("could not be verified as the office's history", "whose chain to the head could not be read", forklift_core::util::ref_heal::unread_step("@office")),
         };
         assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} {}: the trust file (\"", office, said)), "{}", value);

@@ -123,10 +123,15 @@ pub struct Refused {
 /// Whose refusal a meta ref's is, which decides the step that lets a later heal judge it again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Owner {
-    /// The ref's own: nothing heal can verify names a head for it, so its removal is the way out.
-    /// Only a named check gives one, as the [`Verdict`] it carries says; every other refusal is
-    /// one of the kinds below, which the removal refuses.
-    Own(Verdict),
+    /// Nothing names a head for it: neither its copy nor its own bytes. The only refusal whose way
+    /// out is its removal; every other kind below refuses the removal.
+    NoHead,
+
+    /// Something names a head for it, and heal cannot rebuild at any: several parcels, one that is
+    /// possibly lost, a copy and bytes that diverge, or a head whose history does not verify. Its
+    /// removal would drop history something still names, so the way out is by hand
+    /// ([`unrebuildable_step`]).
+    Unrebuildable,
 
     /// It waits on the refusal of this meta ref (`@office` or `@redactions`), which it is
     /// verified against or checked against.
@@ -163,81 +168,6 @@ pub enum Owner {
 
     /// Its files moved while heal ran: a later heal judges it again.
     Again,
-}
-
-/// A verdict on a meta ref's own history: the checks whose refusal admits its removal, and no
-/// others. A refusal no check below gives (a read that failed, a string some step lifted, damage
-/// to a file beside the history, such as a signature's) is never one, so it never reaches the
-/// removal: what is not named here is refused by default.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// Neither its copy nor its own bytes name a head.
-    NoHead,
-
-    /// Its own bytes name one of several parcels, not which.
-    AmbiguousHead,
-
-    /// What its own bytes name is a match under a taint, or one the store decided is absent,
-    /// damaged or another kind of object.
-    UnknownHead,
-
-    /// Its copy and what its own bytes name are both parcels, and neither descends from the
-    /// other along first parents.
-    Diverged,
-
-    /// A parcel or object of its history the store decided about, as the [`Decided`] says.
-    ///
-    /// [`Decided`]: crate::util::file_utils::Decided
-    Object(crate::util::file_utils::Decided),
-
-    /// A tree of its history is no meta tree: it names no format (as an older forklift's shape
-    /// does), or its spine does not read as one.
-    NotASpine,
-
-    /// A tree of its history is a meta tree of a kind this build knows, and not this pallet's.
-    OtherSpine,
-
-    /// A tree or cell of its history reads whole but is not in canonical form.
-    Malformed,
-
-    /// A parcel of its history breaks a rule of the meta format or of the pallet.
-    RuleBroken,
-
-    /// A parcel of its history is not signed as its trust state requires: a signature that
-    /// decodes and does not verify, by a key the office does not track, or by a revoked key outside
-    /// its boundary; none after trust; one with no office to verify it; or, unsigned, no one
-    /// operator to attribute it to.
-    SignatureRefused,
-
-    /// For the office: the anchor of each trust file reads and does not verify its history.
-    AnchorRefused,
-
-    /// It is no meta pallet heal has rules to verify against.
-    NoRules,
-}
-
-impl Verdict {
-    /// The verdict, in words, to follow "heal refused it as its own:".
-    pub fn describe(self) -> &'static str {
-        use crate::util::file_utils::Decided;
-
-        match self {
-            Verdict::NoHead => "nothing names a head for it",
-            Verdict::AmbiguousHead => "its own bytes name one of several parcels",
-            Verdict::UnknownHead => "what its own bytes name is possibly lost",
-            Verdict::Diverged => "its copy and its own bytes name heads that diverge",
-            Verdict::Object(Decided::Absent) => "the store holds no object of its history it needs",
-            Verdict::Object(Decided::Damaged) => "the store holds an object of its history damaged",
-            Verdict::Object(Decided::OtherKind) => "an object of its history is of another kind",
-            Verdict::NotASpine => "a tree of its history is no meta tree",
-            Verdict::OtherSpine => "a tree of its history is a meta tree of another kind",
-            Verdict::Malformed => "a tree or cell of its history is not in canonical form",
-            Verdict::RuleBroken => "a parcel of its history breaks a rule",
-            Verdict::SignatureRefused => "a parcel of its history is not signed as trust requires",
-            Verdict::AnchorRefused => "no trust file's anchor verifies its history",
-            Verdict::NoRules => "heal has no rules to verify it against",
-        }
-    }
 }
 
 /// A meta ref's refusal as heal judged it: whose it is, and the ref and copy it read.
@@ -1193,8 +1123,8 @@ pub enum RemovedKind {
     /// A user pallet's, removed only when its bytes do not read.
     User,
 
-    /// A meta pallet's, removed on heal's verdict on its ref.
-    Meta(Verdict),
+    /// A meta pallet's, removed only when nothing names a head for it.
+    Meta,
 }
 
 /// The folder unreadable refs that `--remove-ref` removed are kept in.
@@ -1234,7 +1164,8 @@ fn kept_path(stem: &str, held: Option<&[u8]>) -> std::path::PathBuf {
 }
 
 /// The step that lets a later heal judge meta ref `refused` again, among the refusals `all` of
-/// the same pass: its removal, for a refusal of its own; for one that waits on another meta ref's
+/// the same pass: its removal, where nothing names a head for it; restoring it by hand, where heal
+/// cannot rebuild at what names one; for one that waits on another meta ref's
 /// refusal, that ref's step; for one beside an unborn office, what brings the office back; for one
 /// over what a newer Forklift may have written, the upgrade; for one heal could not read, settling
 /// what it names; and otherwise heal again. A command, or sentences
@@ -1245,7 +1176,7 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
     for _ in 0..3 {
         match at.meta.as_ref().map(|meta| &meta.owner) {
             // A copy path nothing can be kept from blocks the removal, so it is no step.
-            Some(Owner::Own(_)) => return match at.meta.as_ref().is_some_and(|meta| pallet_utils::copy_blocks(&at.pallet[1..], &meta.copy)) {
+            Some(Owner::NoHead) => return match at.meta.as_ref().is_some_and(|meta| pallet_utils::copy_blocks(&at.pallet[1..], &meta.copy)) {
                 true => pallet_utils::blocked_copy_step(&at.pallet[1..], "run \"forklift heal\" again"),
                 false => removal_step(&at.pallet),
             },
@@ -1253,6 +1184,7 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
                 Some(cause) => at = cause,
                 None => break,
             },
+            Some(Owner::Unrebuildable) => return unrebuildable_step(&at.pallet),
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
             Some(Owner::Newer) => return newer_step(),
             Some(Owner::Trust(step)) => return step.clone(),
@@ -1284,7 +1216,17 @@ pub fn newer_step() -> String {
     "Upgrade Forklift to a version that reads it, then run \"forklift heal\" again.".to_string()
 }
 
-/// The removal of meta ref `wire`: the step of a refusal of its own, where nothing blocks it.
+/// The way out of meta ref `wire`'s refusal where something names a head heal cannot rebuild at:
+/// its removal would drop that history, so the ref is restored by hand.
+pub fn unrebuildable_step(wire: &str) -> String {
+    format!(
+        "Restore the ref of {} and its copy from a backup, or write the hash of the head parcel it should hold into the ref's file, then run \"forklift heal\" again.",
+        wire
+    )
+}
+
+/// The removal of meta ref `wire`: the step where nothing names a head for it and nothing blocks
+/// the removal.
 pub fn removal_step(wire: &str) -> String {
     pallet_utils::meta_removal_step(&wire[1..])
 }
@@ -1298,8 +1240,8 @@ pub fn step_sentence(step: &str) -> String {
 }
 
 /// `forklift heal --remove-ref @<name>`: remove a meta pallet's lost or damaged ref and its copy,
-/// keeping the bytes of each in a file of its own, when heal refused that ref for a reason of its
-/// own. `judged` is what this run's meta pass before the taint recovery left unrebuilt, and
+/// keeping the bytes of each in a file of its own, when heal refused that ref because nothing
+/// names a head for it. `judged` is what this run's meta pass before the taint recovery left unrebuilt, and
 /// `unjudged` what it never judged. Admitted only with no taint record standing, and only while
 /// the ref and its copy still stand as that pass judged them; afterwards the pallet reads unborn.
 ///
@@ -1338,8 +1280,12 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
     };
     let meta = refused.meta.as_ref().expect("a meta ref's refusal carries its verdict");
 
-    let verdict = match &meta.owner {
-        Owner::Own(verdict) => *verdict,
+    match &meta.owner {
+        Owner::NoHead => {}
+        Owner::Unrebuildable => return Err(format!(
+            "The ref of pallet \"{}\" was not removed: something names a head for it ({}), and the removal is only for a ref nothing names a head for, since it would drop that history. {}",
+            wire, refused.reason.trim_end_matches('.'), step_sentence(&unrebuildable_step(wire))
+        )),
         Owner::Cascade(cause) => {
             let (said, step) = match judged.iter().find(|other| other.pallet == *cause) {
                 Some(other) => (format!(": {}", other.reason.trim_end_matches('.')), meta_step(other, judged)),
@@ -1378,7 +1324,7 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
             "The ref of pallet \"{}\" was not removed: heal did not refuse it for a reason of its own ({}). Run \"forklift heal\" again.",
             wire, refused.reason.trim_end_matches('.')
         )),
-    };
+    }
 
     let copy_path = pallet_utils::get_meta_copy_path(name);
     if pallet_utils::copy_blocks(name, &meta.copy) {
@@ -1398,7 +1344,7 @@ fn remove_meta_ref(wire: &str, judged: &[Refused], unjudged: &[String], notes: &
         _ => None,
     };
     let said = |path: &Option<std::path::PathBuf>| path.as_ref().map(|path| path.to_string_lossy().into_owned());
-    let removed = |kept_copy: Option<String>| Removed { pallet: wire.to_string(), kept_ref: said(&kept_ref), kept_copy, kind: RemovedKind::Meta(verdict) };
+    let removed = |kept_copy: Option<String>| Removed { pallet: wire.to_string(), kept_ref: said(&kept_ref), kept_copy, kind: RemovedKind::Meta };
 
     match pallet_utils::remove_damaged_meta_ref(name, &meta.damage, &meta.copy, kept_ref.as_deref(), kept_copy.as_deref()) {
         Ok(()) => Ok(removed(said(&kept_copy))),
@@ -1695,14 +1641,14 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
         format!("what its own bytes name could not be looked up: {}", error.trim_end_matches('.')), candidates.clone(), Owner::Unread(None)
     ))?;
 
-    // Whose a salvage that names no head heal takes is: the ref's own where the store's answer is
-    // a verdict (nothing, several parcels, a match it decided is unknown), a newer build's for a
-    // match this build cannot parse, unread where the store said nothing (a match or a pack it
-    // could not read).
+    // Whose a salvage that names no head heal takes is: nothing named, with no copy, is the one
+    // refusal its removal answers; several parcels or a match the store decided is unknown name
+    // history heal cannot rebuild at; a newer build's for a match this build cannot parse, unread
+    // where the store said nothing (a match or a pack it could not read).
     match salvaged {
         Salvage::Nothing => match copy {
             Some(head) => Ok((head, FROM_COPY)),
-            None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates, Owner::Own(Verdict::NoHead))),
+            None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates, Owner::NoHead)),
         },
         Salvage::Found(salvaged) => {
             candidates.push(Candidate { head: salvaged.clone(), source: Source::Salvage.describe() });
@@ -1714,13 +1660,13 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
                 // copy was not mended in the other; one an interrupted re-genesis or a hand edit
                 // left need not be either, and then nothing proves either the newer.
                 Some(copy) => {
-                    // History the store decided is damaged or gone proves neither the newer; a
-                    // read that said nothing of it is no verdict.
+                    // History the store decided is damaged or gone proves neither the newer, and
+                    // both still name a head; a read that said nothing of it is no verdict.
                     let untold = |(descendant, ancestor): (&str, &str), (error, fault): (String, crate::util::file_utils::ReadFault), candidates| (format!(
                         "whether {} descends from {} could not be told: {}",
                         descendant, ancestor, error.trim_end_matches('.')
                     ), candidates, match fault {
-                        crate::util::file_utils::ReadFault::Decided(decided) => Owner::Own(Verdict::Object(decided)),
+                        crate::util::file_utils::ReadFault::Decided(_) => Owner::Unrebuildable,
                         crate::util::file_utils::ReadFault::Newer => Owner::Newer,
                         crate::util::file_utils::ReadFault::Untold => Owner::Unread(None),
                     });
@@ -1731,7 +1677,7 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
                         Ok(Descent::Neither) => Err((format!(
                             "its copy names {} and its own bytes name {}, and neither descends along first parents from the other, so nothing proves either the newer",
                             copy, salvaged
-                        ), candidates, Owner::Own(Verdict::Diverged))),
+                        ), candidates, Owner::Unrebuildable)),
                         Err((false, error)) => Err(untold((&format!("what its own bytes name, {},", salvaged), &format!("its copy's head {}", copy)), error, candidates)),
                         Err((true, error)) => Err(untold((&format!("its copy's head {}", copy), &format!("{}, what its own bytes name,", salvaged)), error, candidates)),
                     }
@@ -1740,9 +1686,9 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
         }
         Salvage::Ambiguous(parcels, _) => {
             candidates.extend(parcels.into_iter().map(|head| Candidate { head, source: Source::Salvage.describe() }));
-            Err(("its own bytes name one of several parcels, not which".to_string(), candidates, Owner::Own(Verdict::AmbiguousHead)))
+            Err(("its own bytes name one of several parcels, not which".to_string(), candidates, Owner::Unrebuildable))
         }
-        Salvage::Unknown(why) => Err((why, candidates, Owner::Own(Verdict::UnknownHead))),
+        Salvage::Unknown(why) => Err((why, candidates, Owner::Unrebuildable)),
         Salvage::Untold(why) => Err((why, candidates, Owner::Unread(None))),
         Salvage::Newer(why) => Err((why, candidates, Owner::Newer)),
     }
@@ -1752,8 +1698,8 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
 /// office as they are now, and return the preconditions that pin both for the write.
 ///
 /// # Returns
-/// * `Err((reason, owner))` - Why not, and whose refusal that is: the ref's own when `head` fails
-///                            verification, [`Owner::OfficeUnborn`] when the office is unborn
+/// * `Err((reason, owner))` - Why not, and whose refusal that is: [`Owner::Unrebuildable`] when
+///                            `head` fails verification, [`Owner::OfficeUnborn`] when the office is unborn
 ///                            beside an anchor, which refuses before `head` is read, the trust
 ///                            read's owner ([`trust_read_owner`]) when the anchor could not be
 ///                            read, else as [`verify_meta_against`] says; [`Owner::Unread`] when
@@ -1782,11 +1728,12 @@ fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPrecondit
 }
 
 /// Whose a refusal of a meta ref other than the office is, when heal chose no head for it for a
-/// reason `owner` says: a reason of its own is still the office's while the office is refused
+/// reason `owner` says: a reason of its own (nothing names a head, or heal cannot rebuild at what
+/// does) is still the office's while the office is refused
 /// (`blocking`) or unborn beside the trust file's anchor, since its removal would then be judged
 /// against no office.
 fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
-    if !matches!(owner, Owner::Own(_)) {
+    if !matches!(owner, Owner::NoHead | Owner::Unrebuildable) {
         return owner;
     }
     if let Some(cause) = blocking.first() {
@@ -1821,9 +1768,9 @@ fn trust_read_owner(error: &crate::util::office_utils::TrustReadError) -> Owner 
 /// `office_head` (`None`: no anchor, or an unborn office).
 ///
 /// # Returns
-/// * `Err((reason, owner))` - The ref's own refusal when the verdict is on `head`'s history (a rule
-///                            it breaks, or a parcel of it the store decided is absent or holds
-///                            damaged); [`Owner::Newer`] when what it needs is in a format this
+/// * `Err((reason, owner))` - [`Owner::Unrebuildable`] when the verdict is on `head`'s history (a
+///                            rule it breaks, or a parcel of it the store decided is absent or
+///                            holds damaged); [`Owner::Newer`] when what it needs is in a format this
 ///                            build does not know; [`Owner::OfficeUnborn`] or [`Owner::Trust`]
 ///                            when the trust state it is checked against refuses, read whole;
 ///                            [`Owner::Unread`] when the refusal says nothing of it.
@@ -1831,14 +1778,14 @@ fn verify_meta_against(name: &str, head: &str, anchor: Option<&crate::util::offi
     use crate::util::meta_tree::{MetaCheckError, TrustGap};
 
     let Some(rules) = crate::util::meta_tree::meta_rules(name) else {
-        return Err(("it is not a meta pallet heal has rules to verify against".to_string(), Owner::Own(Verdict::NoRules)));
+        return Err(("it is not a meta pallet heal has rules to verify against".to_string(), Owner::Unrebuildable));
     };
 
     crate::util::meta_tree::verify_meta_update(name, rules, crate::util::meta_tree::Admission::Audit, anchor, office_head, None, head)
         .map(|_| ())
         .map_err(|error| {
             let owner = match error {
-                MetaCheckError::Verdict(verdict, _) => Owner::Own(verdict),
+                MetaCheckError::Verdict(_) => Owner::Unrebuildable,
                 MetaCheckError::Newer(_) => Owner::Newer,
                 MetaCheckError::Trust(_, TrustGap::OfficeUnborn) => Owner::OfficeUnborn,
                 MetaCheckError::Trust(_, TrustGap::AnchorLost) => Owner::Trust(trust_step(TrustGap::AnchorLost)),
@@ -2130,7 +2077,7 @@ fn rebuild_office(state: &MetaState, redactions: Option<&MetaState>, tainted: &T
         // would tell could not be read.
         Err((reason, refusal)) => {
             let owner = match refusal {
-                crate::util::office_utils::AnchorRefusal::Own(verdict) => Owner::Own(verdict),
+                crate::util::office_utils::AnchorRefusal::Refused => Owner::Unrebuildable,
                 crate::util::office_utils::AnchorRefusal::Newer => Owner::Newer,
                 crate::util::office_utils::AnchorRefusal::Unread => Owner::Unread(None),
             };
@@ -2715,17 +2662,17 @@ mod tests {
         assert_eq!(step.as_deref(), Some("forklift heal"), "{}", read);
     }
 
-    // The removal is admitted only by a verdict a named check gave, and names it; every other
-    // refusal is refused by default, and keeps the ref. One row per verdict a lost or damaged
-    // @tags ref reaches with no office, and one per refusal that is no verdict. Mutations (each
-    // reaches its row's `owner` assertion): read a damaged signature beside a parcel as a verdict
-    // → "a damaged signature, no office" is Own, red; read a store that cannot be read as the
-    // store's verdict → "an unreadable parcel" is Own, red; read a descent the store said nothing
-    // of as its verdict → "the copy's history back to the ref's bytes cannot be read" is Own, red.
+    // The removal is admitted only where nothing names a head; where something does and heal cannot
+    // rebuild at it, the refusal names restoring the ref by hand, and every other refusal is
+    // refused by default. Both keep the ref. One row per way a lost or damaged @tags ref with no
+    // office reaches each. Mutations (each reaches its row's `owner` assertion): read a history
+    // verdict as nothing named → "a tree of its history is absent" is NoHead, red; read a damaged
+    // signature beside a parcel as a verdict → "a damaged signature, no office" is Unrebuildable,
+    // red; read a descent the store said nothing of as its verdict → "the copy's history back to
+    // the ref's bytes cannot be read" is Unrebuildable, red.
     #[test]
-    fn a_meta_ref_is_removed_only_on_a_named_verdict_and_names_it() {
-        use crate::util::file_utils::Decided;
-        use crate::util::meta_tree::{stack_meta_parcel, store_blob_level, store_meta_tree};
+    fn a_meta_ref_is_removed_only_when_nothing_names_a_head() {
+        use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
         use crate::util::tag_utils::TAGS_PALLET_NAME;
 
         let operator = |identifier: &str| crate::model::operator::Operator { identifier: identifier.to_string() };
@@ -2737,21 +2684,21 @@ mod tests {
         };
         let lost = b"not a head\n".to_vec();
 
-        // Each row: its state, as the ref's bytes and the copy's (None: no copy), and what heal
-        // owes the ref (None: no verdict, so the removal is refused).
-        type Row = (Vec<u8>, Option<String>, Option<Verdict>);
+        // Each row: its state, as the ref's bytes and the copy's (None: no copy), and whose heal
+        // judges the refusal (None: neither NoHead nor Unrebuildable, so no verdict on the ref).
+        type Row = (Vec<u8>, Option<String>, Option<Owner>);
         let rows: Vec<(&str, Box<dyn Fn() -> Row>)> = vec![
-            ("nothing names a head", Box::new(|| (lost.clone(), None, Some(Verdict::NoHead)))),
+            ("nothing names a head", Box::new(|| (lost.clone(), None, Some(Owner::NoHead)))),
             ("the copy and the ref's bytes diverge", Box::new(|| {
                 let (one, two) = (tags("one"), tags("two"));
-                (two.as_bytes()[..12].to_vec(), Some(one), Some(Verdict::Diverged))
+                (two.as_bytes()[..12].to_vec(), Some(one), Some(Owner::Unrebuildable))
             })),
             ("the copy's history back to the ref's bytes is damaged", Box::new(|| {
                 let (parent, salvaged) = (tags("parent"), tags("salvaged"));
                 let child = parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), vec![parent.clone()], "test", "child");
                 crate::util::file_utils::remove_file(&object(&parent)).unwrap();
                 std::fs::write(object(&parent), b"no object").unwrap();
-                (salvaged.as_bytes()[..12].to_vec(), Some(child), Some(Verdict::Object(Decided::Damaged)))
+                (salvaged.as_bytes()[..12].to_vec(), Some(child), Some(Owner::Unrebuildable))
             })),
             #[cfg(unix)]
             ("the copy's history back to the ref's bytes cannot be read", Box::new(|| {
@@ -2766,42 +2713,18 @@ mod tests {
                 let path = object(&unreadable);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(&path, b"not an object").unwrap();
-                (unreadable.as_bytes()[..12].to_vec(), None, Some(Verdict::UnknownHead))
+                (unreadable.as_bytes()[..12].to_vec(), None, Some(Owner::Unrebuildable))
             })),
             ("a tree of its history is absent", Box::new(|| {
                 let tree = store_meta_tree(b"forklift-meta 1 tags", None).unwrap();
                 let head = parcel(tree.clone(), Vec::new(), "test", "absent");
                 crate::util::file_utils::remove_file(&object(&tree)).unwrap();
-                (lost.clone(), Some(head), Some(Verdict::Object(Decided::Absent)))
-            })),
-            ("a tree of its history is damaged", Box::new(|| {
-                let tree = store_meta_tree(b"forklift-meta 1 tags", None).unwrap();
-                let head = parcel(tree.clone(), Vec::new(), "test", "damaged");
-                crate::util::file_utils::remove_file(&object(&tree)).unwrap();
-                std::fs::write(object(&tree), b"no object").unwrap();
-                (lost.clone(), Some(head), Some(Verdict::Object(Decided::Damaged)))
-            })),
-            ("a tree of its history is no meta tree", Box::new(|| {
-                let head = parcel(store_blob_level(&[("x", b"1")]), Vec::new(), "test", "no spine");
-                (lost.clone(), Some(head), Some(Verdict::NotASpine))
-            })),
-            ("a tree of its history is another kind's", Box::new(|| {
-                let head = parcel(store_meta_tree(b"forklift-meta 1 kv", None).unwrap(), Vec::new(), "test", "kv");
-                (lost.clone(), Some(head), Some(Verdict::OtherSpine))
-            })),
-            ("a cell of its history does not read as one", Box::new(|| {
-                let cells = store_blob_level(&[("x", b"not a cell")]);
-                let head = parcel(store_meta_tree(b"forklift-meta 1 tags", Some(&cells)).unwrap(), Vec::new(), "test", "malformed");
-                (lost.clone(), Some(head), Some(Verdict::Malformed))
+                (lost.clone(), Some(head), Some(Owner::Unrebuildable))
             })),
             ("a parcel of its history has two parents", Box::new(|| {
                 let tree = store_meta_tree(b"forklift-meta 1 tags", None).unwrap();
                 let head = parcel(tree, vec![tags("one"), tags("two")], "test", "merge");
-                (lost.clone(), Some(head), Some(Verdict::RuleBroken))
-            })),
-            ("a parcel of its history names no operator", Box::new(|| {
-                let head = parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), "", "anonymous");
-                (lost.clone(), Some(head), Some(Verdict::SignatureRefused))
+                (lost.clone(), Some(head), Some(Owner::Unrebuildable))
             })),
             ("a damaged signature, no office", Box::new(|| {
                 let head = tags("signed");
@@ -2834,7 +2757,7 @@ mod tests {
 
         for (row, state) in rows {
             let (_root, _scope) = scratch("ref-heal-verdicts");
-            let (reference, copy, verdict) = state();
+            let (reference, copy, expected) = state();
             let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
             let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
             for path in [&ref_path, &copy_path] {
@@ -2856,21 +2779,26 @@ mod tests {
                 }
                 let _ = std::fs::set_permissions(std::path::Path::new(&crate::util::file_utils::get_path_objects_root()).join("ab"), std::fs::Permissions::from_mode(0o755));
             }
-            match verdict {
-                Some(verdict) => assert_eq!(owner, Owner::Own(verdict), "{}: {}", row, judged.reason),
-                None => assert!(!matches!(owner, Owner::Own(_)), "{}: {:?} ({})", row, owner, judged.reason),
+            match &expected {
+                Some(expected) => assert_eq!(&owner, expected, "{}: {}", row, judged.reason),
+                None => assert!(!matches!(owner, Owner::NoHead | Owner::Unrebuildable), "{}: {:?} ({})", row, owner, judged.reason),
             }
+            let step = meta_step(judged, &refused);
 
             let removal = remove_damaged_meta_ref("@tags", &refused, &[], &mut Vec::new());
-            match verdict {
-                Some(verdict) => {
+            match expected {
+                Some(Owner::NoHead) => {
+                    assert_eq!(step, "forklift heal --remove-ref @tags", "{}", row);
                     let removed = removal.unwrap_or_else(|(error, _)| panic!("{}: {}", row, error));
-                    assert_eq!(removed.kind, RemovedKind::Meta(verdict), "{}", row);
+                    assert_eq!(removed.kind, RemovedKind::Meta, "{}", row);
                     assert!(!ref_path.exists(), "{}: the ref is removed", row);
                 }
-                None => {
+                expected => {
+                    let restore = "Restore the ref of @tags and its copy from a backup, or write the hash of the head parcel it should hold into the ref's file, then run \"forklift heal\" again.";
+                    assert_eq!(step == restore, expected.is_some(), "{}: {}", row, step);
                     let (error, removed) = removal.unwrap_err();
                     assert!(removed.is_none() && error.contains("was not removed"), "{}: {:?} {}", row, removed, error);
+                    assert_eq!(error.contains("something names a head for it") && error.ends_with(restore), expected.is_some(), "{}: {}", row, error);
                     assert_eq!(std::fs::read(&ref_path).unwrap(), reference, "{}: nothing was removed", row);
                 }
             }

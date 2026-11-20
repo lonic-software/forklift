@@ -114,10 +114,13 @@ A meta pallet's ref (a name starting with `@`, such as `@tags`) keeps a copy bes
 while its copy stands refuses as `ref_damaged` wherever it is read, in place of reading as an empty pallet,
 and so does one whose file does not hold a parcel hash. `heal` rebuilds it from its copy, or from what
 the damaged file still names, the office's and `@redactions`' among them, so the refusal names
-`forklift heal`, which judges the ref. Where neither names a head `heal` can rebuild at (the copy does
-not hold a parcel hash, and the damaged file names nothing, several parcels or one that cannot be read,
-or is missing), or `heal` refuses the ref for a reason of its own, `heal`'s refusal names
-`forklift heal --remove-ref @<name>`. It removes the ref and its copy, keeping the bytes of
+`forklift heal`, which judges the ref. Removal only when nothing names a head: where neither does
+(the copy does not hold a parcel hash, and the damaged file names nothing or is missing), `heal`'s
+refusal names `forklift heal --remove-ref @<name>`. Where something names a head `heal` cannot
+rebuild at (the damaged file names several parcels or one that may be lost, the copy and the file
+name heads that diverge, or the head named does not verify as the pallet's history), the next step
+is to restore the ref and its copy from a backup, or write the head parcel's hash into the ref's
+file, and the removal is refused. The removal removes the ref and its copy, keeping the bytes of
 each under `.forklift/removed-refs`, and the pallet then reads as empty: what it recorded (tags,
 redactions, the office's keys) is gone from it, and what only its history reached may be freed.
 Restore the files from a backup instead if you have one. It runs only once no durability taint
