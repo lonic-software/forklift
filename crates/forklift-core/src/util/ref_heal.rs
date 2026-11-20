@@ -2809,6 +2809,8 @@ mod tests {
         #[cfg(unix)]
         rows.push(Row::ReadOnly);
 
+        // Every row is run before the note is judged, so a failure names each row that misses it.
+        let mut misnamed = Vec::new();
         for row in rows {
             let (_root, _scope) = scratch("ref-heal-stale-gone-head");
             let operator = crate::model::operator::Operator { identifier: "test".to_string() };
@@ -2858,8 +2860,10 @@ mod tests {
                 repair.unwrap().repair
             };
 
-            let naming: Vec<_> = repair.notes.iter().filter(|note| note.contains(&gone)).collect();
-            assert_eq!(naming, vec![&said], "{:?}: {:?}", row, repair);
+            let naming: Vec<_> = repair.notes.iter().filter(|note| note.contains(&gone)).cloned().collect();
+            if naming != vec![said] {
+                misnamed.push((row, naming));
+            }
             let rebuilt: Vec<_> = repair.rebuilt.iter().filter(|rebuilt| rebuilt.pallet == "@tags").map(|rebuilt| rebuilt.head.as_str()).collect();
             let refused = repair.refused.iter().find(|refused| refused.pallet == "@tags");
             match row {
@@ -2887,6 +2891,7 @@ mod tests {
                 }
             }
         }
+        assert!(misnamed.is_empty(), "rows whose notes do not name the gone head exactly once, as said: {:?}", misnamed);
     }
 
     // A head in a format this build does not know reads whole and is no verdict on the ref: a
