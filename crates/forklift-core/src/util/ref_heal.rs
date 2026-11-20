@@ -1137,7 +1137,8 @@ fn kept_path(pallet: &str) -> std::path::PathBuf {
 }
 
 /// The step that lets a later heal judge meta ref `refused` again, among the refusals `all` of
-/// the same pass: restoring it from a backup, where heal has no head it can rebuild it at; for one
+/// the same pass: restoring it from a backup, where heal has no head it can rebuild it at (or
+/// replacing what stands at its copy's path, while that blocks the copy); for one
 /// that waits on another meta ref's
 /// refusal, that ref's step; for one beside an unborn office, what brings the office back; for one
 /// over what a newer Forklift may have written, the upgrade; for one heal could not read, settling
@@ -1152,7 +1153,12 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
                 Some(cause) => at = cause,
                 None => break,
             },
-            Some(Owner::Unrebuildable) => return unrebuildable_step(&at.pallet),
+            // While something not a file stands at the copy's path, replacing it is the way out
+            // a read names too.
+            Some(Owner::Unrebuildable) => return match at.meta.as_ref().is_some_and(|meta| pallet_utils::copy_blocks(&at.pallet[1..], &meta.copy)) {
+                true => pallet_utils::blocked_copy_step(&at.pallet[1..], "run \"forklift heal\" again"),
+                false => unrebuildable_step(&at.pallet),
+            },
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
             Some(Owner::Newer) => return newer_step(),
             Some(Owner::Trust(step)) => return step.clone(),

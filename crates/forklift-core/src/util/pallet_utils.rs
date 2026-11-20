@@ -3148,8 +3148,7 @@ pub(crate) mod tests {
             let (message, next) = step("tags");
             assert!(message.contains("is lost: its file is missing, and something that is not a file stands at its copy's path"), "{}", message);
             assert_eq!(next, format!(
-                "Replace what stands at the copy's path (\"{}\") with the copy's file, or restore the ref's file from a backup, then run the command again. \
-                With neither, moving it aside leaves the pallet empty, as the ref's removal would.",
+                "Replace what stands at the copy's path (\"{}\") with the copy's file, or restore the ref's file from a backup, then run the command again.",
                 get_meta_copy_path("tags").to_string_lossy()
             ));
             drop(_scope);
