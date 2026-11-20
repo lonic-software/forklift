@@ -112,9 +112,7 @@ what only that ref reached is then no longer kept by any pallet.
 A meta pallet's ref (a name starting with `@`, such as `@tags`) keeps a copy beside it
 (`.forklift/meta-copy/<name>`), written with every change of the ref. A meta ref whose file is missing
 while its copy stands refuses as `ref_damaged` wherever it is read, in place of reading as an empty pallet,
-and so does one whose file does not hold a parcel hash. `heal` also takes as damaged a ref, other than
-the office's, that names a head the store does not hold and nothing could account for, beside a copy
-naming a head the store does hold. `heal` rebuilds it from its copy, or from what
+and so does one whose file does not hold a parcel hash. `heal` rebuilds it from its copy, or from what
 the damaged file still names, the office's and `@redactions`' among them, so the refusal names
 `forklift heal`, which judges the ref. `heal` never removes a meta pallet's ref. Where it has no head it
 can rebuild the ref at (the copy does not hold a parcel hash and the damaged file names nothing or is
@@ -146,6 +144,13 @@ path, beside a damaged ref `heal` names that same way out instead of a backup.
 A meta ref lost together with its copy leaves nothing that says the pallet was ever written, so it
 reads as empty, as one never written does: `tag list` then lists no tags, for example, and refuses
 nothing. Restore both files from a backup.
+
+A meta ref that reads but names a head the store has decided it does not hold is not refused where it
+is read as damaged: commands refuse on the missing object. Beside a copy naming a head the store does
+hold, `heal` rebuilds it at the copy's head, even where that is the older one, and its `Note:` names the
+head the ref named. While something could still account for the missing head (a refill from the
+origin, a redaction or a withholding, a pack or record that cannot be read in full, the durability
+taint), `heal` leaves the ref as it is. The office's ref is never rebuilt this way.
 
 `heal` rebuilds the office pallet's ref (`.forklift/meta/office`) from its copy
 (`.forklift/meta-copy/office`) only once the copy's head verifies against the trust file's anchor, and

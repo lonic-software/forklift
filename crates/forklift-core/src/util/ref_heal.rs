@@ -1319,16 +1319,15 @@ fn meta_wire(name: &str) -> String {
 /// head and so leaves the pallet unborn.
 fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
     let mut skipped = Vec::new();
-    let states = meta_states_skipping(&mut skipped, notes);
+    let states = meta_states_skipping(&mut skipped);
     for (_, note) in skipped {
         push_note(notes, note);
     }
     states
 }
 
-/// [`meta_states`], each pallet left out in `skipped` with its note, by name. What reading the
-/// durability taint, to judge a stale ref, had to say goes into `notes`.
-fn meta_states_skipping(skipped: &mut Vec<(String, String)>, notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
+/// [`meta_states`], each pallet left out in `skipped` with its note, by name.
+fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaState>, String> {
     let present = |path: std::path::PathBuf| !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     let names = crate::util::meta_tree::META_PALLET_NAMES.iter()
         .filter(|name| present(pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, name)) || present(pallet_utils::get_meta_copy_path(name)))
@@ -1367,7 +1366,9 @@ fn meta_states_skipping(skipped: &mut Vec<(String, String)>, notes: &mut Vec<Str
     // Only a ref and a copy naming two heads can be stale, so a warehouse whose copies agree reads
     // neither the taint nor the store here. The office is never judged stale: what heal does with
     // an office whose head is gone beside a stored copy is not decided, so it is left to the copy
-    // mend's refusal, which keeps both files.
+    // mend's refusal, which keeps both files. A taint that cannot be read covers every head, so
+    // nothing is judged stale beside it; its note is for the passes that salvage, which read it
+    // themselves, and would say here that salvaged objects count as lost where none was salvaged.
     let mut tainted: Option<Tainted> = None;
     for state in &mut states {
         if is_office(state) {
@@ -1379,7 +1380,7 @@ fn meta_states_skipping(skipped: &mut Vec<(String, String)>, notes: &mut Vec<Str
         if head == copy {
             continue;
         }
-        let tainted = tainted.get_or_insert_with(|| Tainted::read(notes));
+        let tainted = tainted.get_or_insert_with(|| Tainted::read(&mut Vec::new()));
         state.stale = head_decided_absent(&head, tainted) && head_held(&copy, tainted);
     }
 
@@ -1475,7 +1476,11 @@ type MetaRefusal = (String, Vec<Candidate>, Owner);
 /// journaled command's refs are put back, and none of `journal_op`'s commands (stack, consolidate,
 /// pick, shift) writes a meta ref: `git grep -l -E 'update_meta_pallet_head|PalletNamespace::Meta'`
 /// over their command and util modules finds none. A ref ahead of its copy (a write whose copy
-/// was not mended, a copy restored from an older backup) is rebuilt at what its own bytes name.
+/// was not mended, a copy restored from an older backup) is rebuilt at what its own bytes name,
+/// while the store holds that head. A ref whose head the store decided is gone beside a copy whose
+/// head it holds ([`RefDamage::AbsentHead`]) salvages nothing, so it is rebuilt at the copy's head,
+/// even where the copy is the older of the two: the ref goes back to the last head that can be
+/// read, and the note [`write_meta_rebuild`] leaves names the head it named.
 fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), MetaRefusal> {
     let copy = state.copy_head();
     let mut candidates: Vec<Candidate> = copy.iter()
@@ -2117,6 +2122,22 @@ fn write_meta_rebuild(state: &MetaState,
     let damage = state.damage().expect("only a damaged ref is rebuilt");
     let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged);
 
+    // A ref rebuilt over a head the store decided is gone loses the only record of that head, so
+    // the report names it.
+    let gone = match &damage {
+        RefDamage::AbsentHead(bytes) => pallet_utils::parse_ref_bytes(bytes),
+        _ => None,
+    };
+    let rebuilt = |report: &mut Repair, head: String| {
+        if let Some(gone) = &gone {
+            push_note(&mut report.notes, format!(
+                "The ref of pallet \"{}\" named {}, which is not in the store; it was rebuilt at {}, which its copy names.",
+                state.wire(), gone, head
+            ));
+        }
+        report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
+    };
+
     let read = read_back(PalletNamespace::Meta, &state.name, &head);
 
     let (reason, owner) = match written {
@@ -2130,7 +2151,7 @@ fn write_meta_rebuild(state: &MetaState,
         // it left unsynced with no taint recording it is synced again.
         _ if matches!(read, ReadBack::Landed) => {
             let Err(error) = &written else {
-                report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
+                rebuilt(report, head);
                 return false;
             };
             match mended(error, PalletNamespace::Meta, &state.name) {
@@ -2139,7 +2160,7 @@ fn write_meta_rebuild(state: &MetaState,
                     if let Some(again) = again {
                         push_note(&mut report.notes, synced_again(&state.wire(), &again));
                     }
-                    report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
+                    rebuilt(report, head);
                 }
                 Err(why) => report.undurable.push(undurable(&state.wire(), &head, &why)),
             }
