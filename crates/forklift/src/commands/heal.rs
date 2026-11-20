@@ -103,13 +103,20 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         .collect::<Result<Vec<_>, _>>()?;
     // Heal never removes a meta pallet's ref: it rebuilds one where it has a head to rebuild it at,
     // and otherwise names the way out.
-    let meta: Vec<String> = remove_ref.iter().filter(|pallet| pallet.starts_with('@')).map(|pallet| format!("\"--remove-ref {}\"", pallet)).collect();
-    if let Some(first) = remove_ref.iter().find(|pallet| pallet.starts_with('@')) {
+    // Each meta name once, in the order given, so naming one twice still reads as one flag to drop.
+    let mut meta: Vec<&String> = Vec::new();
+    for pallet in remove_ref.iter().filter(|pallet| pallet.starts_with('@')) {
+        if !meta.contains(&pallet) {
+            meta.push(pallet);
+        }
+    }
+    if let Some(first) = meta.first() {
+        let flags: Vec<String> = meta.iter().map(|pallet| format!("\"--remove-ref {}\"", pallet)).collect();
         return Err(format!(
             "--remove-ref removes only a user pallet's ref, and \"{}\" is not one: heal never removes the ref of a metadata pallet. \
             Run the command again without {}: heal rebuilds a damaged metadata ref where it can and otherwise names the way out. \
             Nothing was changed.",
-            first, meta.join(" and ")
+            first, flags.join(" and ")
         ));
     }
     let named = set_ref.iter().map(|(pallet, _)| *pallet).chain(remove_ref.iter().map(String::as_str));

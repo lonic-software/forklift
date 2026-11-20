@@ -378,7 +378,8 @@ fn remove_ref_drops_only_an_unreadable_ref_nothing_names() {
     // Heal never removes a meta pallet's ref, and says so before it changes anything: the
     // removable "side" beside it is not removed either. Mutation: drop the up-front refusal →
     // heal removes "side" before it refuses "@tags" → "side's bytes stand", red.
-    let removal = area.run(&root, &["heal", "--remove-ref", "side", "--remove-ref", "@tags", "--remove-ref", "@redactions"]);
+    // Mutation: list "@tags" for each time it is named → the message names it twice, red.
+    let removal = area.run(&root, &["heal", "--remove-ref", "side", "--remove-ref", "@tags", "--remove-ref", "@redactions", "--remove-ref", "@tags"]);
     assert!(!removal.status.success(), "{}", text(&removal.stdout));
     assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), zeros, "side's bytes stand");
     assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
