@@ -3099,7 +3099,7 @@ pub(crate) mod tests {
         // Revert: name heal for a copy that cannot be read → the step is heal, red.
         // Revert: read a link at the copy path as no copy → the read is unborn, red.
         // Revert: read a folder at the ref's path as missing → the step is heal, red.
-        // Revert: the removal beside a damaged ref whose copy cannot be read → red.
+        // Revert: name heal beside a damaged ref whose copy cannot be read → the step is heal, red.
         // Revert: judge the ref's salvage ahead of a copy that cannot be read → the step is heal, red.
         #[cfg(unix)]
         #[test]

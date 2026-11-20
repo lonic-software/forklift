@@ -374,6 +374,20 @@ fn remove_ref_drops_only_an_unreadable_ref_nothing_names() {
     // Zeroed, with nothing naming a head: removed, the bytes kept aside.
     let zeros = vec![0u8; 65];
     std::fs::write(ref_path(&root, "side"), &zeros).unwrap();
+
+    // Heal never removes a meta pallet's ref, and says so before it changes anything: the
+    // removable "side" beside it is not removed either. Mutation: drop the up-front refusal →
+    // heal removes "side" before it refuses "@tags" → "side's bytes stand", red.
+    let removal = area.run(&root, &["heal", "--remove-ref", "side", "--remove-ref", "@tags", "--remove-ref", "@redactions"]);
+    assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert!(text(&removal.stderr).contains(
+        "--remove-ref removes only a user pallet's ref, and \"@tags\" is not one: heal never removes the ref of a metadata pallet. \
+        Run the command again without \"--remove-ref @tags\" and \"--remove-ref @redactions\": heal rebuilds a damaged metadata ref where it can \
+        and otherwise names the way out. Nothing was changed."
+    ), "{}", text(&removal.stderr));
+    assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), zeros, "side's bytes stand");
+    assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
+
     let output = area.run_ok(&root, &["--json", "heal", "--remove-ref", "side"]);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let kept = root.join(value["data"]["refs_removed"][0]["kept"].as_str().unwrap());
@@ -1216,11 +1230,9 @@ fn tag_names(output: &Output) -> Vec<String> {
 
 // A lost meta ref is refused where it is read, never read as unborn, while its copy stands. The
 // read names heal, which judges whose the refusal is: it rebuilds from a copy that parses, and
-// otherwise names a backup, never removing the ref, which `--remove-ref` refuses for any meta
-// pallet up front. Mutations: read a missing ref as unborn whatever its copy → `tag list` prints
-// no tags, red; have the read name the backup for a copy that does not parse → the second case
-// red; admit `--remove-ref` for a meta pallet → its refusal's assertion, red; refuse with no
-// copy → the last case red.
+// otherwise names a backup. Mutations: read a missing ref as unborn whatever its copy → `tag list`
+// prints no tags, red; have the read name the backup for a copy that does not parse → the second
+// case red; refuse with no copy → the last case red.
 #[test]
 fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     let area = Area::new("meta-loud");
@@ -1246,17 +1258,6 @@ fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
     let judged = ref_damaged(&area.run(&root, &["--json", "heal"]));
     assert_eq!(judged["error"]["next_step"], backup_step("@tags").as_str(), "{}", judged);
-
-    // Heal never removes a meta pallet's ref, and says so before it changes anything.
-    let removal = area.run(&root, &["heal", "--remove-ref", "main", "--remove-ref", "@tags"]);
-    assert!(!removal.status.success(), "{}", text(&removal.stdout));
-    assert!(text(&removal.stderr).contains(
-        "--remove-ref removes only a user pallet's ref, and \"@tags\" is not one: heal never removes the ref of a metadata pallet. \
-        Run \"forklift heal\" without --remove-ref, which rebuilds a damaged metadata ref where it can and otherwise names the way out. \
-        Nothing was changed."
-    ), "{}", text(&removal.stderr));
-    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), b"not a hash", "the copy stands");
-    assert!(ref_path(&root, "main").is_file(), "main's ref stands");
 
     // The ref and its copy lost together: nothing is left to tell the pallet was born, so it
     // reads as unborn. That residual is the guide's.

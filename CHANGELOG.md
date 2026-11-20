@@ -70,9 +70,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `.forklift/meta/` whose file is missing while its copy stands now refuses as `ref_damaged`
   (exit 53) in every command that reads it, listings included, where it read as a pallet never
   written: `tag list` printed no tags, `lower` took the remote's head as a first adoption, and
-  garbage collection held nothing for it. The next step names `forklift heal` when the copy holds a
-  parcel hash, or a damaged ref's own bytes name one parcel, and the hand fix otherwise; a copy
-  that cannot be read, or a link at its path, is refused, naming what to make readable or replace.
+  garbage collection held nothing for it. The next step names `forklift heal`, which judges the ref; a
+  copy that cannot be read, or a link at its path, is refused, naming what to make readable or replace.
   A link at any pallet's ref path is never followed: it refuses as blocked, naming moving it aside,
   and `heal` leaves it with the same step. A ref whose path cannot be read refuses, naming making
   the ref's file and the folders on the way to it readable, where it read as a pallet never written. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`

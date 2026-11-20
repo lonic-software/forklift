@@ -103,12 +103,13 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         .collect::<Result<Vec<_>, _>>()?;
     // Heal never removes a meta pallet's ref: it rebuilds one where it has a head to rebuild it at,
     // and otherwise names the way out.
-    if let Some(meta) = remove_ref.iter().find(|pallet| pallet.starts_with('@')) {
+    let meta: Vec<String> = remove_ref.iter().filter(|pallet| pallet.starts_with('@')).map(|pallet| format!("\"--remove-ref {}\"", pallet)).collect();
+    if let Some(first) = remove_ref.iter().find(|pallet| pallet.starts_with('@')) {
         return Err(format!(
             "--remove-ref removes only a user pallet's ref, and \"{}\" is not one: heal never removes the ref of a metadata pallet. \
-            Run \"forklift heal\" without --remove-ref, which rebuilds a damaged metadata ref where it can and otherwise names the way out. \
+            Run the command again without {}: heal rebuilds a damaged metadata ref where it can and otherwise names the way out. \
             Nothing was changed.",
-            meta
+            first, meta.join(" and ")
         ));
     }
     let named = set_ref.iter().map(|(pallet, _)| *pallet).chain(remove_ref.iter().map(String::as_str));
@@ -1501,7 +1502,7 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
     )
 }
 
-/// Each refused ref's line, then its candidate heads, which the hand step writes.
+/// Each refused ref's line, then its candidate heads: for a user ref, what `--ref` may name.
 fn refusal_lines(all: &[ref_heal::Refused]) -> Vec<String> {
     let mut lines = Vec::new();
 

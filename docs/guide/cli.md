@@ -2919,8 +2919,8 @@ pallet's history, against the office, before it is written. A copy that is lost 
 head beside a ref that reads is set to the ref's head, with a `Note:`.
 
 Until then, every other command that reads such a ref refuses with `ref_damaged` (exit 53) rather
-than read it as a pallet never written, and names `forklift heal` when the copy holds a parcel hash,
-or the damaged file names one parcel. A ref lost together with its copy leaves
+than read it as a pallet never written, and names `forklift heal`, which judges it, except where heal
+would not (see `--remove-ref` above). A ref lost together with its copy leaves
 nothing to tell it from one never written, and reads as empty. A link at any pallet's ref path is
 never followed: the read refuses it as blocked, naming moving it aside, and `heal` leaves it with
 a `Note:` naming the same. A ref whose path cannot be read is refused, never read as a pallet never
