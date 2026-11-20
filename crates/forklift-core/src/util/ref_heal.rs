@@ -2812,7 +2812,8 @@ mod tests {
         // Every row is run before the note is judged, so a failure names each row that misses it.
         let mut misnamed = Vec::new();
         for row in rows {
-            let (_root, _scope) = scratch("ref-heal-stale-gone-head");
+            // A root per row: a taint a row's fault leaves stands under its root for this process.
+            let (_root, _scope) = scratch(&format!("ref-heal-stale-gone-head-{:?}", row));
             let operator = crate::model::operator::Operator { identifier: "test".to_string() };
             let held = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "held", None).unwrap();
             let other = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "other", None).unwrap();
