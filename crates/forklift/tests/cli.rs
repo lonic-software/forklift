@@ -7887,13 +7887,13 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
     assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"", main)), "{}", value);
     assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\""), "{}", value);
     assert_eq!(message.matches("\") holds an anchor it does not verify against").count(), 2, "both files judged: {}", value);
-    // Both anchors refuse a head the copy names: the step is to restore the office by hand.
-    let restore = "Restore the ref of @office and its copy from a backup, or write the hash of the head parcel it should hold into the ref's file, then run \"forklift heal\" again.";
+    // Both anchors refuse a head the copy names: the step is to restore the office from a backup.
+    let restore = "Restore the ref of @office and its copy from a backup, then run \"forklift heal\" again.";
     assert_eq!(value["error"]["next_step"], restore, "{}", value);
     assert!(!forklift.join("meta/office").exists(), "nothing was written");
 
     // With the trust copy lost, the file that might have verified the head is gone: the refusal
-    // is the trust files' damage, never a verdict on the head, so restoring it by hand is no step.
+    // is the trust files' damage, never a verdict on the head, so restoring it from a backup is no step.
     // Revert: read any file holding an anchor that does not verify the head as a verdict → the
     // restore is the step, red.
     forklift_core::util::file_utils::remove_file(forklift.join("trust-copy")).unwrap();
@@ -7902,7 +7902,6 @@ fn heal_refuses_an_office_copy_that_does_not_verify_against_the_anchor() {
     assert!(message.contains(&format!("parcel {} could not be verified as the office's history: the trust file (\"", main)), "{}", value);
     assert!(message.contains("\") holds an anchor it does not verify against, and its copy (\"") && message.contains("\") is lost"), "{}", value);
     assert_ne!(value["error"]["next_step"], restore, "{}", value);
-    assert_ne!(value["error"]["next_step"], "forklift heal --remove-ref @office", "{}", value);
     assert!(!forklift.join("meta/office").exists(), "nothing was written");
 }
 
@@ -7977,7 +7976,7 @@ fn heal_does_not_rebuild_an_office_whose_chain_the_store_cannot_give() {
         let value = json(&refused);
         let message = value["error"]["message"].as_str().unwrap();
         let (said, chain, step) = match *case {
-            "absent" => ("does not verify as the office's history against an anchor heal can read", "whose chain to the head the store holds damaged or absent", "Restore the ref of @office and its copy from a backup, or write the hash of the head parcel it should hold into the ref's file, then run \"forklift heal\" again.".to_string()),
+            "absent" => ("does not verify as the office's history against an anchor heal can read", "whose chain to the head the store holds damaged or absent", "Restore the ref of @office and its copy from a backup, then run \"forklift heal\" again.".to_string()),
             _ => ("could not be verified as the office's history", "whose chain to the head could not be read", forklift_core::util::ref_heal::unread_step("@office")),
         };
         assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: parcel {} {}: the trust file (\"", office, said)), "{}", value);
@@ -9136,7 +9135,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 61);
+    assert_eq!(value["schema"], 60);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -9178,7 +9177,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 61);
+    assert_eq!(value["schema"], 60);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -9237,7 +9236,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 61);
+    assert_eq!(value["schema"], 60);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -9445,7 +9444,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 61,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 60,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);

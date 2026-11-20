@@ -2881,26 +2881,21 @@ are in `details` under `--json`). Choose one yourself:
 - `forklift heal --remove-ref <pallet>` drops a damaged ref that nothing names a head for and no
   checkout stands on, once every checkout's saved state could be read. Its bytes are kept under `.forklift/removed-refs`, and whatever only that
   ref reached is no longer kept by any pallet. Repeatable.
-- `forklift heal --remove-ref @<name>` removes a metadata pallet's lost or damaged ref and its copy:
-  removal only when nothing names a head, so only when neither the copy nor the damaged ref's own
-  bytes name one. Where something names a head `heal` cannot rebuild at (several parcels, one
-  possibly lost, a copy and bytes that diverge, or a head whose history does not verify), it
-  refuses, naming restoring the ref and its copy from a backup, or writing the head parcel's hash
-  into the ref's file. The bytes of each are kept
-  in a file of their own under `.forklift/removed-refs`, and the pallet then reads as empty: its
-  tags, redactions or other records are gone from it, and what only its history reached may be
-  freed. It runs only with no durability taint standing (run `forklift heal` first), and refuses
-  a ref `heal` refused only because the office's or `@redactions`' ref was refused, or because the
-  office is unborn beside the trust file, naming what to settle first. It refuses, too, a ref whose
-  refusal is no verdict on it, naming the step `heal` names: for what heal could not read, that
-  read's own step, else settling it; for a rebuild heal could not write or read back, the write's
-  own step, else settling why; for a format this Forklift does not know, upgrading; and for a trust
-  state that refuses, `forklift heal` where heal restores the trust file from its copy, else a
-  way out of that refusal (a lost anchor's, or one the trust file's own refusal names) or settling
-  why the office does not verify against the anchor. A command that reads a damaged metadata ref never
-  names the removal, since only `heal` judges whose a refusal is: it names `forklift heal`, or, where
-  `heal` would not judge the ref (its copy cannot be read, or something that is not a file stands at
-  the ref's or the copy's path), the step that lets it.
+- `--remove-ref` takes a user pallet only: `heal` never removes a metadata pallet's ref (`@<name>`),
+  and refuses the option for one before it changes anything. Where `heal` has no head it can
+  rebuild a metadata ref at (nothing names one, or what does is several parcels, one possibly lost,
+  a copy and bytes that diverge, or a head whose history does not verify), it names restoring the
+  ref and its copy from a backup. Where its refusal is no verdict on the ref, it names the step
+  that lets a later `heal` judge it: for a ref that waits on the office's or `@redactions`' refusal,
+  or on an unborn office, that step; for what heal could not read, that read's own step, else
+  settling it; for a rebuild heal could not write or read back, the write's own step, else
+  settling why; for a format this Forklift does not know, upgrading; and for a trust state that
+  refuses, `forklift heal` where heal restores the trust file from its copy, else a way out of that
+  refusal (a lost anchor's, or one the trust file's own refusal names) or settling why the office
+  does not verify against the anchor. A command that reads a damaged metadata ref names
+  `forklift heal`, since only `heal` judges whose a refusal is, or, where `heal` would not judge the
+  ref (its copy cannot be read, or something that is not a file stands at the ref's or the copy's
+  path), the step that lets it.
 
 Both refuse a ref that is readable. A refusal also lists any ref the same run already set or
 removed. The report lists `refs_rebuilt`, `refs_removed` and

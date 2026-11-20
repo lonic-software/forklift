@@ -101,6 +101,16 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             "--ref takes PALLET=PARCEL, not \"{}\". Nothing was changed.", spec
         )))
         .collect::<Result<Vec<_>, _>>()?;
+    // Heal never removes a meta pallet's ref: it rebuilds one where it has a head to rebuild it at,
+    // and otherwise names the way out.
+    if let Some(meta) = remove_ref.iter().find(|pallet| pallet.starts_with('@')) {
+        return Err(format!(
+            "--remove-ref removes only a user pallet's ref, and \"{}\" is not one: heal never removes the ref of a metadata pallet. \
+            Run \"forklift heal\" without --remove-ref, which rebuilds a damaged metadata ref where it can and otherwise names the way out. \
+            Nothing was changed.",
+            meta
+        ));
+    }
     let named = set_ref.iter().map(|(pallet, _)| *pallet).chain(remove_ref.iter().map(String::as_str));
     if let Some(twice) = named.clone().enumerate().find(|(at, pallet)| named.clone().skip(at + 1).any(|other| other == *pallet)) {
         return Err(format!(
@@ -384,20 +394,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     }
 
-    // A meta ref is removed on the judgement the meta pass above made of it in this run, which
-    // its removal pins the ref and the copy to.
     for pallet in remove_ref {
-        let removed = match pallet.starts_with('@') {
-            true => ref_heal::remove_damaged_meta_ref(pallet, &meta_deferred, &refs_left.borrow().unjudged, &mut ref_notes),
-            false => ref_heal::remove_damaged_ref(pallet, &mut ref_notes).map_err(|error| (error, None)),
-        };
-        match removed {
+        match ref_heal::remove_damaged_ref(pallet, &mut ref_notes) {
             Ok(removed) => refs_removed.push(removed),
-            // What a removal that stopped had removed is said with its error.
-            Err((error, partial)) => {
-                refs_removed.extend(partial);
-                return Err(changed(error, &refs_rebuilt, &refs_removed, &ref_notes));
-            }
+            Err(error) => return Err(changed(error, &refs_rebuilt, &refs_removed, &ref_notes)),
         }
     }
 
@@ -1514,14 +1514,6 @@ fn refusal_lines(all: &[ref_heal::Refused]) -> Vec<String> {
         for candidate in &refused.candidates {
             lines.push(format!("  {} ({})", candidate.head, candidate.source));
         }
-
-        // What its removal costs, where that is its way out.
-        if refused.meta.is_some() && ref_heal::meta_step(refused, all) == ref_heal::removal_step(&refused.pallet) {
-            lines.push(
-                "  Its removal leaves the pallet empty: what only its history reached may then be freed, and the removed files' bytes \
-                are kept under removed-refs.".to_string()
-            );
-        }
     }
 
     lines
@@ -1674,24 +1666,10 @@ fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {
 }
 
 fn removed_sentence(removed: &ref_heal::Removed) -> String {
-    let ref_said = match &removed.kept_ref {
-        Some(kept) => format!("the damaged ref of pallet \"{}\", keeping its bytes in \"{}\"", removed.pallet, kept),
-        None => format!("the lost ref of pallet \"{}\"", removed.pallet),
-    };
-    match removed.kind {
-        ref_heal::RemovedKind::Meta => format!(
-            "Removed {}{}, which nothing names a head for. The pallet now reads empty, and what only it reached is no longer held by any pallet.",
-            ref_said,
-            match &removed.kept_copy {
-                Some(kept) => format!(", and its copy, keeping the copy's bytes in \"{}\"", kept),
-                None => String::new(),
-            }
-        ),
-        ref_heal::RemovedKind::User => format!(
-            "Removed the unreadable ref of pallet \"{}\", keeping its bytes in \"{}\"; what only it reached is no longer held by any pallet.",
-            removed.pallet, removed.kept_ref.as_deref().unwrap_or_default()
-        ),
-    }
+    format!(
+        "Removed the unreadable ref of pallet \"{}\", keeping its bytes in \"{}\"; what only it reached is no longer held by any pallet.",
+        removed.pallet, removed.kept
+    )
 }
 
 /// Drop the unavailable record's entry of every object the store holds, whose content came back,

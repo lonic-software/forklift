@@ -865,7 +865,7 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
             blocked_copy_step(name, "run the command again"),
         ),
         Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => (format!("its copy (\"{}\") still stands", shown), HEAL_STEP.to_string()),
-        // heal names the ref's removal only for a refusal of its own, which only heal judges.
+        // heal judges what the ref's own bytes name, which only heal reads.
         Ok(MetaCopyState::Bytes(_)) => (format!("its copy (\"{}\") stands but does not hold a parcel hash", shown), HEAL_STEP.to_string()),
         // Whether the ref was lost or never written cannot be told until the copy reads.
         Err(error) => (
@@ -921,12 +921,6 @@ const REF_READABLE_STEP: &str = "Make the ref's file and the folders on the way 
 const COPY_READABLE_STEP: &str = "Make the copy and the folders on the way to it readable, moving aside anything that \
     stands where one of those folders goes, then run the command again.";
 
-/// The removal of meta ref `name` (`heal --remove-ref`): the step heal names for a refusal of the
-/// ref's own. Only heal names it, since only heal judges whose a refusal is; a read names heal.
-pub fn meta_removal_step(name: &str) -> String {
-    format!("forklift heal --remove-ref {}", PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() }.to_wire())
-}
-
 /// Read the ref file at `path`, which stands, as [`get_pallet_head_in`] does.
 fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<Option<String>, String> {
     let bytes = std::fs::read(path)
@@ -945,11 +939,11 @@ fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<
                 Ok(MetaCopyState::Bytes(copy)) if parse_ref_bytes(&copy).is_some() => HEAL_STEP.to_string(),
                 // heal judges no ref whose copy it cannot read, whatever the ref's own bytes name.
                 Err(_) => COPY_READABLE_STEP.to_string(),
-                // The removal keeps the copy's bytes, which it cannot do for what is not a file.
+                // What is not a file at the copy's path is replaced, or the ref restored, first.
                 Ok(copy) if copy_blocks(name, &copy) => blocked_copy_step(name, "run the command again"),
-                // Whose the refusal is, and so whether its step is the removal, rests on what
-                // heal judges: what the bytes name, the trust state, the other meta refs. Only
-                // heal judges that, so a read names heal, which names that step.
+                // Whose the refusal is, and so its step, rests on what heal judges: what the
+                // bytes name, the trust state, the other meta refs. Only heal judges that, so a
+                // read names heal, which names that step.
                 _ => HEAL_STEP.to_string(),
             }
         }
@@ -1718,105 +1712,28 @@ pub fn remove_damaged_ref(name: &str, bytes: &[u8], kept: &Path) -> Result<(), R
         .map_err(RefUpdateError::Failed)
 }
 
-/// Whether what stands at meta pallet `name`'s copy path, read as `copy`, blocks its ref's way
-/// back: something that is neither a file nor a folder, which holds other names' copies and is
-/// read as no copy. Nothing it holds can be kept, so the ref is not removed past it.
+/// Whether what stands at meta pallet `name`'s copy path, read as `copy`, blocks it: something
+/// that is neither a file nor a folder, which holds other names' copies and is read as no copy.
 pub fn copy_blocks(name: &str, copy: &MetaCopyState) -> bool {
     *copy == MetaCopyState::Other && !std::fs::symlink_metadata(get_meta_copy_path(name)).is_ok_and(|metadata| metadata.is_dir())
 }
 
 /// The way out for meta pallet `name` while its copy path is blocked ([`copy_blocks`]), closed
-/// by `rerun`: what heal, the ref's removal and a read of the pallet all name. Moved aside, it
-/// leaves the ref and its copy both gone, read as never written, which is said as its cost.
+/// by `rerun`: what a read of the pallet names.
 pub fn blocked_copy_step(name: &str, rerun: &str) -> String {
     format!(
-        "Replace what stands at the copy's path (\"{}\") with the copy's file, or restore the ref's file from a backup, then {}. \
-        With neither, moving it aside leaves the pallet empty, as the ref's removal would.",
+        "Replace what stands at the copy's path (\"{}\") with the copy's file, or restore the ref's file from a backup, then {}.",
         get_meta_copy_path(name).to_string_lossy(), rerun
     )
 }
 
-/// What a removal of a meta ref ([`remove_damaged_meta_ref`]) had removed when it stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MetaRemoved {
-    /// Nothing: the ref and its copy stand as they did, beside whatever bytes were kept.
-    Nothing,
-
-    /// The ref, and not its copy, which still stands.
-    Ref,
-
-    /// Both, the copy's removal not yet durable.
-    Both,
-}
-
-/// Remove the lost or damaged ref of meta pallet `name` and its copy, which inside the ref lock
-/// must still stand as `damage` and `copy` say, after keeping the ref's bytes in `kept_ref` and
-/// the copy's in `kept_copy` (each given when there are bytes to keep; a file there already
-/// holding the same bytes is kept as it is). The ref goes first, then the copy: stopped between
-/// the two, it leaves a lost ref beside its copy, which a later heal judges again. Nothing else is
-/// written. Afterwards the pallet reads unborn, and what only its history reached is no longer
-/// rooted.
-///
-/// # Returns
-/// * `Err((RefUpdateError, MetaRemoved))` - Why it stopped, and what it had removed by then.
-pub fn remove_damaged_meta_ref(name: &str,
-                               damage: &RefDamage,
-                               copy: &MetaCopyState,
-                               kept_ref: Option<&Path>,
-                               kept_copy: Option<&Path>) -> Result<(), (RefUpdateError, MetaRemoved)> {
-    let nothing = |error: RefUpdateError| (error, MetaRemoved::Nothing);
-    let _lock = crate::util::lock_utils::RefLock::acquire().map_err(|error| nothing(error.into()))?;
-
-    require_damage(PalletNamespace::Meta, name, damage).map_err(nothing)?;
-    require_copy(name, copy).map_err(nothing)?;
-
-    if let (RefDamage::Unreadable(bytes), Some(kept)) = (damage, kept_ref) {
-        keep_removed(kept, bytes, name).map_err(nothing)?;
-    }
-    if let (MetaCopyState::Bytes(bytes), Some(kept)) = (copy, kept_copy) {
-        keep_removed(kept, bytes, name).map_err(nothing)?;
-    }
-
-    // A lost ref has nothing to unlink, so stopped at the copy, nothing was removed.
-    let mut removed = MetaRemoved::Nothing;
-    if let RefDamage::Unreadable(_) = damage {
-        let path = get_pallet_ref_path(PalletNamespace::Meta, name);
-        // An unlink that landed before a sync failed has removed the ref all the same, so the
-        // ref read back decides; a read back that fails too says nothing of it, and the ref is
-        // taken to stand.
-        unlink_ref(PalletNamespace::Meta, &path).map_err(|error| match stands(&path) {
-            Ok(true) => (RefUpdateError::Failed(error), MetaRemoved::Nothing),
-            Ok(false) => (RefUpdateError::Failed(error), MetaRemoved::Ref),
-            Err(read) => (RefUpdateError::Failed(crate::error::append_to_message(error, &format!(
-                "Whether the ref of pallet \"{}\" still stands could not be read back ({}), so it is taken to stand.", name, read
-            ))), MetaRemoved::Nothing),
-        })?;
-        removed = MetaRemoved::Ref;
-    }
-    if let MetaCopyState::Bytes(_) = copy {
-        let path = get_meta_copy_path(name);
-        file_utils::remove_file(&path).map_err(|e| (RefUpdateError::Failed(format!(
-            "Error while removing the copy file \"{}\": {}", path.to_string_lossy(), e
-        )), removed))?;
-        if let Some(parent) = path.parent() {
-            file_utils::sync_dir_or_taint(parent, &[path.as_path()]).map_err(|error| (error.into(), MetaRemoved::Both))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Keep `bytes`, removed from a file of pallet `name`, in `kept`: a new file, or one that holds
-/// those bytes already, as a removal stopped before it finished leaves it.
+/// Keep `bytes`, removed from a file of pallet `name`, in `kept`, a new file.
 fn keep_removed(kept: &Path, bytes: &[u8], name: &str) -> Result<(), RefUpdateError> {
     // A file there whose state cannot be read may hold other bytes: it is never written over.
     if stands(kept).map_err(|e| RefUpdateError::Failed(format!(
         "Whether the file \"{}\" the ref of pallet \"{}\" was to be kept in already exists could not be read: {}",
         kept.to_string_lossy(), name, e
     )))? {
-        if std::fs::read(kept).is_ok_and(|held| held == bytes) {
-            return Ok(());
-        }
         return Err(RefUpdateError::Failed(format!(
             "The file \"{}\" the ref of pallet \"{}\" was to be kept in already exists.",
             kept.to_string_lossy(), name
@@ -3002,42 +2919,6 @@ pub(crate) mod tests {
         }
 
         let _ = file_utils::remove_dir_all(&dir);
-    }
-
-    // A meta ref's removal holds both files to the bytes heal judged, inside the ref lock, and
-    // keeps each one's bytes before removing it. Mutations: drop the copy's re-read → the moved
-    // copy is removed, red; drop the ref's → the moved ref is removed, red; remove the copy before
-    // keeping it → its kept file is missing, red.
-    #[test]
-    fn a_meta_ref_removal_holds_both_files_to_what_was_judged() {
-        let (root, _scope) = scratch("meta-removal");
-        let (reference, copy) = (get_pallet_ref_path(PalletNamespace::Meta, "tags"), get_meta_copy_path("tags"));
-        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
-        std::fs::write(&reference, b"ref bytes").unwrap();
-        std::fs::write(&copy, b"copy bytes").unwrap();
-        let (kept_ref, kept_copy) = (root.join("kept-ref"), root.join("kept-copy"));
-        let damage = RefDamage::Unreadable(b"ref bytes".to_vec());
-        let judged_copy = MetaCopyState::Bytes(b"copy bytes".to_vec());
-
-        for (damage, copy_state) in [
-            (damage.clone(), MetaCopyState::Bytes(b"other".to_vec())),
-            (RefDamage::Unreadable(b"other".to_vec()), judged_copy.clone()),
-            (RefDamage::Missing, judged_copy.clone()),
-        ] {
-            let (error, removed) = remove_damaged_meta_ref("tags", &damage, &copy_state, Some(&kept_ref), Some(&kept_copy)).unwrap_err();
-            assert!(matches!(error, RefUpdateError::Moved(_)) && removed == MetaRemoved::Nothing, "{}", error);
-            assert_eq!(std::fs::read(&reference).unwrap(), b"ref bytes");
-            assert_eq!(std::fs::read(&copy).unwrap(), b"copy bytes");
-            assert!(!kept_ref.exists() && !kept_copy.exists(), "nothing is kept");
-        }
-
-        remove_damaged_meta_ref("tags", &damage, &judged_copy, Some(&kept_ref), Some(&kept_copy)).unwrap();
-        assert!(!reference.exists() && !copy.exists());
-        assert_eq!(std::fs::read(&kept_ref).unwrap(), b"ref bytes");
-        assert_eq!(std::fs::read(&kept_copy).unwrap(), b"copy bytes");
-
-        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// A fresh warehouse root (its `.forklift` folder exists) entered for this thread.
@@ -5016,6 +4897,38 @@ pub(crate) mod tests {
         file_utils::remove_dir_all(&root).ok();
     }
 
+    /// A mixed-case entry whose spellings cannot be read leaves a prefix it cannot spell answered:
+    /// beside a match, it is no reason the match is not found. One it may spell still makes the
+    /// answer an error. The folder lists but cannot be searched, so lowercase entries are matched
+    /// by name and a mixed-case one only by reading it, which fails; skipped as root.
+    ///
+    /// Revert: judge every entry before checking the prefix → the unrelated entry's read fails the
+    /// answer, `Err` → red.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_entry_that_cannot_spell_the_prefix_leaves_its_match_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _scope) = scratch("unreadable-other-entry");
+        let hash = "ab".to_string() + &"cd".repeat(31);
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
+        std::fs::write(Path::new(&folder).join("EF".repeat(31)), b"other").unwrap();
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let found = object_hashes_with_prefix("abcd");
+        let other = object_hashes_with_prefix("abef");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(found, Ok(vec![hash.clone()]), "the match is found beside an entry that cannot spell it");
+            let error = other.unwrap_err();
+            assert!(error.contains("could not be read"), "an entry that may spell the prefix is no answer: {}", error);
+        }
+
+        file_utils::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn a_position_that_cannot_be_recorded_after_the_ref_moved_says_the_parcel_stands() {
         let (root, _scope) = scratch("record-landed");
@@ -5996,6 +5909,12 @@ pub(crate) fn object_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, Str
 
             // Sidecar files (parcel signatures) carry a dotted suffix and are not objects.
             if file_name.contains('.') {
+                continue;
+            }
+
+            // Only a name that may spell a match is judged, so one that cannot read beside it
+            // never fails this prefix's answer.
+            if !file_name.to_ascii_lowercase().starts_with(rest) {
                 continue;
             }
 

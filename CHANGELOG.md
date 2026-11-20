@@ -41,17 +41,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   stands, names each ref left that way with the heads found for it, and each damaged metadata
   ref a pass that stopped never judged.
 
-- **`heal --remove-ref @<name>` removes a metadata pallet's ref that nothing names a head for.**
-  Removal only when nothing names a head: where neither the copy nor the damaged ref's own bytes
-  name one, `heal`'s refusal names `forklift heal --remove-ref @<name>` and says what it costs.
-  Where something names a head `heal` cannot rebuild at (several parcels, one possibly lost, a copy
-  and bytes that diverge, or a head whose history does not verify), the removal is refused, and
-  the step is to restore the ref and its copy from a backup or write the head parcel's hash into
-  the ref's file. The removal keeps the ref's and the copy's bytes under
-  `.forklift/removed-refs` and leaves the pallet empty. It refuses while a durability taint stands,
-  and for a ref that waits on the office's or `@redactions`' refusal, or on an unborn office, it
-  names that step instead. It is refused, too, where the refusal is no verdict on the ref, naming
-  the step `heal` names: where `heal` could not read what it needs (a file it may not read, pack
+- **`heal` names its way out for every damaged metadata ref it does not rebuild, and never
+  removes one.** Where `heal` has no head it can rebuild the ref at (nothing names one, or what does
+  is several parcels, one possibly lost, a copy and bytes that diverge, or a head whose history does
+  not verify), the step is to restore the ref and its copy from a backup. `heal --remove-ref
+  @<name>` is refused before anything changes. Where the refusal is no verdict on the ref, the step
+  is the one `heal` names: for a ref that waits on the office's or `@redactions`' refusal, or on an
+  unborn office, that step; where `heal` could not read what it needs (a file it may not read, pack
   damage it rebuilds, a pack it cannot list in full), that read's own step, else settling it; where
   it could not write the rebuild it chose or read it back, the write's own step, else settling why;
   where what it needs is in a format this Forklift does not know (an object, a record or a signature
@@ -59,12 +55,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   the trust file from its copy, else a way out of that refusal (a lost anchor's, or one the trust
   file's own refusal names) or settling why the office does not verify. A parcel of its history
   that carries no signature after trust, there or on the office pallet, refuses as
-  `signature_missing` (exit 71), naming a backup or a fresh clone. A command that reads a damaged metadata
-  ref never names the removal: it names `forklift heal`, or, where `heal` would not judge the ref
-  (its copy cannot be read, or something that is not a file stands at the ref's or the copy's path),
-  the step that lets it. A removal stopped after the ref went still reports it, and a rerun
-  keeps the bytes in the same file. `--json`: each `refs_removed` entry's `kept` is replaced by
-  `kept_ref` and `kept_copy`, each the file one role's bytes were kept in, or null (schema 61).
+  `signature_missing` (exit 71), naming a backup or a fresh clone. A command that reads a damaged
+  metadata ref names `forklift heal`, or, where `heal` would not judge the ref (its copy cannot be
+  read, or something that is not a file stands at the ref's or the copy's path), the step that lets
+  it.
 
 ### Changed
 

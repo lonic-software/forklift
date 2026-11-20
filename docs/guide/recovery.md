@@ -114,19 +114,13 @@ A meta pallet's ref (a name starting with `@`, such as `@tags`) keeps a copy bes
 while its copy stands refuses as `ref_damaged` wherever it is read, in place of reading as an empty pallet,
 and so does one whose file does not hold a parcel hash. `heal` rebuilds it from its copy, or from what
 the damaged file still names, the office's and `@redactions`' among them, so the refusal names
-`forklift heal`, which judges the ref. Removal only when nothing names a head: where neither does
-(the copy does not hold a parcel hash, and the damaged file names nothing or is missing), `heal`'s
-refusal names `forklift heal --remove-ref @<name>`. Where something names a head `heal` cannot
-rebuild at (the damaged file names several parcels or one that may be lost, the copy and the file
-name heads that diverge, or the head named does not verify as the pallet's history), the next step
-is to restore the ref and its copy from a backup, or write the head parcel's hash into the ref's
-file, and the removal is refused. The removal removes the ref and its copy, keeping the bytes of
-each under `.forklift/removed-refs`, and the pallet then reads as empty: what it recorded (tags,
-redactions, the office's keys) is gone from it, and what only its history reached may be freed.
-Restore the files from a backup instead if you have one. It runs only once no durability taint
-stands, and not for a ref `heal` refused only because the office's or `@redactions`' ref was refused,
-or because the office is unborn beside the trust file: it names what to settle first. Nor does it run
-where `heal`'s refusal is no verdict on the ref, and the step `heal` names then depends on why:
+`forklift heal`, which judges the ref. `heal` never removes a meta pallet's ref. Where it has no head it
+can rebuild the ref at (the copy does not hold a parcel hash and the damaged file names nothing or is
+missing, the damaged file names several parcels or one that may be lost, the copy and the file name
+heads that diverge, or the head named does not verify as the pallet's history), the next step is to
+restore the ref and its copy from a backup. For a ref `heal` refused only because the office's or
+`@redactions`' ref was refused, or because the office is unborn beside the trust file, it names what
+to settle first. Where its refusal is no verdict on the ref, the step `heal` names depends on why:
 
 - It could not read what it needs (a file it may not read, a pack it cannot open or list in full): the
   step that read's own refusal names, else settling what it names, then `forklift heal` again, which
@@ -145,8 +139,7 @@ copy's path, or something other than a file at the ref's path is refused too, na
 and the folders on the way to it readable, replace the link with the copy's file (moving it aside would
 leave the pallet reading as never written), or move aside what stands at the ref's path, and run the
 command again. While a link or anything else that is neither a file nor a folder stands at the copy's
-path, nothing can be kept from it, so beside a damaged ref `heal` and the removal name that same way
-out instead of the removal.
+path, beside a damaged ref `heal` names that same way out instead of a backup.
 
 A meta ref lost together with its copy leaves nothing that says the pallet was ever written, so it
 reads as empty, as one never written does: `tag list` then lists no tags, for example, and refuses
