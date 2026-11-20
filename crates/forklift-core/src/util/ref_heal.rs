@@ -428,6 +428,22 @@ impl Tainted {
     }
 }
 
+/// Whether the store has decided that `head` is gone, and the durability taint does not account
+/// for it. Read as [`judge`] reads a candidate: a refill, a redaction, a withholding or a pack the
+/// store cannot list leaves an absence undecided, which is not this. Bytes held whole, held
+/// damaged, of another kind or of a newer build are not absent, and a head the taint covers is not
+/// read at all, since the taint recovery may yet restore it.
+fn head_decided_absent(head: &str, tainted: &Tainted) -> bool {
+    use crate::util::file_utils::{Decided, ReadFault};
+
+    !tainted.covers(head) && matches!(object_utils::load_parcel_judged(head), Err((_, ReadFault::Decided(Decided::Absent))))
+}
+
+/// Whether the store gives `head` as a whole parcel, and the durability taint does not cover it.
+fn head_held(head: &str, tainted: &Tainted) -> bool {
+    !tainted.covers(head) && matches!(object_utils::load_parcel_judged(head), Ok(Ok(_)))
+}
+
 /// Gather what every checkout and the ref's own bytes say about `damaged`'s head.
 fn gather(damaged: &DamagedRef, tainted: &Tainted, notes: &mut Vec<String>) -> Evidence {
     let pallet = damaged.pallet.as_str();
@@ -1259,6 +1275,11 @@ struct MetaState {
     reference: Option<Vec<u8>>,
 
     copy: pallet_utils::MetaCopyState,
+
+    /// Whether the ref's bytes name a head the store has decided is absent, beside a copy naming
+    /// another head the store holds; never for the office. Judged once, when the state is read, so
+    /// every reader of [`MetaState::damage`] sees the same answer.
+    stale: bool,
 }
 
 impl MetaState {
@@ -1266,10 +1287,12 @@ impl MetaState {
         meta_wire(&self.name)
     }
 
-    /// How the ref is damaged: lost beside a copy, or holding bytes that are not a head. `None`
-    /// for an intact ref, and for a pallet with neither a ref nor a copy, which is unborn.
+    /// How the ref is damaged: lost beside a copy, holding bytes that are not a head, or naming a
+    /// head the store decided is gone beside a copy whose head it holds. `None` for an intact ref,
+    /// and for a pallet with neither a ref nor a copy, which is unborn.
     fn damage(&self) -> Option<RefDamage> {
         match &self.reference {
+            Some(bytes) if self.stale => Some(RefDamage::AbsentHead(bytes.clone())),
             Some(bytes) if pallet_utils::parse_ref_bytes(bytes).is_some() => None,
             Some(bytes) => Some(RefDamage::Unreadable(bytes.clone())),
             None if self.copy == pallet_utils::MetaCopyState::Absent => None,
@@ -1296,15 +1319,16 @@ fn meta_wire(name: &str) -> String {
 /// head and so leaves the pallet unborn.
 fn meta_states(notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
     let mut skipped = Vec::new();
-    let states = meta_states_skipping(&mut skipped);
+    let states = meta_states_skipping(&mut skipped, notes);
     for (_, note) in skipped {
         push_note(notes, note);
     }
     states
 }
 
-/// [`meta_states`], each pallet left out in `skipped` with its note, by name.
-fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaState>, String> {
+/// [`meta_states`], each pallet left out in `skipped` with its note, by name. What reading the
+/// durability taint, to judge a stale ref, had to say goes into `notes`.
+fn meta_states_skipping(skipped: &mut Vec<(String, String)>, notes: &mut Vec<String>) -> Result<Vec<MetaState>, String> {
     let present = |path: std::path::PathBuf| !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     let names = crate::util::meta_tree::META_PALLET_NAMES.iter()
         .filter(|name| present(pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, name)) || present(pallet_utils::get_meta_copy_path(name)))
@@ -1333,11 +1357,30 @@ fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaS
                 "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), which has no ref: it names no head, so heal did not judge that ref.",
                 meta_wire(&name), pallet_utils::get_meta_copy_path(&name).to_string_lossy()
             ))),
-            Ok(copy) => states.push(MetaState { name, reference, copy }),
+            Ok(copy) => states.push(MetaState { name, reference, copy, stale: false }),
             Err(error) => skipped.push((name.clone(), format!(
                 "The copy of pallet \"{}\"'s ref could not be read, so heal did not judge that ref: {}", meta_wire(&name), error
             ))),
         }
+    }
+
+    // Only a ref and a copy naming two heads can be stale, so a warehouse whose copies agree reads
+    // neither the taint nor the store here. The office is never judged stale: what heal does with
+    // an office whose head is gone beside a stored copy is not decided, so it is left to the copy
+    // mend's refusal, which keeps both files.
+    let mut tainted: Option<Tainted> = None;
+    for state in &mut states {
+        if is_office(state) {
+            continue;
+        }
+        let (Some(head), Some(copy)) = (state.reference.as_deref().and_then(pallet_utils::parse_ref_bytes), state.copy_head()) else {
+            continue;
+        };
+        if head == copy {
+            continue;
+        }
+        let tainted = tainted.get_or_insert_with(|| Tainted::read(notes));
+        state.stale = head_decided_absent(&head, tainted) && head_held(&copy, tainted);
     }
 
     Ok(states)
@@ -1672,6 +1715,36 @@ fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>)
                 "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), so the copy was not set to the ref's head {}; move it aside and run \"forklift heal\" again.",
                 state.wire(), pallet_utils::get_meta_copy_path(&state.name).to_string_lossy(), head
             ));
+        }
+        return;
+    }
+
+    // The copy is set only toward a head the store gives whole: over any other answer, it may be
+    // the one file still naming a head a reader can load. The store's outer error is only a
+    // decided answer or an untold one, never bytes of a newer build, which come back inside `Ok`.
+    // Before the taint the refusal is silent, as the error arm below is: the pass after the taint
+    // recovery reads the store again and mends a head the recovery made readable, or says why
+    // not. A run that returns before that pass reports nothing of this copy; the next run does.
+    let refused = match object_utils::load_parcel_judged(head) {
+        Ok(Ok(_)) | Ok(Err(object_utils::NotAParcel::Newer(_))) => None,
+        Ok(Err(object_utils::NotAParcel::Other(_))) => Some("is not a parcel".to_string()),
+        Err((_, crate::util::file_utils::ReadFault::Decided(crate::util::file_utils::Decided::Absent))) => Some("is not in the store".to_string()),
+        Err((error, crate::util::file_utils::ReadFault::Decided(_))) => Some(format!("cannot be read: {}", error)),
+        Err((error, _)) => Some(format!("could not be read from the store: {}", error)),
+    };
+
+    if let Some(said) = refused {
+        if pass == Pass::AfterTaint {
+            push_note(notes, match state.copy_head() {
+                Some(other) => format!(
+                    "The copy of pallet \"{}\"'s ref names {}, and was left as it is: the ref's head {} {}, so the copy was not set to it.",
+                    state.wire(), other, head, said
+                ),
+                None => format!(
+                    "The copy of pallet \"{}\"'s ref is lost or damaged, and was left as it is: the ref's head {} {}, so the copy was not set to it.",
+                    state.wire(), head, said
+                ),
+            });
         }
         return;
     }
@@ -2346,7 +2419,7 @@ mod tests {
         let framed = |step: &str| -> String {
             crate::error::CoreError::refusal(crate::error::RefusalCode::TrustDamaged, "the store could not give it", step).into()
         };
-        let state = MetaState { name: "tags".to_string(), reference: None, copy: pallet_utils::MetaCopyState::Bytes(b"x\n".to_vec()) };
+        let state = MetaState { name: "tags".to_string(), reference: None, copy: pallet_utils::MetaCopyState::Bytes(b"x\n".to_vec()), stale: false };
         let rows = [
             ("a concrete step", format!("parcel p does not pass verification: {}", framed("Restore the parcel from a backup")), Some("Restore the parcel from a backup")),
             ("heal first, then a concrete one", format!("{} and {}", framed("forklift heal"), framed("Restore the parcel from a backup")), Some("Restore the parcel from a backup")),
@@ -2363,6 +2436,55 @@ mod tests {
             let expected = step.map_or_else(|| unread_step("@tags"), str::to_string);
             assert_eq!(meta_step(refused, &report.refused), expected, "{}", row);
         }
+    }
+
+    // Mutation: drop the taint check from the predicate → a covered head reads as decided
+    // absent, red. The clean half shows the fixture reaches the decided answer.
+    #[test]
+    fn a_head_the_taint_covers_is_never_decided_absent() {
+        let (_root, _scope) = scratch("ref-heal-absent-tainted");
+        let absent = blake3::hash(b"never stored here").to_hex().to_string();
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        let covering = Tainted { hashes: BTreeSet::from([absent.clone()]), torn: false, unread: false };
+
+        assert!(head_decided_absent(&absent, &clean), "the store decided it is absent");
+        assert!(!head_decided_absent(&absent, &covering), "the taint may yet restore it");
+    }
+
+    // A meta ref whose head the store cannot tell of, beside a copy naming a held head, is no
+    // stale ref, and its copy is not set to that head. Mutations: let the predicate take an untold
+    // answer → the ref reads as damaged, red; drop the copy mend's refusal → the copy takes the
+    // ref's head, red.
+    #[test]
+    fn a_meta_ref_whose_head_the_store_cannot_tell_of_is_not_stale_and_keeps_its_copy() {
+        let (_root, _scope) = scratch("ref-heal-untold");
+        let held = stub_parcel("held");
+        let absent = blake3::hash(b"never stored here").to_hex().to_string();
+        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, "tags");
+        let copy_path = pallet_utils::get_meta_copy_path("tags");
+        for path in [&ref_path, &copy_path] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&ref_path, format!("{}\n", absent)).unwrap();
+        std::fs::write(&copy_path, format!("{}\n", held)).unwrap();
+
+        // With the store answering, the same files are a stale ref: the fixture reaches the verdict.
+        let tags = |notes: &mut Vec<String>| meta_states(notes).unwrap().into_iter().find(|state| state.name == "tags").unwrap();
+        assert_eq!(tags(&mut Vec::new()).damage(), Some(RefDamage::AbsentHead(format!("{}\n", absent).into_bytes())));
+
+        let _failing = crate::util::pack_utils::fail_unindexed_holders("the pack registry could not be read");
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        assert!(head_held(&held, &clean), "the copy's head still reads whole");
+        let state = tags(&mut Vec::new());
+        assert_eq!(state.damage(), None);
+
+        let mut notes = Vec::new();
+        mend_copy(&state, &absent, Pass::AfterTaint, &mut notes);
+        assert_eq!(std::fs::read(&copy_path).unwrap(), format!("{}\n", held).into_bytes());
+        assert_eq!(std::fs::read(&ref_path).unwrap(), format!("{}\n", absent).into_bytes());
+        assert!(notes.iter().any(|note| note.starts_with(&format!(
+            "The copy of pallet \"@tags\"'s ref names {}, and was left as it is: the ref's head {} could not be read from the store:", held, absent
+        ))), "{:?}", notes);
     }
 
     // Mutation: judge two matching parcels as Nothing → the ref's bytes stop being a floor and

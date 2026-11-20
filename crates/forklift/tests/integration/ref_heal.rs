@@ -1906,6 +1906,79 @@ fn a_lost_or_stale_copy_beside_an_intact_ref_is_mended() {
     assert!(output.contains(&format!("The copy of pallet \"@tags\"'s ref named the ref's head {}, in other bytes; it was set to the ref's bytes.", second)), "{}", output);
 }
 
+/// `head` with its hex digit at `at` changed: a head nothing stored.
+fn flip_digit(head: &str, at: usize) -> String {
+    let mut digits: Vec<char> = head.chars().collect();
+    digits[at] = if digits[at] == '0' { '1' } else { '0' };
+    digits.into_iter().collect()
+}
+
+// A meta ref whose head the store decided is gone, beside a copy naming a head it holds, is
+// rebuilt at the copy's head, and the copy is left as it stands. Mutations: never judge a ref
+// that parses as damaged → the copy mend's refusal leaves both files, red at the ref; drop that
+// refusal as well → the copy takes the absent head, red at the copy.
+#[test]
+fn a_meta_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_copy() {
+    let area = Area::new("meta-absent-head");
+    let (root, _, second) = tagged(&area);
+    let copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
+    std::fs::write(meta_path(&root, "tags"), format!("{}\n", flip_digit(&second, 63))).unwrap();
+
+    let data = healed(&area, &root);
+    assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
+    assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "{}", data);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), copy, "{}", data);
+    assert!(rebuilt_meta(&healed(&area, &root)).is_empty(), "a second heal finds nothing to do");
+}
+
+// A meta ref whose head is gone beside a copy naming no head the store holds is no stale ref,
+// and neither file is written. Mutations: drop the copy mend's refusal → the copy takes the
+// ref's head, red; judge it stale without the copy's head held → the rebuild is refused, and the
+// note that the copy was left is gone, red.
+#[test]
+fn a_meta_ref_naming_a_lost_head_beside_a_copy_naming_another_keeps_both() {
+    let area = Area::new("meta-absent-both");
+    let (root, _, second) = tagged(&area);
+    let (gone, other) = (flip_digit(&second, 63), flip_digit(&second, 62));
+    std::fs::write(meta_path(&root, "tags"), format!("{}\n", gone)).unwrap();
+    std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", other)).unwrap();
+
+    // Neither head is stored, so heal still refuses on the objects history reaches.
+    let output = area.run(&root, &["--json", "heal"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "objects_lost", "{}", value);
+    let data = &value["error"]["details"];
+    assert_eq!(std::fs::read(meta_path(&root, "tags")).unwrap(), format!("{}\n", gone).into_bytes(), "{}", data);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), format!("{}\n", other).into_bytes(), "{}", data);
+    assert!(data["notes"].to_string().contains(&format!(
+        "The copy of pallet \\\"@tags\\\"'s ref names {}, and was left as it is: the ref's head {} is not in the store, so the copy was not set to it.", other, gone
+    )), "{}", data);
+}
+
+// The office is never judged stale: its ref naming a head the store decided is gone is left, and
+// so is its copy, which names the stored head. Mutations: judge the office as any other meta ref
+// → it is rebuilt at its copy, red; drop the copy mend's refusal → the copy takes the absent
+// head, red.
+#[test]
+fn an_office_ref_naming_a_head_the_store_decided_is_gone_keeps_both_files() {
+    let area = Area::new("meta-absent-office");
+    let (root, _, _) = tagged(&area);
+    area.run_ok(&root, &["office", "enroll"]);
+    let office = meta_head(&root, "office").unwrap();
+    let copy = std::fs::read(meta_copy_path(&root, "office")).unwrap();
+    let gone = flip_digit(&office, 63);
+    std::fs::write(meta_path(&root, "office"), format!("{}\n", gone)).unwrap();
+
+    let output = area.run(&root, &["--json", "heal"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(std::fs::read(meta_path(&root, "office")).unwrap(), format!("{}\n", gone).into_bytes(), "{}", value);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "office")).unwrap(), copy, "{}", value);
+    assert!(rebuilt_meta(&value["data"]).is_empty(), "{}", value);
+    assert!(value.to_string().contains(&format!(
+        "The copy of pallet \\\"@office\\\"'s ref names {}, and was left as it is: the ref's head {} is not in the store", office, gone
+    )), "{}", value);
+}
+
 // A folder planted at the copy's path fails the first write's copy, after its ref landed.
 // Mutation: skip the copy mend → the copy stays absent, red.
 #[test]
