@@ -3327,8 +3327,12 @@ pub(crate) mod tests {
             let mut notes = Vec::new();
             let found = crate::util::ref_heal::detect(&mut notes).unwrap();
             assert!(found.is_empty(), "heal files no ref a folder stands at: {:?}", found.iter().map(|d| &d.pallet).collect::<Vec<_>>());
+            // A folder there may hold the refs of pallets named under it, so the step moves the
+            // checkout, never the folder. Revert: name moving it aside, as for a link → red.
             let said = format!(
-                "Something that is not a file stands at the ref of pallet \"main\" (\"{}\"), so heal did not judge it. Move it aside, then run heal again.",
+                "A folder stands at the ref of pallet \"main\" (\"{}\"), which the warehouse's own working tree stands on, so heal did not judge it. \
+                It may hold the refs of pallets named under \"main/\", so do not move it aside: \
+                run \"forklift shift <pallet>\" in the warehouse's own working tree to put it on another pallet, then run heal again.",
                 main.to_string_lossy()
             );
             assert!(notes.contains(&said), "{:?}", notes);

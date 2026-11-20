@@ -399,6 +399,31 @@ fn remove_ref_drops_only_an_unreadable_ref_nothing_names() {
     healed(&area, &root);
 }
 
+/// A bay on pallet "team" whose ref's path became the folder of pallet "team/x": heal names the
+/// folder and the bay, tells the user not to move the folder aside (it holds "team/x"'s ref), and
+/// the step it names, shifting the bay to another pallet, settles it with "team/x" untouched.
+/// Revert: the checkout's note says to move it aside, as for a link → the first assertion, red.
+#[test]
+fn a_folder_at_a_bays_ref_is_left_where_it_is_and_the_bay_moves() {
+    let area = Area::new("folder-at-bay-ref");
+    let root = area.warehouse();
+    let bay = area.bay(&root, "team");
+    let main = head(&root, "main");
+    forklift_core::util::file_utils::remove_file(&ref_path(&root, "team")).unwrap();
+    std::fs::create_dir_all(ref_path(&root, "team")).unwrap();
+    std::fs::write(ref_path(&root, "team").join("x"), format!("{}\n", main)).unwrap();
+
+    let notes = healed(&area, &root)["notes"].to_string();
+    assert!(notes.contains("A folder stands at the ref of pallet \\\"team\\\"") && notes.contains("which bay \\\"team\\\" stands on")
+        && notes.contains("so do not move it aside: run \\\"forklift shift <pallet>\\\" in bay \\\"team\\\""), "{}", notes);
+    assert!(!notes.contains("Move it aside"), "{}", notes);
+
+    area.run_ok(&bay, &["shift", "main"]);
+    let notes = healed(&area, &root)["notes"].to_string();
+    assert!(!notes.contains("pallet \\\"team\\\""), "the bay is off the folder: {}", notes);
+    assert_eq!(head(&root, "team/x"), main, "the nested pallet's ref is where it was");
+}
+
 #[test]
 fn a_ref_that_is_not_damaged_is_not_set() {
     let area = Area::new("set-readable");

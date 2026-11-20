@@ -391,6 +391,22 @@ fn not_a_file_note(pallet: &str, path: &Path) -> String {
     )
 }
 
+/// The note for the ref of `pallet` at `path`, which checkout `which` stands on, when something
+/// that is not a file stands there. A folder at a user ref's path is where the refs of the
+/// pallets named under it are kept, so moving it aside would take theirs: the way out is to move
+/// the checkout off the pallet instead.
+fn checkout_not_a_file_note(which: &str, pallet: &str, path: &Path) -> String {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => format!(
+            "A folder stands at the ref of pallet \"{}\" (\"{}\"), which {} stands on, so heal did not judge it. \
+            It may hold the refs of pallets named under \"{}/\", so do not move it aside: \
+            run \"forklift shift <pallet>\" in {} to put it on another pallet, then run heal again.",
+            pallet, path.to_string_lossy(), which, pallet, which
+        ),
+        _ => not_a_file_note(pallet, path),
+    }
+}
+
 fn push_note(notes: &mut Vec<String>, note: String) {
     if !notes.contains(&note) {
         notes.push(note);
@@ -435,7 +451,7 @@ pub fn detect(notes: &mut Vec<String>) -> Result<Vec<DamagedRef>, String> {
                     Ok(pallet_utils::MetaCopyState::Absent) => {
                         found.entry(position.pallet).or_insert(RefDamage::Missing);
                     }
-                    Ok(pallet_utils::MetaCopyState::Other) => push_note(notes, not_a_file_note(&position.pallet, &path)),
+                    Ok(pallet_utils::MetaCopyState::Other) => push_note(notes, checkout_not_a_file_note(&which, &position.pallet, &path)),
                     Err(error) => push_note(notes, format!(
                         "Whether {} stands on a lost pallet ref could not be told: the ref of pallet \"{}\" (\"{}\") could not be read: {}",
                         which, position.pallet, path.to_string_lossy(), error
