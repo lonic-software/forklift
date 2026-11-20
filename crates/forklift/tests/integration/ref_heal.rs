@@ -1935,8 +1935,9 @@ fn a_meta_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_copy()
 }
 
 // A stale @redactions is rebuilt at its copy's head ahead of the refs checked against it, beside
-// an office that reads and beside one lost with it. Mutation: never judge a meta ref stale → the
-// ref stays at the gone head and heal refuses on the objects it reaches, red.
+// an office that reads and beside one lost with it, and the head it named is reported. Mutation:
+// never judge a meta ref stale → the ref stays at the gone head and heal refuses on the objects it
+// reaches, red.
 #[test]
 fn a_redactions_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_copy() {
     for office_lost in [false, true] {
@@ -1961,7 +1962,10 @@ fn a_redactions_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_
         if office_lost {
             expected.insert(0, ("@office".to_string(), office.clone().unwrap(), "the ref's copy".to_string()));
         }
-        assert_eq!(sorted(rebuilt_meta(&data)), expected, "office lost: {}: {}", office_lost, data);
+        assert_eq!(rebuilt_meta(&data), expected, "in the order rebuilt; office lost: {}: {}", office_lost, data);
+        assert!(data["notes"].to_string().contains(&format!(
+            "The ref of pallet \\\"@redactions\\\" named {}, which is not in the store; it was rebuilt at {}, which its copy names.", flip_digit(&redactions, 63), redactions
+        )), "office lost: {}: {}", office_lost, data);
         assert_eq!(meta_head(&root, "redactions").as_deref(), Some(redactions.as_str()), "office lost: {}", office_lost);
         assert_eq!(std::fs::read(meta_copy_path(&root, "redactions")).unwrap(), format!("{}\n", redactions).into_bytes());
     }
