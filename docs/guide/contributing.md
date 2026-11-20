@@ -669,6 +669,15 @@ heads (`forklift-server`, `forklift-aws-lambda`) or the infrastructure that
 deploys them (`infra/aws-serverless`) require the
 [CLA](../../CLA.md), signed once via a bot comment on your pull request.
 
+**The maintainer's commit identity.** Maintainer commits, including an agent session's, are
+authored as `matekolonics <66274697+matekolonics@users.noreply.github.com>`, a GitHub noreply
+address, so GitHub attributes the commits to that account. It lives in the repository's own `.git/config`, which
+every worktree shares, so commit with a plain `git commit`: no `-c user.email=`, no
+`GIT_AUTHOR_EMAIL`, no `--author`. `commit_email` in `.claude/gates.json` names the same address,
+and the agent sessions' gate hook refuses a commit or a push that carries another one. A scratch
+`HOME` exported for a test also hides a global identity, which is one more reason the identity is
+repository-local.
+
 Commit subjects follow `Area - Topic: short description`, e.g.
 `Trust - Revocation: reason + distrust boundary`. The body explains the *why* and
 the invariants touched, not just the *what*. When a feature lands, flip its status

@@ -28,6 +28,18 @@
     "exit-code": {
       "kind": "counter",
       "max_cmd": "git show $REF:docs/generated/errors.md | sed -n 's/^| `[a-z_]*` | \\([0-9][0-9]*\\) |.*/\\1/p' | sort -n | tail -1"
+    },
+    "schema-version": {
+      "kind": "counter",
+      "max_cmd": "git show $REF:crates/forklift/src/output.rs | sed -n 's/^pub const SCHEMA_VERSION: u32 = \\([0-9][0-9]*\\);.*/\\1/p'"
+    },
+    "warehouse-format": {
+      "kind": "counter",
+      "max_cmd": "git show $REF:crates/forklift-core/src/util/warehouse_utils.rs | sed -n 's/^pub const WAREHOUSE_FORMAT: u32 = \\([0-9][0-9]*\\);.*/\\1/p'"
+    },
+    "aws-format": {
+      "kind": "counter",
+      "max_cmd": "git show $REF:crates/forklift-aws-lambda/src/format.rs | sed -n 's/^pub const AWS_FORMAT: u32 = \\([0-9][0-9]*\\);.*/\\1/p'"
     }
   },
   "mechanical_files": [
@@ -44,6 +56,12 @@
       "regenerate": "git checkout --theirs tools/proof-load-desktop/Cargo.lock && cargo metadata --format-version 1 --manifest-path tools/proof-load-desktop/Cargo.toml >/dev/null && ./bin/check-no-aws-lc"
     }
   ],
+  "version_lines": {
+    "pattern": "(const|static) [A-Z_]*(VERSION|FORMAT)[A-Z_]*: *u[0-9]+ *= *[0-9]+",
+    "paths": [
+      "crates/**/*.rs"
+    ]
+  },
   "branch_update": "merge",
   "areas": [
     "core",
