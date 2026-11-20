@@ -380,13 +380,13 @@ fn remove_ref_drops_only_an_unreadable_ref_nothing_names() {
     // heal removes "side" before it refuses "@tags" → "side's bytes stand", red.
     let removal = area.run(&root, &["heal", "--remove-ref", "side", "--remove-ref", "@tags", "--remove-ref", "@redactions"]);
     assert!(!removal.status.success(), "{}", text(&removal.stdout));
+    assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), zeros, "side's bytes stand");
+    assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
     assert!(text(&removal.stderr).contains(
         "--remove-ref removes only a user pallet's ref, and \"@tags\" is not one: heal never removes the ref of a metadata pallet. \
         Run the command again without \"--remove-ref @tags\" and \"--remove-ref @redactions\": heal rebuilds a damaged metadata ref where it can \
         and otherwise names the way out. Nothing was changed."
     ), "{}", text(&removal.stderr));
-    assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), zeros, "side's bytes stand");
-    assert!(!root.join(".forklift").join("removed-refs").exists(), "nothing is kept");
 
     let output = area.run_ok(&root, &["--json", "heal", "--remove-ref", "side"]);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
