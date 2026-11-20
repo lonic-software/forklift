@@ -469,7 +469,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         Err(stopped) => {
             refs_left.replace(RefsLeft::after_second(&meta_deferred, stopped.refused, stopped.unjudged));
             refs_rebuilt.extend(stopped.rebuilt);
-            ref_notes.extend(stopped.notes);
+            note_once(&mut ref_notes, stopped.notes);
             return Err(changed_after(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes));
         }
     };
@@ -480,14 +480,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     if let (Some(_), Some(after)) = (&trust_repair.restored, &trust_restored_after) {
         ref_notes.push(format!("{} (after the taint recovery).", after.sentence().trim_end_matches('.')));
     }
-    for note in meta_second.trust.notes {
-        if !ref_notes.contains(&note) {
-            ref_notes.push(note);
-        }
-    }
+    note_once(&mut ref_notes, meta_second.trust.notes);
+    // So for the meta refs: one still damaged when this pass reads it was judged by the first
+    // too, and may be noted the same way again.
     let meta_second = meta_second.repair;
     refs_rebuilt.extend(meta_second.rebuilt);
-    ref_notes.extend(meta_second.notes);
+    note_once(&mut ref_notes, meta_second.notes);
     if let Some(error) = stopped_with(meta_second.stopped, &meta_second.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
@@ -1609,6 +1607,16 @@ fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
     sentence
 }
 
+/// Add to `notes` each of `more` it does not hold yet: a ref both passes judge may be noted the
+/// same way by each, and the report says it once.
+fn note_once(notes: &mut Vec<String>, more: Vec<String>) {
+    for note in more {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+}
+
 /// The sentences a refusal carries for the meta refs `deferred` that the pass before the taint
 /// recovery left for the pass after it, which the run did not reach; none for none. A ref `held`
 /// names says why a later heal does not settle it, or what it waits on.
@@ -2329,7 +2337,18 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deferred_sentences, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
+    use super::{deferred_sentences, note_once, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
+
+    // The second pass's notes join the first's once each: a note both passes made is said once,
+    // and one only the second made is kept. This pins the merge alone, a proxy for a heal run
+    // whose meta ref both passes note before it stops, which no fixture reaches without a fault
+    // hook in production code. Mutation: append every note (`extend`) → the repeat stays, red.
+    #[test]
+    fn the_second_pass_notes_join_the_first_once_each() {
+        let mut notes = vec!["first".to_string(), "both".to_string()];
+        note_once(&mut notes, vec!["both".to_string(), "second".to_string()]);
+        assert_eq!(notes, vec!["first", "both", "second"]);
+    }
 
     // A pallet whose ref could not be read may be the one whose history reaches the lost
     // objects, so the report names it and never says no pallet's history reaches them.

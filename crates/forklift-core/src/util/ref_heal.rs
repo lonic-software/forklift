@@ -2120,38 +2120,22 @@ fn write_meta_rebuild(state: &MetaState,
                       pass: Pass,
                       report: &mut Repair) -> bool {
     let damage = state.damage().expect("only a damaged ref is rebuilt");
-    let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged);
-
     // A ref rebuilt over a head the store decided is gone loses the only record of that head, so
-    // every outcome in which the write landed, or may have, names it: rebuilt, landed but not
-    // durable, or written with no read-back to say whether it landed.
+    // the head it named is said before the write, as the state heal judged and what it set out to
+    // do: true whichever way the write then goes, which what is reported beside it says.
     let gone = match &damage {
         RefDamage::AbsentHead(bytes) => pallet_utils::parse_ref_bytes(bytes),
         _ => None,
     };
-    let name_gone = |report: &mut Repair, head: &str, landed: bool| {
-        if let Some(gone) = &gone {
-            push_note(&mut report.notes, match landed {
-                true => format!(
-                    "The ref of pallet \"{}\" named {}, which is not in the store; it was rebuilt at {}, which its copy names.",
-                    state.wire(), gone, head
-                ),
-                false => format!(
-                    "The ref of pallet \"{}\" named {}, which is not in the store; the rebuild at {}, which its copy names, may have been written over it.",
-                    state.wire(), gone, head
-                ),
-            });
-        }
-    };
-    let rebuilt = |report: &mut Repair, head: String| {
-        name_gone(report, &head, true);
-        report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
-    };
+    if let Some(gone) = gone {
+        push_note(&mut report.notes, format!(
+            "The ref of pallet \"{}\" named {}, which was not in the store, when heal set out to rebuild it at {} from {}.",
+            state.wire(), gone, head, source
+        ));
+    }
+    let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged);
 
     let read = read_back(PalletNamespace::Meta, &state.name, &head);
-    // As `unwritten_reason` reads it: only a write that reported success or failed outright may
-    // have landed where its ref could not be read back.
-    let unread_landing = matches!(read, ReadBack::Unread(_)) && matches!(written, Ok(()) | Err(RefUpdateError::Failed(_)));
 
     let (reason, owner) = match written {
         // As in the user pass: the refusal is the answer, and what this pass rebuilt stays
@@ -2164,7 +2148,7 @@ fn write_meta_rebuild(state: &MetaState,
         // it left unsynced with no taint recording it is synced again.
         _ if matches!(read, ReadBack::Landed) => {
             let Err(error) = &written else {
-                rebuilt(report, head);
+                report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
                 return false;
             };
             match mended(error, PalletNamespace::Meta, &state.name) {
@@ -2173,12 +2157,9 @@ fn write_meta_rebuild(state: &MetaState,
                     if let Some(again) = again {
                         push_note(&mut report.notes, synced_again(&state.wire(), &again));
                     }
-                    rebuilt(report, head);
+                    report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
                 }
-                Err(why) => {
-                    name_gone(report, &head, true);
-                    report.undurable.push(undurable(&state.wire(), &head, &why));
-                }
+                Err(why) => report.undurable.push(undurable(&state.wire(), &head, &why)),
             }
             return false;
         }
@@ -2199,9 +2180,6 @@ fn write_meta_rebuild(state: &MetaState,
         Ok(()) => (format!("the rebuild at {} did not read back", head), Owner::Again),
     };
 
-    if unread_landing {
-        name_gone(report, &head, false);
-    }
     refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }], owner);
     false
 }
@@ -2813,47 +2791,102 @@ mod tests {
         assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(child.as_str()));
     }
 
-    // A stale meta ref's rebuild names the head the ref named on every outcome in which the write
-    // landed: rebuilt though its folder sync failed once, and landed but not durable. Mutations:
-    // name it only on a clean rebuild (the landed-despite arm pushes `Rebuilt` bare) → the first
-    // note is missing, red; drop it from the undurable arm → the second is missing, red.
+    // A stale meta ref's rebuild names the head the ref named before it writes, so the note is the
+    // same on every outcome: rebuilt, rebuilt though its folder sync failed once, landed but not
+    // durable, written with its ref unread back, refused in a folder heal may not write, and
+    // refused because the ref moved to another head before the hold. Mutation: name the head only
+    // from the outcomes in which the write landed or may have → the not-written and moved rows
+    // carry no note, red.
     #[test]
-    fn a_stale_meta_ref_rebuilt_despite_a_failed_sync_names_the_head_it_named() {
+    fn a_stale_meta_ref_rebuild_names_the_head_it_named_whatever_the_write_does() {
         use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
         use crate::util::tag_utils::TAGS_PALLET_NAME;
 
-        let (_root, _scope) = scratch("ref-heal-stale-undurable");
-        let operator = crate::model::operator::Operator { identifier: "test".to_string() };
-        let tree = store_meta_tree(b"forklift-meta 1 tags", None).unwrap();
-        let held = stack_meta_parcel(tree, Vec::new(), &operator, "held", None).unwrap();
-        let gone = format!("{}{}", &held[..63], if held.ends_with('0') { '1' } else { '0' });
-        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
-        let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
-        for path in [&ref_path, &copy_path] {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        #[derive(Debug, Clone, Copy)]
+        enum Row { Clean, LandedDespite, Undurable, Unread, #[cfg(unix)] ReadOnly, Moved }
+        #[allow(unused_mut)]
+        let mut rows = vec![Row::Clean, Row::LandedDespite, Row::Undurable, Row::Unread, Row::Moved];
+        #[cfg(unix)]
+        rows.push(Row::ReadOnly);
+
+        for row in rows {
+            let (_root, _scope) = scratch("ref-heal-stale-gone-head");
+            let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+            let held = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "held", None).unwrap();
+            let other = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "other", None).unwrap();
+            let gone = format!("{}{}", &held[..63], if held.ends_with('0') { '1' } else { '0' });
+            let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
+            let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
+            for path in [&ref_path, &copy_path] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            }
+            std::fs::write(&copy_path, format!("{}\n", held)).unwrap();
+            std::fs::write(&ref_path, format!("{}\n", gone)).unwrap();
+            let folder = ref_path.parent().unwrap().to_path_buf();
+            let said = format!(
+                "The ref of pallet \"@tags\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.",
+                gone, held
+            );
+
+            let repair = {
+                let _sync = match row {
+                    Row::LandedDespite => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder)),
+                    Row::Undurable => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder)),
+                    _ => None,
+                };
+                let _taint = matches!(row, Row::Undurable).then(crate::util::file_utils::TaintRecordFaultGuard::failing);
+                match row {
+                    Row::Unread => READ_BACK_UNREAD.with(|unread| unread.set(true)),
+                    #[cfg(unix)]
+                    Row::ReadOnly => {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+                    }
+                    Row::Moved => {
+                        let (moved, other) = (ref_path.clone(), other.clone());
+                        pallet_utils::tests::set_before_hold(move || std::fs::write(&moved, format!("{}\n", other)).unwrap());
+                    }
+                    _ => {}
+                }
+                let repair = repair_meta(Pass::AfterTaint);
+                READ_BACK_UNREAD.with(|unread| unread.set(false));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                repair.unwrap().repair
+            };
+
+            let naming: Vec<_> = repair.notes.iter().filter(|note| note.contains(&gone)).collect();
+            assert_eq!(naming, vec![&said], "{:?}: {:?}", row, repair);
+            let rebuilt: Vec<_> = repair.rebuilt.iter().filter(|rebuilt| rebuilt.pallet == "@tags").map(|rebuilt| rebuilt.head.as_str()).collect();
+            let refused = repair.refused.iter().find(|refused| refused.pallet == "@tags");
+            match row {
+                Row::Clean => assert_eq!(rebuilt, vec![held.as_str()], "{:?}", repair),
+                Row::LandedDespite => {
+                    assert_eq!(rebuilt, vec![held.as_str()], "{:?}", repair);
+                    assert!(repair.notes.iter().any(|note| note.starts_with("The ref of pallet \"@tags\" was rebuilt at")), "the landed-despite arm ran: {:?}", repair.notes);
+                }
+                Row::Undurable => assert_eq!(repair.undurable.len(), 1, "{:?}", repair),
+                Row::Unread => {
+                    let tags = refused.expect("@tags is refused");
+                    assert!(tags.reason.contains(&format!("the rebuild at {} was written, but its ref could not be read back", held)), "{:?}", tags);
+                }
+                #[cfg(unix)]
+                Row::ReadOnly => {
+                    let tags = refused.expect("@tags is refused");
+                    assert!(tags.reason.contains(&format!("the rebuild at {} was not written", held)), "{:?}", tags);
+                    assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+                }
+                Row::Moved => {
+                    let tags = refused.expect("@tags is refused");
+                    assert!(tags.reason.contains(&format!("the rebuild at {} was not written", held)), "{:?}", tags);
+                    assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Again, "{:?}", tags);
+                    assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(other.as_str()), "nothing was written over the move");
+                }
+            }
         }
-        std::fs::write(&copy_path, format!("{}\n", held)).unwrap();
-        let folder = ref_path.parent().unwrap().to_path_buf();
-        let said = format!("The ref of pallet \"@tags\" named {}, which is not in the store; it was rebuilt at {}, which its copy names.", gone, held);
-
-        std::fs::write(&ref_path, format!("{}\n", gone)).unwrap();
-        let once = {
-            let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder);
-            repair_meta(Pass::AfterTaint).unwrap().repair
-        };
-        assert_eq!(once.rebuilt.iter().filter(|rebuilt| rebuilt.pallet == "@tags").map(|rebuilt| rebuilt.head.as_str()).collect::<Vec<_>>(), vec![held.as_str()], "{:?}", once);
-        assert!(once.notes.iter().any(|note| note.starts_with("The ref of pallet \"@tags\" was rebuilt at")), "the landed-despite arm ran: {:?}", once.notes);
-        assert!(once.notes.contains(&said), "{:?}", once.notes);
-
-        std::fs::write(&ref_path, format!("{}\n", gone)).unwrap();
-        let undurable = {
-            let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder);
-            let _taint = crate::util::file_utils::TaintRecordFaultGuard::failing();
-            repair_meta(Pass::AfterTaint).unwrap().repair
-        };
-        assert_eq!(undurable.undurable.len(), 1, "{:?}", undurable);
-        assert!(undurable.notes.contains(&said), "{:?}", undurable.notes);
-        assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(held.as_str()));
     }
 
     // A head in a format this build does not know reads whole and is no verdict on the ref: a

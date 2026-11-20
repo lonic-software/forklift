@@ -2876,6 +2876,12 @@ pub(crate) mod tests {
         static BEFORE_HOLD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     }
 
+    /// Set what the next head write on this thread runs between its closure check and its hold,
+    /// for tests outside this module.
+    pub(crate) fn set_before_hold(run: impl FnOnce() + 'static) {
+        BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
+    }
+
     /// The seam [`update_pallet_head_checked`] calls before each hold.
     pub(super) fn before_hold_checkpoint() {
         if let Some(run) = BEFORE_HOLD.with(|slot| slot.borrow_mut().take()) {

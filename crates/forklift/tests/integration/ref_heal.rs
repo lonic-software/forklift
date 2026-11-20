@@ -1929,7 +1929,7 @@ fn a_meta_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_copy()
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "{}", data);
     assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), copy, "{}", data);
     assert!(data["notes"].to_string().contains(&format!(
-        "The ref of pallet \\\"@tags\\\" named {}, which is not in the store; it was rebuilt at {}, which its copy names.", flip_digit(&second, 63), second
+        "The ref of pallet \\\"@tags\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", flip_digit(&second, 63), second
     )), "the head the ref named is reported: {}", data);
     assert!(rebuilt_meta(&healed(&area, &root)).is_empty(), "a second heal finds nothing to do");
 }
@@ -1964,7 +1964,7 @@ fn a_redactions_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_
         }
         assert_eq!(rebuilt_meta(&data), expected, "in the order rebuilt; office lost: {}: {}", office_lost, data);
         assert!(data["notes"].to_string().contains(&format!(
-            "The ref of pallet \\\"@redactions\\\" named {}, which is not in the store; it was rebuilt at {}, which its copy names.", flip_digit(&redactions, 63), redactions
+            "The ref of pallet \\\"@redactions\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", flip_digit(&redactions, 63), redactions
         )), "office lost: {}: {}", office_lost, data);
         assert_eq!(meta_head(&root, "redactions").as_deref(), Some(redactions.as_str()), "office lost: {}", office_lost);
         assert_eq!(std::fs::read(meta_copy_path(&root, "redactions")).unwrap(), format!("{}\n", redactions).into_bytes());

@@ -148,7 +148,7 @@ nothing. Restore both files from a backup.
 A meta ref that reads but names a head the store has decided it does not hold is not refused where it
 is read as damaged: commands refuse on the missing object. Beside a copy naming a head the store does
 hold, `heal` rebuilds it at the copy's head, even where that is the older one, and its `Note:` names the
-head the ref named. While something could still account for the missing head (a refill from the
+head the ref named, whether or not the rebuild is then written. While something could still account for the missing head (a refill from the
 origin, a redaction or a withholding, a pack or record that cannot be read in full, the durability
 taint), `heal` leaves the ref as it is. The office's ref is never rebuilt this way.
 
