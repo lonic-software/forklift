@@ -2265,6 +2265,8 @@ mod tests {
     // Mutations: route the trust refusal through the write's error → "may have been written",
     // red; let a landed read-back drop the write's error → no note, red; let a landed read-back
     // win over an unrecorded taint → main is rebuilt, red.
+    // Unix only: a folder sync is a no-op elsewhere, so no injected sync failure can fire.
+    #[cfg(unix)]
     #[test]
     fn a_user_rebuild_says_what_its_write_did() {
         let (_root, _scope) = scratch("ref-heal-user-write");
