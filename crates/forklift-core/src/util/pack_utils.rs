@@ -1936,6 +1936,11 @@ pub(crate) fn sweep_unreadable_reason(hash: &str) -> Result<Option<String>, Stri
 /// * `Ok(Vec<PathBuf>)` - The files, indexes first, each in name order.
 /// * `Err(String)`      - The pack registry itself could not be loaded.
 pub(crate) fn unindexed_holders() -> Result<Vec<PathBuf>, String> {
+    #[cfg(test)]
+    if let Some(error) = UNINDEXED_HOLDERS_FAIL.with(|slot| slot.borrow().clone()) {
+        return Err(error);
+    }
+
     let pack_set = loaded_packs()?;
     let mut holders: Vec<PathBuf> = pack_set.unenumerable.iter()
         .filter(|pack| !pack.foreign_version)
@@ -1944,6 +1949,87 @@ pub(crate) fn unindexed_holders() -> Result<Vec<PathBuf>, String> {
     holders.sort();
     holders.extend(orphan_data_files(&pack_folder(), &pack_set.stamp.names));
     Ok(holders)
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNINDEXED_HOLDERS_FAIL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Make [`unindexed_holders`] on this thread fail with `error` until the guard drops: a registry
+/// that cannot be loaded after a read's miss loaded it, which only another thread's eviction and a
+/// failing reload reach otherwise.
+#[cfg(test)]
+pub(crate) fn fail_unindexed_holders(error: &str) -> impl Drop {
+    struct Failing;
+    impl Drop for Failing {
+        fn drop(&mut self) {
+            UNINDEXED_HOLDERS_FAIL.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    UNINDEXED_HOLDERS_FAIL.with(|slot| *slot.borrow_mut() = Some(error.to_string()));
+    Failing
+}
+
+/// What the packs cannot list, read once ([`unlisted_packs`]) for any number of prefixes
+/// ([`UnlistedPacks::reason_for`]): the pack set as it stands, and why every prefix is unlisted
+/// alike when one is (the prefix-independent part, told once).
+pub(crate) struct UnlistedPacks {
+    packs: Arc<PackSet>,
+    every_prefix: Option<String>,
+}
+
+/// Read what the packs cannot list (see [`UnlistedPacks`]): the pack registry, reloaded once if
+/// it is stale, and the parts of the answer no prefix changes, an index of another format version
+/// or any pack file with no index this build can read (every one of these may hold any hash).
+///
+/// # Returns
+/// * `Err(String)` - The pack registry itself could not be loaded.
+pub(crate) fn unlisted_packs() -> Result<UnlistedPacks, String> {
+    let cached = loaded_packs()?;
+    let packs = reloaded_if_stale(&cached)?.unwrap_or(cached);
+
+    let every_prefix = match packs.unenumerable.first() {
+        Some(unread) => Some(format!(
+            "pack index \"{}\" may hold an object it may be, and could not be read: {}",
+            unread.index_path.to_string_lossy(), unread.error
+        )),
+        None => orphan_data_files(&pack_folder(), &packs.stamp.names).first().map(|orphan| format!(
+            "pack data file \"{}\" may hold an object it may be, and has no index beside it",
+            orphan.to_string_lossy()
+        )),
+    };
+
+    Ok(UnlistedPacks { packs, every_prefix })
+}
+
+impl UnlistedPacks {
+    /// Why the packs cannot list every object whose hash starts with `prefix`, so that what
+    /// [`find_hashes_with_prefix`] answers, found or not, is not the store's whole answer: a
+    /// quarantined index that names such a hash (its data file did not load) or whose bucket for
+    /// the prefix is corrupt, else the reason every prefix shares ([`unlisted_packs`]). Answers
+    /// from the same set [`find_hashes_with_prefix`] reads.
+    ///
+    /// # Returns
+    /// * `Some(reason)` - A pack may hold a match unseen; `reason` names the file and why.
+    /// * `None`         - Every pack that could hold a match is listed.
+    pub(crate) fn reason_for(&self, prefix: &str) -> Option<String> {
+        for quarantined in self.packs.quarantined.iter() {
+            let path = quarantined.index_path.to_string_lossy();
+            match quarantined.index.records_for_hex_prefix(prefix) {
+                Err(bucket) => return Some(index_format::corrupt_bucket_message(&quarantined.index_path, bucket)),
+                Ok(records) if records.iter().any(|record| sign_utils::to_hex(record.hash).starts_with(prefix)) => {
+                    return Some(format!(
+                        "pack index \"{}\" names an object it may be, and its data file could not be loaded: {}",
+                        path, quarantined.error
+                    ));
+                }
+                Ok(_) => {}
+            }
+        }
+
+        self.every_prefix.clone()
+    }
 }
 
 /// Every data file among `names` (a pack folder's listing) with no index of the same stem.

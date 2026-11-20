@@ -35,11 +35,30 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   beside it is then restored from its copy. The redactions' own ref (`@redactions`) is rebuilt
   next, ahead of every other metadata ref, which is checked against it; beside a damaged office
   the head it is to be rebuilt at is verified first, and the office is checked against that head.
-  While either ref is damaged and was not rebuilt, every damaged metadata ref is refused, to be set
-  by hand. A metadata ref that cannot be settled before the taint recovery is judged again after
+  While either ref is damaged and was not rebuilt, every damaged metadata ref is refused, naming
+  that ref's step. A metadata ref that cannot be settled before the taint recovery is judged again after
   it; a refusal that stops the run before then, such as one for a durability taint that still
   stands, names each ref left that way with the heads found for it, and each damaged metadata
   ref a pass that stopped never judged.
+
+- **`heal` names its way out for every damaged metadata ref it does not rebuild, and never
+  removes one.** Where `heal` has no head it can rebuild the ref at (nothing names one, or what does
+  is several parcels, one possibly lost, a copy and bytes that diverge, or a head whose history does
+  not verify), the step is to restore the ref and its copy from a backup. `heal --remove-ref
+  @<name>` is refused before anything changes. Where the refusal is no verdict on the ref, the step
+  is the one `heal` names: for a ref that waits on the office's or `@redactions`' refusal, or on an
+  unborn office, that step; where `heal` could not read what it needs (a file it may not read, pack
+  damage it rebuilds, a pack it cannot list in full), that read's own step, else settling it; where
+  it could not write the rebuild it chose or read it back, the write's own step, else settling why;
+  where what it needs is in a format this Forklift does not know (an object, a record or a signature
+  a newer version wrote), upgrading; and where the trust state refuses, `heal` again when it restores
+  the trust file from its copy, else a way out of that refusal (a lost anchor's, or one the trust
+  file's own refusal names) or settling why the office does not verify. A parcel of its history
+  that carries no signature after trust, there or on the office pallet, refuses as
+  `signature_missing` (exit 71), naming a backup or a fresh clone. A command that reads a damaged
+  metadata ref names `forklift heal`, or, where `heal` would not judge the ref (its copy cannot be
+  read, or something that is not a file stands at the ref's or the copy's path), the step that lets
+  it.
 
 ### Changed
 
@@ -51,9 +70,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `.forklift/meta/` whose file is missing while its copy stands now refuses as `ref_damaged`
   (exit 53) in every command that reads it, listings included, where it read as a pallet never
   written: `tag list` printed no tags, `lower` took the remote's head as a first adoption, and
-  garbage collection held nothing for it. The next step names `forklift heal` when the copy holds a
-  parcel hash, or a damaged ref's own bytes name one parcel, and the hand fix otherwise; a copy
-  that cannot be read, or a link at its path, is refused, naming what to make readable or replace. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
+  garbage collection held nothing for it. The next step names `forklift heal`, which judges the ref; a
+  copy that cannot be read, or a link at its path, is refused, naming what to make readable or replace.
+  A link at any pallet's ref path is never followed: it refuses as blocked, naming moving it aside,
+  and `heal` leaves it with the same step. A ref whose path cannot be read refuses, naming making
+  the ref's file and the folders on the way to it readable, where it read as a pallet never written. A ref lost together with its copy still reads as empty. `heal`'s `objects_lost`
   report names each pallet whose ref could not be read (`pallets_unread` in `--json`) instead of
   leaving it out, and no longer says no pallet's history reaches the objects while one is named (`--json`
   schema 60).

@@ -29,7 +29,7 @@ pub async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), Str
         return Err(format!("\"{}\" is already the current pallet.", name));
     }
 
-    if pallet_utils::does_pallet_exist(name) {
+    if pallet_utils::does_pallet_exist(name)? {
         return Err(format!(
             "Pallet \"{}\" already exists. Use the \"forklift shift\" command to move to it.",
             name

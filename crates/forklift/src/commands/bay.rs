@@ -41,7 +41,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     bay_utils::validate_bay_name(name)?;
 
     // A bay is its own line of work: it checks out a new pallet named after it.
-    if pallet_utils::does_pallet_exist(name) {
+    if pallet_utils::does_pallet_exist(name)? {
         return Err(format!(
             "A pallet named \"{}\" already exists; a bay checks out a new pallet, so pick \
             another name.", name

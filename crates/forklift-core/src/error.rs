@@ -760,6 +760,11 @@ pub fn prefix_message(context: &str, error: String) -> String {
 /// lines (a frame's own fields were sanitized when it was built). A prefix whose code is not a
 /// code word is not a frame, and is left as it is.
 fn render_wrapped_frames(message: &str) -> Option<String> {
+    render_frames(message, true)
+}
+
+/// [`render_wrapped_frames`], with each frame's next step kept (`steps`) or dropped.
+fn render_frames(message: &str, steps: bool) -> Option<String> {
     let mut rendered = String::new();
     let mut any = false;
     let mut rest = message;
@@ -774,7 +779,10 @@ fn render_wrapped_frames(message: &str) -> Option<String> {
         match (fields.next(), fields.next(), fields.next()) {
             (Some(code), Some(human), Some(next_step))
                 if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') => {
-                rendered.push_str(&with_next_step(human, next_step));
+                match steps {
+                    true => rendered.push_str(&with_next_step(human, next_step)),
+                    false => rendered.push_str(human),
+                }
                 rendered.push_str(fields.next().map(after_detail).unwrap_or_default());
                 any = true;
             }
@@ -796,6 +804,13 @@ fn render_wrapped_frames(message: &str) -> Option<String> {
 /// note), where the frame's separators would otherwise be sanitized into stray words.
 pub fn rendered_frames(text: &str) -> String {
     render_wrapped_frames(text).unwrap_or_else(|| text.to_string())
+}
+
+/// [`rendered_frames`] without the frames' next steps: for a reason put into a refusal whose own
+/// next step is another way out, where a frame's step would be a second one, and one its caller
+/// has not judged to lead anywhere.
+pub fn frames_without_steps(text: &str) -> String {
+    render_frames(text, false).unwrap_or_else(|| text.to_string())
 }
 
 /// What follows a frame's detail field, `text`: the detail is one JSON value, and anything after it

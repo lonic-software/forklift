@@ -201,22 +201,49 @@ pub fn is_fan_out_folder_name(name: &str) -> bool {
 ///
 /// # Returns
 /// * `Some((String, String))` - The folder and file name the path builder spells.
-/// * `None`                   - The path builder's spelling does not reach this entry.
+/// * `None`                   - The path builder's spelling does not reach this entry, or either
+///                              spelling could not be read: a sweep leaves alone what it cannot
+///                              place. A caller that answers for the whole store reads
+///                              [`judged_loose_entry`] instead.
 pub fn canonical_loose_entry(folder: &Path, file_name: &str) -> Option<(String, String)> {
-    let folder_name = folder.file_name()?.to_str()?;
+    judged_loose_entry(folder, file_name).ok().flatten()
+}
+
+/// [`canonical_loose_entry`], with a spelling that could not be read told apart from one that is
+/// not there.
+///
+/// # Returns
+/// * `Ok(Some((String, String)))` - The folder and file name the path builder spells.
+/// * `Ok(None)`                   - The path builder's spelling does not reach this entry: it is
+///                                  absent under one of the two spellings, or both open different
+///                                  entries.
+/// * `Err(String)`                - If either spelling could not be read, so whether it is this
+///                                  object is unknown.
+pub fn judged_loose_entry(folder: &Path, file_name: &str) -> Result<Option<(String, String)>, String> {
+    let Some(folder_name) = folder.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
     let lower_folder = folder_name.to_ascii_lowercase();
     let lower_file = file_name.to_ascii_lowercase();
 
     if lower_folder == folder_name && lower_file == file_name {
-        return Some((lower_folder, lower_file));
+        return Ok(Some((lower_folder, lower_file)));
     }
 
-    let identity = |path: &Path| std::fs::symlink_metadata(path).ok()
-        .and_then(|metadata| get_device_and_inode(path, &metadata).ok());
-    let listed = identity(&folder.join(file_name))?;
-    let spelled = identity(&folder.with_file_name(&lower_folder).join(&lower_file))?;
+    let unread = |path: &Path, error: String| format!("The object store entry {} could not be read: {}", path.display(), error);
+    let identity = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(metadata) => get_device_and_inode(path, &metadata).map(Some).map_err(|error| unread(path, error)),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(None),
+        Err(error) => Err(unread(path, error.to_string())),
+    };
+    let Some(listed) = identity(&folder.join(file_name))? else {
+        return Ok(None);
+    };
+    let Some(spelled) = identity(&folder.with_file_name(&lower_folder).join(&lower_file))? else {
+        return Ok(None);
+    };
 
-    (listed == spelled).then_some((lower_folder, lower_file))
+    Ok((listed == spelled).then_some((lower_folder, lower_file)))
 }
 
 /// Every byte of `text` is `0-9` or `a-f`.
@@ -838,8 +865,13 @@ fn injected_sync_dir_fault(folder: &Path) -> Option<String> {
     SYNC_DIR_FAULT.with(|f| {
         let mut f = f.borrow_mut();
         f.attempted.push(folder.to_path_buf());
-        f.fails(folder)
-            .then(|| format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy()))
+        // A limited guard fails only its first matches; an unlimited one fails every match.
+        let fails = f.fails(folder) && SYNC_DIR_FAULTS_LEFT.with(|left| match left.get() {
+            None => true,
+            Some(0) => false,
+            Some(n) => { left.set(Some(n - 1)); true }
+        });
+        fails.then(|| format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy()))
     })
 }
 
@@ -855,6 +887,10 @@ thread_local! {
     /// can drive it too.
     static SYNC_DIR_FAULT: std::cell::RefCell<DirSyncFaultState> =
         const { std::cell::RefCell::new(DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false }) };
+
+    /// How many more matches [`SYNC_DIR_FAULT`] fails, when it is limited
+    /// ([`SyncDirFaultGuard::failing_exactly_once`]); `None` fails every match.
+    static SYNC_DIR_FAULTS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// RAII scope for [`SYNC_DIR_FAULT`]: both construction and `Drop` reset this thread's state, so
@@ -901,11 +937,20 @@ impl SyncDirFaultGuard {
         });
         SyncDirFaultGuard { _syncs: syncs }
     }
+
+    /// Record every directory, and fail only the first sync of `dir` itself: a later sync of it,
+    /// such as a retry, succeeds.
+    pub(crate) fn failing_exactly_once(dir: &Path) -> Self {
+        let guard = Self::failing_exactly(dir);
+        SYNC_DIR_FAULTS_LEFT.with(|left| left.set(Some(1)));
+        guard
+    }
 }
 
 #[cfg(test)]
 impl Drop for SyncDirFaultGuard {
     fn drop(&mut self) {
+        SYNC_DIR_FAULTS_LEFT.with(|left| left.set(None));
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
     }
 }
@@ -960,13 +1005,54 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(),
 /// [`taint_utils::activate`] has been called in this process — see
 /// [`taint_utils::record_taint`]'s own doc comment.
 fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String {
+    #[cfg(test)]
+    if TAINT_RECORD_FAULT.with(|fault| fault.get()) {
+        return format!("{}{}injected taint-record failure)", sync_error, TAINT_UNRECORDED);
+    }
+
     match taint_utils::record_taint(final_paths) {
         Ok(()) => sync_error,
-        Err(taint_error) => format!(
-            "{} (additionally, while recording a durability taint for the affected object(s): {})",
-            sync_error, taint_error
-        ),
+        Err(taint_error) => format!("{}{}{})", sync_error, TAINT_UNRECORDED, taint_error),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`taint_after_sync_failure`] report that the taint could not be recorded, as an
+    /// unactivated process's record never fails. See [`TaintRecordFaultGuard`].
+    static TAINT_RECORD_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII scope for [`TAINT_RECORD_FAULT`]: armed while it lives, cleared on construction's
+/// failure and on `Drop`, so it never bleeds into another test on a reused thread.
+#[cfg(test)]
+pub(crate) struct TaintRecordFaultGuard;
+
+#[cfg(test)]
+impl TaintRecordFaultGuard {
+    /// Fail every taint record that follows a failed directory sync on this thread.
+    pub(crate) fn failing() -> Self {
+        TAINT_RECORD_FAULT.with(|fault| fault.set(true));
+        TaintRecordFaultGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for TaintRecordFaultGuard {
+    fn drop(&mut self) {
+        TAINT_RECORD_FAULT.with(|fault| fault.set(false));
+    }
+}
+
+/// What [`taint_after_sync_failure`] puts between the sync error and the taint write's own.
+const TAINT_UNRECORDED: &str = " (additionally, while recording a durability taint for the affected object(s): ";
+
+/// Whether `error`, as a write reported it, says a directory sync failed and no taint records
+/// it: what the write renamed into place is visible, not durable, and nothing will heal it. A
+/// writer that reads its target back as landed must not report such a write as done. A message
+/// that merely holds the same words reads the same way, which only ever refuses.
+pub fn is_taint_unrecorded(error: &str) -> bool {
+    error.contains(TAINT_UNRECORDED)
 }
 
 /// Process-global count of currently-armed [`SelfTripExemptionGuard`]s. A *counter*, not a bool,
@@ -2481,6 +2567,12 @@ pub fn retrieve_object_by_hash_uncached(hash: &str) -> Result<Vec<u8>, String> {
     read_object_uncached(hash)
 }
 
+/// [`retrieve_object_by_hash_uncached`], whose error also carries what [`read_object_as_classified`]
+/// says of the failure.
+pub(crate) fn retrieve_object_by_hash_uncached_classified(hash: &str) -> Result<Vec<u8>, (String, Option<Unreadable>)> {
+    read_object_as_classified(hash, Absence::History)
+}
+
 /// Retrieve an object by a hash the caller was handed, such as one a user typed, rather than one
 /// history reached. It reads as [`retrieve_object_by_hash`] does, cache refill and refusals
 /// included, except for an absence nothing accounts for: the store simply not holding the hash
@@ -2498,7 +2590,7 @@ pub fn retrieve_named_object_by_hash(hash: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Who named the hash a read is for, which decides what an absence nothing accounts for is told.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Absence {
     /// History reached it, so the store should hold it: refused
     /// [`RefusalCode::ObjectUnreadable`], naming `forklift heal`.
@@ -2527,6 +2619,54 @@ pub(crate) enum StoreReadOutcome {
     Unverifiable(String, Unreadable),
 }
 
+/// What a failed read says of the object it was asked for, to a check that judges that object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFault {
+    /// The store positively decided about the object, as the [`Decided`] says. A verdict on the
+    /// object, and the only one a failed read gives.
+    Decided(Decided),
+    /// The read says nothing of the object: the store could not be consulted, a pack index is
+    /// damaged or its data file did not load (heal rebuilds it, and the object may be in it), an
+    /// index of another format version or a base read failed some other way, or the absence was
+    /// left undecided or is a redaction's or a withholding's.
+    Untold,
+    /// The store gave the object whole, its bytes matching its address, but this build cannot
+    /// parse them. The store verifies every object it gives, so this is never damage: a newer
+    /// Forklift may have written it, and only a build that reads it can judge it. No verdict on
+    /// the object. The store's own parse of an object's verified bytes (its envelope and kind)
+    /// gives this, never a [`ReadFault::Decided`]; only a whole object of a kind this build knows,
+    /// which is not the kind asked for, is a verdict ([`Decided::OtherKind`]). What an object
+    /// holds (a meta cell, a spine, an office record) is judged by its own reader, not as this.
+    Newer,
+}
+
+/// What the store positively decided about an object a read asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decided {
+    /// It is absent, and nothing leaves that undecided: no refill, redaction, withholding or
+    /// pack file whose hash set is unknown accounts for it ([`read_absent`]'s causeless error).
+    Absent,
+    /// The bytes it holds at the address are damaged: a loose file that does not decompress to
+    /// the address, a pack record that does not rebuild to it.
+    Damaged,
+    /// The bytes read whole, as an object of a kind this build knows that is not the kind asked
+    /// for.
+    OtherKind,
+}
+
+impl ReadFault {
+    /// What a failure whose cause [`read_object_as_classified`] gives as `cause` says: no cause is
+    /// the absence the store decided, since every read that leaves an absence undecided gives
+    /// [`Unreadable::Other`].
+    pub(crate) fn of(cause: Option<Unreadable>) -> ReadFault {
+        match cause {
+            None => ReadFault::Decided(Decided::Absent),
+            Some(Unreadable::LooseCorrupt | Unreadable::RecordDamage) => ReadFault::Decided(Decided::Damaged),
+            Some(Unreadable::PackDamage | Unreadable::Other) => ReadFault::Untold,
+        }
+    }
+}
+
 /// Why an [`StoreReadOutcome::Unverifiable`] read failed, as far as `forklift heal` is concerned:
 /// what [`read_object_uncached`] frames as [`RefusalCode::ObjectUnreadable`] and what it leaves
 /// untyped.
@@ -2534,7 +2674,7 @@ pub(crate) enum StoreReadOutcome {
 pub(crate) enum Unreadable {
     /// A pack index heal acts on: one whose data file did not load (a quarantined pair), or one
     /// with a corrupt bucket. Heal rebuilds such an index from its data file, or names what it
-    /// held as lost.
+    /// held as lost; until it has, the read says nothing of the object (a [`ReadFault::Untold`]).
     PackDamage,
     /// A loose file at the address whose bytes do not decompress, or decompress to other content.
     /// Heal names the object as lost; the file is kept where it is.
@@ -2896,13 +3036,22 @@ fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, (String, Option<
     };
 
     // Pack files whose hash set is unknown may hold it; they never change the verdict
-    // (I4), only what the reader is told; a folder that cannot be listed adds nothing, so
-    // the read still names the missing object.
-    let holders = crate::util::pack_utils::unindexed_holders().unwrap_or_default();
+    // (I4), only what the reader is told. A pack registry that cannot be loaded leaves the
+    // absence undecided: what it would have listed may hold the object.
+    let (holders, registry) = match crate::util::pack_utils::unindexed_holders() {
+        Ok(holders) => (holders, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let missing = match &registry {
+        Some(error) => format!(
+            "{}. Whether a pack file holds it could not be told: {}", missing, error
+        ),
+        None => missing,
+    };
 
     // Nothing left undecided and nothing says the store ever held it: a hash the caller
     // was handed is simply not here.
-    let decided = records_decided && holders.is_empty();
+    let decided = records_decided && registry.is_none() && holders.is_empty();
     if absence == Absence::Named && decided {
         return Err((format!("Object {} is not in this store.", hash), None));
     }
@@ -6464,6 +6613,34 @@ mod tests {
         assert!(result.is_err(), "a loose file that hashes wrong must fail the read, got {:?}", result);
         assert!(result.unwrap_err().contains("corrupt"), "the error should name the corruption");
 
+        remove_dir_all(&temp).ok();
+    }
+
+    // An absence is the store's verdict only when nothing that might hold the object is left
+    // unread: a pack registry that cannot be loaded leaves it undecided, so no verdict leans on it.
+    // Mutation: count a registry that fails to load as no holders → the cause is None, red.
+    #[test]
+    fn a_pack_registry_that_cannot_be_loaded_leaves_an_absence_undecided() {
+        let temp = std::env::temp_dir().join(format!("forklift-absent-registry-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let hash = blake3::hash(b"never stored here").to_hex().to_string();
+
+        // The registry loads: the store decided the object is not here.
+        let (why, cause) = read_object_as_classified(&hash, Absence::Named).unwrap_err();
+        assert_eq!(cause, None, "{}", why);
+        assert!(matches!(ReadFault::of(cause), ReadFault::Decided(Decided::Absent)), "{}", why);
+
+        let _failing = crate::util::pack_utils::fail_unindexed_holders("the pack registry could not be read");
+        for absence in [Absence::Named, Absence::History] {
+            let (why, cause) = read_object_as_classified(&hash, absence).unwrap_err();
+            assert_eq!(cause, Some(Unreadable::Other), "{:?}: {}", absence, why);
+            assert!(matches!(ReadFault::of(cause), ReadFault::Untold), "{:?}: {}", absence, why);
+            assert!(why.contains("Whether a pack file holds it could not be told: the pack registry could not be read"), "{:?}: {}", absence, why);
+        }
+
+        drop(_failing);
         remove_dir_all(&temp).ok();
     }
 

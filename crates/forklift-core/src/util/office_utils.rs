@@ -651,13 +651,42 @@ pub enum TrustReadMode {
 
 /// The trust anchor and its bytes, read as `mode` says ([`TrustReadMode`]).
 pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, Vec<u8>)>, String> {
-    if let Some(bytes) = read_trust_anchor_bytes()? {
-        return decode_trust_file(&bytes).map(|anchor| Some((anchor, bytes)));
+    read_trust_anchor_judged(mode).map_err(String::from)
+}
+
+/// Why the trust anchor could not be read, by what that says of the trust state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrustReadError {
+    /// The trust state reads, and refuses: trust was established here and its anchor is lost, or
+    /// what stands at the trust file's path is not a file or does not parse. The refusal names
+    /// its ways out.
+    Refused(String),
+
+    /// The trust file reads whole but names a version this build does not know: a newer Forklift
+    /// may have written it.
+    Newer(String),
+
+    /// What the read needs (the trust file, its copy, the office's ref) could not be read.
+    Unread(String),
+}
+
+impl From<TrustReadError> for String {
+    fn from(error: TrustReadError) -> String {
+        match error {
+            TrustReadError::Refused(message) | TrustReadError::Newer(message) | TrustReadError::Unread(message) => message,
+        }
+    }
+}
+
+/// [`read_trust_anchor_in`], its refusal typed by what it says of the trust state.
+pub(crate) fn read_trust_anchor_judged(mode: TrustReadMode) -> Result<Option<(TrustAnchor, Vec<u8>)>, TrustReadError> {
+    if let Some(bytes) = read_trust_anchor_bytes_judged()? {
+        return decode_trust_file_judged(&bytes).map(|anchor| Some((anchor, bytes)));
     }
 
-    let copy = trust_copy_stands()?;
+    let copy = trust_copy_stands().map_err(TrustReadError::Unread)?;
     let office = match mode {
-        TrustReadMode::Checked if !copy => pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some(),
+        TrustReadMode::Checked if !copy => pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).map_err(TrustReadError::Unread)?.is_some(),
         _ => false,
     };
 
@@ -670,12 +699,12 @@ pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, 
     #[cfg(test)]
     tests::BEFORE_TRUST_REREAD.with(|seam| seam.take().map(|seam| seam()));
 
-    if let Some(bytes) = read_trust_anchor_bytes()? {
-        return decode_trust_file(&bytes).map(|anchor| Some((anchor, bytes)));
+    if let Some(bytes) = read_trust_anchor_bytes_judged()? {
+        return decode_trust_file_judged(&bytes).map(|anchor| Some((anchor, bytes)));
     }
 
     let (next_step, ways_out) = trust_remedy();
-    Err(CoreError::refusal(
+    Err(TrustReadError::Refused(CoreError::refusal(
         RefusalCode::TrustDamaged,
         format!(
             "The warehouse's trust file (\"{}\") is missing, but {}: trust was established here and \
@@ -688,7 +717,7 @@ pub fn read_trust_anchor_in(mode: TrustReadMode) -> Result<Option<(TrustAnchor, 
             ways_out
         ),
         next_step,
-    ).into())
+    ).into()))
 }
 
 /// The ways out of a trust anchor no repair restores.
@@ -699,18 +728,19 @@ pub const LOST_ANCHOR_WAYS_OUT: &str = "Restore the trust file from a backup if 
     here: run \"forklift prepare\" in another folder, which starts without this warehouse's history, and \
     enroll there.";
 
-/// Decode the trust file's `bytes`, refusing a file that does not parse as damaged. A file a newer
-/// version wrote is not damage, and is refused uncoded.
-fn decode_trust_file(bytes: &[u8]) -> Result<TrustAnchor, String> {
+/// Decode the trust file's `bytes`, refusing a file that does not parse as damaged
+/// ([`TrustReadError::Refused`], coded). A file a newer version wrote is not damage, and is refused
+/// uncoded ([`TrustReadError::Newer`]).
+fn decode_trust_file_judged(bytes: &[u8]) -> Result<TrustAnchor, TrustReadError> {
     let decoded = std::str::from_utf8(bytes)
         .map_err(|e| TrustDecodeError::Damaged(format!("The trust file is not valid UTF-8: {}", e)))
         .and_then(parse_trust_anchor_classified);
 
     decoded.map_err(|error| match error {
-        TrustDecodeError::Newer(message) => message,
+        TrustDecodeError::Newer(message) => TrustReadError::Newer(message),
         TrustDecodeError::Damaged(why) => {
             let (next_step, ways_out) = trust_remedy();
-            CoreError::refusal(
+            TrustReadError::Refused(CoreError::refusal(
                 RefusalCode::TrustDamaged,
                 format!(
                     "{}. So the warehouse's trust file (\"{}\") is damaged, and its anchor cannot be read. \
@@ -718,7 +748,7 @@ fn decode_trust_file(bytes: &[u8]) -> Result<TrustAnchor, String> {
                     why.trim_end().trim_end_matches('.'), forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), ways_out
                 ),
                 next_step,
-            ).into()
+            ).into())
         }
     })
 }
@@ -743,10 +773,15 @@ fn trust_copy_stands() -> Result<bool, String> {
 ///                that reaches no file, a dangling one included); an uncoded error if it could not
 ///                be read.
 pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
+    read_trust_anchor_bytes_judged().map_err(String::from)
+}
+
+/// [`read_trust_anchor_bytes`], its refusal typed.
+fn read_trust_anchor_bytes_judged() -> Result<Option<Vec<u8>>, TrustReadError> {
     match read_trust_file(FILE_NAME_TRUST) {
         Ok(bytes) => Ok(bytes),
         // heal does not write over what stands there, so the next step is never heal's.
-        Err(TrustFileError::NotAFile(path)) => Err(CoreError::refusal(
+        Err(TrustFileError::NotAFile(path)) => Err(TrustReadError::Refused(CoreError::refusal(
             RefusalCode::TrustDamaged,
             format!(
                 "The warehouse's trust file (\"{}\") is not a file or a link to one, so its anchor \
@@ -755,8 +790,8 @@ pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
                 path, trust_remedy().1
             ),
             "",
-        ).into()),
-        Err(TrustFileError::Unreadable(why)) => Err(why),
+        ).into())),
+        Err(TrustFileError::Unreadable(why)) => Err(TrustReadError::Unread(why)),
     }
 }
 
@@ -790,26 +825,24 @@ pub(crate) fn observe_trust_files() -> Result<(pallet_utils::TrustEntryState, pa
 ///                                   - Both files, as judged, and the anchor that verified
 ///                                     `head`, which what is judged beside the office is
 ///                                     verified against.
-/// * `Err(String)`                   - Why the head is not written, as a refusal's reason:
-///                                     neither file holds an anchor that verifies it; a newer
-///                                     version wrote one; or a file, the served state or the
-///                                     office chain could not be read, which says nothing of the
-///                                     head.
-pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorPrecondition, TrustAnchor), String> {
-    let unjudged = |why: String| format!("parcel {} could not be verified against the anchor: {}", head, why.trim_end_matches('.'));
+/// * `Err((String, AnchorRefusal))`  - Why the head is not written, as a refusal's reason, and
+///                                     whose that is ([`AnchorRefusal`]).
+pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorPrecondition, TrustAnchor), (String, AnchorRefusal)> {
+    let unjudged = |why: String| (format!("parcel {} could not be verified against the anchor: {}", head, why.trim_end_matches('.')), AnchorRefusal::Unread);
     let (trust, copy) = observe_trust_files().map_err(unjudged)?;
     let served = crate::util::tombstone_utils::served_state().map_err(unjudged)? != crate::util::tombstone_utils::ServedState::Never;
-    let mut said = Vec::new();
+    // What each file says of the head, and whose that is.
+    let mut said: Vec<(String, AnchorRefusal)> = Vec::new();
 
     // What a newer version wrote is that version's to judge, the file not reached included: an
     // office written beside it would stand where only that version reads the anchor.
     for (entry, name) in [(&trust, FILE_NAME_TRUST), (&copy, FILE_NAME_TRUST_COPY)] {
         if let pallet_utils::TrustEntryState::Bytes(bytes) = entry {
             if newer_refusal_in(bytes).is_some() {
-                return Err(format!(
+                return Err((format!(
                     "\"{}\" was written by a newer version of Forklift, so heal does not verify the office against it",
                     forklift_root().join(name).to_string_lossy()
-                ));
+                ), AnchorRefusal::Newer));
             }
         }
     }
@@ -817,11 +850,11 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
     for entry in [&trust, &copy] {
         let bytes = match entry {
             pallet_utils::TrustEntryState::Absent => {
-                said.push("is lost");
+                said.push(("is lost".to_string(), AnchorRefusal::Unread));
                 continue;
             }
             pallet_utils::TrustEntryState::NotAFile => {
-                said.push("is not a file or a link to one");
+                said.push(("is not a file or a link to one".to_string(), AnchorRefusal::Unread));
                 continue;
             }
             pallet_utils::TrustEntryState::Bytes(bytes) => bytes,
@@ -831,33 +864,91 @@ pub(crate) fn office_rebuild_anchor(head: &str) -> Result<(pallet_utils::AnchorP
             Ok(Ok(anchor)) => anchor,
             // A newer version's file refused above.
             Ok(Err(_)) | Err(_) => {
-                said.push("does not read as an anchor");
+                said.push(("does not read as an anchor".to_string(), AnchorRefusal::Unread));
                 continue;
             }
         };
 
-        match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served).map_err(unjudged)? {
-            true => return Ok((pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }, anchor)),
-            false => said.push("holds an anchor it does not verify against"),
+        // A chain that reads and does not verify, or one with a parcel the store decided about, is
+        // this anchor's verdict on the head: it cannot verify it. One the store could not give,
+        // one crossing a damaged signature, or one crossing a signature a newer version may have
+        // written, says nothing of it. Either way the other file's anchor is still tried: it may
+        // verify the head.
+        match anchor_serves(&Ok(bytes.clone()), &anchor, Some(head), served) {
+            Ok(true) => return Ok((pallet_utils::AnchorPrecondition::Files { trust: trust.clone(), copy: copy.clone() }, anchor)),
+            Ok(false) => said.push((UNVERIFIED_ANCHOR.to_string(), AnchorRefusal::Refused)),
+            Err(ChainUnjudged::Unread(why, crate::util::audit_utils::ChainFault::Decided(_))) => said.push((format!(
+                "holds an anchor whose chain to the head the store holds damaged or absent ({})",
+                crate::error::frames_without_steps(&why).trim_end_matches('.')
+            ), AnchorRefusal::Refused)),
+            Err(ChainUnjudged::SignatureDamaged(why)) => said.push((format!(
+                "holds an anchor whose chain to the head crosses a damaged signature ({})",
+                crate::error::frames_without_steps(&why).trim_end_matches('.')
+            ), AnchorRefusal::Unread)),
+            Err(ChainUnjudged::Unread(why, crate::util::audit_utils::ChainFault::Untold)) => said.push((format!(
+                "holds an anchor whose chain to the head could not be read ({})",
+                crate::error::frames_without_steps(&why).trim_end_matches('.')
+            ), AnchorRefusal::Unread)),
+            Err(ChainUnjudged::Newer(why)) => said.push((format!(
+                "holds an anchor whose chain to the head is in a version this Forklift does not read ({})",
+                crate::error::frames_without_steps(&why).trim_end_matches('.')
+            ), AnchorRefusal::Newer)),
         }
     }
 
-    Err(format!(
-        "parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
-        head, forklift_root().join(FILE_NAME_TRUST).to_string_lossy(), said[0],
-        forklift_root().join(FILE_NAME_TRUST_COPY).to_string_lossy(), said[1]
-    ))
+    // Only two anchors that both read and both refuse the head judge it, the trust file's verdict
+    // standing for both; a file that does not hold one, or whose chain could not be read, may be
+    // the one that would have verified it. One a newer version may read is that version's to
+    // judge, before what could not be read.
+    let refusal = match said.as_slice() {
+        [(_, AnchorRefusal::Refused), (_, AnchorRefusal::Refused)] => AnchorRefusal::Refused,
+        _ if said.iter().any(|(_, whose)| *whose == AnchorRefusal::Newer) => AnchorRefusal::Newer,
+        _ => AnchorRefusal::Unread,
+    };
+    let trust_path = forklift_root().join(FILE_NAME_TRUST);
+    let copy_path = forklift_root().join(FILE_NAME_TRUST_COPY);
+    Err((match refusal == AnchorRefusal::Refused {
+        true => format!(
+            "parcel {} does not verify as the office's history against an anchor heal can read: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
+            head, trust_path.to_string_lossy(), said[0].0, copy_path.to_string_lossy(), said[1].0
+        ),
+        false => format!(
+            "parcel {} could not be verified as the office's history: the trust file (\"{}\") {}, and its copy (\"{}\") {}",
+            head, trust_path.to_string_lossy(), said[0].0, copy_path.to_string_lossy(), said[1].0
+        ),
+    }, refusal))
 }
+
+/// Whose an [`office_rebuild_anchor`] refusal is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchorRefusal {
+    /// Both files hold an anchor and neither verifies the head (its chain reads and does not reach
+    /// the head, or the store decided about a parcel of that chain).
+    Refused,
+
+    /// A newer version may judge it: it wrote a file, or a signature of a file's chain to the
+    /// head, in a version this build does not know.
+    Newer,
+
+    /// Nothing of the head: a file is lost, is not a file or does not read as an anchor (damage
+    /// to the trust files, which the trust file repair judges), or a file, the served state or a
+    /// chain could not be read.
+    Unread,
+}
+
+/// What [`office_rebuild_anchor`] says of a trust file whose anchor reads but does not verify the
+/// head.
+const UNVERIFIED_ANCHOR: &str = "holds an anchor it does not verify against";
 
 /// Whether the anchor `anchor`, parsed from the trust-file `bytes` (`Err`: the entry is not a
 /// file), serves beside the office head `office_head` (`None`: unborn) of a root that has been
 /// `served` or not.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether it serves.
-/// * `Err(String)` - The office chain could not be read ([`judge_trust_bytes`]), which says
-///                   nothing of the anchor.
-fn anchor_serves(bytes: &Result<Vec<u8>, String>, anchor: &TrustAnchor, office_head: Option<&str>, served: bool) -> Result<bool, String> {
+/// * `Ok(bool)`             - Whether it serves.
+/// * `Err(ChainUnjudged)`   - The office chain could not be judged ([`judge_trust_bytes`]),
+///                            which says nothing of the anchor.
+fn anchor_serves(bytes: &Result<Vec<u8>, String>, anchor: &TrustAnchor, office_head: Option<&str>, served: bool) -> Result<bool, ChainUnjudged> {
     match office_head {
         None => Ok(served),
         // A server's re-genesis adopts the office head and names the genesis it succeeds; an
@@ -1123,10 +1214,44 @@ pub fn collect_trust_pin_roots(policy: TrustPinReadPolicy) -> Result<TrustPinRoo
 /// * `Ok((Parcel, OfficeState))` - The parcel and the state its records hold.
 /// * `Err(String)`               - The refusal, or why an object could not be read.
 pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<(Parcel, OfficeState), String> {
-    let parcel = object_utils::load_parcel(office_parcel_hash)?;
+    check_office_parcel_shape_faulted(office_parcel_hash).map_err(String::from)
+}
+
+/// Why [`check_office_parcel_shape_faulted`] refused.
+#[derive(Debug)]
+pub(crate) enum OfficeShapeError {
+    /// What the store gave is not of office shape: a verdict on the parcel.
+    NotOffice(String),
+
+    /// An object could not be read, or a record of it reads whole but does not parse
+    /// ([`ReadFault::Newer`](crate::util::file_utils::ReadFault::Newer)), with what the store's
+    /// answer says of it.
+    Unread(String, crate::util::file_utils::ReadFault),
+}
+
+impl From<(String, crate::util::file_utils::ReadFault)> for OfficeShapeError {
+    fn from((message, fault): (String, crate::util::file_utils::ReadFault)) -> OfficeShapeError {
+        OfficeShapeError::Unread(message, fault)
+    }
+}
+
+impl From<OfficeShapeError> for String {
+    fn from(error: OfficeShapeError) -> String {
+        match error {
+            OfficeShapeError::NotOffice(message) | OfficeShapeError::Unread(message, _) => message,
+        }
+    }
+}
+
+/// [`check_office_parcel_shape`], telling a refusal of what the store gave from a read it could
+/// not make.
+pub(crate) fn check_office_parcel_shape_faulted(office_parcel_hash: &str) -> Result<(Parcel, OfficeState), OfficeShapeError> {
+    use OfficeShapeError::NotOffice;
+
+    let parcel = object_utils::load_parcel_faulted(office_parcel_hash)?;
 
     if parcel.parents.len() > 1 {
-        return Err(not_office_shape(office_parcel_hash, &format!("has {} parents", parcel.parents.len())));
+        return Err(NotOffice(not_office_shape(office_parcel_hash, &format!("has {} parents", parcel.parents.len()))));
     }
 
     let mut tree_hash = parcel.tree_hash.clone();
@@ -1136,19 +1261,19 @@ pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<(Parcel, Of
         (TREE_NAME_FORKLIFT, &[TREE_NAME_TRACKED][..]),
         (TREE_NAME_TRACKED, &[TREE_NAME_USERS, TREE_NAME_KEYS][..]),
     ] {
-        let tree = object_utils::load_tree(&tree_hash)?;
+        let tree = object_utils::load_tree_faulted(&tree_hash)?;
 
         if let Some((file, _)) = tree.get_files().next() {
-            return Err(not_office_shape(office_parcel_hash, &format!("holds a file {} in {}", file, at)));
+            return Err(NotOffice(not_office_shape(office_parcel_hash, &format!("holds a file {} in {}", file, at))));
         }
 
         if let Some((other, _)) = tree.get_subtrees().find(|(name, _)| !expected.contains(&name.as_str())) {
-            return Err(not_office_shape(office_parcel_hash, &format!("holds a folder {} in {}", other, at)));
+            return Err(NotOffice(not_office_shape(office_parcel_hash, &format!("holds a folder {} in {}", other, at))));
         }
 
         for wanted in expected {
             let Some((_, subtree)) = tree.get_subtrees().find(|(name, _)| name == wanted) else {
-                return Err(not_office_shape(office_parcel_hash, &format!("has no folder {} in {}", wanted, at)));
+                return Err(NotOffice(not_office_shape(office_parcel_hash, &format!("has no folder {} in {}", wanted, at))));
             };
 
             tree_hash = subtree.hash.clone();
@@ -1156,7 +1281,7 @@ pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<(Parcel, Of
     }
 
     // What `users` and `keys` hold: only record files, named for what they hold.
-    let state = read_office_state_of(office_parcel_hash)?;
+    let state = read_office_state_of_faulted(office_parcel_hash)?;
 
     Ok((parcel, state))
 }
@@ -1269,7 +1394,7 @@ fn load_object_classified<T>(
     }
 }
 
-/// [`resolve_subtree`], classified the same way [`load_object_classified`] classifies a single
+/// [`resolve_subtree_faulted`], classified the same way [`load_object_classified`] classifies a single
 /// object load — each tree along `path` is read through the one classified read, so an absent one
 /// is [`OfficeReadErrorKind::AbsentObject`] by construction (from
 /// [`file_utils::StoreReadOutcome::Absent`]), never guessed from a deeper loader's error text.
@@ -1765,13 +1890,36 @@ enum TrustJudged {
     Newer(String),
 }
 
+/// Why an office chain could not be judged against an anchor: nothing of the anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChainUnjudged {
+    /// The store could not give a part of it; the fault says whether the store decided about that
+    /// part ([`OfficeChainError::Unreadable`](crate::util::audit_utils::OfficeChainError::Unreadable)).
+    Unread(String, crate::util::audit_utils::ChainFault),
+
+    /// A signature of it reads but is damaged: no verdict on the history it signs.
+    SignatureDamaged(String),
+
+    /// A signature of it names a version this build does not know: the refusal, which says so.
+    Newer(String),
+}
+
+impl ChainUnjudged {
+    /// The refusal, phrased for the user.
+    fn into_message(self) -> String {
+        match self {
+            ChainUnjudged::Unread(message, _) | ChainUnjudged::SignatureDamaged(message) | ChainUnjudged::Newer(message) => message,
+        }
+    }
+}
+
 /// Judge the trust-file `bytes` (`Err`: the entry is not a file) against `office_head`.
 ///
 /// # Returns
-/// * `Ok(TrustJudged)` - The judgement.
-/// * `Err(String)`     - The office chain could not be read: a coded refusal, such as damage to
-///                       the store, which says nothing about the trust file.
-fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Result<TrustJudged, String> {
+/// * `Ok(TrustJudged)`       - The judgement.
+/// * `Err(ChainUnjudged)`    - The office chain could not be judged, which says nothing about the
+///                             trust file, so it is neither used nor written over.
+fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Result<TrustJudged, ChainUnjudged> {
     let Ok(bytes) = bytes else {
         return Ok(TrustJudged::Unusable);
     };
@@ -1784,11 +1932,15 @@ fn judge_trust_bytes(bytes: &Result<Vec<u8>, String>, office_head: &str) -> Resu
 
     match crate::util::audit_utils::verify_office_chain_memoized(&anchor, office_head) {
         Ok(_) => Ok(TrustJudged::Usable),
-        // A parcel the store cannot give says nothing of the anchor; nor does a coded refusal met
-        // past the walk, such as a key object that does not read.
-        Err(crate::util::audit_utils::OfficeChainError::Unreadable(why)) => Err(why),
-        Err(refused) if crate::error::frames_in(refused.message()).next().is_some() => Err(refused.message().to_string()),
-        Err(_) => Ok(TrustJudged::Unverified(anchor)),
+        // An object the store could not give keeps what its read said, a damaged signature says
+        // nothing of the history it signs, and a signature a newer version may have written is
+        // that version's to judge; the rest is the walk's verdict on what it read.
+        Err(crate::util::audit_utils::OfficeChainError::Unreadable(why, fault)) => Err(ChainUnjudged::Unread(why, fault)),
+        Err(crate::util::audit_utils::OfficeChainError::SignatureDamaged(why)) => Err(ChainUnjudged::SignatureDamaged(why)),
+        Err(crate::util::audit_utils::OfficeChainError::Newer(why)) => Err(ChainUnjudged::Newer(why)),
+        Err(crate::util::audit_utils::OfficeChainError::Inauthentic(_) | crate::util::audit_utils::OfficeChainError::Unauthorized { .. }) => {
+            Ok(TrustJudged::Unverified(anchor))
+        }
     }
 }
 
@@ -1862,8 +2014,8 @@ pub(crate) fn refuse_unsettled_trust(_lock: &crate::util::lock_utils::RefLock) -
         ).into());
     };
 
-    let trust_judged = judge_trust_bytes(&trust, &office_head)?;
-    let copy_judged = copy.as_ref().map(|copy| judge_trust_bytes(copy, &office_head)).transpose()?;
+    let trust_judged = judge_trust_bytes(&trust, &office_head).map_err(ChainUnjudged::into_message)?;
+    let copy_judged = copy.as_ref().map(|copy| judge_trust_bytes(copy, &office_head)).transpose().map_err(ChainUnjudged::into_message)?;
 
     let copy_differs = copy.as_ref().is_some_and(|copy| match (copy, &trust) {
         (Ok(copy), Ok(trust)) => copy != trust,
@@ -2175,13 +2327,13 @@ fn plan_trust_repair(files: &TrustFiles, notes: &mut Vec<String>) -> Result<Opti
         false => {}
     }
 
-    // Whether `file`, parsed as `anchor`, is usable. A chain the store cannot read says nothing of
-    // either file, so nothing is written over it.
+    // Whether `file`, parsed as `anchor`, is usable. A chain the store cannot read, or one a newer
+    // version may have signed, says nothing of either file, so nothing is written over it.
     let usable = |file: &Option<Result<Vec<u8>, String>>, anchor: &Option<TrustAnchor>| -> Result<bool, String> {
         let (Some(file), Some(anchor)) = (file, anchor) else {
             return Ok(false);
         };
-        anchor_serves(file, anchor, office_head.as_deref(), served)
+        anchor_serves(file, anchor, office_head.as_deref(), served).map_err(ChainUnjudged::into_message)
     };
 
     if matches!((trust, copy), (Some(Ok(trust)), Some(Ok(copy))) if trust == copy) {
@@ -2404,6 +2556,40 @@ pub fn office_unborn_refusal(closing: &str) -> String {
     office_unborn_refusal_over(closing, unchecked_remote())
 }
 
+/// The way out [`office_unborn_refusal`] names for an office pallet unborn beside the trust
+/// file's anchor, as a command or as sentences: what a refusal that waits on the office names. A
+/// served state that does not read is said, with its own step: which remedy applies turns on it.
+pub fn office_unborn_step() -> String {
+    let served = match crate::util::tombstone_utils::served_state() {
+        Ok(state) => state != crate::util::tombstone_utils::ServedState::Never,
+        Err(unreadable) => {
+            let (said, step) = match crate::error::deframe(&unreadable) {
+                Some((_, human, step)) => (human.into_owned(), step.to_string()),
+                None => (unreadable.clone(), String::new()),
+            };
+            return format!(
+                "Whether this warehouse is served could not be read, and the way back for its unborn office pallet turns on it: {} {}",
+                said.trim(),
+                match step.is_empty() {
+                    true => "Settle that, then run \"forklift heal\" again.".to_string(),
+                    false => format!("Run \"{}\", then run \"forklift heal\" again.", step),
+                }
+            );
+        }
+    };
+    if served {
+        return format!(
+            "On a served warehouse that is the state before the enrolling client lifts the office pallet; if it was lifted here \
+            before, restore its ref (\"{}\") from a backup.",
+            pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME).to_string_lossy()
+        );
+    }
+    match unborn_office_remedy(unchecked_remote()) {
+        (step, _) if !step.is_empty() => step,
+        (_, ways_out) => ways_out,
+    }
+}
+
 /// What is known, without asking it, of a remote a lower could take the office pallet from:
 /// `None` when one is configured, which may or may not hold it; `Some(false)` when none is.
 fn unchecked_remote() -> Option<bool> {
@@ -2567,12 +2753,20 @@ pub fn read_office_state_and_head() -> Result<(OfficeState, Option<String>), Str
 /// * `Ok(OfficeState)` - The state.
 /// * `Err(String)`     - If an object or record could not be read.
 pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, String> {
-    let tree_hash = object_utils::load_parcel(office_parcel_hash)?.tree_hash;
+    read_office_state_of_faulted(office_parcel_hash).map_err(String::from)
+}
+
+/// [`read_office_state_of`], telling records that are not an office's from a read it could not
+/// make.
+fn read_office_state_of_faulted(office_parcel_hash: &str) -> Result<OfficeState, OfficeShapeError> {
+    use OfficeShapeError::NotOffice;
+
+    let tree_hash = object_utils::load_parcel_faulted(office_parcel_hash)?.tree_hash;
 
     let mut users: Vec<UserRecord> = Vec::new();
     let mut keys: Vec<KeyRecord> = Vec::new();
 
-    let Some(tracked) = resolve_subtree(
+    let Some(tracked) = resolve_subtree_faulted(
         office_parcel_hash, &tree_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED],
     )? else {
         return Ok(OfficeState { users, keys });
@@ -2582,55 +2776,59 @@ pub fn read_office_state_of(office_parcel_hash: &str) -> Result<OfficeState, Str
     // such records.
     if let Some((name, _)) = tracked.get_files()
         .find(|(name, _)| name.as_str() == TREE_NAME_USERS || name.as_str() == TREE_NAME_KEYS) {
-        return Err(file_in_place_of_folder(
+        return Err(NotOffice(file_in_place_of_folder(
             office_parcel_hash, &[TREE_NAME_FORKLIFT, TREE_NAME_TRACKED, name.as_str()],
-        ));
+        )));
     }
 
     for (name, item) in tracked.get_subtrees() {
-        let subtree = object_utils::load_tree(&item.hash)?;
+        let subtree = object_utils::load_tree_faulted(&item.hash)?;
 
         if name == TREE_NAME_USERS || name == TREE_NAME_KEYS {
             if let Some((nested, _)) = subtree.get_subtrees().next() {
-                return Err(format!(
+                return Err(NotOffice(format!(
                     "The office parcel {} holds a folder {}/{}, but {}/ holds only record files. \
                     Forklift never writes a folder there, so this office may have been tampered with.",
                     office_parcel_hash, name, nested, name
-                ));
+                )));
             }
         }
 
         // A record that cannot be loaded or does not parse is named by parcel and file, as a
-        // misfiled one is.
-        let unreadable = |file_name: &str, error: String| format!(
-            "The office parcel {} holds a record {}/{} that cannot be read: {}",
+        // misfiled one is; one the store could not give keeps what its read said.
+        let unreadable = |file_name: &str, (error, fault): (String, crate::util::file_utils::ReadFault)| {
+            OfficeShapeError::Unread(format!(
+                "The office parcel {} holds a record {}/{} that cannot be read: {}",
+                office_parcel_hash, name, file_name, error
+            ), fault)
+        };
+        // A record the store verified that does not parse is one this build cannot read, never
+        // damage.
+        let unparseable = |file_name: &str, error: String| OfficeShapeError::Unread(format!(
+            "The office parcel {} holds a record {}/{} that this Forklift cannot parse: {}",
             office_parcel_hash, name, file_name, error
-        );
-        let unparseable = |file_name: &str, error: String| format!(
-            "The office parcel {} holds a record {}/{} that does not parse: {}",
-            office_parcel_hash, name, file_name, error
-        );
+        ), crate::util::file_utils::ReadFault::Newer);
 
         match name.as_str() {
             TREE_NAME_USERS => {
                 for (file_name, file) in subtree.get_files() {
-                    let toml = load_record(&file.hash).map_err(|e| unreadable(file_name, e))?;
+                    let toml = load_record_faulted(&file.hash).map_err(|e| unreadable(file_name, e))?;
                     let user = parse_user_record(&toml).map_err(|e| unparseable(file_name, e))?;
                     verify_record_file_name(
                         office_parcel_hash, TREE_NAME_USERS, file_name,
                         &user_record_file_name(&user), &format!("user {}", user.identifier),
-                    )?;
+                    ).map_err(NotOffice)?;
                     users.push(user);
                 }
             }
             TREE_NAME_KEYS => {
                 for (file_name, file) in subtree.get_files() {
-                    let toml = load_record(&file.hash).map_err(|e| unreadable(file_name, e))?;
+                    let toml = load_record_faulted(&file.hash).map_err(|e| unreadable(file_name, e))?;
                     let key = parse_key_record(&toml).map_err(|e| unparseable(file_name, e))?;
                     verify_record_file_name(
                         office_parcel_hash, TREE_NAME_KEYS, file_name,
                         &key_record_file_name(&key), &format!("key {}", key.key_id),
-                    )?;
+                    ).map_err(NotOffice)?;
                     keys.push(key);
                 }
             }
@@ -2805,13 +3003,15 @@ fn store_record(toml: &str) -> Result<String, String> {
     Ok(object.hash)
 }
 
-/// Load one record blob as a string.
-fn load_record(hash: &str) -> Result<String, String> {
-    String::from_utf8(object_utils::load_blob(hash)?.content)
-        .map_err(|_| format!("The metadata record {} is not valid UTF-8.", hash))
+/// Load one record blob as a string. The error says what it tells of the record: a blob that is
+/// not UTF-8, which the store verified, is one this build cannot read,
+/// [`ReadFault::Newer`](crate::util::file_utils::ReadFault::Newer).
+fn load_record_faulted(hash: &str) -> Result<String, (String, crate::util::file_utils::ReadFault)> {
+    String::from_utf8(object_utils::load_blob_faulted(hash)?.content)
+        .map_err(|_| (format!("The metadata record {} is not valid UTF-8, so this Forklift cannot read it.", hash), crate::util::file_utils::ReadFault::Newer))
 }
 
-/// [`load_record`]'s bytes-in-hand sibling — parses a record blob's content as a string from an
+/// [`load_record_faulted`]'s bytes-in-hand sibling — parses a record blob's content as a string from an
 /// already-in-hand classified read's bytes, rather than triggering a second, independent read of
 /// the same hash. See [`object_utils::parse_local_tree_bytes`]'s own doc comment for why
 /// [`load_object_classified`] needs this shape.
@@ -2823,16 +3023,16 @@ fn parse_record_bytes(hash: &str, bytes: &[u8]) -> Result<String, String> {
 /// Resolve a chain of subtree names from a root tree.
 ///
 /// # Returns
-/// * `Ok(Some(TreeItem))` - The resolved (loaded) subtree.
-/// * `Ok(None)`           - If a component does not exist.
-/// * `Err(String)`        - If a tree object could not be loaded, or a component is a file.
-fn resolve_subtree(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str])
-    -> Result<Option<TreeItem>, String> {
-    let mut current = object_utils::load_tree(root_tree_hash)?;
+/// * `Ok(Some(TreeItem))`    - The resolved (loaded) subtree.
+/// * `Ok(None)`              - If a component does not exist.
+/// * `Err(OfficeShapeError)` - If a tree object could not be loaded, or a component is a file.
+fn resolve_subtree_faulted(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str])
+    -> Result<Option<TreeItem>, OfficeShapeError> {
+    let mut current = object_utils::load_tree_faulted(root_tree_hash)?;
 
     for (depth, component) in path.iter().enumerate() {
         if current.get_files().any(|(name, _)| name == component) {
-            return Err(file_in_place_of_folder(office_parcel_hash, &path[..=depth]));
+            return Err(OfficeShapeError::NotOffice(file_in_place_of_folder(office_parcel_hash, &path[..=depth])));
         }
 
         let subtree_hash = current.get_subtrees()
@@ -2840,7 +3040,7 @@ fn resolve_subtree(office_parcel_hash: &str, root_tree_hash: &str, path: &[&str]
             .map(|(_, item)| item.hash.clone());
 
         match subtree_hash {
-            Some(hash) => current = object_utils::load_tree(&hash)?,
+            Some(hash) => current = object_utils::load_tree_faulted(&hash)?,
             None => return Ok(None),
         }
     }
@@ -4475,7 +4675,7 @@ pub(crate) mod tests {
 
         let planted = plant_office(&[], &[entry("x.toml", "not = [toml".to_string())], Vec::new(), None);
         let error = read_office_state_of(&planted).err().expect("an unparseable record must not read");
-        assert!(error.contains(&planted) && error.contains("keys/x.toml") && error.contains("does not parse"),
+        assert!(error.contains(&planted) && error.contains("keys/x.toml") && error.contains("cannot parse"),
             "the error must name the parcel and the file: {}", error);
 
         drop(scope);

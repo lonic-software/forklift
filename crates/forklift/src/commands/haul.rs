@@ -68,7 +68,7 @@ fn open(target: &str, source: Option<String>, title: &str, description: String) 
         return Err(format!("Pallet \"{}\" has nothing stacked; there is nothing to propose.", source));
     };
 
-    if pallet_utils::get_pallet_head(target)?.is_none() && !pallet_utils::does_pallet_exist(target) {
+    if pallet_utils::get_pallet_head(target)?.is_none() && !pallet_utils::does_pallet_exist(target)? {
         if target == current {
             return Err(format!("Pallet \"{}\" has nothing stacked; there is nothing to merge into.", target));
         }

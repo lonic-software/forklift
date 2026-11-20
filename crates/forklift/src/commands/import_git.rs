@@ -1258,7 +1258,7 @@ fn map_branches(branches: &[(String, String)]) -> Result<Vec<String>, String> {
     }
 
     for ((branch, _), pallet) in branches.iter().zip(&pallets) {
-        if pallet_utils::does_pallet_exist(pallet) {
+        if pallet_utils::does_pallet_exist(pallet)? {
             return Err(format!(
                 "Branch \"{}\" maps to pallet \"{}\", which already exists in this warehouse. Import \
                 into a warehouse without that pallet, or rename the branch in git.",

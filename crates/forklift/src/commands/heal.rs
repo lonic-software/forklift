@@ -101,6 +101,24 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             "--ref takes PALLET=PARCEL, not \"{}\". Nothing was changed.", spec
         )))
         .collect::<Result<Vec<_>, _>>()?;
+    // Heal never removes a meta pallet's ref: it rebuilds one where it has a head to rebuild it at,
+    // and otherwise names the way out.
+    // Each meta name once, in the order given, so naming one twice still reads as one flag to drop.
+    let mut meta: Vec<&String> = Vec::new();
+    for pallet in remove_ref.iter().filter(|pallet| pallet.starts_with('@')) {
+        if !meta.contains(&pallet) {
+            meta.push(pallet);
+        }
+    }
+    if let Some(first) = meta.first() {
+        let flags: Vec<String> = meta.iter().map(|pallet| format!("\"--remove-ref {}\"", pallet)).collect();
+        return Err(format!(
+            "--remove-ref removes only a user pallet's ref, and \"{}\" is not one: heal never removes the ref of a metadata pallet. \
+            Run the command again without {}: heal rebuilds a damaged metadata ref where it can and otherwise names the way out. \
+            Nothing was changed.",
+            first, flags.join(" and ")
+        ));
+    }
     let named = set_ref.iter().map(|(pallet, _)| *pallet).chain(remove_ref.iter().map(String::as_str));
     if let Some(twice) = named.clone().enumerate().find(|(at, pallet)| named.clone().skip(at + 1).any(|other| other == *pallet)) {
         return Err(format!(
@@ -154,6 +172,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         ref_notes.push(format!("Not every meta pallet ref was judged before the taint recovery: {}", error.trim_end_matches('.')));
     }
     let meta_rebuilt = meta_first.repair.rebuilt;
+    let meta_undurable = meta_first.repair.undurable;
     // The damaged refs a refusal from here on names beside what was written: those the pass before
     // the taint left for the pass after it, until that pass has judged them; then those it refused.
     let meta_deferred = meta_first.repair.deferred;
@@ -174,6 +193,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         deferred_sentences(&left.deferred, left.held.as_ref()).iter().chain(&unjudged_sentences(&left.unjudged))
             .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence))
     };
+
+    // A rebuild left not durable is said by the pass that wrote it alone: every later pass reads
+    // its ref as undamaged. So it ends the run, in each pass below as here.
+    if let Some(error) = undurable_error(&meta_undurable) {
+        return Err(config_said(ref_notes.iter().fold(error, |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))));
+    }
 
     let record_rebuilt = sealed_utils::rebuild()
         .map_err(|error| config_said(ref_notes.iter().fold(format!(
@@ -405,7 +430,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
-    if let Some(error) = first.stopped {
+    if let Some(error) = stopped_with(first.stopped, &first.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
 
@@ -463,7 +488,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let meta_second = meta_second.repair;
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
-    if let Some(error) = meta_second.stopped {
+    if let Some(error) = stopped_with(meta_second.stopped, &meta_second.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
 
@@ -473,7 +498,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
     refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: Vec::new(), held: None });
-    if let Some(error) = second.stopped {
+    if let Some(error) = stopped_with(second.stopped, &second.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
 
@@ -1462,16 +1487,18 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
         lines.push(format!("{}.", unfinished.trim_end_matches('.')));
     }
 
-    // A meta ref, which --ref does not set, is set only by hand. The office's and @redactions' come
-    // first, since a user ref's rebuild, --ref's among them, is verified against the one and
-    // checked against the other; any other meta ref's waits behind a user ref's --ref.
-    let hand = "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.".to_string();
+    // A meta ref, which --ref does not set, has its own step (ref_heal::meta_step). The office's
+    // and @redactions' come first, since a user ref's rebuild, --ref's among them, is verified
+    // against the one and checked against the other; any other meta ref's waits behind a user
+    // ref's --ref.
     let gating = [forklift_core::util::office_utils::OFFICE_PALLET_NAME, forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME]
         .map(|name| format!("@{}", name));
-    let next_step = match report.refs_refused.iter().find(|refused| !refused.pallet.starts_with('@')) {
-        _ if report.refs_refused.iter().any(|refused| gating.contains(&refused.pallet)) => hand,
-        Some(user) => format!("forklift heal --ref {}=<parcel>", user.pallet),
-        None => hand,
+    let meta_step = |refused: &ref_heal::Refused| ref_heal::meta_step(refused, &report.refs_refused);
+    let gate = gating.iter().find_map(|wire| report.refs_refused.iter().find(|refused| refused.pallet == *wire));
+    let next_step = match (gate, report.refs_refused.iter().find(|refused| !refused.pallet.starts_with('@'))) {
+        (Some(gate), _) => meta_step(gate),
+        (None, Some(user)) => format!("forklift heal --ref {}=<parcel>", user.pallet),
+        (None, None) => report.refs_refused.first().map(meta_step).unwrap_or_else(|| "forklift heal".to_string()),
     };
 
     CoreError::refusal_with_details(
@@ -1482,11 +1509,11 @@ fn ref_refusal(report: &HealReport, unfinished: Option<&str>) -> CoreError {
     )
 }
 
-/// Each refused ref's line, then its candidate heads, which the hand step writes.
-fn refusal_lines(refused: &[ref_heal::Refused]) -> Vec<String> {
+/// Each refused ref's line, then its candidate heads: for a user ref, what `--ref` may name.
+fn refusal_lines(all: &[ref_heal::Refused]) -> Vec<String> {
     let mut lines = Vec::new();
 
-    for refused in refused {
+    for refused in all {
         lines.push(format!("The ref of pallet \"{}\" was not rebuilt: {}.", refused.pallet, refused.reason));
 
         if refused.candidates.is_empty() {
@@ -1626,6 +1653,20 @@ fn deferred_sentences(deferred: &[ref_heal::Refused], held: Option<&ref_heal::Ta
 /// stopped before judging.
 fn unjudged_sentences(unjudged: &[String]) -> Vec<String> {
     unjudged.iter().map(|pallet| format!("The ref of pallet \"{}\" is lost or damaged; this run stopped before judging it.", pallet)).collect()
+}
+
+/// The refusal for the rebuilds a ref pass left not durable ([`ref_heal::Repair::undurable`]), or
+/// `None` when it left none.
+fn undurable_error(undurable: &[String]) -> Option<String> {
+    (!undurable.is_empty()).then(|| format!("{} Heal went no further.", undurable.join(" ")))
+}
+
+/// Why a ref pass ends the run: where it `stopped`, and what it left `undurable` beside that.
+fn stopped_with(stopped: Option<String>, undurable: &[String]) -> Option<String> {
+    match stopped {
+        Some(stopped) => Some(undurable.iter().fold(stopped, |error, sentence| forklift_core::error::append_to_message(error, sentence))),
+        None => undurable_error(undurable),
+    }
 }
 
 fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {
@@ -2325,6 +2366,7 @@ mod tests {
             pallet: pallet.to_string(),
             reason: "it waits.".to_string(),
             candidates: candidates.iter().map(|(head, source)| ref_heal::Candidate { head: head.to_string(), source: source.to_string() }).collect(),
+            meta: None,
         };
         let held = |unread: bool| ref_heal::TaintHold { unread, refs: vec!["@tags".to_string()] };
         assert!(deferred_sentences(&[], None).is_empty());

@@ -8,6 +8,7 @@
 use toml_edit::{value, Item, Table};
 use crate::model::operator::Operator;
 use crate::util::meta_tree::{
+    MetaCheckError, broken,
     self, CellEdit, CellEnvelope, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange, Stamp,
 };
 use crate::util::{object_utils, pallet_utils, sign_utils};
@@ -40,15 +41,15 @@ impl PalletRules for KvRules {
         schema == KV_TEXT_SCHEMA
     }
 
-    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), MetaCheckError> {
         for cell in change.changes {
-            parse_cell_path(&cell.path)?;
+            parse_cell_path(&cell.path).map_err(broken)?;
 
             let Some(after) = &cell.after else { continue };
-            let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
+            let envelope = meta_tree::read_checked_cell(after)?;
 
             if envelope.schema == KV_TEXT_SCHEMA {
-                text_of(&envelope.value).map_err(|why| format!("the value at {} {}", cell.path, why))?;
+                text_of(&envelope.value).map_err(|why| broken(format!("the value at {} {}", cell.path, why)))?;
             }
         }
 

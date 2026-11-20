@@ -310,10 +310,27 @@ fn pallet_name_problem(name: &str) -> Option<String> {
 /// * `name` - The name of the pallet.
 ///
 /// # Returns
-/// * `true`  - If the pallet has a ref file.
-/// * `false` - If it does not.
-pub fn does_pallet_exist(name: &str) -> bool {
-    get_pallet_ref_path(PalletNamespace::User, name).is_file()
+/// * `Ok(true)`    - If the pallet has a ref file.
+/// * `Ok(false)`   - If `name` is no pallet name, or names a path no file can have (too long, or
+///                   invalid on this host), or nothing, or a folder (the refs of names below it),
+///                   stands at its path.
+/// * `Err(String)` - If a link or anything else that is neither a file nor a folder stands at its
+///                   path, or its state could not be read: refused as [`get_pallet_head`] refuses
+///                   it, never followed and never read as absent.
+pub fn does_pallet_exist(name: &str) -> Result<bool, String> {
+    // No ref can stand at a name that is not a pallet's: a caller asking of any argument (a
+    // revision that may be a hash) is answered, never refused for the name.
+    if validate_pallet_name(name).is_err() {
+        return Ok(false);
+    }
+
+    match std::fs::symlink_metadata(get_pallet_ref_path(PalletNamespace::User, name)) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(metadata) if metadata.is_dir() => Ok(false),
+        Err(e) if matches!(e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidFilename) => Ok(false),
+        _ => get_pallet_head_in(PalletNamespace::User, name).map(|head| head.is_some()),
+    }
 }
 
 /// Where a bay stands: its current pallet, and the base — the parcel its inventory and working
@@ -787,15 +804,42 @@ pub fn get_meta_pallet_head(name: &str) -> Result<Option<String>, String> {
 /// * `Ok(None)`         - If the pallet is unborn: it has no ref file, and, for a meta pallet,
 ///   no copy either.
 /// * `Err(String)`      - If the name is invalid, or the ref file could not be read, or it
-///   does not contain a valid hash, or a meta pallet's ref file is missing while its copy stands
-///   (each a [`RefusalCode::RefDamaged`] refusal but the first two).
+///   does not contain a valid hash, or a link or anything else that is neither a file nor a folder
+///   stands at its path, or a meta pallet's ref file is missing while its copy stands (each a
+///   [`RefusalCode::RefDamaged`] refusal but the first two).
 pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
     validate_pallet_name(name)?;
 
     let path = get_pallet_ref_path(namespace, name);
 
-    if path.is_file() {
-        return read_ref_file(namespace, name, &path);
+    // A ref is judged as it stands, never through a link: nothing writes one at a ref's path, and
+    // heal, which reads it the same way, judges no ref a link stands at. A folder holds the refs of
+    // names below this one, so it is no ref of this one. A path whose state cannot be read is no
+    // unborn pallet: the ref may stand there.
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => return read_ref_file(namespace, name, &path),
+        Ok(metadata) if !metadata.is_dir() => return Err(CoreError::refusal(
+            RefusalCode::RefDamaged,
+            format!(
+                "The ref of pallet \"{}\" (\"{}\") is blocked: something that is not a file stands at its path. \
+                Nothing was changed.",
+                PalletRef { namespace, name: name.to_string() }.to_wire(),
+                path.to_string_lossy()
+            ),
+            BLOCKED_REF_STEP,
+        ).into()),
+        Ok(_) => {}
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
+        Err(e) => return Err(CoreError::refusal(
+            RefusalCode::RefDamaged,
+            format!(
+                "The ref of pallet \"{}\" (\"{}\") cannot be read: its file could not be read ({}). Nothing was changed.",
+                PalletRef { namespace, name: name.to_string() }.to_wire(),
+                path.to_string_lossy(),
+                e
+            ),
+            REF_READABLE_STEP,
+        ).into()),
     }
 
     if namespace == PalletNamespace::User {
@@ -818,20 +862,19 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
         Ok(MetaCopyState::Other) if std::fs::symlink_metadata(&copy_path).is_ok_and(|metadata| metadata.is_dir()) => return Ok(None),
         Ok(MetaCopyState::Other) => (
             format!("something that is not a file stands at its copy's path (\"{}\")", shown),
-            // Moved aside, it would leave the ref and its copy both gone, read as never written.
-            "Replace what stands at the copy's path with the copy's file, or restore the ref's file from a backup, then \
-            run the command again.",
+            blocked_copy_step(name, "run the command again"),
         ),
-        Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => (format!("its copy (\"{}\") still stands", shown), HEAL_STEP),
-        Ok(MetaCopyState::Bytes(_)) => (format!("its copy (\"{}\") stands but does not hold a parcel hash", shown), META_REF_HAND_STEP),
+        Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => (format!("its copy (\"{}\") still stands", shown), HEAL_STEP.to_string()),
+        // heal judges what the ref's own bytes name, which only heal reads.
+        Ok(MetaCopyState::Bytes(_)) => (format!("its copy (\"{}\") stands but does not hold a parcel hash", shown), HEAL_STEP.to_string()),
         // Whether the ref was lost or never written cannot be told until the copy reads.
         Err(error) => (
             format!("its copy (\"{}\") could not be read: {}", shown, error.trim_end_matches('.')),
-            COPY_READABLE_STEP,
+            COPY_READABLE_STEP.to_string(),
         ),
     };
 
-    if path.is_file() {
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
         return read_ref_file(namespace, name, &path);
     }
 
@@ -842,11 +885,11 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
             "its file is missing".to_string(),
             copy_step,
         ),
-        Err(e) => ("cannot be read", format!("its file could not be read ({})", e), "Make the ref's file readable, then run the command again."),
+        Err(e) => ("cannot be read", format!("its file could not be read ({})", e), REF_READABLE_STEP.to_string()),
         Ok(_) => (
             "is blocked",
             "something that is not a file stands at its path".to_string(),
-            "Move aside what stands at the ref's path, then run the command again.",
+            BLOCKED_REF_STEP.to_string(),
         ),
     };
 
@@ -866,14 +909,17 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
 
 const HEAL_STEP: &str = "forklift heal";
 
+/// The step for a ref something that is not a file stands at: heal judges no such ref.
+const BLOCKED_REF_STEP: &str = "Move aside what stands at the ref's path, then run the command again.";
+
+/// The step for a ref whose file could not be read: what fails may be the file or a folder on
+/// the way to it.
+const REF_READABLE_STEP: &str = "Make the ref's file and the folders on the way to it readable, then run the command again.";
+
 /// The step for a meta ref whose copy could not be read: `heal` skips such a ref, and what fails
 /// may be the copy or a folder on the way to it.
 const COPY_READABLE_STEP: &str = "Make the copy and the folders on the way to it readable, moving aside anything that \
     stands where one of those folders goes, then run the command again.";
-
-/// The step for a meta ref `heal` has nothing to rebuild from.
-const META_REF_HAND_STEP: &str =
-    "Restore the file from a backup, or write the pallet's head parcel hash into it by hand.";
 
 /// Read the ref file at `path`, which stands, as [`get_pallet_head_in`] does.
 fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<Option<String>, String> {
@@ -886,14 +932,19 @@ fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<
 
     // `heal` rebuilds a meta ref only from its copy or from what its own bytes still name.
     let step = match namespace {
-        PalletNamespace::User => HEAL_STEP,
+        PalletNamespace::User => HEAL_STEP.to_string(),
         PalletNamespace::Meta => {
-            match read_file_state(&get_meta_copy_path(name)) {
-                Ok(MetaCopyState::Bytes(copy)) if parse_ref_bytes(&copy).is_some() => HEAL_STEP,
+            let copy_path = get_meta_copy_path(name);
+            match read_file_state(&copy_path) {
+                Ok(MetaCopyState::Bytes(copy)) if parse_ref_bytes(&copy).is_some() => HEAL_STEP.to_string(),
                 // heal judges no ref whose copy it cannot read, whatever the ref's own bytes name.
-                Err(_) => COPY_READABLE_STEP,
-                _ if crate::util::ref_heal::salvage_names_a_head(&bytes) => HEAL_STEP,
-                _ => META_REF_HAND_STEP,
+                Err(_) => COPY_READABLE_STEP.to_string(),
+                // What is not a file at the copy's path is replaced, or the ref restored, first.
+                Ok(copy) if copy_blocks(name, &copy) => blocked_copy_step(name, "run the command again"),
+                // Whose the refusal is, and so its step, rests on what heal judges: what the
+                // bytes name, the trust state, the other meta refs. Only heal judges that, so a
+                // read names heal, which names that step.
+                _ => HEAL_STEP.to_string(),
             }
         }
     };
@@ -1655,7 +1706,34 @@ pub fn remove_damaged_ref(name: &str, bytes: &[u8], kept: &Path) -> Result<(), R
 
     require_damage(PalletNamespace::User, name, &RefDamage::Unreadable(bytes.to_vec()))?;
 
-    if kept.exists() {
+    keep_removed(kept, bytes, name)?;
+
+    unlink_ref(PalletNamespace::User, &get_pallet_ref_path(PalletNamespace::User, name))
+        .map_err(RefUpdateError::Failed)
+}
+
+/// Whether what stands at meta pallet `name`'s copy path, read as `copy`, blocks it: something
+/// that is neither a file nor a folder, which holds other names' copies and is read as no copy.
+pub fn copy_blocks(name: &str, copy: &MetaCopyState) -> bool {
+    *copy == MetaCopyState::Other && !std::fs::symlink_metadata(get_meta_copy_path(name)).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// The way out for meta pallet `name` while its copy path is blocked ([`copy_blocks`]), closed
+/// by `rerun`: what a read of the pallet names.
+pub fn blocked_copy_step(name: &str, rerun: &str) -> String {
+    format!(
+        "Replace what stands at the copy's path (\"{}\") with the copy's file, or restore the ref's file from a backup, then {}.",
+        get_meta_copy_path(name).to_string_lossy(), rerun
+    )
+}
+
+/// Keep `bytes`, removed from a file of pallet `name`, in `kept`, a new file.
+fn keep_removed(kept: &Path, bytes: &[u8], name: &str) -> Result<(), RefUpdateError> {
+    // A file there whose state cannot be read may hold other bytes: it is never written over.
+    if stands(kept).map_err(|e| RefUpdateError::Failed(format!(
+        "Whether the file \"{}\" the ref of pallet \"{}\" was to be kept in already exists could not be read: {}",
+        kept.to_string_lossy(), name, e
+    )))? {
         return Err(RefUpdateError::Failed(format!(
             "The file \"{}\" the ref of pallet \"{}\" was to be kept in already exists.",
             kept.to_string_lossy(), name
@@ -1669,9 +1747,18 @@ pub fn remove_damaged_ref(name: &str, bytes: &[u8], kept: &Path) -> Result<(), R
     }
 
     file_utils::write_file_atomically(kept, bytes)?;
+    Ok(())
+}
 
-    unlink_ref(PalletNamespace::User, &get_pallet_ref_path(PalletNamespace::User, name))
-        .map_err(RefUpdateError::Failed)
+/// Whether anything stands at `path`, links unfollowed: only the answer that nothing does reads as
+/// absent, so a read that fails is an error, never taken for an absence (as `Path::exists` takes
+/// it).
+fn stands(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Refuse with [`RefUpdateError::Moved`] unless the ref of `name` is damaged exactly as `damage`
@@ -1680,10 +1767,22 @@ fn require_damage(namespace: PalletNamespace, name: &str, damage: &RefDamage) ->
     let path = get_pallet_ref_path(namespace, name);
 
     let holds = match damage {
-        RefDamage::Missing => !path.exists(),
-        RefDamage::Unreadable(bytes) => path.is_file() && std::fs::read(&path).map_err(|e| RefUpdateError::Failed(format!(
-            "Error while reading the ref of pallet \"{}\": {}", name, e
-        )))? == *bytes,
+        // A ref whose state cannot be read is not known to be lost.
+        RefDamage::Missing => !stands(&path).map_err(|e| RefUpdateError::Failed(format!(
+            "Error while reading whether the ref of pallet \"{}\" stands: {}", name, e
+        )))?,
+        // Nor is one whose state cannot be read known to have moved: a stat that fails is no
+        // answer, and filed as moved it would be judged again into the same failure.
+        RefDamage::Unreadable(bytes) => match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => std::fs::read(&path).map_err(|e| RefUpdateError::Failed(format!(
+                "Error while reading the ref of pallet \"{}\": {}", name, e
+            )))? == *bytes,
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(RefUpdateError::Failed(format!(
+                "Error while reading whether the ref of pallet \"{}\" stands: {}", name, e
+            ))),
+        },
     };
 
     if !holds {
@@ -2358,7 +2457,12 @@ pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState
         Ok(metadata) if metadata.is_file() => Some(std::fs::read(&path).map_err(|e| format!(
             "Error while reading the ref of pallet \"{}\": {}", reference.to_wire(), e
         ))?),
-        _ => None,
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // A stat that fails says nothing of the ref, so it is no move.
+        Err(e) => return Err(RefUpdateError::Failed(format!(
+            "Error while reading whether the ref of pallet \"{}\" stands: {}", reference.to_wire(), e
+        ))),
     };
 
     if found.as_deref() != Some(judged_ref) {
@@ -2792,6 +2896,31 @@ pub(crate) mod tests {
         let _ = file_utils::remove_dir_all(&dir);
     }
 
+    // What a removal reads back to tell whether a file still stands: only the answer that nothing
+    // stands there is an absence; a read that itself fails is an error, never taken for one.
+    // Mutation: answer false for every error, as `Path::exists` does → the path under a file
+    // reads as gone, red.
+    #[test]
+    fn only_nothing_standing_reads_as_absent() {
+        let dir = std::env::temp_dir().join(format!("forklift-stands-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), b"bytes").unwrap();
+
+        assert_eq!(stands(&dir.join("file")).ok(), Some(true), "a file stands");
+        assert_eq!(stands(&dir.join("missing")).ok(), Some(false), "nothing stands at a free name");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("missing"), dir.join("dangling")).unwrap();
+            assert_eq!(stands(&dir.join("dangling")).ok(), Some(true), "a dangling link stands, unfollowed");
+            // A name under a file cannot be read (not a folder): no answer, not an absence.
+            let under = stands(&dir.join("file").join("ref"));
+            assert!(under.is_err(), "{:?}", under);
+        }
+
+        let _ = file_utils::remove_dir_all(&dir);
+    }
+
     /// A fresh warehouse root (its `.forklift` folder exists) entered for this thread.
     pub(crate) fn scratch(name: &str) -> (PathBuf, StorageRootScope) {
         let root = std::env::temp_dir()
@@ -2970,7 +3099,7 @@ pub(crate) mod tests {
         // Revert: name heal for a copy that cannot be read → the step is heal, red.
         // Revert: read a link at the copy path as no copy → the read is unborn, red.
         // Revert: read a folder at the ref's path as missing → the step is heal, red.
-        // Revert: the hand step beside a damaged ref whose copy cannot be read → red.
+        // Revert: name heal beside a damaged ref whose copy cannot be read → the step is heal, red.
         // Revert: judge the ref's salvage ahead of a copy that cannot be read → the step is heal, red.
         #[cfg(unix)]
         #[test]
@@ -3001,7 +3130,7 @@ pub(crate) mod tests {
             // Even when its bytes name one parcel: heal does not judge the ref while its copy cannot be read.
             let named = stub_parcel("named");
             std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "tags"), &named.as_bytes()[..12]).unwrap();
-            assert!(crate::util::ref_heal::salvage_names_a_head(&named.as_bytes()[..12]), "the fixture's bytes salvage");
+            assert!(crate::util::ref_heal::salvage_finds(&named.as_bytes()[..12]), "the fixture's bytes salvage");
             let (_, next) = step("tags");
             assert!(next.starts_with("Make the copy and the folders on the way to it readable"), "{}", next);
             drop(_scope);
@@ -3018,7 +3147,10 @@ pub(crate) mod tests {
             assert!(list_pallets_in(PalletNamespace::Meta).unwrap().contains(&"tags".to_string()), "a link at the copy path is listed");
             let (message, next) = step("tags");
             assert!(message.contains("is lost: its file is missing, and something that is not a file stands at its copy's path"), "{}", message);
-            assert_eq!(next, "Replace what stands at the copy's path with the copy's file, or restore the ref's file from a backup, then run the command again.");
+            assert_eq!(next, format!(
+                "Replace what stands at the copy's path (\"{}\") with the copy's file, or restore the ref's file from a backup, then run the command again.",
+                get_meta_copy_path("tags").to_string_lossy()
+            ));
             drop(_scope);
 
             // A folder at the ref's path beside a copy that names a head: moved aside, not healed.
@@ -3028,6 +3160,62 @@ pub(crate) mod tests {
             let (message, next) = step("tags");
             assert!(message.contains("is blocked: something that is not a file stands at its path"), "{}", message);
             assert_eq!(next, "Move aside what stands at the ref's path, then run the command again.");
+            drop(_scope);
+
+            // A link at the ref's path is never followed, in either namespace, though what it
+            // points at names a head: nothing writes one, and heal judges no ref a link stands at,
+            // so heal is never the step, and heal names the same one.
+            let (_root, _scope) = scratch("ref-a-link");
+            write("tags", None, &h1).unwrap();
+            let target = forklift_root().join("elsewhere");
+            std::fs::write(&target, format!("{}\n", h1)).unwrap();
+            for (namespace, name) in [(PalletNamespace::Meta, "tags"), (PalletNamespace::User, "main")] {
+                let path = get_pallet_ref_path(namespace, name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                if path.is_file() {
+                    file_utils::remove_file(&path).unwrap();
+                }
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+                let refused = get_pallet_head_in(namespace, name).map_err(|e| e.to_string());
+                let refused = refused.expect_err(name);
+                let (_, message, next) = crate::error::deframe(&refused).unwrap();
+                assert!(message.contains("is blocked: something that is not a file stands at its path"), "{}: {}", name, message);
+                assert_eq!(next, "Move aside what stands at the ref's path, then run the command again.", "{}", name);
+            }
+            // Asking whether the pallet exists refuses it the same way, never following it.
+            // Revert: judge it through the link (`is_file()`) → `Ok(true)`, red.
+            let asked = does_pallet_exist("main").expect_err("a link at a pallet's ref is no answer");
+            assert!(asked.contains("is blocked: something that is not a file stands at its path"), "{}", asked);
+
+            // A link pointing nowhere is judged as it stands too: a checkout on the pallet finds
+            // something at its ref's path, so the ref is not lost.
+            // Revert: judge the checkout's ref through the link (`exists()`) → filed missing, red.
+            let main = get_pallet_ref_path(PalletNamespace::User, "main");
+            file_utils::remove_file(&main).unwrap();
+            std::os::unix::fs::symlink(forklift_root().join("nowhere"), &main).unwrap();
+            write_position(&BayPosition::new("main", Some(h1.clone()))).unwrap();
+            let mut notes = Vec::new();
+            let found = crate::util::ref_heal::detect(&mut notes).unwrap();
+            assert!(found.is_empty(), "heal files no ref a link stands at: {:?}", found.iter().map(|d| &d.pallet).collect::<Vec<_>>());
+            assert!(notes.iter().any(|note| note.contains("ref of pallet \"main\"") && note.contains("Move it aside")), "{:?}", notes);
+
+            // A folder at the checkout's ref path is no ref standing there either: it is named,
+            // never passed over, and never filed lost (heal could write no ref there).
+            // Revert: count anything standing at the path as the ref → no note, red.
+            file_utils::remove_file(&main).unwrap();
+            plant_folder(&main);
+            let mut notes = Vec::new();
+            let found = crate::util::ref_heal::detect(&mut notes).unwrap();
+            assert!(found.is_empty(), "heal files no ref a folder stands at: {:?}", found.iter().map(|d| &d.pallet).collect::<Vec<_>>());
+            // A folder there may hold the refs of pallets named under it, so the step moves the
+            // checkout, never the folder. Revert: name moving it aside, as for a link → red.
+            let said = format!(
+                "A folder stands at the ref of pallet \"main\" (\"{}\"), which the warehouse's own working tree stands on, so heal did not judge it. \
+                It may hold the refs of pallets named under \"main/\", so do not move it aside: \
+                run \"forklift shift <pallet>\" in the warehouse's own working tree to put it on another pallet, then run heal again.",
+                main.to_string_lossy()
+            );
+            assert!(notes.contains(&said), "{:?}", notes);
         }
 
         /// A meta ref's repair is a compare-and-set on its copy as well as its ref: a copy that
@@ -3100,6 +3288,31 @@ pub(crate) mod tests {
             assert!(written.is_err(), "the ref write returns the taint's error");
             assert_eq!(head("office").as_deref(), Some(h1.as_str()), "the ref write lands");
             assert_eq!(copy_state("office"), ref_bytes(&h2), "the copy must stay at the newer head");
+        }
+
+        /// A ref whose state cannot be read has not moved: a stat that fails is a failure, never
+        /// a move, since a move is judged again and would meet the same failure. So for the
+        /// check a rebuild or removal makes, and for the mend.
+        /// Revert: read a failed stat as no file → `Ok(false)` / `Moved`, red.
+        #[cfg(unix)]
+        #[test]
+        fn a_ref_whose_state_cannot_be_read_has_not_moved() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let (_root, _scope) = scratch("meta-ref-stat-fails");
+            let h1 = stub_parcel("h1");
+            write("tags", None, &h1).unwrap();
+            let bytes = format!("{}\n", h1).into_bytes();
+            let folder = get_pallet_ref_path(PalletNamespace::Meta, "tags").parent().unwrap().to_path_buf();
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let stands = meta_ref_stands_as("tags", &RefDamage::Unreadable(bytes.clone()), &ref_bytes(&h1));
+            let mended = mend_meta_copy("tags", &bytes, &ref_bytes(&h1));
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(matches!(&stands, Err(RefUpdateError::Failed(message)) if message.contains("Error while reading whether the ref of pallet \"tags\" stands")), "{:?}", stands);
+            assert!(matches!(&mended, Err(RefUpdateError::Failed(message)) if message.contains("Error while reading whether the ref of pallet \"@tags\" stands")), "{:?}", mended);
+
+            // Readable again, the same check holds: the domain was the stat alone.
+            assert_eq!(meta_ref_stands_as("tags", &RefDamage::Unreadable(bytes.clone()), &ref_bytes(&h1)), Ok(true));
         }
 
         /// The mend re-reads the ref under the hold, and writes nothing when the ref moved since
@@ -4683,6 +4896,38 @@ pub(crate) mod tests {
         file_utils::remove_dir_all(&root).ok();
     }
 
+    /// A mixed-case entry whose spellings cannot be read leaves a prefix it cannot spell answered:
+    /// beside a match, it is no reason the match is not found. One it may spell still makes the
+    /// answer an error. The folder lists but cannot be searched, so lowercase entries are matched
+    /// by name and a mixed-case one only by reading it, which fails; skipped as root.
+    ///
+    /// Revert: judge every entry before checking the prefix → the unrelated entry's read fails the
+    /// answer, `Err` → red.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_entry_that_cannot_spell_the_prefix_leaves_its_match_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _scope) = scratch("unreadable-other-entry");
+        let hash = "ab".to_string() + &"cd".repeat(31);
+        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
+        file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
+        std::fs::write(Path::new(&folder).join("EF".repeat(31)), b"other").unwrap();
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let found = object_hashes_with_prefix("abcd");
+        let other = object_hashes_with_prefix("abef");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(found, Ok(vec![hash.clone()]), "the match is found beside an entry that cannot spell it");
+            let error = other.unwrap_err();
+            assert!(error.contains("could not be read"), "an entry that may spell the prefix is no answer: {}", error);
+        }
+
+        file_utils::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn a_position_that_cannot_be_recorded_after_the_ref_moved_says_the_parcel_stands() {
         let (root, _scope) = scratch("record-landed");
@@ -5500,7 +5745,7 @@ pub(crate) mod tests {
 
         // "team" is a folder holding another ref: it reads as no pallet, never as an unborn one
         // that shadows the folder, and creating it refuses naming the folder.
-        assert!(!does_pallet_exist("team"));
+        assert!(!does_pallet_exist("team").unwrap());
         assert_eq!(all_pallet_refs().unwrap(), vec![(PalletRef::user("team/x"), hash('a'))]);
 
         let refused = update_pallet_head("team", None, &hash('b'), &RefPreconditions::NONE);
@@ -5514,6 +5759,52 @@ pub(crate) mod tests {
         assert!(matches!(update_pallet_head("team", None, &hash('b'), &RefPreconditions::NONE),
                          Err(RefUpdateError::Failed(message)) if message.contains("a folder stands")));
 
+        let _ = file_utils::remove_dir_all(&root);
+    }
+
+    /// A ref whose path cannot be read is refused, never read as a pallet never written.
+    /// Revert: read a failed stat as nothing standing (`if let Ok(...)`) → `Ok(None)` /
+    /// `Ok(false)`, red.
+    #[cfg(unix)]
+    #[test]
+    fn a_ref_whose_path_cannot_be_read_is_refused_not_unborn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _scope) = scratch("ref-stat-fails");
+        update_pallet_head("team/x", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        let folder = get_pallet_ref_path(PalletNamespace::User, "team");
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let head = get_pallet_head_in(PalletNamespace::User, "team/x").map_err(|e| e.to_string());
+        let exists = does_pallet_exist("team/x");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let refused = head.expect_err("an unreadable ref path is no unborn pallet");
+        let (_, message, next) = crate::error::deframe(&refused).unwrap();
+        assert!(message.contains("(\"") && message.contains("cannot be read: its file could not be read ("), "{}", message);
+        assert_eq!(next, "Make the ref's file and the folders on the way to it readable, then run the command again.");
+        let asked = exists.expect_err("an unreadable ref path is no answer to whether the pallet exists");
+        assert!(asked.contains("cannot be read: its file could not be read ("), "{}", asked);
+
+        // Readable again, the same reads answer: the domain was the stat alone.
+        assert_eq!(get_pallet_head_in(PalletNamespace::User, "team/x").unwrap(), Some(hash('a')));
+        assert_eq!(does_pallet_exist("team/x"), Ok(true));
+
+        // No ref stands at a name that is not a pallet's, nor at one too long for a file, so
+        // asking of either answers no, whatever the stat says; a revision that is no pallet's
+        // name then resolves as a hash. Reverts: refuse a failed stat before judging the name →
+        // the invalid name is refused, red; read a name too long as unreadable → refused, red.
+        let parcel = stub_parcel("by-hash");
+        let refs = folder.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let invalid = does_pallet_exist("team/X");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let resolved = resolve_revision(&parcel[..8].to_ascii_uppercase());
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(invalid, Ok(false));
+        assert_eq!(resolved, Ok(parcel));
+        assert_eq!(does_pallet_exist(&"a".repeat(300)), Ok(false));
         let _ = file_utils::remove_dir_all(&root);
     }
 }
@@ -5536,7 +5827,7 @@ pub fn resolve_revision(arg: &str) -> Result<String, String> {
             .ok_or(format!("Meta pallet \"{}\" has nothing stacked yet.", arg));
     }
 
-    if does_pallet_exist(arg) {
+    if does_pallet_exist(arg)? {
         return get_pallet_head(arg)?
             .ok_or(format!("Pallet \"{}\" has nothing stacked yet.", arg));
     }
@@ -5592,6 +5883,7 @@ fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
 /// An absent fan-out folder holds nothing, and so does a file in its place, which every sweep
 /// skips. A folder that is there but cannot be listed is an error, never an empty answer: a
 /// caller that enumerates the whole store would otherwise miss what sits in it without being told.
+/// So is an entry spelled other than in lowercase whose spellings cannot be read.
 pub(crate) fn object_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
     let mut matches: Vec<String> = Vec::new();
 
@@ -5619,9 +5911,17 @@ pub(crate) fn object_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, Str
                 continue;
             }
 
+            // Only a name that may spell a match is judged, so one that cannot read beside it
+            // never fails this prefix's answer.
+            if !file_name.to_ascii_lowercase().starts_with(rest) {
+                continue;
+            }
+
             // A name spelled other than in lowercase is matched under the spelling a read opens
-            // it by, or not at all, so a match is always a hash the store answers for.
-            let Some((folder_name, file_name)) = file_utils::canonical_loose_entry(&folder, &file_name) else {
+            // it by, or not at all, so a match is always a hash the store answers for. One whose
+            // spellings cannot be read may be a match, so the answer is an error, not a list
+            // without it.
+            let Some((folder_name, file_name)) = file_utils::judged_loose_entry(&folder, &file_name)? else {
                 continue;
             };
 

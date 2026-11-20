@@ -3711,7 +3711,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     office_head.as_deref(),
                     request.old_head.as_deref(),
                     &request.new_head
-                ).map_err(refused_or_damaged)?;
+                ).map_err(String::from).map_err(refused_or_damaged)?;
             } else if let Some(anchor) = anchor {
                 // A trusted warehouse accepts nothing a local audit would reject. This is the
                 // user-pallet path (the office and the meta-tree pallets took the branches above). The office head is the one

@@ -114,14 +114,32 @@ A meta pallet's ref (a name starting with `@`, such as `@tags`) keeps a copy bes
 while its copy stands refuses as `ref_damaged` wherever it is read, in place of reading as an empty pallet,
 and so does one whose file does not hold a parcel hash. `heal` rebuilds it from its copy, or from what
 the damaged file still names, the office's and `@redactions`' among them, so the refusal names
-`forklift heal` when the copy holds a parcel hash, or the damaged file names one parcel. Where neither
-does (the copy does not hold a parcel hash, and the damaged file names nothing, several parcels or one
-that cannot be read, or is missing), and for a ref `heal` refuses, the next step is to restore the
-file from a backup, or write the head parcel's hash into it. A copy that cannot be read, a link at the
+`forklift heal`, which judges the ref. `heal` never removes a meta pallet's ref. Where it has no head it
+can rebuild the ref at (the copy does not hold a parcel hash and the damaged file names nothing or is
+missing, the damaged file names several parcels or one that may be lost, the copy and the file name
+heads that diverge, or the head named does not verify as the pallet's history), the next step is to
+restore the ref and its copy from a backup. For a ref `heal` refused only because the office's or
+`@redactions`' ref was refused, or because the office is unborn beside the trust file, it names what
+to settle first. Where its refusal is no verdict on the ref, the step `heal` names depends on why:
+
+- It could not read what it needs (a file it may not read, a pack it cannot open or list in full): the
+  step that read's own refusal names, else settling what it names, then `forklift heal` again, which
+  judges the ref.
+- It chose a head but could not write the rebuild, or could not read the ref back after writing it: the
+  step the write's refusal names, else settling why it failed, then `forklift heal` again.
+- What it needs reads in a format this Forklift does not know, as one a newer version wrote: upgrading
+  Forklift.
+- The trust state refuses: `forklift heal` again where `heal` restores the trust file from its copy.
+  Otherwise, one of the ways out of that refusal (those a lost anchor has on this warehouse, or those
+  the trust file's own refusal names, as where it is not a file or does not parse), or, where the
+  office's history does not verify against the anchor, settling why.
+
+A copy that cannot be read, a link at the
 copy's path, or something other than a file at the ref's path is refused too, naming it: make the copy
 and the folders on the way to it readable, replace the link with the copy's file (moving it aside would
 leave the pallet reading as never written), or move aside what stands at the ref's path, and run the
-command again.
+command again. While a link or anything else that is neither a file nor a folder stands at the copy's
+path, beside a damaged ref `heal` names that same way out instead of a backup.
 
 A meta ref lost together with its copy leaves nothing that says the pallet was ever written, so it
 reads as empty, as one never written does: `tag list` then lists no tags, for example, and refuses
@@ -744,7 +762,8 @@ a remote, the damage is in the server's store: ask its operator.
 
 ### `signature_missing` (exit 71)
 
-A parcel stacked after trust was established carries no signature. A lost signature and a stripped
+A parcel stacked after trust was established, or a parcel of the office pallet, carries no
+signature. A lost signature and a stripped
 one look alike, so the warehouse may have been tampered with. As for `signature_damaged`, restore the
 objects from a backup or clone again from a remote you trust. Signing the parcel now would not tell
 you who stacked it.

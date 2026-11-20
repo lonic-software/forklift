@@ -2881,6 +2881,21 @@ are in `details` under `--json`). Choose one yourself:
 - `forklift heal --remove-ref <pallet>` drops a damaged ref that nothing names a head for and no
   checkout stands on, once every checkout's saved state could be read. Its bytes are kept under `.forklift/removed-refs`, and whatever only that
   ref reached is no longer kept by any pallet. Repeatable.
+- `--remove-ref` takes a user pallet only: `heal` never removes a metadata pallet's ref (`@<name>`),
+  and refuses the option for one before it changes anything. Where `heal` has no head it can
+  rebuild a metadata ref at (nothing names one, or what does is several parcels, one possibly lost,
+  a copy and bytes that diverge, or a head whose history does not verify), it names restoring the
+  ref and its copy from a backup. Where its refusal is no verdict on the ref, it names the step
+  that lets a later `heal` judge it: for a ref that waits on the office's or `@redactions`' refusal,
+  or on an unborn office, that step; for what heal could not read, that read's own step, else
+  settling it; for a rebuild heal could not write or read back, the write's own step, else
+  settling why; for a format this Forklift does not know, upgrading; and for a trust state that
+  refuses, `forklift heal` where heal restores the trust file from its copy, else a way out of that
+  refusal (a lost anchor's, or one the trust file's own refusal names) or settling why the office
+  does not verify against the anchor. A command that reads a damaged metadata ref names
+  `forklift heal`, since only `heal` judges whose a refusal is, or, where `heal` would not judge the
+  ref (its copy cannot be read, or something that is not a file stands at the ref's or the copy's
+  path), the step that lets it.
 
 Both refuse a ref that is readable. A refusal also lists any ref the same run already set or
 removed. The report lists `refs_rebuilt`, `refs_removed` and
@@ -2896,16 +2911,20 @@ refs after that.
 A metadata pallet's ref (`.forklift/meta/<name>`, such as `@tags`'s) has a copy at
 `.forklift/meta-copy/<name>`. `heal` rebuilds a lost or damaged one from that copy or, with no copy,
 from the parcel the damaged file's remaining bytes still name, as for a pallet's ref. When both
-name a head and they differ, the copy is taken only when it descends from the other along first
-parents, which is where a write interrupted moving the pallet forward leaves it; otherwise `heal`
-changes nothing and refuses with `ref_damaged`, naming both. The head chosen must verify as that
+name a head and they differ, the copy is taken when it descends from the other along first
+parents, which is where a write interrupted moving the pallet forward leaves it, and the head the
+damaged file names is taken when it descends from the copy, which is where a copy left behind
+leaves it; otherwise `heal` changes nothing and refuses with `ref_damaged`, naming both. The head chosen must verify as that
 pallet's history, against the office, before it is written. A copy that is lost or names another
 head beside a ref that reads is set to the ref's head, with a `Note:`.
 
 Until then, every other command that reads such a ref refuses with `ref_damaged` (exit 53) rather
-than read it as a pallet never written, and names `forklift heal` when the copy holds a parcel hash,
-or the damaged file names one parcel. A ref lost together with its copy leaves
-nothing to tell it from one never written, and reads as empty.
+than read it as a pallet never written, and names `forklift heal`, which judges it, except beside a copy that
+cannot be read, or something not a file at the ref's or the copy's path, where it names that. A ref lost together with its copy leaves
+nothing to tell it from one never written, and reads as empty. A link at any pallet's ref path is
+never followed: the read refuses it as blocked, naming moving it aside, and `heal` leaves it with
+a `Note:` naming the same. A ref whose path cannot be read is refused, never read as a pallet never
+written, naming making the ref's file and the folders on the way to it readable.
 
 The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the
 trust file or, when that file is lost, is not a file, does not read as an anchor or does not

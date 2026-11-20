@@ -28,6 +28,7 @@ use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::manifest_utils::operator_leaf;
 use crate::util::meta_tree::{
+    MetaCheckError, broken,
     self, CellChange, CellEdit, CellEnvelope, CellRead, MetaKind, MetaState, MetaWriter, PalletRules,
     ParcelChange, Stamp,
 };
@@ -446,30 +447,41 @@ fn check_value(name: &CellName, table: &Table) -> Result<(), String> {
 
 /// The state of a haul in a `cells/` tree, or `None` when it has none. A state this build cannot
 /// read is an error, since a rule that needs it cannot tell whether it reads merged.
-fn state_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option<(HaulStatus, String)>, String> {
+fn state_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option<(HaulStatus, String)>, MetaCheckError> {
     let path = format!("{}/{}", dir, CELL_STATE);
 
-    match meta_tree::read_cell_in(cells, &path, rules)? {
+    match meta_tree::read_checked_cell_in(cells, &path, rules)? {
         None => Ok(None),
         Some(CellRead::Readable(envelope)) if envelope.schema == SCHEMA_STATE =>
-            parse_state(&envelope.value).map(Some).map_err(|why| format!("the state at {} {}", path, why)),
-        Some(_) => Err(format!(
+            parse_state(&envelope.value).map(Some).map_err(|why| broken(format!("the state at {} {}", path, why))),
+        Some(read) => Err(newer_or_content(&read, format!(
             "the state at {} cannot be read by this forklift, so it cannot tell whether the haul \
             was merged",
             path
-        )),
+        ))),
     }
 }
 
 /// The proposal of a haul in a `cells/` tree, or `None` when it has none.
-fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option<Opened>, String> {
+fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option<Opened>, MetaCheckError> {
     let path = format!("{}/{}", dir, CELL_OPENED);
 
-    match meta_tree::read_cell_in(cells, &path, rules)? {
+    match meta_tree::read_checked_cell_in(cells, &path, rules)? {
         None => Ok(None),
         Some(CellRead::Readable(envelope)) if envelope.schema == SCHEMA_OPENED =>
-            parse_opened(&envelope.value).map(Some).map_err(|why| format!("the proposal at {} {}", path, why)),
-        Some(_) => Err(format!("the proposal at {} cannot be read by this forklift", path)),
+            parse_opened(&envelope.value).map(Some).map_err(|why| broken(format!("the proposal at {} {}", path, why))),
+        Some(read) => Err(newer_or_content(&read, format!("the proposal at {} cannot be read by this forklift", path))),
+    }
+}
+
+/// The refusal `why` of a cell the rules read and cannot: a newer forklift's, for a schema this
+/// build does not know; a malformed history's, for a cell whose envelope does not parse;
+/// otherwise one on the cell's own content.
+fn newer_or_content(read: &CellRead, why: String) -> MetaCheckError {
+    match read {
+        CellRead::Unknown { .. } => MetaCheckError::Newer(why),
+        CellRead::Malformed(_) => MetaCheckError::Verdict(why),
+        CellRead::Readable(_) => broken(why),
     }
 }
 
@@ -499,7 +511,7 @@ impl PalletRules for HaulRules {
         [SCHEMA_OPENED, SCHEMA_STATE, SCHEMA_REVIEW, SCHEMA_COMMENT].contains(&schema)
     }
 
-    fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
+    fn check(&self, change: &ParcelChange<'_>) -> Result<(), MetaCheckError> {
         let operator = change.attribution.operator();
         let owner = operator_leaf(operator);
 
@@ -507,27 +519,27 @@ impl PalletRules for HaulRules {
         let mut proposals: BTreeMap<String, Option<Opened>> = BTreeMap::new();
 
         for cell in change.changes {
-            let path = parse_cell_path(&cell.path)?;
+            let path = parse_cell_path(&cell.path).map_err(broken)?;
             let dir = haul_dir(path.haul);
 
             match &path.name {
-                CellName::Opened if cell.before.is_some() => return Err(format!(
+                CellName::Opened if cell.before.is_some() => return Err(broken(format!(
                     "{} is the proposal of a haul, which is never changed or removed", cell.path
-                )),
-                CellName::State if cell.after.is_none() => return Err(format!(
+                ))),
+                CellName::State if cell.after.is_none() => return Err(broken(format!(
                     "{} is the state of a haul, which is never removed", cell.path
-                )),
+                ))),
                 CellName::Review { owner: written } | CellName::Comment { owner: written, .. }
-                    if *written != owner => return Err(format!(
+                    if *written != owner => return Err(broken(format!(
                         "the cell at {} sits under another operator's directory, so only they may \
                         write or remove it",
                         cell.path
-                    )),
+                    ))),
                 // A cell no rule here covers would be stored unchecked; a newer forklift's cell
                 // waits for a remote that knows its rules.
-                CellName::Other => return Err(format!(
+                CellName::Other => return Err(MetaCheckError::Newer(format!(
                     "{} is not a cell this forklift knows a haul to hold", cell.path
-                )),
+                ))),
                 _ => {}
             }
 
@@ -538,7 +550,7 @@ impl PalletRules for HaulRules {
             };
 
             if let Some((HaulStatus::Merged(_), _)) = before {
-                return Err(format!("the haul {} is merged, and a merge is final", path.haul));
+                return Err(broken(format!("the haul {} is merged, and a merge is final", path.haul)));
             }
 
             let Some(after) = &cell.after else { continue };
@@ -553,14 +565,14 @@ impl PalletRules for HaulRules {
             };
 
             let Some(opened) = opened else {
-                return Err(format!(
+                return Err(broken(format!(
                     "the cell at {} belongs to a haul with no proposal; resolve the whole haul \
                     (its id) rather than its proposal alone",
                     cell.path
-                ));
+                )));
             };
 
-            let envelope = meta_tree::parse_cell(&object_utils::load_blob(after)?.content)?;
+            let envelope = meta_tree::read_checked_cell(after)?;
             let Some(schema) = schema_of(&path.name) else { continue };
 
             if envelope.schema != schema {
@@ -568,49 +580,55 @@ impl PalletRules for HaulRules {
                 // hold exactly their own.
                 let carried = matches!(path.name, CellName::Review { .. } | CellName::Comment { .. });
 
-                if self.knows_schema(&envelope.schema) || !carried {
-                    return Err(format!("the cell at {} holds a {} value", cell.path, envelope.schema));
+                if self.knows_schema(&envelope.schema) {
+                    return Err(broken(format!("the cell at {} holds a {} value", cell.path, envelope.schema)));
+                }
+
+                // A schema this build does not know, where the rules read the cell: a newer
+                // forklift's, which a build that knows it judges.
+                if !carried {
+                    return Err(MetaCheckError::Newer(format!("the cell at {} holds a {} value", cell.path, envelope.schema)));
                 }
 
                 continue;
             }
 
-            check_value(&path.name, &envelope.value).map_err(|why| format!("the value at {} {}", cell.path, why))?;
+            check_value(&path.name, &envelope.value).map_err(|why| broken(format!("the value at {} {}", cell.path, why)))?;
 
             match &path.name {
                 CellName::Opened => {
                     if opened.id() != path.haul {
-                        return Err(format!("the proposal at {} is not at the id its content derives", cell.path));
+                        return Err(broken(format!("the proposal at {} is not at the id its content derives", cell.path)));
                     }
 
                     if &opened.opener != operator {
-                        return Err(format!(
+                        return Err(broken(format!(
                             "the proposal at {} names {} as its opener, but is signed by {}",
                             cell.path, opened.opener, operator
-                        ));
+                        )));
                     }
 
                     // A haul is opened open: never born closed, or merged without a merge.
                     match state_in(change.cells, &dir, self)? {
-                        None => return Err(format!("the haul {} is opened without a state", path.haul)),
+                        None => return Err(broken(format!("the haul {} is opened without a state", path.haul))),
                         Some((HaulStatus::Open, _)) => {}
-                        Some((status, _)) => return Err(format!(
+                        Some((status, _)) => return Err(broken(format!(
                             "the haul {} is opened {}, but a haul is opened open", path.haul, status.as_str()
-                        )),
+                        ))),
                     }
                 }
                 CellName::State => {
-                    let (status, moved) = parse_state(&envelope.value)?;
+                    let (status, moved) = parse_state(&envelope.value).map_err(broken)?;
 
                     // A state written with its proposal is the opener's by the proposal's own rule.
                     if let Some((_, head)) = &before {
                         if &moved != head && opened.opener != operator {
-                            return Err(format!(
+                            return Err(broken(format!(
                                 "the state at {} moves the head, but is written by {}; only the haul's \
                                 opener, {}, moves it. A merge or close that raced the opener's update \
                                 keeps theirs at {} and runs again",
                                 cell.path, operator, opened.opener, self.display_path(&cell.path)
-                            ));
+                            )));
                         }
                     }
 
@@ -622,14 +640,14 @@ impl PalletRules for HaulRules {
                     };
 
                     if let Some(refusal) = refusal {
-                        return Err(format!(
+                        return Err(broken(format!(
                             "the state at {} records a merge into {}, but is signed by {}, who {} it",
                             cell.path, opened.target, operator, refusal.why()
-                        ));
+                        )));
                     }
                 }
                 CellName::Comment { id, .. } if comment_id(&envelope.value) != *id => {
-                    return Err(format!("the comment at {} is not at the id its content derives", cell.path));
+                    return Err(broken(format!("the comment at {} is not at the id its content derives", cell.path)));
                 }
                 _ => {}
             }
@@ -826,7 +844,7 @@ pub fn held_merges(changes: &[CellChange],
         }
         let Ok((HaulStatus::Merged(parcel), _)) = parse_state(&state.value) else { continue };
 
-        let Some(opened) = opened_in(local_cells, &haul_dir(haul), &HaulRules)? else { continue };
+        let Some(opened) = opened_in(local_cells, &haul_dir(haul), &HaulRules).map_err(String::from)? else { continue };
 
         // A target this warehouse cannot name holds nothing here, so waiting brings nothing.
         let Ok(Some(local_target)) = pallet_utils::get_pallet_head(&opened.target) else { continue };
@@ -1233,6 +1251,25 @@ pub fn find_haul(id_prefix: &str) -> Result<Haul, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A cell whose envelope does not parse is a malformed history, as every other read of a meta
+    // tree names it, never a rule its content breaks. Mutation: fold `Malformed` into the
+    // readable arm (`broken`) → `RuleBroken`, red.
+    #[test]
+    fn a_malformed_haul_cell_is_a_malformed_history() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+
+        let (_root, _scope) = crate::util::pallet_utils::tests::scratch("haul-malformed-cell");
+        let mut blob = LooseObjectBuilder::build_blob(&crate::model::blob::Blob { content: b"signer = [".to_vec() });
+        blob.store().unwrap();
+        let cells = meta_tree::apply_edits(None, &[CellEdit::Set { path: "h1/opened".to_string(), blob: blob.hash.clone() }]).unwrap();
+
+        match opened_in(cells.as_deref(), "h1", &HaulRules) {
+            Err(MetaCheckError::Verdict(why)) =>
+                assert_eq!(why, "the proposal at h1/opened cannot be read by this forklift"),
+            other => panic!("expected a malformed history, got {:?}", other.map(|_| ()).map_err(String::from)),
+        }
+    }
 
     fn opened() -> Opened {
         Opened {
