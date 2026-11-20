@@ -1705,7 +1705,8 @@ impl Drop for RemedyScope {
 /// the ways out: they are in the reason, so the step does not restate them.
 const TRUST_REFUSED_STEP: &str = "Take one of the ways out the trust file's refusal names, then run \"forklift heal\" again.";
 
-/// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs.
+/// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs and the
+/// store gives the ref's head whole.
 fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>) {
     let reference = state.reference.as_deref().unwrap_or_default();
 
@@ -1825,8 +1826,10 @@ fn is_redactions(state: &MetaState) -> bool {
 ///    left it, so a trust file lost beside a lost office is restored once the office stands.
 /// 3. A lost or damaged `@redactions` ref is rebuilt first, while the office reads, verified
 ///    against the anchor and the office as step 2 left them, and checked against the head it is
-///    rebuilt at. Then every meta ref that reads has a lost or differing copy set to it, and
-///    every other lost or damaged one is rebuilt the same way, checked against the redactions
+///    rebuilt at. Then every meta ref that reads has a lost or differing copy set to it, where
+///    the store gives its head whole, and every other lost or damaged one, a ref naming a head
+///    the store decided is gone beside a copy whose head it holds among them, is rebuilt the
+///    same way, checked against the redactions
 ///    as `@redactions` then reads. One beside an office or a `@redactions` still damaged is
 ///    refused, since each is verified against the office and checked against the redactions.
 ///

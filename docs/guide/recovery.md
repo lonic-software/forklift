@@ -112,7 +112,9 @@ what only that ref reached is then no longer kept by any pallet.
 A meta pallet's ref (a name starting with `@`, such as `@tags`) keeps a copy beside it
 (`.forklift/meta-copy/<name>`), written with every change of the ref. A meta ref whose file is missing
 while its copy stands refuses as `ref_damaged` wherever it is read, in place of reading as an empty pallet,
-and so does one whose file does not hold a parcel hash. `heal` rebuilds it from its copy, or from what
+and so does one whose file does not hold a parcel hash. `heal` also takes as damaged a ref, other than
+the office's, that names a head the store does not hold and nothing could account for, beside a copy
+naming a head the store does hold. `heal` rebuilds it from its copy, or from what
 the damaged file still names, the office's and `@redactions`' among them, so the refusal names
 `forklift heal`, which judges the ref. `heal` never removes a meta pallet's ref. Where it has no head it
 can rebuild the ref at (the copy does not hold a parcel hash and the damaged file names nothing or is

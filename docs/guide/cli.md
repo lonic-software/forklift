@@ -2916,7 +2916,12 @@ parents, which is where a write interrupted moving the pallet forward leaves it,
 damaged file names is taken when it descends from the copy, which is where a copy left behind
 leaves it; otherwise `heal` changes nothing and refuses with `ref_damaged`, naming both. The head chosen must verify as that
 pallet's history, against the office, before it is written. A copy that is lost or names another
-head beside a ref that reads is set to the ref's head, with a `Note:`.
+head beside a ref that reads is set to the ref's head, with a `Note:`, but only when the store
+holds that head; otherwise both files are left as they are, and the note says what the store said
+of the ref's head. A ref that reads but names a head the store does not hold, where nothing (a
+refill, a redaction, a pack it cannot list, the durability taint) could account for that, beside a
+copy naming a head the store holds, is rebuilt at the copy's head. The office's ref is the
+exception: it is left as it is, with its copy.
 
 Until then, every other command that reads such a ref refuses with `ref_damaged` (exit 53) rather
 than read it as a pallet never written, and names `forklift heal`, which judges it, except beside a copy that
