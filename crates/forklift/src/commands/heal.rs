@@ -154,6 +154,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         ref_notes.push(format!("Not every meta pallet ref was judged before the taint recovery: {}", error.trim_end_matches('.')));
     }
     let meta_rebuilt = meta_first.repair.rebuilt;
+    let meta_undurable = meta_first.repair.undurable;
     // The damaged refs a refusal from here on names beside what was written: those the pass before
     // the taint left for the pass after it, until that pass has judged them; then those it refused.
     let meta_deferred = meta_first.repair.deferred;
@@ -174,6 +175,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         deferred_sentences(&left.deferred, left.held.as_ref()).iter().chain(&unjudged_sentences(&left.unjudged))
             .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence))
     };
+
+    // A rebuild left not durable is said by the pass that wrote it alone: every later pass reads
+    // its ref as undamaged. So it ends the run, in each pass below as here.
+    if let Some(error) = undurable_error(&meta_undurable) {
+        return Err(config_said(ref_notes.iter().fold(error, |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))));
+    }
 
     let record_rebuilt = sealed_utils::rebuild()
         .map_err(|error| config_said(ref_notes.iter().fold(format!(
@@ -415,7 +422,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
-    if let Some(error) = first.stopped {
+    if let Some(error) = stopped_with(first.stopped, &first.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
 
@@ -473,7 +480,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let meta_second = meta_second.repair;
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
-    if let Some(error) = meta_second.stopped {
+    if let Some(error) = stopped_with(meta_second.stopped, &meta_second.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
 
@@ -483,7 +490,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
     refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: Vec::new(), held: None });
-    if let Some(error) = second.stopped {
+    if let Some(error) = stopped_with(second.stopped, &second.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
 
@@ -1646,6 +1653,20 @@ fn deferred_sentences(deferred: &[ref_heal::Refused], held: Option<&ref_heal::Ta
 /// stopped before judging.
 fn unjudged_sentences(unjudged: &[String]) -> Vec<String> {
     unjudged.iter().map(|pallet| format!("The ref of pallet \"{}\" is lost or damaged; this run stopped before judging it.", pallet)).collect()
+}
+
+/// The refusal for the rebuilds a ref pass left not durable ([`ref_heal::Repair::undurable`]), or
+/// `None` when it left none.
+fn undurable_error(undurable: &[String]) -> Option<String> {
+    (!undurable.is_empty()).then(|| format!("{} Heal went no further.", undurable.join(" ")))
+}
+
+/// Why a ref pass ends the run: where it `stopped`, and what it left `undurable` beside that.
+fn stopped_with(stopped: Option<String>, undurable: &[String]) -> Option<String> {
+    match stopped {
+        Some(stopped) => Some(undurable.iter().fold(stopped, |error, sentence| forklift_core::error::append_to_message(error, sentence))),
+        None => undurable_error(undurable),
+    }
 }
 
 fn rebuilt_sentence(rebuilt: &ref_heal::Rebuilt) -> String {

@@ -865,8 +865,13 @@ fn injected_sync_dir_fault(folder: &Path) -> Option<String> {
     SYNC_DIR_FAULT.with(|f| {
         let mut f = f.borrow_mut();
         f.attempted.push(folder.to_path_buf());
-        f.fails(folder)
-            .then(|| format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy()))
+        // A limited guard fails only its first matches; an unlimited one fails every match.
+        let fails = f.fails(folder) && SYNC_DIR_FAULTS_LEFT.with(|left| match left.get() {
+            None => true,
+            Some(0) => false,
+            Some(n) => { left.set(Some(n - 1)); true }
+        });
+        fails.then(|| format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy()))
     })
 }
 
@@ -882,6 +887,10 @@ thread_local! {
     /// can drive it too.
     static SYNC_DIR_FAULT: std::cell::RefCell<DirSyncFaultState> =
         const { std::cell::RefCell::new(DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false }) };
+
+    /// How many more matches [`SYNC_DIR_FAULT`] fails, when it is limited
+    /// ([`SyncDirFaultGuard::failing_exactly_once`]); `None` fails every match.
+    static SYNC_DIR_FAULTS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// RAII scope for [`SYNC_DIR_FAULT`]: both construction and `Drop` reset this thread's state, so
@@ -928,11 +937,20 @@ impl SyncDirFaultGuard {
         });
         SyncDirFaultGuard { _syncs: syncs }
     }
+
+    /// Record every directory, and fail only the first sync of `dir` itself: a later sync of it,
+    /// such as a retry, succeeds.
+    pub(crate) fn failing_exactly_once(dir: &Path) -> Self {
+        let guard = Self::failing_exactly(dir);
+        SYNC_DIR_FAULTS_LEFT.with(|left| left.set(Some(1)));
+        guard
+    }
 }
 
 #[cfg(test)]
 impl Drop for SyncDirFaultGuard {
     fn drop(&mut self) {
+        SYNC_DIR_FAULTS_LEFT.with(|left| left.set(None));
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
     }
 }

@@ -275,6 +275,12 @@ pub struct Repair {
     /// Why the pass stopped short, perhaps after writing: what it rebuilt before stopping is in
     /// `rebuilt` all the same.
     pub stopped: Option<String>,
+
+    /// The rebuilds whose ref (or a meta ref's copy) landed but is not durable, each said in a
+    /// sentence: heal synced its folder again, and neither that sync nor a taint recording it
+    /// held. A later pass reads such a ref as undamaged, so the pass that wrote it is the only one
+    /// that can say so, and heal ends the run with it.
+    pub undurable: Vec<String>,
 }
 
 /// Where a candidate came from.
@@ -885,10 +891,16 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                         break;
                     }
                     Err(error) => match read_back(PalletNamespace::User, &damaged.pallet, &head) {
-                        ReadBack::Landed if !taint_unrecorded(&error) => {
-                            push_note(&mut report.notes, landed_despite(&damaged.pallet, &head, &error));
-                            report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source });
-                        }
+                        ReadBack::Landed => match mended(&error, PalletNamespace::User, &damaged.pallet) {
+                            Ok(again) => {
+                                push_note(&mut report.notes, landed_despite(&damaged.pallet, &head, &error));
+                                if let Some(again) = again {
+                                    push_note(&mut report.notes, synced_again(&damaged.pallet, &again));
+                                }
+                                report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source });
+                            }
+                            Err(why) => report.undurable.push(undurable(&damaged.pallet, &head, &why)),
+                        },
                         // The first pass leaves a failed write to the second, which reports it.
                         _ if pass == Pass::BeforeTaint => {}
                         read => report.refused.push(Refused {
@@ -906,11 +918,66 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
     Ok(report)
 }
 
-/// Whether a ref write's `error` says its folder was not synced and no taint records that, so the
-/// ref it renamed into place is visible but not durable, and nothing heals it: such a write is
-/// never reported as a rebuild, whatever the ref reads back as.
+/// Whether a ref write's `error` says a folder was not synced and no taint records that, so what
+/// it renamed into place is visible but not durable, and nothing else heals it: heal syncs it
+/// again itself ([`mended`]) before it reports the rebuild.
 fn taint_unrecorded(error: &RefUpdateError) -> bool {
     matches!(error, RefUpdateError::Failed(error) if crate::util::file_utils::is_taint_unrecorded(error))
+}
+
+/// Mend a rebuild of the ref of pallet `name` in `namespace` that landed although its write
+/// reported `error`: one that says a folder was not synced and no taint records it is synced again
+/// ([`sync_again`]); any other already stands durable or has a taint recording it.
+fn mended(error: &RefUpdateError, namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
+    match taint_unrecorded(error) {
+        true => sync_again(namespace, name),
+        false => Ok(None),
+    }
+}
+
+/// Sync again the folder of each file a rebuild of the ref of pallet `name` in `namespace` wrote:
+/// its ref, and a meta ref's copy. A sync that fails records a taint, as any write's does.
+///
+/// # Returns
+/// * `Ok(None)` - If every folder synced.
+/// * `Ok(Some(error))` - If a sync failed and a taint records it, which the taint recovery mends.
+/// * `Err(why)` - If a sync failed and no taint records it either: which file is not durable, and
+///   the error.
+fn sync_again(namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
+    let mut written = vec![("ref", pallet_utils::get_pallet_ref_path(namespace, name))];
+    if namespace == PalletNamespace::Meta {
+        written.push(("copy", pallet_utils::get_meta_copy_path(name)));
+    }
+
+    let mut tainted = None;
+    // A copy the write did not get as far as leaves nothing to sync.
+    for (file, path) in written.iter().filter(|(_, path)| path.symlink_metadata().is_ok()) {
+        let Some(folder) = path.parent() else { continue };
+        match file_utils::sync_dir_or_taint(folder, &[path]) {
+            Ok(()) => {}
+            Err(error) if file_utils::is_taint_unrecorded(&error) => return Err(format!("its {} is not durable: {}", file, error)),
+            Err(error) => { tainted.get_or_insert(error); }
+        }
+    }
+    Ok(tainted)
+}
+
+/// The note for a rebuild of the ref of `pallet` (as it is written on the wire) whose folder heal
+/// synced again after its write left it unsynced, where that sync failed too and a taint records
+/// it: `error`.
+fn synced_again(pallet: &str, error: &str) -> String {
+    format!("Heal synced the folder of the ref of pallet \"{}\" again, which reported: {}", pallet, error)
+}
+
+/// The sentence for a rebuild of the ref of `pallet` (as it is written on the wire) at `head` that
+/// landed and is not durable, `why` naming which file and the error, though heal synced it again.
+fn undurable(pallet: &str, head: &str, why: &str) -> String {
+    format!(
+        "The ref of pallet \"{}\" was rebuilt at {}, but {}. Heal synced its folder again, and neither \
+        that sync nor a taint recording it held, so a crash can still lose the rebuild; a later heal reads \
+        the ref as undamaged and does not sync it again.",
+        pallet, head, why.trim_end_matches('.')
+    )
 }
 
 /// The note for a rebuild of the ref of `pallet` (as it is written on the wire) at `head` that
@@ -1985,6 +2052,8 @@ pub fn repair_meta(pass: Pass) -> Result<MetaRepair, TrustStopped> {
             if let Some(stopped) = report.stopped.take() {
                 notes.push(format!("The office pallet's ref was not rebuilt: {}", stopped.trim_end_matches('.')));
             }
+            // The run ends on the trust refusal, and what landed not durable is said beside it.
+            notes.append(&mut report.undurable);
             Err(TrustStopped {
                 error, rebuilt: std::mem::take(&mut report.rebuilt), deferred: std::mem::take(&mut report.deferred),
                 refused: std::mem::take(&mut report.refused), unjudged: std::mem::take(&mut report.unjudged), held: report.held.take(), notes,
@@ -2196,10 +2265,6 @@ fn read_back(namespace: PalletNamespace, name: &str, head: &str) -> ReadBack {
 /// said to be unwritten. A precondition that moved refused before anything was written.
 fn unwritten_reason(head: &str, error: &RefUpdateError, read: &ReadBack) -> String {
     match (error, read) {
-        (_, ReadBack::Landed) => format!(
-            "the rebuild at {} was written but is not durable, and no taint records that: the write reported {}",
-            head, error
-        ),
         (RefUpdateError::Failed(_), ReadBack::Unread(why)) => format!(
             "the rebuild at {} may have been written: the write reported {}, and its ref could not be read back: {}",
             head, error, why
@@ -2232,13 +2297,23 @@ fn write_meta_rebuild(state: &MetaState,
             report.stopped = Some(error);
             return true;
         }
-        // As in the user pass: what the write reported stands beside the ref it wrote, unless it
-        // says the ref is not durable and no taint records it.
-        _ if matches!(read, ReadBack::Landed) && !written.as_ref().is_err_and(taint_unrecorded) => {
-            if let Err(error) = &written {
-                push_note(&mut report.notes, landed_despite(&state.wire(), &head, error));
+        // As in the user pass: what the write reported stands beside the ref it wrote, once what
+        // it left unsynced with no taint recording it is synced again.
+        _ if matches!(read, ReadBack::Landed) => {
+            let Err(error) = &written else {
+                report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
+                return false;
+            };
+            match mended(error, PalletNamespace::Meta, &state.name) {
+                Ok(again) => {
+                    push_note(&mut report.notes, landed_despite(&state.wire(), &head, error));
+                    if let Some(again) = again {
+                        push_note(&mut report.notes, synced_again(&state.wire(), &again));
+                    }
+                    report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
+                }
+                Err(why) => report.undurable.push(undurable(&state.wire(), &head, &why)),
             }
-            report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
             return false;
         }
         // A precondition that moved is heal's own race: a later heal judges the ref afresh.
@@ -2470,18 +2545,40 @@ mod tests {
         assert!(rebuilt.notes.iter().any(|note| note.starts_with(&said) && note.contains("injected directory-sync failure for")), "{:?}", rebuilt.notes);
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
 
-        // Landed, but its folder not synced and no taint recording that: visible and not
-        // durable, so it is not rebuilt, and it is not said to be unwritten.
+        // Landed, its folder not synced and no taint recording that: the pass that wrote it, the
+        // first as heal runs them, syncs the folder again, and the rebuild stands once that holds.
+        // Mutation: skip the sync again (`sync_again` answers `Ok(None)` at once) → one sync, red.
         std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
-        let unrecorded = {
+        let (mended, syncs) = {
+            let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder);
+            let _taint = crate::util::file_utils::TaintRecordFaultGuard::failing();
+            let mended = repair(Pass::BeforeTaint).unwrap();
+            (mended, crate::util::file_utils::sync_dir_attempts().into_iter().filter(|synced| *synced == folder).count())
+        };
+        assert_eq!(syncs, 2, "the write's sync, then heal's own");
+        assert!(mended.undurable.is_empty(), "{:?}", mended.undurable);
+        assert_eq!(mended.rebuilt.iter().map(|rebuilt| (rebuilt.pallet.as_str(), rebuilt.head.as_str())).collect::<Vec<_>>(), vec![("main", head.as_str())]);
+        assert!(mended.notes.iter().any(|note| note.starts_with(&said) && note.contains("injected taint-record failure")), "{:?}", mended.notes);
+
+        // Neither that sync nor a taint recording it holds: the first pass says so, since the
+        // second reads the ref as undamaged and says nothing. Mutation: drop the sentence, as the
+        // first pass drops a failed write → nothing said, red.
+        std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
+        let (before, after) = {
             let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder);
             let _taint = crate::util::file_utils::TaintRecordFaultGuard::failing();
-            repair(Pass::AfterTaint).unwrap()
+            (repair(Pass::BeforeTaint).unwrap(), repair(Pass::AfterTaint).unwrap())
         };
-        assert!(unrecorded.rebuilt.is_empty(), "{:?}", unrecorded.rebuilt);
-        let main = unrecorded.refused.iter().find(|refused| refused.pallet == "main").expect("main is refused");
-        assert!(main.reason.starts_with(&format!("the rebuild at {} was written but is not durable, and no taint records that: the write reported ", head)), "{}", main.reason);
-        assert!(main.reason.contains("injected taint-record failure"), "{}", main.reason);
+        assert!(before.rebuilt.is_empty() && before.refused.is_empty(), "{:?}", before);
+        assert_eq!(before.undurable, vec![format!(
+            "The ref of pallet \"main\" was rebuilt at {}, but its ref is not durable: injected directory-sync failure for \"{}\" \
+            (additionally, while recording a durability taint for the affected object(s): injected taint-record failure). Heal synced \
+            its folder again, and neither that sync nor a taint recording it held, so a crash can still lose the rebuild; a later \
+            heal reads the ref as undamaged and does not sync it again.",
+            head, folder.to_string_lossy()
+        )]);
+        assert!(after.rebuilt.is_empty() && after.refused.is_empty() && after.undurable.is_empty(), "{:?}", after);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
     }
 
     // An unread refusal's way out is the step its read named, when that is not heal itself: it
@@ -2967,18 +3064,34 @@ mod tests {
         assert!(tags.reason.contains("and its ref could not be read back: the read was refused for the test"), "{:?}", tags);
         assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
 
-        // Landed with its folder not synced and no taint recording that: visible and not
-        // durable, so it is no rebuild, and its way out stays settling why. Mutation: let the
-        // landed read-back win over an unrecorded taint → @tags is rebuilt, red.
-        let refused = {
+        // Landed with its folder not synced and no taint recording that, and so again when heal
+        // syncs it: the pass that wrote it, the first as heal runs them, says so, since the pass
+        // after it reads @tags as undamaged. Mutation: let the landed read-back win without the
+        // sync again → @tags is rebuilt, red.
+        let (before, after) = {
             let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder);
             let _taint = crate::util::file_utils::TaintRecordFaultGuard::failing();
-            repair_meta(Pass::AfterTaint).unwrap().repair
+            (repair_meta(Pass::BeforeTaint).unwrap().repair, repair_meta(Pass::AfterTaint).unwrap().repair)
         };
-        assert!(refused.rebuilt.is_empty(), "{:?}", refused.rebuilt);
-        let tags = refused.refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
-        assert!(tags.reason.starts_with(&format!("the rebuild at {} was written but is not durable, and no taint records that", parcel)), "{:?}", tags);
-        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+        assert!(before.rebuilt.is_empty() && before.deferred.is_empty(), "{:?}", before);
+        let said = format!("The ref of pallet \"@tags\" was rebuilt at {}, but its ref is not durable: injected directory-sync failure for \"{}\"", parcel, folder.to_string_lossy());
+        assert!(before.undurable.len() == 1 && before.undurable[0].starts_with(&said), "{:?}", before.undurable);
+        assert!(after.rebuilt.is_empty() && after.refused.is_empty() && after.undurable.is_empty(), "{:?}", after);
+        crate::util::file_utils::remove_file(&ref_path).unwrap();
+
+        // The ref's write and sync held and only its copy's did not: the copy is said to be what
+        // is not durable. Mutation: name the ref for every file `sync_again` syncs → "its ref", red.
+        std::fs::write(&ref_path, &parcel.as_bytes()[..20]).unwrap();
+        crate::util::file_utils::remove_file(&copy_path).unwrap();
+        let copies = copy_path.parent().unwrap().to_path_buf();
+        let copy = {
+            let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&copies);
+            let _taint = crate::util::file_utils::TaintRecordFaultGuard::failing();
+            repair_meta(Pass::BeforeTaint).unwrap().repair
+        };
+        let said = format!("The ref of pallet \"@tags\" was rebuilt at {}, but its copy is not durable: injected directory-sync failure for \"{}\"", parcel, copies.to_string_lossy());
+        assert!(copy.undurable.len() == 1 && copy.undurable[0].starts_with(&said), "{:?}", copy);
+        assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(parcel.as_str()));
         crate::util::file_utils::remove_file(&ref_path).unwrap();
 
         let rebuilt = repair_meta(Pass::AfterTaint).unwrap().repair;
