@@ -2704,6 +2704,19 @@ mod tests {
                 std::fs::set_permissions(object(&head), std::fs::Permissions::from_mode(0o000)).unwrap();
                 (lost.clone(), Some(head), None)
             })),
+            // A folder that lists but cannot be searched: its lowercase entries are matched by
+            // name, a mixed-case one only by reading it, which fails.
+            #[cfg(unix)]
+            ("the one match of the ref's bytes cannot be read", Box::new(|| {
+                use std::os::unix::fs::PermissionsExt;
+                let unreadable = format!("ab{}", "c".repeat(HASH_LENGTH - 2));
+                let path = object(&unreadable);
+                let folder = path.parent().unwrap();
+                std::fs::create_dir_all(folder).unwrap();
+                std::fs::write(folder.join(unreadable[2..].to_ascii_uppercase()), b"an object").unwrap();
+                std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o444)).unwrap();
+                (unreadable.as_bytes()[..12].to_vec(), None, None)
+            })),
         ];
 
         for (row, state) in rows {
@@ -2723,9 +2736,12 @@ mod tests {
             let judged = refused.iter().find(|refused| refused.pallet == "@tags").unwrap_or_else(|| panic!("{}: @tags is refused", row));
             let owner = judged.meta.as_ref().unwrap().owner.clone();
             #[cfg(unix)]
-            if let Some(copy) = &copy {
+            {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(object(copy), std::fs::Permissions::from_mode(0o644));
+                if let Some(copy) = &copy {
+                    let _ = std::fs::set_permissions(object(copy), std::fs::Permissions::from_mode(0o644));
+                }
+                let _ = std::fs::set_permissions(std::path::Path::new(&crate::util::file_utils::get_path_objects_root()).join("ab"), std::fs::Permissions::from_mode(0o755));
             }
             match verdict {
                 Some(verdict) => assert_eq!(owner, Owner::Own(verdict), "{}: {}", row, judged.reason),

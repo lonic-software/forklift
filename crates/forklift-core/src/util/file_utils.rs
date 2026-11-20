@@ -201,22 +201,49 @@ pub fn is_fan_out_folder_name(name: &str) -> bool {
 ///
 /// # Returns
 /// * `Some((String, String))` - The folder and file name the path builder spells.
-/// * `None`                   - The path builder's spelling does not reach this entry.
+/// * `None`                   - The path builder's spelling does not reach this entry, or either
+///                              spelling could not be read: a sweep leaves alone what it cannot
+///                              place. A caller that answers for the whole store reads
+///                              [`judged_loose_entry`] instead.
 pub fn canonical_loose_entry(folder: &Path, file_name: &str) -> Option<(String, String)> {
-    let folder_name = folder.file_name()?.to_str()?;
+    judged_loose_entry(folder, file_name).ok().flatten()
+}
+
+/// [`canonical_loose_entry`], with a spelling that could not be read told apart from one that is
+/// not there.
+///
+/// # Returns
+/// * `Ok(Some((String, String)))` - The folder and file name the path builder spells.
+/// * `Ok(None)`                   - The path builder's spelling does not reach this entry: it is
+///                                  absent under one of the two spellings, or both open different
+///                                  entries.
+/// * `Err(String)`                - If either spelling could not be read, so whether it is this
+///                                  object is unknown.
+pub fn judged_loose_entry(folder: &Path, file_name: &str) -> Result<Option<(String, String)>, String> {
+    let Some(folder_name) = folder.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
     let lower_folder = folder_name.to_ascii_lowercase();
     let lower_file = file_name.to_ascii_lowercase();
 
     if lower_folder == folder_name && lower_file == file_name {
-        return Some((lower_folder, lower_file));
+        return Ok(Some((lower_folder, lower_file)));
     }
 
-    let identity = |path: &Path| std::fs::symlink_metadata(path).ok()
-        .and_then(|metadata| get_device_and_inode(path, &metadata).ok());
-    let listed = identity(&folder.join(file_name))?;
-    let spelled = identity(&folder.with_file_name(&lower_folder).join(&lower_file))?;
+    let unread = |path: &Path, error: String| format!("The object store entry {} could not be read: {}", path.display(), error);
+    let identity = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(metadata) => get_device_and_inode(path, &metadata).map(Some).map_err(|error| unread(path, error)),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(None),
+        Err(error) => Err(unread(path, error.to_string())),
+    };
+    let Some(listed) = identity(&folder.join(file_name))? else {
+        return Ok(None);
+    };
+    let Some(spelled) = identity(&folder.with_file_name(&lower_folder).join(&lower_file))? else {
+        return Ok(None);
+    };
 
-    (listed == spelled).then_some((lower_folder, lower_file))
+    Ok((listed == spelled).then_some((lower_folder, lower_file)))
 }
 
 /// Every byte of `text` is `0-9` or `a-f`.

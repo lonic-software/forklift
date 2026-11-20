@@ -5967,6 +5967,7 @@ fn resolve_object_hash_prefix(prefix: &str) -> Result<String, String> {
 /// An absent fan-out folder holds nothing, and so does a file in its place, which every sweep
 /// skips. A folder that is there but cannot be listed is an error, never an empty answer: a
 /// caller that enumerates the whole store would otherwise miss what sits in it without being told.
+/// So is an entry spelled other than in lowercase whose spellings cannot be read.
 pub(crate) fn object_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, String> {
     let mut matches: Vec<String> = Vec::new();
 
@@ -5995,8 +5996,10 @@ pub(crate) fn object_hashes_with_prefix(prefix: &str) -> Result<Vec<String>, Str
             }
 
             // A name spelled other than in lowercase is matched under the spelling a read opens
-            // it by, or not at all, so a match is always a hash the store answers for.
-            let Some((folder_name, file_name)) = file_utils::canonical_loose_entry(&folder, &file_name) else {
+            // it by, or not at all, so a match is always a hash the store answers for. One whose
+            // spellings cannot be read may be a match, so the answer is an error, not a list
+            // without it.
+            let Some((folder_name, file_name)) = file_utils::judged_loose_entry(&folder, &file_name)? else {
                 continue;
             };
 
