@@ -51,7 +51,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   it; a refusal that stops the run before then, such as one for a durability taint that still
   stands, names each ref left that way with the heads found for it, and each damaged metadata
   ref a pass that stopped never judged. Where damaged tombstones would refuse a pallet ref's rebuild,
-  `heal` now writes no pallet ref and stops the run, with their repair as the step; the refusal
+  `heal` now writes no user pallet ref and stops the run, with their repair as the step; the refusal
   names each ref it would have rebuilt and the head, each other it refused, and each damaged pallet
   ref the run stopped before judging. Before, it stopped at the first such ref and left the rest
   unnamed.

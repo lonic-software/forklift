@@ -2904,7 +2904,7 @@ removed. The report lists `refs_rebuilt`, `refs_removed` and
 In a served warehouse whose tombstone list or `served` mark is lost or damaged, `heal` does not
 rebuild a ref: the list may record the pallet's deletion. It refuses with `tombstones_damaged`
 (exit 55) and names `forklift-server tombstone repair`, which the server's operator runs; heal the
-refs after that. Heal then writes no pallet ref: the refusal names each ref it would have rebuilt,
+refs after that. Heal then writes no user pallet ref: the refusal names each ref it would have rebuilt,
 each other it refused with why and the heads found for it, and each damaged ref the run stopped
 before judging.
 
