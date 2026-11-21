@@ -2583,3 +2583,63 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
         }
     }
 }
+
+/// A damaged user ref whose head parcel is gone and recorded by a taint cannot be read, so the
+/// taint's recovery cannot check what it reaches and keeps the parcel: the pass after the
+/// recovery, which would rebuild the ref, runs only once the taint is resolved. Every heal says
+/// so and gives the way out for when it is not, never the promise a later heal rebuilds the ref;
+/// and once the parcel is back, the taint resolves and heal rebuilds the ref at it.
+// Mutations: always say the damaged ref "also stands" → red (the promise is said, the way out is
+// not); never name the kept refs (judge every damaged ref as one of the rest) → red; name every
+// damaged ref as kept → "missing" red.
+#[test]
+fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
+    for case in ["kept", "missing"] {
+        let area = Area::new(&format!("user-kept-{}", case));
+        let root = area.warehouse();
+        area.run_ok(&root, &["pallet", "create", "side"]);
+        area.run_ok(&root, &["shift", "side"]);
+        area.stack(&root, "d.txt", "side only");
+        // A checkout standing on a lost ref is what makes it damaged.
+        if case == "kept" {
+            area.run_ok(&root, &["shift", "main"]);
+        }
+        let side = head(&root, "side");
+        let object = loose_object(&root, &side);
+        let bytes = std::fs::read(&object).unwrap();
+        forklift_core::util::file_utils::remove_file(&object).unwrap();
+        plant_taint(&root, &[side.as_str()]);
+
+        let promise = "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.";
+        let way_out = "The ref of pallet \"side\" is damaged. While it cannot be read, the durability taint's recovery \
+            cannot check what it reaches, and heal rebuilds the ref only once the taint is resolved; if it is not, restore \
+            the warehouse from a backup, or clone it afresh, then run \"forklift heal\" again.";
+
+        // A lost ref reads as no head, so nothing is left unread, and the ref is one of the rest.
+        if case == "missing" {
+            std::fs::remove_file(ref_path(&root, "side")).unwrap();
+            let output = area.run(&root, &["--json", "heal"]);
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let message = value["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains(promise) && !message.contains(way_out), "{}", value);
+            continue;
+        }
+
+        damage(&root, "side", Damage::Zero);
+        let broken = std::fs::read(ref_path(&root, "side")).unwrap();
+        for _ in 0..2 {
+            let output = area.run(&root, &["--json", "heal"]);
+            assert_eq!(output.status.code(), Some(21), "{}{}", text(&output.stdout), text(&output.stderr));
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["error"]["code"], "durability_taint", "{}", value);
+            let message = value["error"]["message"].as_str().unwrap();
+            assert!(message.contains(way_out) && !message.contains(promise), "{}", message);
+            assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), broken, "the ref is left as it was");
+        }
+
+        std::fs::write(&object, &bytes).unwrap();
+        let output = area.run(&root, &["--json", "heal"]);
+        assert_eq!(output.status.code(), Some(0), "{}{}", text(&output.stdout), text(&output.stderr));
+        assert_eq!(head(&root, "side"), side);
+    }
+}
