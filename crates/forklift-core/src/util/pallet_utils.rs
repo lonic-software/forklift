@@ -862,11 +862,14 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
         Ok(MetaCopyState::Other) if std::fs::symlink_metadata(&copy_path).is_ok_and(|metadata| metadata.is_dir()) => return Ok(None),
         Ok(MetaCopyState::Other) => (
             format!("something that is not a file stands at its copy's path (\"{}\")", shown),
-            blocked_copy_step(name, "run the command again"),
+            blocked_copy_step(name, RERUN),
         ),
         Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => (format!("its copy (\"{}\") still stands", shown), HEAL_STEP.to_string()),
-        // heal judges what the ref's own bytes name, which only heal reads.
-        Ok(MetaCopyState::Bytes(_)) => (format!("its copy (\"{}\") stands but does not hold a parcel hash", shown), HEAL_STEP.to_string()),
+        // With no head to rebuild at, the backup heal would name; otherwise heal, which judges.
+        Ok(MetaCopyState::Bytes(_)) => (
+            format!("its copy (\"{}\") stands but does not hold a parcel hash", shown),
+            crate::util::ref_heal::read_step(name, RERUN).unwrap_or_else(|| HEAL_STEP.to_string()),
+        ),
         // Whether the ref was lost or never written cannot be told until the copy reads.
         Err(error) => (
             format!("its copy (\"{}\") could not be read: {}", shown, error.trim_end_matches('.')),
@@ -909,6 +912,9 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
 
 const HEAL_STEP: &str = "forklift heal";
 
+/// How a read's way out that is done by hand closes.
+const RERUN: &str = "run the command again";
+
 /// The step for a ref something that is not a file stands at: heal judges no such ref.
 const BLOCKED_REF_STEP: &str = "Move aside what stands at the ref's path, then run the command again.";
 
@@ -940,11 +946,11 @@ fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<
                 // heal judges no ref whose copy it cannot read, whatever the ref's own bytes name.
                 Err(_) => COPY_READABLE_STEP.to_string(),
                 // What is not a file at the copy's path is replaced, or the ref restored, first.
-                Ok(copy) if copy_blocks(name, &copy) => blocked_copy_step(name, "run the command again"),
+                Ok(copy) if copy_blocks(name, &copy) => blocked_copy_step(name, RERUN),
                 // Whose the refusal is, and so its step, rests on what heal judges: what the
-                // bytes name, the trust state, the other meta refs. Only heal judges that, so a
-                // read names heal, which names that step.
-                _ => HEAL_STEP.to_string(),
+                // bytes name, the trust state, the other meta refs. Where heal would have no head
+                // to rebuild at, the read names the backup it would name; otherwise heal.
+                _ => crate::util::ref_heal::read_step(name, RERUN).unwrap_or_else(|| HEAL_STEP.to_string()),
             }
         }
     };
@@ -3250,6 +3256,65 @@ pub(crate) mod tests {
                 main.to_string_lossy()
             );
             assert!(notes.contains(&said), "{:?}", notes);
+        }
+        /// A read of a damaged meta ref names the backup heal names where heal has no head to
+        /// rebuild it at, and heal wherever heal's own step could be another.
+        /// Revert: drop the taint check in `read_step` → the taint row names the backup → red.
+        /// Revert: drop its check of the other meta refs → the @redactions row names the backup → red.
+        /// Revert: drop its `choice_owner` check → the trust row names the backup → red.
+        #[test]
+        fn a_read_names_the_backup_only_where_heal_would() {
+            let step = |name: &str| crate::error::deframe(&get_meta_pallet_head(name).unwrap_err())
+                .map(|(_, _, step)| step.to_string()).unwrap();
+            let backup = |wire: &str| format!("Restore the ref of {} and its copy from a backup, then run the command again.", wire);
+            let lost_beside_a_bad_copy = |name: &str| {
+                let path = get_pallet_ref_path(PalletNamespace::Meta, name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                if path.exists() {
+                    file_utils::remove_file(&path).unwrap();
+                }
+                std::fs::create_dir_all(get_meta_copy_path(name).parent().unwrap()).unwrap();
+                std::fs::write(get_meta_copy_path(name), "not a hash\n").unwrap();
+            };
+
+            // Nothing names a head: lost beside a copy that does not parse, damaged beside it, and
+            // damaged with no copy; for the office as for any other.
+            let (_root, _scope) = scratch("meta-read-backup");
+            lost_beside_a_bad_copy("tags");
+            assert_eq!(step("tags"), backup("@tags"));
+            std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "tags"), "not a hash\n").unwrap();
+            assert_eq!(step("tags"), backup("@tags"));
+            file_utils::remove_file(get_meta_copy_path("tags")).unwrap();
+            assert_eq!(step("tags"), backup("@tags"));
+            drop(_scope);
+
+            // A standing taint: its recovery may restore what the ref names.
+            let (_root, _scope) = scratch("meta-read-backup-taint");
+            lost_beside_a_bad_copy("tags");
+            let _taint = plant_taint(&["objects/ab/cdef"]);
+            assert_eq!(step("tags"), "forklift heal");
+            drop(_taint);
+            drop(_scope);
+
+            // Another meta ref damaged beside it: that ref's refusal may be the one it waits on.
+            let (_root, _scope) = scratch("meta-read-backup-redactions");
+            lost_beside_a_bad_copy("tags");
+            std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "redactions"), "not a hash\n").unwrap();
+            assert_eq!(step("tags"), "forklift heal");
+            drop(_scope);
+
+            // The trust file's anchor beside an unborn office: the ref waits on the office, whose
+            // own refusal waits on nothing, so a lost office names its backup.
+            let (_root, _scope) = scratch("meta-read-backup-trust");
+            lost_beside_a_bad_copy("tags");
+            std::fs::write(
+                forklift_root().join(crate::util::office_utils::FILE_NAME_TRUST),
+                "version = 1\ngenesis = \"genesis-hash\"\nenabled_at = 1\nboundary = []\n",
+            ).unwrap();
+            assert_eq!(step("tags"), "forklift heal");
+            file_utils::remove_file(get_meta_copy_path("tags")).unwrap();
+            lost_beside_a_bad_copy("office");
+            assert_eq!(step("office"), backup("@office"));
         }
 
         /// A meta ref's repair is a compare-and-set on its copy as well as its ref: a copy that

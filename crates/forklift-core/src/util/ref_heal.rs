@@ -1307,7 +1307,7 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
             // a read names too.
             Some(Owner::Unrebuildable) => return match at.meta.as_ref().is_some_and(|meta| pallet_utils::copy_blocks(&at.pallet[1..], &meta.copy)) {
                 true => pallet_utils::blocked_copy_step(&at.pallet[1..], "run \"forklift heal\" again"),
-                false => unrebuildable_step(&at.pallet),
+                false => unrebuildable_step(&at.pallet, "run \"forklift heal\" again"),
             },
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
             Some(Owner::Newer) => return newer_step(),
@@ -1340,10 +1340,44 @@ pub fn newer_step() -> String {
     "Upgrade Forklift to a version that reads it, then run \"forklift heal\" again.".to_string()
 }
 
-/// The way out of meta ref `wire`'s refusal where heal has no head it can rebuild it at: heal
-/// never removes a meta ref, so the ref and its copy are restored from a backup.
-pub fn unrebuildable_step(wire: &str) -> String {
-    format!("Restore the ref of {} and its copy from a backup, then run \"forklift heal\" again.", wire)
+/// The way out of meta ref `wire`'s refusal where heal has no head it can rebuild it at, closed
+/// by `rerun`: heal never removes a meta ref, so the ref and its copy are restored from a backup.
+pub fn unrebuildable_step(wire: &str, rerun: &str) -> String {
+    format!("Restore the ref of {} and its copy from a backup, then {}.", wire, rerun)
+}
+
+/// The step a read of damaged meta ref `name` names where heal would refuse it with no head it
+/// can rebuild it at: the backup restore heal names, closed by `rerun`. `None` wherever heal's
+/// own step could be another, so the read names heal: an intact ref, a durability taint that
+/// stands or cannot be read (the taint recovery may restore what the ref names), another meta ref
+/// damaged beside it (its refusal may be the one this waits on), a blocked copy path, and every
+/// choice of a head, or refusal, [`choose_meta`] and [`choice_owner`] give otherwise. A head heal
+/// chooses but cannot verify is left to heal, since only it verifies.
+pub fn read_step(name: &str, rerun: &str) -> Option<String> {
+    let taint = taint_utils::read_taints(&forklift_root()).ok()?;
+    if taint.torn || !taint.recorded.is_empty() {
+        return None;
+    }
+    let tainted = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+
+    let states = meta_states_skipping(&mut Vec::new()).ok()?;
+    let state = states.iter().find(|state| state.name == name)?;
+    if state.damage().is_none() || pallet_utils::copy_blocks(name, &state.copy) {
+        return None;
+    }
+    if states.iter().any(|other| other.name != name && other.damage().is_some()) {
+        return None;
+    }
+
+    let Err((_, _, Owner::Unrebuildable)) = choose_meta(state, &tainted) else {
+        return None;
+    };
+    // The office's own refusal is never another's; every other ref's waits on the office and the
+    // trust state, read as heal reads them.
+    if !is_office(state) && choice_owner(Owner::Unrebuildable, &[]) != Owner::Unrebuildable {
+        return None;
+    }
+    Some(unrebuildable_step(&state.wire(), rerun))
 }
 
 /// `step`, a command or sentences from [`meta_step`], as a sentence of its own.

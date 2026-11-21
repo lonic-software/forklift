@@ -1256,6 +1256,11 @@ fn backup_step(pallet: &str) -> String {
     format!("Restore the ref of {} and its copy from a backup, then run \"forklift heal\" again.", pallet)
 }
 
+/// The step a read of meta pallet `pallet` names where heal has no head it can rebuild it at.
+fn read_backup_step(pallet: &str) -> String {
+    format!("Restore the ref of {} and its copy from a backup, then run the command again.", pallet)
+}
+
 /// `forklift tag list` in `root`, as JSON.
 fn tag_list(area: &Area, root: &Path) -> Output {
     area.run(root, &["--json", "tag", "list"])
@@ -1268,10 +1273,10 @@ fn tag_names(output: &Output) -> Vec<String> {
 }
 
 // A lost meta ref is refused where it is read, never read as unborn, while its copy stands. The
-// read names heal, which judges whose the refusal is: it rebuilds from a copy that parses, and
-// otherwise names a backup. Mutations: read a missing ref as unborn whatever its copy → `tag list`
-// prints no tags, red; have the read name the backup for a copy that does not parse → the second
-// case red; refuse with no copy → the last case red.
+// read names heal for a copy that parses, which heal rebuilds from, and for a copy that does not,
+// the backup heal names too. Mutations: read a missing ref as unborn whatever its copy → `tag
+// list` prints no tags, red; have the read name heal whatever heal would name → the second case
+// red; refuse with no copy → the last case red.
 #[test]
 fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     let area = Area::new("meta-loud");
@@ -1288,13 +1293,13 @@ fn a_lost_meta_ref_is_refused_where_it_is_read_while_its_copy_stands() {
     healed(&area, &root);
     assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
 
-    // The copy does not parse: the read names heal, which has nothing to rebuild from, so its
-    // step is a backup.
+    // The copy does not parse: heal has nothing to rebuild from, so the read and heal both name
+    // a backup.
     forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
     std::fs::write(meta_copy_path(&root, "tags"), b"not a hash").unwrap();
     let refused = ref_damaged(&tag_list(&area, &root));
     assert!(refused["error"]["message"].as_str().unwrap().contains(") stands but does not hold a parcel hash. Nothing was changed."), "{}", refused);
-    assert_eq!(refused["error"]["next_step"], "forklift heal", "{}", refused);
+    assert_eq!(refused["error"]["next_step"], read_backup_step("@tags").as_str(), "{}", refused);
     let judged = ref_damaged(&area.run(&root, &["--json", "heal"]));
     assert_eq!(judged["error"]["next_step"], backup_step("@tags").as_str(), "{}", judged);
 
@@ -1328,11 +1333,11 @@ fn a_damaged_meta_ref_whose_bytes_salvage_names_heal_with_no_copy() {
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(head.as_str()));
     assert_eq!(tag_names(&tag_list(&area, &root)), vec!["v1".to_string()]);
 
-    // Bytes that name nothing, with no copy, leave heal nothing: the read names heal, whose step
-    // is a backup.
+    // Bytes that name nothing, with no copy, leave heal nothing: the read names the backup heal
+    // names. Mutation: have the read name heal whatever heal would name → red.
     forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap();
     std::fs::write(meta_path(&root, "tags"), b"not a hash").unwrap();
-    assert_eq!(ref_damaged(&tag_list(&area, &root))["error"]["next_step"], "forklift heal");
+    assert_eq!(ref_damaged(&tag_list(&area, &root))["error"]["next_step"], read_backup_step("@tags").as_str());
     assert_eq!(ref_damaged(&area.run(&root, &["--json", "heal"]))["error"]["next_step"], backup_step("@tags").as_str());
 }
 
