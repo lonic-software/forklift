@@ -973,7 +973,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // lost staged content, is refused while it is damaged. Every repair above has run.
     if inventory_error.is_some() || report.inventory_held.is_some() {
         // A run that only found the step that failed says nothing of its own: the refusal speaks.
-        if !output::is_json() && !(inventory_error.is_some() && !report.was_tainted && report.nothing_done()) {
+        if !output::is_json() && report.says_anything() {
             report.render_human();
         }
         let mut lines = match (&inventory_error, &report.inventory_held) {
@@ -1028,7 +1028,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
 
     if let Err(error) = lost {
-        if !output::is_json() {
+        if !output::is_json() && report.says_anything() {
             report.render_human();
         }
         let unfinished = format!(
@@ -1479,7 +1479,7 @@ fn with_report(report: &HealReport, refused: CoreError, also: Vec<String>) -> Co
 /// reports it), would go unreported. Human mode prints the report before the failure, so this is
 /// empty there, and for a run that found and did nothing, where the failure speaks alone.
 fn json_said(report: &HealReport) -> Vec<String> {
-    match output::is_json() && (report.was_tainted || !report.nothing_done()) {
+    match output::is_json() && report.says_anything() {
         true => report.lines(),
         false => Vec::new(),
     }
@@ -2153,24 +2153,30 @@ impl HealReport {
             && self.objects_lost.is_none()
     }
 
+    /// Whether a failure after the run has anything of the run's to say beside it: a run that found
+    /// and did nothing leaves the failure to speak alone, with no "Nothing to heal" before it.
+    fn says_anything(&self) -> bool {
+        self.was_tainted || !self.nothing_done()
+    }
+
     /// The report as the lines a person reads, in the order they are printed.
     fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
 
         if let Some(rebuilt) = &self.record_rebuilt {
-            lines.push(rebuilt.sentence().to_string());
+            lines.push(rebuilt.sentence());
         }
 
         if let Some(rebuilt) = &self.unavailable_rebuilt {
-            lines.push(rebuilt.sentence().to_string());
+            lines.push(rebuilt.sentence());
         }
 
         if let Some(rebuilt) = &self.redactions_applied_rebuilt {
-            lines.push(rebuilt.sentence().to_string());
+            lines.push(rebuilt.sentence());
         }
 
         if let Some(restored) = &self.checkout_scope_restored {
-            lines.push(restored.sentence().to_string());
+            lines.push(restored.sentence());
         }
 
         for sentence in self.merge_state_restored.iter().flat_map(MergeStateRestored::sentences) {
@@ -2178,15 +2184,15 @@ impl HealReport {
         }
 
         if let Some(rebuilt) = &self.fetch_scope_rebuilt {
-            lines.push(scope_sentence(rebuilt).to_string());
+            lines.push(scope_sentence(rebuilt));
         }
 
         if let Some(rebuilt) = &self.parked_rebuilt {
-            lines.push(rebuilt.sentence().to_string());
+            lines.push(rebuilt.sentence());
         }
 
         if let Some(rebuilt) = &self.position_rebuilt {
-            lines.push(rebuilt.sentence().to_string());
+            lines.push(rebuilt.sentence());
         }
 
         if let Some(repaired) = &self.config_repaired {
@@ -2196,19 +2202,19 @@ impl HealReport {
         }
 
         if let Some(restored) = &self.trust_restored {
-            lines.push(restored.sentence().to_string());
+            lines.push(restored.sentence());
         }
 
         if let Some(rebuilt) = &self.inventory_rebuilt {
-            lines.push(rebuilt.sentence().to_string());
+            lines.push(rebuilt.sentence());
         }
 
         for rebuilt in &self.refs_rebuilt {
-            lines.push(rebuilt_sentence(rebuilt).to_string());
+            lines.push(rebuilt_sentence(rebuilt));
         }
 
         for removed in &self.refs_removed {
-            lines.push(removed_sentence(removed).to_string());
+            lines.push(removed_sentence(removed));
         }
 
         if let Some(operation) = &self.operation {

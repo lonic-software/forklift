@@ -1104,8 +1104,13 @@ fn a_reachability_walk_that_cannot_finish_claims_nothing_lost() {
     let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
     assert!(shown.contains("heal could not finish its reachability check"), "{}", shown);
     assert!(!shown.contains("objects_lost"), "{}", shown);
-    // A run that did nothing has nothing to add to its failure, least of all "nothing to heal".
+    // A run that did nothing has nothing to add to its failure, least of all "nothing to heal",
+    // in either mode.
     assert!(!shown.contains("Nothing to heal"), "{}", shown);
+    let output = area.run(&root, &["heal"]);
+    assert!(!output.status.success(), "{}", text(&output.stdout));
+    assert!(text(&output.stderr).contains("heal could not finish its reachability check"), "{}", text(&output.stderr));
+    assert!(!text(&output.stdout).contains("Nothing to heal"), "{}", text(&output.stdout));
 }
 
 #[test]
@@ -1127,7 +1132,8 @@ fn a_walk_that_cannot_finish_still_reports_the_repairs_under_json() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let message = value["error"]["message"].as_str().unwrap();
     assert!(message.starts_with("heal could not finish its reachability check"), "{}", value);
-    assert!(message.contains(&rebuilt), "{}", value);
+    // Said once, after the failure it follows.
+    assert_eq!(message.matches(rebuilt.as_str()).count(), 1, "{}", value);
     assert_eq!(head(&root, "main"), before);
 
     // Human mode printed the report before the failure, and the failure does not say it twice.
