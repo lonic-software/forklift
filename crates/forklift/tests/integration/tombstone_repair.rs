@@ -478,12 +478,18 @@ fn heal_over_damaged_tombstones_answers_with_the_repair_and_rebuilds_once_it_is_
             assert_eq!(std::fs::read(&main_ref).unwrap(), main.as_bytes()[..20].to_vec(), "{}: the ref is left alone", what);
         }
 
-        // The ref whose rebuild the damage refused is said, not left out of the answer. Revert:
-        // stop the pass with no refusal → the message never names main, red.
+        // The ref whose rebuild the damage refused is said, not left out of the answer, and so is
+        // a damaged ref the stop left unjudged. Revert: stop the pass with no refusal → the message
+        // never names main, red; leave the first pass's unjudged refs out of heal's answer → zeta
+        // unnamed, red.
+        let zeta_ref = root.join(".forklift").join("pallets").join("zeta");
+        std::fs::write(&zeta_ref, b"not a head\n").unwrap();
         let refused = area.run(&root, &["--json", "heal"]);
         let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
         let said = format!("The ref of pallet \"main\" was not rebuilt: the rebuild at {} was not written: the damaged tombstones refused it, and the pass stopped there;", main);
         assert!(message.contains(&said), "{}: {}", what, message);
+        assert!(message.contains("The ref of pallet \"zeta\" is lost or damaged; this run stopped before judging it."), "{}: {}", what, message);
+        forklift_core::util::file_utils::remove_file(&zeta_ref).unwrap();
 
         area.server_ok(&root, &["tombstone", "repair"]);
         assert!(area.server_ok(&root, &["tombstone", "list"]).contains("side"), "{}: the repair keeps side", what);

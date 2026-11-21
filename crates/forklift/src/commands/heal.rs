@@ -425,8 +425,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
     // What the first pass refused, the ref whose write met the stop included, is said here: the
-    // second pass, which would refuse it again, never runs.
+    // second pass, which would refuse it again, never runs. So are the damaged refs it stopped
+    // before judging, beside the meta refs left.
     if let Some(error) = stopped_with(first.stopped, &first.undurable) {
+        refs_left.borrow_mut().unjudged.extend(first.unjudged);
         return Err(changed_after(refused_too(error, &first.refused), &refs_rebuilt, &refs_removed, &ref_notes));
     }
 
@@ -493,7 +495,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     ref_notes.extend(second.notes);
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
-    refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: Vec::new(), held: None });
+    refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: second.unjudged, held: None });
     if let Some(error) = stopped_with(second.stopped, &second.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
@@ -1543,7 +1545,7 @@ fn candidates_clause(candidates: &[ref_heal::Candidate]) -> String {
 }
 
 /// The damaged refs a refusal names: those left for the meta pass after the taint recovery, until
-/// it has run, then those refused; and the meta refs a pass that stopped never judged.
+/// it has run, then those refused; and the refs a pass that stopped never judged.
 struct RefsLeft {
     deferred: Vec<ref_heal::Refused>,
     refused: Vec<ref_heal::Refused>,
@@ -1659,8 +1661,8 @@ fn deferred_sentences(deferred: &[ref_heal::Refused], held: Option<&ref_heal::Ta
     sentences
 }
 
-/// The sentences a refusal carries for the lost or damaged meta refs `unjudged`, which a meta pass
-/// stopped before judging.
+/// The sentences a refusal carries for the lost or damaged refs `unjudged`, which a pass stopped
+/// before judging.
 fn unjudged_sentences(unjudged: &[String]) -> Vec<String> {
     unjudged.iter().map(|pallet| format!("The ref of pallet \"{}\" is lost or damaged; this run stopped before judging it.", pallet)).collect()
 }

@@ -189,8 +189,9 @@ pub struct Repair {
     /// why and every head it found: a run that stops before that pass names them.
     pub deferred: Vec<Refused>,
 
-    /// The lost or damaged meta refs, as `@<name>`, that a meta pass which stopped never judged:
-    /// neither rebuilt, refused nor deferred.
+    /// The lost or damaged refs that a pass which stopped never judged, meta refs as `@<name>`:
+    /// neither rebuilt, refused nor deferred. A user pass lists too those it left for the pass
+    /// after the taint recovery.
     pub unjudged: Vec<String>,
 
     /// The deferred meta refs, as `@<name>`, whose own bytes name only objects that a taint whose
@@ -789,20 +790,21 @@ fn choose(pallet: &str, evidence: &Evidence, pass: Pass) -> Choice {
 ///
 /// # Returns
 /// * `Ok(Repair)`  - What it rebuilt and what it refused, the ref whose write met damaged
-///                   tombstones included, where it stopped.
+///                   tombstones included, where it stopped, with the damaged refs it never
+///                   judged.
 /// * `Err(String)` - If the user refs could not be listed.
 pub fn repair(pass: Pass) -> Result<Repair, String> {
     let mut report = Repair::default();
-    let damaged = detect(&mut report.notes)?;
+    let detected = detect(&mut report.notes)?;
 
-    if damaged.is_empty() {
+    if detected.is_empty() {
         return Ok(report);
     }
 
     let tainted = Tainted::read(&mut report.notes);
 
-    for damaged in damaged {
-        let evidence = gather(&damaged, &tainted, &mut report.notes);
+    for damaged in &detected {
+        let evidence = gather(damaged, &tainted, &mut report.notes);
 
         match choose(&damaged.pallet, &evidence, pass) {
             Choice::Defer => {}
@@ -840,6 +842,12 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                             meta: None,
                         });
                         report.stopped = Some(error);
+                        // The run ends here, so every damaged ref it did not judge is named: the
+                        // refs after this one, and those the first pass left for the second. The
+                        // tombstones refuse every write alike, so none before this one was written.
+                        report.unjudged = detected.iter().map(|damaged| damaged.pallet.as_str())
+                            .filter(|pallet| !report.refused.iter().any(|refused| refused.pallet == *pallet))
+                            .map(str::to_string).collect();
                         break;
                     }
                     Err(error) => {
@@ -2572,14 +2580,25 @@ mod tests {
         // Damaged tombstones refuse the write and stop the pass, which ends the run in either
         // pass: the ref it was writing is refused for them, not left unsaid. Mutation: stop with
         // no refusal → main is not refused, red.
+        //
+        // Nor is any damaged ref the pass did not judge: "zeta", after main, is never reached, and
+        // "alpha", before it, names no head, which the first pass leaves for the second and the
+        // second refuses. Mutations: list nothing → zeta unnamed, red; list only the refs after
+        // the stop → alpha unnamed before the taint recovery, red.
         std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
+        for other in ["alpha", "zeta"] {
+            std::fs::write(pallet_utils::get_pallet_ref_path(PalletNamespace::User, other), b"not a head\n").unwrap();
+        }
         std::fs::write(crate::util::tombstone_utils::served_path(), b"not a served mark").unwrap();
-        for pass in [Pass::BeforeTaint, Pass::AfterTaint] {
+        for (pass, unjudged, alpha) in [(Pass::BeforeTaint, vec!["alpha", "zeta"], false), (Pass::AfterTaint, vec!["zeta"], true)] {
             let stopped = repair(pass).unwrap();
             assert!(stopped.stopped.as_deref().is_some_and(crate::util::tombstone_utils::is_damage), "{:?}: {:?}", pass, stopped.stopped);
-            let refused: Vec<_> = stopped.refused.iter().map(|refused| (refused.pallet.as_str(), refused.reason.as_str())).collect();
+            let refused: Vec<_> = stopped.refused.iter().filter(|refused| refused.pallet == "main")
+                .map(|refused| (refused.pallet.as_str(), refused.reason.as_str())).collect();
             let reason = format!("the rebuild at {} was not written: the damaged tombstones refused it, and the pass stopped there", head);
             assert_eq!(refused, vec![("main", reason.as_str())], "{:?}", pass);
+            assert_eq!(stopped.refused.iter().any(|refused| refused.pallet == "alpha"), alpha, "{:?}: {:?}", pass, stopped.refused);
+            assert_eq!(stopped.unjudged, unjudged, "{:?}", pass);
             assert_eq!(std::fs::read(&path).unwrap(), &head.as_bytes()[..20], "{:?}: the ref is left alone", pass);
         }
     }
