@@ -865,7 +865,7 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
             blocked_copy_step(name, RERUN),
         ),
         Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => (format!("its copy (\"{}\") still stands", shown), HEAL_STEP.to_string()),
-        // Neither the lost ref nor its copy names a head, so the backup heal names too.
+        // Neither the lost ref nor its copy names a head, so heal has nothing to rebuild it at.
         Ok(MetaCopyState::Bytes(_)) => (
             format!("its copy (\"{}\") stands but does not hold a parcel hash", shown),
             crate::util::ref_heal::read_step(name, None, RERUN).unwrap_or_else(|| HEAL_STEP.to_string()),
@@ -948,8 +948,8 @@ fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<
                 // What is not a file at the copy's path is replaced, or the ref restored, first.
                 Ok(copy) if copy_blocks(name, &copy) => blocked_copy_step(name, RERUN),
                 // With no head named by the copy, the bytes decide: where they name none, the
-                // backup heal names too; where they name a prefix, heal, which judges what the
-                // store holds for it.
+                // backup, since heal has nothing to rebuild at; where they name a prefix, heal,
+                // which judges what the store holds for it.
                 _ => crate::util::ref_heal::read_step(name, Some(&bytes), RERUN).unwrap_or_else(|| HEAL_STEP.to_string()),
             }
         }
@@ -3305,6 +3305,13 @@ pub(crate) mod tests {
             assert_eq!(step("tags"), "forklift heal");
             damaged("tags", &format!("{}x{}\n", "a".repeat(5), "b".repeat(58)));
             assert_eq!(step("tags"), "forklift heal");
+            damaged("tags", "abcdef01\n");
+            assert_eq!(step("tags"), "forklift heal");
+            // One short of either: a hex run of 7, and 63 characters with one flipped.
+            damaged("tags", "abcdef0\n");
+            assert_eq!(step("tags"), backup("@tags"));
+            damaged("tags", &format!("{}x{}", "a".repeat(5), "b".repeat(57)));
+            assert_eq!(step("tags"), backup("@tags"));
             drop(_scope);
 
             // A standing taint leaves the bytes naming nothing, so the read and heal still name

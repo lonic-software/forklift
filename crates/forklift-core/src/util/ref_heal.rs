@@ -1364,7 +1364,8 @@ pub fn unrebuildable_step(wire: &str, rerun: &str) -> String {
 /// (`reference`, `None` where the ref is lost) name a head: the backup restore heal names, closed
 /// by `rerun`. The caller has found the copy absent or holding no parcel hash. Heal rebuilds a meta
 /// ref only at a head its copy or its bytes name, so where both name none, no other repair gives it
-/// one and its verdict on this ref is that restore, whatever else it stops on first. `None` where
+/// one, and that restore is this ref's way out once nothing else heal waits on stands (another
+/// damaged meta ref or the trust state may be named first). `None` where
 /// the bytes name a hash, or a prefix [`salvage`] looks up: whether the store holds a match is
 /// heal's to judge, so the read names heal.
 pub fn read_step(name: &str, reference: Option<&[u8]>, rerun: &str) -> Option<String> {
