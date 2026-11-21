@@ -381,7 +381,8 @@ fn an_unmatched_shard_holds_the_rebuild_and_later_repairs_still_land() {
 /// on how long the setup took. So the count of those leading rewrites varied between runs on a
 /// slow machine, shifting the two renames after which a whole park's marker reads as listed past
 /// the N tried. Every file is backdated after the setup: none then matches the stat its entry
-/// records, and each shard the refresh reads that holds a file is rewritten in every run alike.
+/// records, and each shard holding a file within the refresh's scope is rewritten in every run
+/// alike.
 fn interrupted_park(name: &str, setup: impl Fn(&Area), args: &[&str], keep: impl Fn(&Area) -> bool) -> Area {
     for at in 1..60 {
         let area = Area::new(&format!("{}-{}", name, at));
