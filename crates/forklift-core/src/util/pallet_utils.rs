@@ -2437,40 +2437,42 @@ pub enum CopyMend {
 /// written and the mend is reported as left for after the taint.
 ///
 /// # Returns
-/// * `Ok(CopyMend::Mended)`         - The copy was written with the ref's bytes.
-/// * `Ok(CopyMend::AfterTaint)`     - A taint record stands; nothing was written.
-/// * `Err(RefUpdateError::Moved)`   - The ref no longer holds `judged_ref`; nothing was written.
-/// * `Err(RefUpdateError::Failed)`  - `judged_ref` is not a head, the copy changed since it was
-///                                    judged (nothing was written), or a read or the write failed
-///                                    (the write may still have landed: read the copy back to tell).
-pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState) -> Result<CopyMend, RefUpdateError> {
-    validate_pallet_name(name)?;
+/// * `Ok(CopyMend::Mended)`            - The copy was written with the ref's bytes.
+/// * `Ok(CopyMend::AfterTaint)`        - A taint record stands; nothing was written.
+/// * `Err(CopyMendError::Moved)`       - The ref no longer holds `judged_ref`; nothing was written.
+/// * `Err(CopyMendError::Refused)`     - `name` is not a pallet name, `judged_ref` is not a head,
+///                                       the copy changed since it was judged, or a read or the
+///                                       hold failed; nothing was written.
+/// * `Err(CopyMendError::WriteFailed)` - The copy's write failed, and may still have landed: read
+///                                       the copy back to tell.
+pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState) -> Result<CopyMend, CopyMendError> {
+    validate_pallet_name(name).map_err(CopyMendError::Refused)?;
 
     let reference = PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() };
     let Some(head) = parse_ref_bytes(judged_ref) else {
-        return Err(RefUpdateError::Failed(format!(
+        return Err(CopyMendError::Refused(format!(
             "Refusing to mend the copy of pallet \"{}\": the ref bytes it was given are not a head.",
             reference.to_wire()
         )));
     };
 
-    let _lock = crate::util::lock_utils::RefLock::acquire()?;
+    let _lock = crate::util::lock_utils::RefLock::acquire().map_err(CopyMendError::Refused)?;
 
     let path = get_pallet_ref_path(PalletNamespace::Meta, name);
     let found = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() => Some(std::fs::read(&path).map_err(|e| format!(
+        Ok(metadata) if metadata.is_file() => Some(std::fs::read(&path).map_err(|e| CopyMendError::Refused(format!(
             "Error while reading the ref of pallet \"{}\": {}", reference.to_wire(), e
-        ))?),
+        )))?),
         Ok(_) => None,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         // A stat that fails says nothing of the ref, so it is no move.
-        Err(e) => return Err(RefUpdateError::Failed(format!(
+        Err(e) => return Err(CopyMendError::Refused(format!(
             "Error while reading whether the ref of pallet \"{}\" stands: {}", reference.to_wire(), e
         ))),
     };
 
     if found.as_deref() != Some(judged_ref) {
-        return Err(RefUpdateError::Moved(RefMoved {
+        return Err(CopyMendError::Moved(RefMoved {
             reference,
             expected: Some(head),
             found: found.as_deref().and_then(parse_ref_bytes),
@@ -2479,23 +2481,45 @@ pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState
 
     let copy = get_meta_copy_path(name);
 
-    if read_file_state(&copy)? != *judged_copy {
-        return Err(RefUpdateError::Failed(format!(
+    if read_file_state(&copy).map_err(CopyMendError::Refused)? != *judged_copy {
+        return Err(CopyMendError::Refused(format!(
             "Refusing to mend the copy of pallet \"{}\" (\"{}\"): it changed since it was judged. \
             Nothing was written. Run the command again.",
             reference.to_wire(), copy.to_string_lossy()
         )));
     }
 
-    let taints = crate::util::taint_utils::read_taints(&forklift_root())?;
+    let taints = crate::util::taint_utils::read_taints(&forklift_root()).map_err(CopyMendError::Refused)?;
 
     if taints.torn || !taints.recorded.is_empty() {
         return Ok(CopyMend::AfterTaint);
     }
 
-    write_copy_file(&copy, judged_ref)?;
+    write_copy_file(&copy, judged_ref).map_err(CopyMendError::WriteFailed)?;
 
     Ok(CopyMend::Mended)
+}
+
+/// Why [`mend_meta_copy`] did not mend the copy. There is no `From<String>`: each failure is
+/// sorted by hand into one that wrote nothing and the copy's write, which may have landed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyMendError {
+    /// The ref no longer holds the bytes the mend was judged against; nothing was written.
+    Moved(RefMoved),
+    /// The mend refused before writing: nothing was written.
+    Refused(String),
+    /// The copy's write failed, anywhere from its folder to the sync after its rename, so it may
+    /// have landed.
+    WriteFailed(String),
+}
+
+impl std::fmt::Display for CopyMendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CopyMendError::Moved(moved) => RefUpdateError::Moved(moved.clone()).fmt(f),
+            CopyMendError::Refused(message) | CopyMendError::WriteFailed(message) => f.write_str(message),
+        }
+    }
 }
 
 /// Remove the ref of user pallet `name`, which must hold `expected`: the compare-and-set core's
@@ -3319,7 +3343,7 @@ pub(crate) mod tests {
             let mended = mend_meta_copy("tags", &bytes, &ref_bytes(&h1));
             std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert!(matches!(&stands, Err(RefUpdateError::Failed(message)) if message.contains("Error while reading whether the ref of pallet \"tags\" stands")), "{:?}", stands);
-            assert!(matches!(&mended, Err(RefUpdateError::Failed(message)) if message.contains("Error while reading whether the ref of pallet \"@tags\" stands")), "{:?}", mended);
+            assert!(matches!(&mended, Err(CopyMendError::Refused(message)) if message.contains("Error while reading whether the ref of pallet \"@tags\" stands")), "{:?}", mended);
 
             // Readable again, the same check holds: the domain was the stat alone.
             assert_eq!(meta_ref_stands_as("tags", &RefDamage::Unreadable(bytes.clone()), &ref_bytes(&h1)), Ok(true));
@@ -3337,7 +3361,7 @@ pub(crate) mod tests {
             std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "tags"), format!("{}\n", h3)).unwrap();
 
             match mend_meta_copy("tags", format!("{}\n", h1).as_bytes(), &ref_bytes(&h2)) {
-                Err(RefUpdateError::Moved(moved)) => assert_eq!(moved.found.as_deref(), Some(h3.as_str())),
+                Err(CopyMendError::Moved(moved)) => assert_eq!(moved.found.as_deref(), Some(h3.as_str())),
                 other => panic!("expected the mend refused as moved, got {:?}", other),
             }
             assert_eq!(copy_state("tags"), ref_bytes(&h2), "nothing is written");

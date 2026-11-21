@@ -41,7 +41,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   with the head heal set out to write. A metadata ref's rebuild that pass left
   for the one after it is noted with the reason, and a refusal says each note once. A copy lost or out of step beside
   a ref that reads is set back to the ref only when the store holds the ref's head; otherwise both
-  are left, with a note. A copy write that reports a failure (a folder sync after its rename failing)
+  are left, with a note. A copy write that reports a failure (such as a folder sync after its rename failing)
   is now followed by a read of the copy, and a note says it holds the ref's head, or may, where
   the copy cannot be read, with what the write reported; before, the pass before the taint
   recovery said nothing of it and the pass after read the copy as in step. Where no taint records
