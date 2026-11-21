@@ -2919,7 +2919,7 @@ mod tests {
                         let landed = repair.notes.iter().position(|note| note.starts_with("The ref of pallet \"@tags\" was rebuilt at"));
                         let named = repair.notes.iter().position(|note| *note == said);
                         assert!(landed.is_some(), "{:?}: the landed-despite arm ran: {:?}", pass, repair.notes);
-                        assert!(named < landed, "{:?}: the gone head is named before the write: {:?}", pass, repair.notes);
+                        assert!(named.is_some() && named < landed, "{:?}: the gone head is named before the write: {:?}", pass, repair.notes);
                     }
                     Row::Undurable => assert_eq!(repair.undurable.len(), 1, "{:?} {:?}: {:?}", pass, row, repair),
                     Row::Unread => {
