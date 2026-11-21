@@ -499,6 +499,35 @@ fn heal_over_damaged_tombstones_answers_with_the_repair_and_rebuilds_once_it_is_
     assert_eq!(head(&root, "main"), main);
 }
 
+/// A taint over the damaged ref's head leaves it for the pass after the taint recovery, which
+/// meets the damaged tombstones instead: heal's answer names the ref it was writing and the
+/// damaged ref after it, which that pass never judged. Revert: leave the second pass's unjudged
+/// refs out of heal's answer → zeta unnamed, red.
+#[test]
+fn heal_names_the_refs_a_stop_after_the_taint_recovery_left_unjudged() {
+    let area = Area::new("heal-after-taint");
+    let root = area.served();
+    area.deleted(&root, "side");
+    let main = head(&root, "main");
+    let pallets = root.join(".forklift").join("pallets");
+    std::fs::write(pallets.join("main"), &main.as_bytes()[..20]).unwrap();
+    std::fs::write(pallets.join("zeta"), b"not a head\n").unwrap();
+    let taint = forklift_core::util::taint_utils::taint_dir_path_under(&root);
+    std::fs::create_dir_all(&taint).unwrap();
+    std::fs::write(taint.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(
+        [format!("objects/{}/{}", &main[..2], &main[2..])],
+    )).unwrap();
+    std::fs::write(list_path(&root), b"\xff\xfe not a list").unwrap();
+
+    let refused = area.run(&root, &["--json", "heal"]);
+    assert_eq!(refused.status.code(), Some(TOMBSTONES_DAMAGED_EXIT), "{}{}", text(&refused.stdout), text(&refused.stderr));
+    assert_eq!(std::fs::read_dir(&taint).map(|entries| entries.count()).unwrap_or(0), 0, "the taint recovery ran first");
+    let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
+    let said = format!("The ref of pallet \"main\" was not rebuilt: the rebuild at {} was not written: the damaged tombstones refused it, and the pass stopped there;", main);
+    assert!(message.contains(&said), "{}", message);
+    assert!(message.contains("The ref of pallet \"zeta\" is lost or damaged; this run stopped before judging it."), "{}", message);
+}
+
 /// Revert: leave kept heads out of the holder census → the redaction applies and deletes content
 /// a kept head still holds → red.
 #[test]
