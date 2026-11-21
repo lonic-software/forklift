@@ -281,7 +281,7 @@ fn a_prefix_too_short_or_naming_no_parcel_salvages_nothing() {
 // warehouse names its head", and the bay row rebuilds at the bay's base, red.
 #[test]
 fn a_ref_whose_bytes_name_a_gone_parcel_is_refused_naming_it() {
-    for row in ["nothing else", "a bay below it"] {
+    for row in ["a bay below it", "nothing else"] {
         let area = Area::new(&format!("salvage-gone-{}", row.replace(' ', "-")));
         let (root, side) = side_only_its_bytes_name(&area);
         let candidates = match row {
