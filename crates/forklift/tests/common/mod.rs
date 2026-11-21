@@ -128,3 +128,35 @@ pub fn prose_lines(page: &str) -> Vec<&str> {
         })
         .collect()
 }
+
+/// Move a file's mtime `seconds` into the past, leaving its content alone, so the next command's
+/// stat can prove the file's content without waiting until it is old enough: a stat proves an
+/// entry only when the file's mtime is two whole seconds older than the clock probe read before it.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn backdate(path: &std::path::Path, seconds: u64) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
+}
+
+/// [`backdate`] every file under `root` outside its `.forklift` and `.git` folders. Directories
+/// keep their mtimes: a stat proof reads only a file's.
+///
+/// A sweep that stops a command at its Nth rename (`FORKLIFT_DEBUG_CRASH_AT_RENAME`) in a fresh
+/// warehouse per N relies on every run renaming in the same order. The command's first stat of the
+/// working tree rewrites each shard holding an entry it can now prove, and which entries an earlier
+/// command proved depends on how long the setup took, so on a slow machine the count of those
+/// rewrites, and every later rename's N, varies from run to run. Backdating every file after the
+/// setup changes every file's mtime past what any shard records, so that first stat rewrites every
+/// shard that holds a file, in every run alike.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn backdate_tree(root: &std::path::Path, seconds: u64) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() && entry.file_name() != ".forklift" && entry.file_name() != ".git" {
+            backdate_tree(&entry.path(), seconds);
+        } else if kind.is_file() {
+            backdate(&entry.path(), seconds);
+        }
+    }
+}

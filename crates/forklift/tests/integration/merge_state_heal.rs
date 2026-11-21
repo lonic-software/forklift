@@ -328,6 +328,7 @@ fn crashed_with_a_marker(name: &str, prepare: &dyn Fn(&str) -> Area, args: &[&st
 
     for at in 1..200 {
         let area = prepare(&format!("{}-{}", name, at));
+        common::backdate_tree(&area.root, 3600);
         let stopped = area.command(args).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string()).output().unwrap();
         if stopped.status.code() != Some(CRASH_POINT_EXIT_CODE) {
             break;

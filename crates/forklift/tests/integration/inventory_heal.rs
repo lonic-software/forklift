@@ -372,8 +372,9 @@ fn an_unmatched_shard_holds_the_rebuild_and_later_repairs_still_land() {
 }
 
 /// Stop `park args` at each rename in turn, in a fresh area set up by `setup` with the folder `n`
-/// staged on top, until one leaves the operation marker
-/// standing with `keep` true of the area; return that area.
+/// staged on top and every file backdated (so each run renames in the same order, see
+/// [`common::backdate_tree`]), until one leaves the operation marker standing with `keep` true of
+/// the area; return that area.
 fn interrupted_park(name: &str, setup: impl Fn(&Area), args: &[&str], keep: impl Fn(&Area) -> bool) -> Area {
     for at in 1..60 {
         let area = Area::new(&format!("{}-{}", name, at));
@@ -381,6 +382,7 @@ fn interrupted_park(name: &str, setup: impl Fn(&Area), args: &[&str], keep: impl
         std::fs::create_dir_all(area.root().join("n")).unwrap();
         area.write("n/q.txt", "q\n");
         area.run_ok(&["load", "n"]);
+        common::backdate_tree(&area.root(), 3600);
         let output = area.command_in(&area.root(), &[&["park"][..], args].concat())
             .env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string())
             .output().unwrap();

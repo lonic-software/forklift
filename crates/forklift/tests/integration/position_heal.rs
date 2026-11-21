@@ -308,6 +308,7 @@ fn rebuilt_from_a_standing_operation(stale_copy: bool) {
         let area = Area::new(&format!("marker-{}-{}", stale_copy, at));
         let root = area.warehouse();
         let dir = state_dir(&root, None);
+        common::backdate_tree(&root, 3600);
 
         let stopped = area.command(&root, &["shift", "main"])
             .env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string())

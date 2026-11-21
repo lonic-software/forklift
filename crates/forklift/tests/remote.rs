@@ -8,7 +8,7 @@ use std::process::{Child, Command, Output, Stdio};
 use forklift_core::util::progress_utils::Progress;
 
 mod common;
-use common::{forklift_command, hold_store_access, server_binary};
+use common::{backdate, forklift_command, hold_store_access, server_binary};
 
 /// `forklift-server` with fsync off, for the same reason as [`forklift_command`].
 fn server_command() -> Command {
@@ -1171,12 +1171,6 @@ fn a_lower_refused_over_an_untracked_file_leaves_nothing_standing() {
 
     let stacked = area.forklift("b", &["stack", "-m", "nothing"]);
     assert!(stderr(&stacked).contains("Nothing to stack"), "no operation may stand: {}", stderr(&stacked));
-}
-
-/// Push mtime `seconds` into the past, so the next command's stat can prove the file's content.
-fn backdate(path: &std::path::Path, seconds: u64) {
-    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
 }
 
 /// A bay whose remote moved only `app.txt` lowers past every local change the new parcel leaves
