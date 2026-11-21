@@ -34,8 +34,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   store holds that one (the office's ref excepted), with a note naming the head it named, made before the rebuild
   is written, so it is reported whatever the write's outcome. A rebuild, of a pallet's ref or a
   metadata ref, that the pass before the taint recovery wrote but could not read back is read back
-  once more right away, and is reported as rebuilt when it landed, where before the pass after the
-  recovery read the ref as undamaged and said nothing of it. A failed write still unread has the
+  once more right away, and is reported as rebuilt when that read finds it. Before, a pallet's ref
+  was never reported, and a metadata ref was reported only in a note saying it might have been
+  written. The second read comes straight after the first, so it usually meets the same fault. A failed write still unread has the
   folder sync it left unrecorded run again, and a pallet's ref still unread is named in a note
   with the head heal set out to write. A metadata ref's rebuild that pass left
   for the one after it is noted with the reason, and a refusal says each note once. A copy lost or out of step beside

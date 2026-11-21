@@ -2177,10 +2177,15 @@ thread_local! {
 
     /// Run before the next [`read_back`] that reads the ref, once.
     static BEFORE_READ_BACK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+
+    /// The wire name of each ref [`read_back`] was asked to read, in order.
+    static READS_BACK: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Read back the ref of pallet `name` after heal wrote it at `head`.
 fn read_back(namespace: PalletNamespace, name: &str, head: &str) -> ReadBack {
+    #[cfg(test)]
+    READS_BACK.with(|reads| reads.borrow_mut().push(pallet_utils::PalletRef { namespace, name: name.to_string() }.to_wire()));
     #[cfg(test)]
     if READ_BACK_UNREAD.with(|unread| unread.replace(unread.get().saturating_sub(1)) > 0) {
         return ReadBack::Unread("the read was refused for the test".to_string());
@@ -3345,6 +3350,7 @@ mod tests {
                 let _taint = (failed && row != Row::MetaFailed && row != Row::UserFailed).then(crate::util::file_utils::TaintRecordFaultGuard::failing);
                 // The first read back answers unread; the settle's reads the ref, or is unread too.
                 READ_BACK_UNREAD.with(|unread| unread.set(if read == Read::Unread { 2 } else { 1 }));
+                READS_BACK.with(|reads| reads.borrow_mut().clear());
                 if read == Read::Elsewhere {
                     let (moved, other) = (ref_path.clone(), other.clone());
                     BEFORE_READ_BACK.with(|before| before.set(Some(Box::new(move || std::fs::write(&moved, format!("{}\n", other)).unwrap()))));
@@ -3365,7 +3371,10 @@ mod tests {
                 };
                 let left = READ_BACK_UNREAD.with(|unread| unread.replace(0));
                 let unrun = BEFORE_READ_BACK.with(std::cell::Cell::take).is_some();
-                assert!(left == 0 && !unrun, "{}: the write was read back twice: {:?}", cell, seen);
+                assert!(left == 0 && !unrun, "{}: both hooks were consumed: {:?}", cell, seen);
+                let reads = READS_BACK.with(|reads| reads.take());
+                assert_eq!(reads.iter().filter(|read| **read == wire).count(), 2, "{}: the write was read back exactly twice: {:?}", cell, reads);
+                assert_eq!(reads[..2], [wire.clone(), wire.clone()], "{}: the first two reads are of the ref heal wrote: {:?}", cell, reads);
                 seen
             };
 
