@@ -781,10 +781,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - `heal` no longer refuses forever over a durability taint that records a lost metadata ref copy
   (`.forklift/meta-copy/<name>`), as a crash can leave one after a metadata pallet's first write.
-  When the ref beside it still holds a parcel hash, the taint is resolved and the copy is set to the
-  ref's bytes. Before, the taint named the copy as a shape it did not recognize, and the copy was
-  left until the taint cleared, so every run refused the same way. A copy lost with its ref lost
-  or damaged too still refuses.
+  When the ref beside it is a file naming a parcel the store holds whole, that part of the taint is
+  resolved, and once the whole taint has cleared `heal` sets the copy to the ref's bytes. Before,
+  the taint named the copy as a shape it did not recognize, and the copy was left until the taint
+  cleared, so every run refused the same way. A copy lost beside a ref that is lost, damaged,
+  unreadable or names a parcel the store does not give still refuses, and says which.
 - Under `--json`, a `heal` whose reachability check cannot finish, with no damaged ref or inventory
   refusing, now says what the run repaired in the error's `message`, after the failure. Before, that
   error carried only the failure, so the repairs went unreported though they had happened. A heal
