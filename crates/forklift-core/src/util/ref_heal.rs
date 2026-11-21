@@ -538,6 +538,11 @@ fn is_hex(byte: u8) -> bool {
 /// characters is a prefix of (a truncation). A hash the taint records as possibly lost matches
 /// as well as a stored one, so an object a crash took is an unknown answer rather than none.
 fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
+    // Bytes that name no prefix salvage to nothing, whatever the store holds, which a read of the
+    // ref relies on (`read_step`).
+    if !names_a_prefix(bytes) {
+        return Ok(Salvage::Nothing);
+    }
     let run = bytes.iter().take_while(|byte| is_hex(**byte)).count();
     // A pack the store cannot list may hold a match, found or not, so no answer stands beside it.
     // What the packs cannot list is read once, at the first lookup, for every prefix the bytes
@@ -592,6 +597,15 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     }
 
     Ok(judge(matches, tainted))
+}
+
+/// Whether a damaged ref's `bytes` name a hash, or a prefix of one, that [`salvage`] looks up: 64
+/// characters with at most one of them not hex, or a leading hex run of at least
+/// [`MIN_SALVAGE_PREFIX`] characters.
+fn names_a_prefix(bytes: &[u8]) -> bool {
+    let run = bytes.iter().take_while(|byte| is_hex(**byte)).count();
+    run >= MIN_SALVAGE_PREFIX
+        || (bytes.len() >= HASH_LENGTH && bytes[..HASH_LENGTH].iter().filter(|byte| !is_hex(**byte)).count() == 1)
 }
 
 /// Whether a damaged ref's `bytes` name the one parcel heal rebuilds it at.
@@ -1307,7 +1321,7 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
             // a read names too.
             Some(Owner::Unrebuildable) => return match at.meta.as_ref().is_some_and(|meta| pallet_utils::copy_blocks(&at.pallet[1..], &meta.copy)) {
                 true => pallet_utils::blocked_copy_step(&at.pallet[1..], "run \"forklift heal\" again"),
-                false => unrebuildable_step(&at.pallet),
+                false => unrebuildable_step(&at.pallet, "run \"forklift heal\" again"),
             },
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
             Some(Owner::Newer) => return newer_step(),
@@ -1340,10 +1354,25 @@ pub fn newer_step() -> String {
     "Upgrade Forklift to a version that reads it, then run \"forklift heal\" again.".to_string()
 }
 
-/// The way out of meta ref `wire`'s refusal where heal has no head it can rebuild it at: heal
-/// never removes a meta ref, so the ref and its copy are restored from a backup.
-pub fn unrebuildable_step(wire: &str) -> String {
-    format!("Restore the ref of {} and its copy from a backup, then run \"forklift heal\" again.", wire)
+/// The way out of meta ref `wire`'s refusal where heal has no head it can rebuild it at, closed
+/// by `rerun`: heal never removes a meta ref, so the ref and its copy are restored from a backup.
+pub fn unrebuildable_step(wire: &str, rerun: &str) -> String {
+    format!("Restore the ref of {} and its copy from a backup, then {}.", wire, rerun)
+}
+
+/// The step a read of meta ref `name` names where neither its copy nor its own bytes
+/// (`reference`, `None` where the ref is lost) name a head: the backup restore heal names, closed
+/// by `rerun`. The caller has found the copy absent or holding no parcel hash. Heal rebuilds a meta
+/// ref only at a head its copy or its bytes name, so where both name none, no other repair gives it
+/// one, and that restore is this ref's way out once nothing else heal waits on stands (another
+/// damaged meta ref or the trust state may be named first). `None` where
+/// the bytes name a hash, or a prefix [`salvage`] looks up: whether the store holds a match is
+/// heal's to judge, so the read names heal.
+pub fn read_step(name: &str, reference: Option<&[u8]>, rerun: &str) -> Option<String> {
+    match reference {
+        Some(bytes) if names_a_prefix(bytes) => None,
+        _ => Some(unrebuildable_step(&meta_wire(name), rerun)),
+    }
 }
 
 /// `step`, a command or sentences from [`meta_step`], as a sentence of its own.

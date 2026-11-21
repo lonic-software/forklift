@@ -77,9 +77,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   file's own refusal names) or settling why the office does not verify. A parcel of its history
   that carries no signature after trust, there or on the office pallet, refuses as
   `signature_missing` (exit 71), naming a backup or a fresh clone. A command that reads a damaged
-  metadata ref names `forklift heal`, or, where `heal` would not judge the ref (its copy cannot be
+  metadata ref names `forklift heal`; where `heal` would not judge the ref (its copy cannot be
   read, or something that is not a file stands at the ref's or the copy's path), the step that lets
-  it.
+  it; and where neither its copy nor its own bytes name a head (the copy holds no parcel hash and
+  the bytes hold neither a hash nor a prefix of one), restoring the ref and its copy from a backup:
+  `heal` has nothing to rebuild it from, so that is its way out too, once nothing else it waits on
+  stands.
 
 ### Changed
 
@@ -91,7 +94,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `.forklift/meta/` whose file is missing while its copy stands now refuses as `ref_damaged`
   (exit 53) in every command that reads it, listings included, where it read as a pallet never
   written: `tag list` printed no tags, `lower` took the remote's head as a first adoption, and
-  garbage collection held nothing for it. The next step names `forklift heal`, which judges the ref; a
+  garbage collection held nothing for it. The next step names `forklift heal`, which judges the ref
+  (or, where the copy holds no parcel hash, restoring both from a backup, since `heal` has nothing
+  to rebuild it from); a
   copy that cannot be read, or a link at its path, is refused, naming what to make readable or replace.
   A link at any pallet's ref path is never followed: it refuses as blocked, naming moving it aside,
   and `heal` leaves it with the same step. A ref whose path cannot be read refuses, naming making
