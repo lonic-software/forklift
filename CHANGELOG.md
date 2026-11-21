@@ -41,12 +41,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   with the head heal set out to write. A metadata ref's rebuild that pass left
   for the one after it is noted with the reason, and a refusal says each note once. A copy lost or out of step beside
   a ref that reads is set back to the ref only when the store holds the ref's head; otherwise both
-  are left, with a note. A copy write that reports a failure but reads back as set (a folder sync
-  after its rename failing) is now noted as set, with what the write reported; before, the pass
-  before the taint recovery said nothing of it and the pass after read the copy as in step. Where
-  no taint records the folder it left unsynced, `heal` syncs that folder again, also for a copy
-  it cannot read back, and when that sync does not hold either it says the copy may not be durable
-  and goes no further. The office's ref is rebuilt first, at a
+  are left, with a note. A copy write that reports a failure (a folder sync after its rename failing)
+  is now followed by a read of the copy, and a note says it holds the ref's head, or may, where
+  the copy cannot be read, with what the write reported; before, the pass before the taint
+  recovery said nothing of it and the pass after read the copy as in step. Where no taint records
+  the folder it left unsynced, `heal` syncs that folder again, also for a copy it cannot read
+  back, and says what that sync reported; when it does not hold either, `heal` says in place of
+  the note that the copy may not be durable, and goes no further. The office's ref is rebuilt first, at a
   head that verifies against the anchor of the trust file or of its copy, and a trust file lost
   beside it is then restored from its copy. The redactions' own ref (`@redactions`) is rebuilt
   next, ahead of every other metadata ref, which is checked against it; beside a damaged office

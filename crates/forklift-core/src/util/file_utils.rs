@@ -1006,7 +1006,11 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(),
 /// [`taint_utils::record_taint`]'s own doc comment.
 fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String {
     #[cfg(test)]
-    if TAINT_RECORD_FAULT.with(|fault| fault.get()) {
+    if TAINT_RECORD_FAULT.with(|fault| fault.get()) && TAINT_RECORD_FAULTS_LEFT.with(|left| match left.get() {
+        None => true,
+        Some(0) => false,
+        Some(n) => { left.set(Some(n - 1)); true }
+    }) {
         return format!("{}{}injected taint-record failure)", sync_error, TAINT_UNRECORDED);
     }
 
@@ -1021,6 +1025,10 @@ thread_local! {
     /// Makes [`taint_after_sync_failure`] report that the taint could not be recorded, as an
     /// unactivated process's record never fails. See [`TaintRecordFaultGuard`].
     static TAINT_RECORD_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// How many more taint records [`TAINT_RECORD_FAULT`] fails
+    /// ([`TaintRecordFaultGuard::failing_once`]); `None` fails every one.
+    static TAINT_RECORD_FAULTS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// RAII scope for [`TAINT_RECORD_FAULT`]: armed while it lives, cleared on construction's
@@ -1035,12 +1043,22 @@ impl TaintRecordFaultGuard {
         TAINT_RECORD_FAULT.with(|fault| fault.set(true));
         TaintRecordFaultGuard
     }
+
+    /// Fail only the first taint record that follows a failed directory sync on this thread: a
+    /// later one, such as a retry's, is recorded.
+    #[cfg(unix)]
+    pub(crate) fn failing_once() -> Self {
+        let guard = Self::failing();
+        TAINT_RECORD_FAULTS_LEFT.with(|left| left.set(Some(1)));
+        guard
+    }
 }
 
 #[cfg(test)]
 impl Drop for TaintRecordFaultGuard {
     fn drop(&mut self) {
         TAINT_RECORD_FAULT.with(|fault| fault.set(false));
+        TAINT_RECORD_FAULTS_LEFT.with(|left| left.set(None));
     }
 }
 
