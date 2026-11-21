@@ -445,7 +445,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let outcome = match recovery_utils::run(Some(&|line: &str| crate::human!("{}", line))).await {
         Ok(outcome) => outcome,
         Err(refused) => {
-            // A deferred ref the taint stands on is never judged again while it stays unread.
+            // A deferred meta ref, or a damaged user ref, the taint stands on is never judged
+            // again while it stays unread, so both say so (below).
             let kept = refused.kept_by_unread_refs;
             refs_left.borrow_mut().kept = kept.clone();
             // An interrupted operation waits for the taint (below), so the refusal says so: it
