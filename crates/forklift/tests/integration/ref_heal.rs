@@ -2556,8 +2556,9 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
         }
 
         // With the parcel only `side` reaches back, nothing else holds the taint: the deferred
-        // ref is judged and rebuilt, but the one whose unread head keeps the taint stops the
-        // next heal the same way, until its copy's head is back too and the taint resolves.
+        // ref is judged and rebuilt, but the one whose unread head keeps the taint, or keeps a
+        // torn taint's rescan from finishing, stops the next heal the same way, until its copy's
+        // head is back too and the taint resolves.
         if let ("deferred" | "lost-deferred" | "torn-lost", Some((path, bytes))) = (case, &side_object) {
             std::fs::write(path, bytes).unwrap();
             let output = area.run(&root, &["--json", "heal"]);
