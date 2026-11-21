@@ -180,7 +180,9 @@ pub struct Repair {
     /// The refs it rebuilt.
     pub rebuilt: Vec<Rebuilt>,
 
-    /// The refs it refused to rebuild (only [`Pass::AfterTaint`] refuses; the first pass defers).
+    /// The refs it refused to rebuild. A meta pass refuses only in [`Pass::AfterTaint`], the first
+    /// deferring; a user pass refuses in either pass, deferring from the first only what the taint
+    /// recovery may settle.
     pub refused: Vec<Refused>,
 
     /// The meta refs [`Pass::BeforeTaint`] judged and left for [`Pass::AfterTaint`], each with
@@ -786,7 +788,8 @@ fn choose(pallet: &str, evidence: &Evidence, pass: Pass) -> Choice {
 /// Run one repair pass over every damaged user ref.
 ///
 /// # Returns
-/// * `Ok(Repair)`  - What it rebuilt, and in [`Pass::AfterTaint`] what it refused.
+/// * `Ok(Repair)`  - What it rebuilt and what it refused, the ref whose write met damaged
+///                   tombstones included, where it stopped.
 /// * `Err(String)` - If the user refs could not be listed.
 pub fn repair(pass: Pass) -> Result<Repair, String> {
     let mut report = Repair::default();
@@ -827,8 +830,15 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                     Ok(()) => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
                     // Damaged tombstones refuse every ref write alike, and only the operator's
                     // repair mends them, so the refusal is the answer, with its own next step.
-                    // What this pass already rebuilt stays reported.
+                    // What this pass already rebuilt stays reported, and so does the ref it was
+                    // writing, refused in either pass, since the run ends on the stop.
                     Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
+                        report.refused.push(Refused {
+                            pallet: damaged.pallet.clone(),
+                            reason: tombstones_stopped_reason(&head),
+                            candidates: listed(&evidence.candidates),
+                            meta: None,
+                        });
                         report.stopped = Some(error);
                         break;
                     }
@@ -2180,6 +2190,10 @@ thread_local! {
 
     /// The wire name of each ref [`read_back`] was asked to read, in order.
     static READS_BACK: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The refusal the next meta rebuild's write answers instead of writing, once: a repair writes
+    /// as a creation, and no fixture makes one meet damaged tombstones.
+    static META_WRITE_REFUSED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Read back the ref of pallet `name` after heal wrote it at `head`.
@@ -2243,7 +2257,14 @@ fn write_meta_rebuild(state: &MetaState,
             state.wire(), gone, head, source
         ));
     }
-    let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged);
+    #[cfg(test)]
+    let refused = META_WRITE_REFUSED.with(|refused| refused.borrow_mut().take());
+    #[cfg(not(test))]
+    let refused: Option<String> = None;
+    let written = match refused {
+        Some(error) => Err(RefUpdateError::Failed(error)),
+        None => pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged),
+    };
 
     let mut read = read_back(PalletNamespace::Meta, &state.name, &head);
     let attempt = WriteAttempt::of_ref(pass, PalletNamespace::Meta, &state.name, &head, written.as_ref().err(), &read);
@@ -2251,12 +2272,16 @@ fn write_meta_rebuild(state: &MetaState,
         read = settled;
     }
 
+    let mut stops = false;
     let (reason, owner) = match written {
         // As in the user pass: the refusal is the answer, and what this pass rebuilt stays
-        // reported.
+        // reported. The ref it was writing is refused (deferred, in the pass before the taint
+        // recovery) like any write that did not land, its way out the tombstones' repair.
         Err(RefUpdateError::Failed(error)) if crate::util::tombstone_utils::is_damage(&error) => {
+            let step = lifted_step(&error);
             report.stopped = Some(error);
-            return true;
+            stops = true;
+            (tombstones_stopped_reason(&head), Owner::Unwritten(step))
         }
         // As in the user pass.
         _ if matches!(read, ReadBack::Landed) => {
@@ -2289,7 +2314,14 @@ fn write_meta_rebuild(state: &MetaState,
         ));
     }
     refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }], owner);
-    false
+    stops
+}
+
+/// Why the rebuild at `head` is refused when its write met damaged tombstones, which refused it
+/// before its write and stopped the pass: their refusal, said where the pass stopped, carries the
+/// detail and the step.
+fn tombstones_stopped_reason(head: &str) -> String {
+    format!("the rebuild at {} was not written: the damaged tombstones refused it, and the pass stopped there", head)
 }
 
 /// Step 3 of [`repair_meta`], over the meta refs as the steps before it left them. The office is
@@ -2536,6 +2568,20 @@ mod tests {
         )]);
         assert!(after.rebuilt.is_empty() && after.refused.is_empty() && after.undurable.is_empty(), "{:?}", after);
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
+
+        // Damaged tombstones refuse the write and stop the pass, which ends the run in either
+        // pass: the ref it was writing is refused for them, not left unsaid. Mutation: stop with
+        // no refusal → main is not refused, red.
+        std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
+        std::fs::write(crate::util::tombstone_utils::served_path(), b"not a served mark").unwrap();
+        for pass in [Pass::BeforeTaint, Pass::AfterTaint] {
+            let stopped = repair(pass).unwrap();
+            assert!(stopped.stopped.as_deref().is_some_and(crate::util::tombstone_utils::is_damage), "{:?}: {:?}", pass, stopped.stopped);
+            let refused: Vec<_> = stopped.refused.iter().map(|refused| (refused.pallet.as_str(), refused.reason.as_str())).collect();
+            let reason = format!("the rebuild at {} was not written: the damaged tombstones refused it, and the pass stopped there", head);
+            assert_eq!(refused, vec![("main", reason.as_str())], "{:?}", pass);
+            assert_eq!(std::fs::read(&path).unwrap(), &head.as_bytes()[..20], "{:?}: the ref is left alone", pass);
+        }
     }
 
     // An unread refusal's way out is the step its read named, when that is not heal itself: it
@@ -2915,9 +2961,9 @@ mod tests {
         use crate::util::tag_utils::TAGS_PALLET_NAME;
 
         #[derive(Debug, Clone, Copy)]
-        enum Row { Clean, #[cfg(unix)] LandedDespite, #[cfg(unix)] Undurable, Unread, #[cfg(unix)] ReadOnly, Moved }
+        enum Row { Clean, #[cfg(unix)] LandedDespite, #[cfg(unix)] Undurable, Unread, #[cfg(unix)] ReadOnly, Moved, Tombstones }
         #[allow(unused_mut)]
-        let mut rows = vec![Row::Clean, Row::Unread, Row::Moved];
+        let mut rows = vec![Row::Clean, Row::Unread, Row::Moved, Row::Tombstones];
         // A folder sync is a no-op off unix, so no injected sync failure can fire there; nor does
         // a 0o555 folder refuse a write.
         #[cfg(unix)]
@@ -2975,6 +3021,10 @@ mod tests {
                         Row::Moved => {
                             let (moved, other) = (ref_path.clone(), other.clone());
                             pallet_utils::tests::set_before_hold(move || std::fs::write(&moved, format!("{}\n", other)).unwrap());
+                        }
+                        Row::Tombstones => {
+                            let damage = crate::util::tombstone_utils::damaged("The tombstone list does not read.");
+                            META_WRITE_REFUSED.with(|refused| *refused.borrow_mut() = Some(damage));
                         }
                         _ => {}
                     }
@@ -3042,6 +3092,19 @@ mod tests {
                         let owner = not_landed(&format!("the rebuild at {} was not written: ", held), false);
                         assert_eq!(owner, Owner::Again, "{:?}", pass);
                         assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(other.as_str()), "{:?}: nothing was written over the move", pass);
+                    }
+                    // The write that met the stop was judged: refused (deferred) for it, its way
+                    // out the tombstones' repair, and never listed as unjudged.
+                    Row::Tombstones => {
+                        let reason = format!("the rebuild at {} was not written: the damaged tombstones refused it, and the pass stopped there", held);
+                        let owner = not_landed(&reason, true);
+                        match owner {
+                            Owner::Unwritten(Some(step)) => assert!(step.starts_with("forklift-server tombstone repair --root"), "{:?}: {}", pass, step),
+                            owner => panic!("{:?}: {:?}", pass, owner),
+                        }
+                        assert!(repair.stopped.as_deref().is_some_and(crate::util::tombstone_utils::is_damage), "{:?}: {:?}", pass, repair.stopped);
+                        assert!(repair.unjudged.is_empty(), "{:?}: {:?}", pass, repair.unjudged);
+                        assert_eq!(std::fs::read(&ref_path).unwrap(), format!("{}\n", gone).into_bytes(), "{:?}: the ref is left alone", pass);
                     }
                 }
                 let landed = match row {
