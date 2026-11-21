@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
 mod common;
-use common::{forklift_command, hold_store_access};
+use common::{backdate, backdate_tree, forklift_command, hold_store_access};
 
 /// A temporary warehouse directory that is deleted when the test ends.
 struct TestWarehouse {
@@ -2307,27 +2307,6 @@ fn file_identity(path: &std::path::Path) -> (std::time::SystemTime, u64) {
     let inode = 0;
 
     (metadata.modified().unwrap(), inode)
-}
-
-/// Move a file's mtime `seconds` into the past, leaving its content alone.
-fn backdate(path: &std::path::Path, seconds: u64) {
-    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
-}
-
-/// [`backdate`] every file under `root` outside its `.forklift` and `.git` folders, so the next
-/// command's stats can prove them without waiting until they are old enough. Directories keep
-/// their mtimes: a stat proof reads only a file's.
-fn backdate_tree(root: &std::path::Path, seconds: u64) {
-    for entry in std::fs::read_dir(root).unwrap() {
-        let entry = entry.unwrap();
-        let kind = entry.file_type().unwrap();
-        if kind.is_dir() && entry.file_name() != ".forklift" && entry.file_name() != ".git" {
-            backdate_tree(&entry.path(), seconds);
-        } else if kind.is_file() {
-            backdate(&entry.path(), seconds);
-        }
-    }
 }
 
 /// The rollup hash of the shard `key`, read straight off disk.

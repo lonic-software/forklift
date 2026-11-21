@@ -128,3 +128,28 @@ pub fn prose_lines(page: &str) -> Vec<&str> {
         })
         .collect()
 }
+
+/// Move a file's mtime `seconds` into the past, leaving its content alone. The next command's
+/// stat then proves the file's content without waiting until it is old enough: a stat proves an
+/// entry only when the file's mtime is two whole seconds older than the clock probe read before
+/// it, and the file is on the probe's device.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn backdate(path: &std::path::Path, seconds: u64) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
+}
+
+/// [`backdate`] every regular file under `root` outside its `.forklift` and `.git` folders; links
+/// are left alone. Directories keep their mtimes: a stat proof reads only a file's.
+#[allow(dead_code)] // Used by only some of the test files that include this module.
+pub fn backdate_tree(root: &std::path::Path, seconds: u64) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() && entry.file_name() != ".forklift" && entry.file_name() != ".git" {
+            backdate_tree(&entry.path(), seconds);
+        } else if kind.is_file() {
+            backdate(&entry.path(), seconds);
+        }
+    }
+}
