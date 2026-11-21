@@ -1730,7 +1730,7 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
                 // not gone back to without the note a stale ref gets: it is judged again. Any other
                 // is verified as before, and refuses as its read says.
                 Some(head) if matches!(object_utils::load_parcel_judged(&head), Ok(Ok(_))) => Err((format!(
-                    "its own bytes name {}, which is not in the store, and its copy's head {} is in the store, but heal's first reading of the two did not find the ref stale", parcel, head
+                    "its own bytes name {}, which is not in the store, and its copy's head {} is in the store now, though the durability taint covered it or the store did not hold it when heal first read the ref", parcel, head
                 ), candidates, Owner::Again)),
                 Some(head) => Ok((head, FROM_COPY)),
                 None => lost(match state.copy {
