@@ -664,7 +664,7 @@ async fn resolve_the_rest(
             // other ref, the record stays: nothing else would say the copy is lost.
             VanishedClass::MetaCopy(name) => {
                 let reference = format!("{}/{}", pallet_utils::FOLDER_NAME_META_ROOT, name);
-                let why = match pallet_utils::read_file_state(&root.join(pallet_utils::FOLDER_NAME_META_ROOT).join(name)) {
+                let why = match pallet_utils::read_file_state(&pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, name)) {
                     Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => match pallet_utils::parse_ref_bytes(&bytes) {
                         Some(_) => None,
                         None => Some("does not hold a head either".to_string()),

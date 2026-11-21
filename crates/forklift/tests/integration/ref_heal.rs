@@ -2157,13 +2157,14 @@ fn link_file(target: &Path, link: &Path) -> bool {
 /// A meta pallet's first write whose sync failed and whose birth a power loss then undid: the
 /// taint records the vanished file. A copy gone beside a ref that is a file holding a head
 /// resolves in the taint recovery, and the meta pass after it sets the copy to the ref's bytes;
-/// where the store does not give that head, the copy is left and the run refuses the head as
-/// lost, as on a warehouse with no taint. A ref gone beside its copy is rebuilt from the copy before the recovery. A copy
-/// gone beside a ref that is gone, damaged or not a file is more than one fault, and the taint
-/// stands.
+/// where the store does not give that head, the copy is left, the pass says why, and the run
+/// refuses the head as lost, as on a warehouse with no taint. A ref gone beside its copy is
+/// rebuilt from the copy before the recovery. A copy gone beside a ref that is gone, damaged or
+/// not a file is more than one fault, and the taint stands.
 // Mutations: file a vanished copy as unrecognized again → "copy" red (the run refuses, the
 // taint stands); resolve a vanished copy whatever its ref holds → "copy-ref-damaged" red (the
-// taint clears); read the ref through a link → "copy-ref-link" red (the taint clears).
+// taint clears); read the ref through a link → "copy-ref-link" red (the taint clears); judge
+// the ref's head against the store in the recovery → "copy-head-absent" red (the taint stands).
 #[test]
 fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
     for case in ["copy", "ref", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
@@ -2215,6 +2216,8 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
                 assert!(!copy.exists(), "{}: the copy is not set to a head the store does not give: {}", case, said);
                 assert!(!output.status.success(), "{}: {}", case, said);
                 assert!(said.contains("\"code\": \"objects_lost\"") && said.contains(&absent), "{}: the lost head is refused as lost: {}", case, said);
+                let note = format!("the ref's head {} is not in the store, so the copy was not set to it", absent);
+                assert!(said.contains(&note), "{}: the meta pass says why the copy was not set ({}): {}", case, note, said);
             }
             _ => {
                 assert!(!output.status.success(), "{}: {}", case, said);
