@@ -2779,7 +2779,7 @@ next step is to restore the warehouse from a backup or clone it afresh, to re-cr
 pack folder holds another build's index, or to run `heal` again when the store lock was busy. A walk
 that cannot finish (an unreadable staged shard, say) exits non-zero saying it could not finish its
 reachability check, and claims nothing lost. When nothing else refuses, under `--json` that error
-carries no report, so its `message` also says what the run repaired before it.
+carries no report, so its `message` says, after the failure, what the run repaired.
 
 `heal` and the read-only `audit` are the only two commands that run while a taint is standing —
 every other command refuses first, precisely so nothing durable is ever recorded on top of

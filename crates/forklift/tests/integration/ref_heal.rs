@@ -1132,7 +1132,7 @@ fn a_walk_that_cannot_finish_still_reports_the_repairs_under_json() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let message = value["error"]["message"].as_str().unwrap();
     assert!(message.starts_with("heal could not finish its reachability check"), "{}", value);
-    // Said once, after the failure it follows.
+    // Said once, and after the failure, which leads.
     assert_eq!(message.matches(rebuilt.as_str()).count(), 1, "{}", value);
     assert_eq!(head(&root, "main"), before);
 

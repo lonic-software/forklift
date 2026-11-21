@@ -776,10 +776,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - Under `--json`, a `heal` whose reachability check cannot finish, with no damaged ref or inventory
   refusing, now says what the run repaired in the error's `message`, after the failure. Before, that
-  error carried only the failure, so the repairs went unreported though they had happened. An
-  inventory rebuild that fails with an uncoded error now says every repair the same way, where it
-  said only the recovery of an interrupted operation. In either mode, a failed reachability check
-  after a run that did nothing no longer prints "Nothing to heal" before it.
+  error carried only the failure, so the repairs went unreported though they had happened. A heal
+  whose inventory step fails with an uncoded error (a rebuild that fails, a metadata path that is
+  not a file) now says every repair the same way, where it said only the recovery of an interrupted
+  operation. A failed reachability check after a run that did nothing no longer prints "Nothing to
+  heal" before it.
 - **`heal` restores a damaged record of a merge in progress from a copy kept beside it.** Every
   write of a consolidation's state, its out-of-scope skeleton or a pick's state now leaves a copy
   (`consolidation-copy`, `consolidation-skeleton-copy`, `cherry-pick-copy`), and `forklift heal`
