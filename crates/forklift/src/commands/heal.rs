@@ -446,7 +446,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         Ok(outcome) => outcome,
         Err(refused) => {
             // A deferred meta ref, or a damaged user ref, the taint stands on is never judged
-            // again while it stays unread, so both say so (below).
+            // again while it stays unread: changed_after says so for the meta refs, through
+            // refs_left (so it is set first), and the loop below for the user refs.
             let kept = refused.kept_by_unread_refs;
             refs_left.borrow_mut().kept = kept.clone();
             // An interrupted operation waits for the taint (below), so the refusal says so: it

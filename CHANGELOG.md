@@ -60,8 +60,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   ref a pass that stopped never judged. A ref left that way that cannot be read keeps the
   recovery from checking what it reaches, so the taint can stand on it for good: that refusal
   says the ref is judged again only once the taint is resolved, and names a backup or a fresh
-  clone as the way out for when it is not. A damaged user pallet ref left unread that way gets
-  the same sentence, where the refusal said `heal` rebuilds it once the taint is resolved.
+  clone as the way out for when it is not. A damaged user pallet ref whose unread head keeps the
+  taint standing now gets that way out too, where the refusal said `heal` rebuilds it once the
+  taint is resolved.
   Where damaged tombstones would refuse a pallet ref's rebuild,
   `heal` now writes no user pallet ref and stops the run, with their repair as the step; the refusal
   names each ref it would have rebuilt and the head, each other it refused, and each damaged pallet
