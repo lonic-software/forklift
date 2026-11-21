@@ -2140,6 +2140,20 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
     std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
 }
 
+/// Make `link` a link to file `target`. A Windows runner without the privilege to make one
+/// answers false; anywhere else a failure is the test's.
+fn link_file(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+}
+
 /// A meta pallet's first write whose sync failed and whose birth a power loss then undid: the
 /// taint records the vanished file. A copy gone beside a ref that is a file holding a head
 /// resolves in the taint recovery, and the meta pass after it sets the copy to the ref's bytes;
@@ -2178,14 +2192,8 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
                 let target = root.join("ref-target");
                 std::fs::write(&target, std::fs::read(&reference).unwrap()).unwrap();
                 forklift_core::util::file_utils::remove_file(&reference).unwrap();
-                #[cfg(unix)]
-                let linked = std::os::unix::fs::symlink(&target, &reference);
-                #[cfg(windows)]
-                let linked = std::os::windows::fs::symlink_file(&target, &reference);
-                // A Windows runner without the privilege to make a link skips the case, and says so.
-                if let Err(error) = linked {
-                    assert!(cfg!(windows), "{}: {}", case, error);
-                    eprintln!("{}: skipped, no link could be made here: {}", case, error);
+                if !link_file(&target, &reference) {
+                    eprintln!("{}: skipped, no link could be made here", case);
                     continue;
                 }
             }

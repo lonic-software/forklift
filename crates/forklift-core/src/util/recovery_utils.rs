@@ -1522,7 +1522,7 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         let mut parts = name.components();
         if let (Some(std::path::Component::Normal(name)), None) = (parts.next(), parts.next()) {
             if let Some(name) = crate::util::meta_tree::META_PALLET_NAMES.iter().find(|known| std::ffi::OsStr::new(known) == name) {
-                return VanishedClass::MetaCopy(*name);
+                return VanishedClass::MetaCopy(name);
             }
         }
     }
