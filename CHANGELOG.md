@@ -781,6 +781,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   write that fails) now says every repair the same way, where it said only the recovery of an interrupted
   operation. A failed reachability check after a run that did nothing no longer prints "Nothing to
   heal" before it.
+- A `heal` that clears a durability taint and then stops, for damaged tombstones or another refusal
+  later in the run, now says in its error the taint it cleared, with the paths it stored again or
+  resolved and its notes, and every repair made after the taint in the order the run made it: a
+  trust file restored only then, and, when a damaged merge record's repair fails after it, the
+  recovery of an interrupted operation. Before, those stops left them out, and with the taint's
+  files gone no later run reported them. A note quoting a refusal is said once, as prose.
 - **`heal` restores a damaged record of a merge in progress from a copy kept beside it.** Every
   write of a consolidation's state, its out-of-scope skeleton or a pick's state now leaves a copy
   (`consolidation-copy`, `consolidation-skeleton-copy`, `cherry-pick-copy`), and `forklift heal`

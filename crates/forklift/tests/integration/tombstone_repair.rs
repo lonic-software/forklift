@@ -502,20 +502,31 @@ fn heal_over_damaged_tombstones_answers_with_the_repair_and_rebuilds_once_it_is_
 /// A taint over the damaged ref's head leaves it for the pass after the taint recovery, which
 /// meets the damaged tombstones instead: heal's answer names the ref it would rebuild, and the
 /// damaged ref after it, which that pass judges all the same. Revert: break the pass at the
-/// first refusal → zeta unnamed, red.
+/// first refusal → zeta unnamed, red. The meta pass before it rebuilds a meta ref the taint held,
+/// which the stop says once, after the taint.
 #[test]
 fn heal_over_damaged_tombstones_after_the_taint_recovery_names_every_ref_it_judged() {
     let area = Area::new("heal-after-taint");
     let root = area.served();
     area.deleted(&root, "side");
+    area.run_ok(&root, &["tag", "create", "v1", "main"]);
     let main = head(&root, "main");
+    let meta = root.join(".forklift").join("meta");
+    let tags = std::fs::read_to_string(meta.join("tags")).unwrap().trim_end().to_string();
+    std::fs::write(meta.join("tags"), &tags.as_bytes()[..20]).unwrap();
     let pallets = root.join(".forklift").join("pallets");
     std::fs::write(pallets.join("main"), &main.as_bytes()[..20]).unwrap();
     std::fs::write(pallets.join("zeta"), b"not a head\n").unwrap();
     let taint = forklift_core::util::taint_utils::taint_dir_path_under(&root);
     std::fs::create_dir_all(&taint).unwrap();
+    // A staged shard the taint names that is gone is a note of the taint recovery's own.
+    let shard = std::path::Path::new("inventory").join(forklift_core::util::file_utils::shard_folder_relative("gone")).join("data");
     std::fs::write(taint.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(
-        [format!("objects/{}/{}", &main[..2], &main[2..])],
+        [
+            format!("objects/{}/{}", &main[..2], &main[2..]),
+            format!("objects/{}/{}", &tags[..2], &tags[2..]),
+            shard.to_string_lossy().replace('\\', "/"),
+        ],
     )).unwrap();
     std::fs::write(list_path(&root), b"\xff\xfe not a list").unwrap();
 
@@ -527,6 +538,23 @@ fn heal_over_damaged_tombstones_after_the_taint_recovery_names_every_ref_it_judg
     assert!(message.contains(&said), "{}", message);
     assert!(message.contains("The ref of pallet \"zeta\" was not rebuilt: nothing in this warehouse names its head"), "{}", message);
     assert!(!message.contains("this run stopped before judging it"), "{}", message);
+    // The taint it cleared is said too, before the notes on the run: its files are gone, so no
+    // later run reports it. The shard's path is read with "/" between its parts on every platform.
+    let message = message.replace('\\', "/");
+    let mut restaged = [format!("objects/{}/{}", &main[..2], &main[2..]), format!("objects/{}/{}", &tags[..2], &tags[2..])];
+    restaged.sort();
+    let cleared = format!(
+        "Durability taint cleared: restaged {}; resolved (absent and unreferenced) {}.",
+        restaged.join(", "), shard.to_string_lossy().replace('\\', "/"),
+    );
+    let at = message.find(&cleared).unwrap_or_else(|| panic!("{}", message));
+    let note = message.find("Note: ").unwrap_or_else(|| panic!("{}", message));
+    assert!(at < note, "{}", message);
+    // The meta ref the pass after the taint rebuilt is said once, among the repairs since it.
+    let rebuilt = format!("Rebuilt the ref of pallet \"@tags\" at {}, from the ref's copy.", tags);
+    assert_eq!(message.matches(&rebuilt).count(), 1, "{}", message);
+    assert!(message.find(&rebuilt).is_some_and(|said| at < said && said < note), "{}", message);
+    assert!(message.contains("Note: the staged inventory shard"), "{}", message);
 }
 
 /// Revert: leave kept heads out of the holder census → the redaction applies and deletes content

@@ -356,7 +356,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // judge only what is left. A refusal says what this run already changed: its own "Nothing was
     // changed" speaks only for the write it refused. Its notes go along: a check they say was
     // skipped would otherwise go unreported.
-    let changed = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
+    let repairs = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed]| {
         let mut error = config_said(error);
         if let Some(record) = &record_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
@@ -386,7 +386,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         for removed in removed {
             error = forklift_core::error::append_to_message(error, &removed_sentence(removed));
         }
-        append_notes(error, notes)
+        error
+    };
+    let changed = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
+        append_notes(repairs(error, rebuilt, removed), notes)
     };
 
     for (pallet, parcel) in set_ref {
@@ -424,6 +427,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
+    // What the run repaired before the taint recovery is said before it, by every failure after it.
+    let rebuilt_before_taint = refs_rebuilt.clone();
     // What the first pass refused, the ref whose write met the stop included, is said here: the
     // second pass, which would refuse it again, never runs. So are the damaged refs it stopped
     // before judging, beside the meta refs left.
@@ -456,6 +461,23 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     };
 
+    // Every failure from here on says the taint this run cleared, and what its recovery noted:
+    // the taint's files are gone, so no later run reports them. It goes after the repairs made
+    // before it (with the refs any pass judged and left, which those sentences carry), and
+    // `since_taint` holds what each step after it repaired, pushed as the step ends; the notes,
+    // the taint recovery's first, follow every repair.
+    let taint_notes = outcome.notes.clone();
+    let mut since_taint: Vec<String> = taint_sentence(&outcome).into_iter().collect();
+    let changed_after_taint = |error: String, notes: &[String], since_taint: &[String]| {
+        let mut error = repairs(error, &rebuilt_before_taint, &refs_removed);
+        if let Some(position) = &late_position {
+            error = forklift_core::error::append_to_message(error, &position.sentence());
+        }
+        let error = since_taint.iter().fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence));
+        let notes: Vec<String> = taint_notes.iter().chain(notes).cloned().collect();
+        append_notes(error, &notes)
+    };
+
     // After the taint, which may have refetched what a candidate lacked; before the operation
     // recovery, whose landed test reads the ref.
     // The meta refs first, as before the taint: a user ref's rebuild reads the office.
@@ -466,9 +488,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
         Err(stopped) => {
             refs_left.replace(RefsLeft::after_second(&meta_deferred, stopped.refused, stopped.unjudged));
+            since_taint.extend(stopped.rebuilt.iter().map(rebuilt_sentence));
             refs_rebuilt.extend(stopped.rebuilt);
             ref_notes.extend(stopped.notes);
-            return Err(changed_after(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes));
+            return Err(changed_after_taint(stopped.error, &ref_notes, &since_taint));
         }
     };
     // The trust repair runs in both passes, and may note the same thing in each: a refusal and
@@ -482,22 +505,26 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
     ref_notes.extend(meta_second.trust.notes);
     // So for the meta refs: one still damaged when this pass reads it was judged by the first
-    // too, and may be noted the same way again.
+    // too, and may be noted the same way again. The pass's rebuilt meta refs are said before a
+    // trust file only it restored.
     let meta_second = meta_second.repair;
+    since_taint.extend(meta_second.rebuilt.iter().map(rebuilt_sentence));
+    since_taint.extend(trust_after_said(trust_repair.restored.as_ref(), trust_restored_after.as_ref()));
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
     if let Some(error) = stopped_with(meta_second.stopped, &meta_second.undurable) {
-        return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
+        return Err(changed_after_taint(error, &ref_notes, &since_taint));
     }
 
-    let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
+    let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after_taint(error, &ref_notes, &since_taint))?;
+    since_taint.extend(second.rebuilt.iter().map(rebuilt_sentence));
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
     refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: Vec::new(), held: None });
     if let Some(error) = stopped_with(second.stopped, &second.undurable) {
-        return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
+        return Err(changed_after_taint(error, &ref_notes, &since_taint));
     }
 
     // An operation on a pallet whose ref is still damaged waits: its landed test would read the
@@ -532,11 +559,9 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         Err(error) => inventory_error = Some(error),
     }
     let unreadable = inventory_error.is_some();
-    // A step that fails after a written rebuild says so beside every other repair.
-    let with_rebuilt = |error: String, rebuilt: &Option<InventoryRebuilt>| match rebuilt {
-        Some(rebuilt) => forklift_core::error::append_to_message(error, &rebuilt.sentence()),
-        None => error,
-    };
+    // A rebuild written here is said by every failure after it, in its place among the repairs
+    // since the taint.
+    since_taint.extend(inventory_rebuilt.iter().map(InventoryRebuilt::sentence));
     let held_park = partial_park.is_some() && inventory_held.is_some();
     if held_park {
         ref_notes.push(
@@ -558,7 +583,21 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let recovered = match waits.is_some() || held_park || unreadable {
         true => Ok(None),
         false => operation_utils::recover(),
-    }.map_err(|error| with_rebuilt(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
+    }.map_err(|error| changed_after_taint(error, &ref_notes, &since_taint))?;
+    let operation = recovered.map(|recovery| OperationRecovery {
+        operation: recovery.operation.as_str().to_string(),
+        outcome: match recovery.outcome {
+            RecoveryOutcome::Finished => OperationOutcome::Finished,
+            RecoveryOutcome::RolledForward => OperationOutcome::RolledForward,
+            RecoveryOutcome::RolledBack => OperationOutcome::RolledBack,
+            RecoveryOutcome::Cleared => OperationOutcome::Cleared,
+        },
+        pallet: recovery.position.pallet,
+        base: recovery.position.base,
+        unheld: recovery.unheld,
+    });
+    // The recovery lowered its marker, so a failure after it is the only place it is said.
+    since_taint.extend(operation.iter().map(OperationRecovery::sentence));
 
     // A merge record left damaged under another kind of operation is repaired again once that
     // operation's recovery has lowered its marker, so a refusal it ends with names a way out that
@@ -569,7 +608,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 // Judged against the position that recovery left, which it may have moved.
                 let settled = merge_state_heal::agreement_in(&forklift_core::globals::bay_root());
                 let later = merge_state_heal::repair(settled.as_ref(), &mut ref_notes)
-                    .map_err(|error| with_rebuilt(changed_after(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes), &inventory_rebuilt))?;
+                    .map_err(|error| changed_after_taint(String::from(error), &ref_notes, &since_taint))?;
                 merge_repair = merge_repair.then(later);
                 if merge_note.is_none() {
                     merge_note = merge_note_of(&merge_repair.refusal);
@@ -595,19 +634,6 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             Err(error) => inventory_error = Some(error),
         }
     }
-    let operation = recovered.map(|recovery| OperationRecovery {
-        operation: recovery.operation.as_str().to_string(),
-        outcome: match recovery.outcome {
-            RecoveryOutcome::Finished => OperationOutcome::Finished,
-            RecoveryOutcome::RolledForward => OperationOutcome::RolledForward,
-            RecoveryOutcome::RolledBack => OperationOutcome::RolledBack,
-            RecoveryOutcome::Cleared => OperationOutcome::Cleared,
-        },
-        pallet: recovery.position.pallet,
-        base: recovery.position.base,
-        unheld: recovery.unheld,
-    });
-
     // A refill whose removal was lost leaves an object present and still recorded. That seals
     // nothing while it is present, but were it lost later it would read as held rather than lost.
     let mut notes = outcome.notes;
@@ -1619,13 +1645,16 @@ fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
 /// call already appended: a ref both meta passes judge may be noted the same way by each, and
 /// more than one pass adds to the notes a refusal carries, so a refusal says each note once.
 fn append_notes(error: String, notes: &[String]) -> String {
-    let mut said: Vec<&str> = Vec::new();
+    let mut said: Vec<String> = Vec::new();
     notes.iter().fold(error, |error, note| {
-        if said.contains(&note.as_str()) {
+        // Judged once rendered: a note carrying a refusal's frame says the same as its rendering.
+        let note = forklift_core::error::rendered_frames(note);
+        if said.contains(&note) {
             return error;
         }
+        let error = forklift_core::error::append_to_message(error, &format!("Note: {}", note));
         said.push(note);
-        forklift_core::error::append_to_message(error, &format!("Note: {}", note))
+        error
     })
 }
 
@@ -2328,26 +2357,70 @@ impl CommandOutput for HealReport {
 }
 
 impl OperationRecovery {
-    /// The recovery as report lines: its outcome, then the files it left unheld.
-    fn lines(&self) -> Vec<String> {
+    /// What the recovery did, and where it left the bay.
+    fn outcome_line(&self) -> String {
         let at = match &self.base {
             Some(base) => format!("\"{}\" at {}", self.pallet, base),
             None => format!("\"{}\" (unborn)", self.pallet),
         };
-
-        let mut lines = vec![match self.outcome {
+        match self.outcome {
             OperationOutcome::Finished => format!("The interrupted {} had already finished; the bay stands on {}.", self.operation, at),
             OperationOutcome::RolledForward => format!("Finished the interrupted {}; the bay stands on {}.", self.operation, at),
             OperationOutcome::RolledBack => format!("Undid the interrupted {}; the bay is back on {}.", self.operation, at),
             OperationOutcome::Cleared => format!("The interrupted {} had changed nothing to undo; its record is cleared.", self.operation),
-        }];
+        }
+    }
+
+    /// The recovery as report lines: its outcome, then the files it left unheld.
+    fn lines(&self) -> Vec<String> {
+        let mut lines = vec![self.outcome_line()];
 
         if !self.unheld.is_empty() {
-            lines.push("These tracked files do not hold their recorded content and show as local changes (\"forklift restore --confirm <path>\" brings one back):".to_string());
+            lines.push(format!("{}:", UNHELD));
             lines.extend(self.unheld.iter().map(|path| format!("  {}", path)));
         }
         lines
     }
+
+    /// The recovery as one sentence of a failure's message, the files it left unheld listed inline.
+    fn sentence(&self) -> String {
+        match self.unheld.is_empty() {
+            true => self.outcome_line(),
+            false => format!("{} {}: {}.", self.outcome_line(), UNHELD, self.unheld.join(", ")),
+        }
+    }
+}
+
+/// What [`OperationRecovery`] says before the files a recovery left unheld.
+const UNHELD: &str =
+    "These tracked files do not hold their recorded content and show as local changes (\"forklift restore --confirm <path>\" brings one back)";
+
+/// The trust file the meta pass after the taint recovery restored, as the sentence a failure after
+/// it says: only when the pass before it restored none, since a second restore is a note of its own.
+fn trust_after_said(before: Option<&office_utils::TrustRestored>, after: Option<&office_utils::TrustRestored>) -> Option<String> {
+    match (before, after) {
+        (None, Some(after)) => Some(after.sentence()),
+        _ => None,
+    }
+}
+
+/// The taint a recovery cleared, as one sentence of a failure's message: the paths it restaged and
+/// resolved listed inline, as the report lists them. None when no taint stood.
+fn taint_sentence(outcome: &recovery_utils::HealOutcome) -> Option<String> {
+    if !outcome.was_tainted {
+        return None;
+    }
+    let mut cleared = Vec::new();
+    if !outcome.restaged.is_empty() {
+        cleared.push(format!("restaged {}", outcome.restaged.join(", ")));
+    }
+    if !outcome.resolved.is_empty() {
+        cleared.push(format!("resolved (absent and unreferenced) {}", outcome.resolved.join(", ")));
+    }
+    Some(match cleared.is_empty() {
+        true => "Durability taint cleared.".to_string(),
+        false => format!("Durability taint cleared: {}.", cleared.join("; ")),
+    })
 }
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
@@ -2360,7 +2433,70 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_notes, deferred_sentences, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
+    use super::{append_notes, deferred_sentences, ref_heal, taint_sentence, trust_after_said, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, OperationOutcome, OperationRecovery, UnreadPallet};
+    use forklift_core::util::office_utils::{TrustFileWritten, TrustRestored};
+    use forklift_core::util::recovery_utils::HealOutcome;
+
+    // A failure after the taint recovery says the taint it cleared, with the paths it restaged and
+    // resolved, and nothing when no taint stood.
+    #[test]
+    fn a_cleared_taint_is_one_sentence_naming_what_it_restaged_and_resolved() {
+        let outcome = |was_tainted: bool, restaged: &[&str], resolved: &[&str]| HealOutcome {
+            was_tainted,
+            restaged: restaged.iter().map(|path| path.to_string()).collect(),
+            resolved: resolved.iter().map(|path| path.to_string()).collect(),
+            notes: Vec::new(),
+            index_rebuild_skipped: false,
+        };
+        assert_eq!(taint_sentence(&outcome(false, &[], &[])), None);
+        assert_eq!(taint_sentence(&outcome(true, &[], &[])).as_deref(), Some("Durability taint cleared."));
+        assert_eq!(
+            taint_sentence(&outcome(true, &["objects/aa/1", "objects/bb/2"], &["objects/cc/3"])).as_deref(),
+            Some("Durability taint cleared: restaged objects/aa/1, objects/bb/2; resolved (absent and unreferenced) objects/cc/3."),
+        );
+        assert_eq!(
+            taint_sentence(&outcome(true, &[], &["objects/cc/3"])).as_deref(),
+            Some("Durability taint cleared: resolved (absent and unreferenced) objects/cc/3."),
+        );
+    }
+
+    // The recovery's outcome and the files it left unheld, in one sentence: its marker is lowered,
+    // so a failure after it is the only place a run says it.
+    #[test]
+    fn an_operation_recovery_is_one_sentence_naming_the_files_it_left_unheld() {
+        let recovery = |unheld: &[&str]| OperationRecovery {
+            operation: "shift".to_string(),
+            outcome: OperationOutcome::RolledBack,
+            pallet: "main".to_string(),
+            base: Some("abc".to_string()),
+            unheld: unheld.iter().map(|path| path.to_string()).collect(),
+        };
+        assert_eq!(recovery(&[]).sentence(), "Undid the interrupted shift; the bay is back on \"main\" at abc.");
+        assert_eq!(
+            recovery(&["a.txt", "b.txt"]).sentence(),
+            "Undid the interrupted shift; the bay is back on \"main\" at abc. These tracked files do not hold their recorded content \
+            and show as local changes (\"forklift restore --confirm <path>\" brings one back): a.txt, b.txt.",
+        );
+    }
+
+    // A trust file the pass after the taint restored is said only when the pass before restored
+    // none: a second restore is noted on its own.
+    #[test]
+    fn a_trust_file_restored_after_the_taint_is_said_only_when_the_first_pass_restored_none() {
+        let restored = |written: TrustFileWritten| TrustRestored {
+            written,
+            path: std::path::PathBuf::from("t"),
+            from: std::path::PathBuf::from("c"),
+        };
+        let after = restored(TrustFileWritten::Trust);
+        assert_eq!(
+            trust_after_said(None, Some(&after)).as_deref(),
+            Some("The trust file \"t\" was missing or did not hold the anchor, and is restored from its copy \"c\"."),
+        );
+        assert_eq!(trust_after_said(Some(&restored(TrustFileWritten::Copy)), Some(&after)), None);
+        assert_eq!(trust_after_said(Some(&after), None), None);
+        assert_eq!(trust_after_said(None, None), None);
+    }
 
     // A pallet whose ref could not be read may be the one whose history reaches the lost
     // objects, so the report names it and never says no pallet's history reaches them.
@@ -2401,6 +2537,11 @@ mod tests {
         assert_eq!(append_notes("It was refused.".to_string(), &notes), "It was refused. Note: The first. Note: The both. Note: The second.");
         // Distinct notes are each said.
         assert_eq!(append_notes("It was refused.".to_string(), &notes[..2]), "It was refused. Note: The first. Note: The both.");
+        // A note carrying a refusal's frame is said rendered, and once beside its rendering.
+        use forklift_core::error::{CoreError, RefusalCode};
+        let framed: String = CoreError::refusal(RefusalCode::SealedDamaged, "The record is damaged.", "forklift heal").into();
+        let notes = [framed, "The record is damaged. (Next step: forklift heal)".to_string()];
+        assert_eq!(append_notes("It was refused.".to_string(), &notes), "It was refused. Note: The record is damaged. (Next step: forklift heal)");
     }
 
     #[test]
