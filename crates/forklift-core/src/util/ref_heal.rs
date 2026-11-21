@@ -2839,6 +2839,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_copy_write_that_landed_despite_its_error_is_reported_and_synced_again() {
+        // Unactivated, a taint that records writes nothing: activated by another test, the cell
+        // whose second sync is recorded leaves a taint standing, and every later mend waits for it.
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::reset_activation_for_test();
         let (_root, _scope) = scratch("ref-heal-copy-write");
         let head = stub_parcel("head");
         let stale = stub_parcel("stale");
