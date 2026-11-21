@@ -428,6 +428,22 @@ impl Tainted {
     }
 }
 
+/// Whether the store has decided that `head` is gone, and the durability taint does not account
+/// for it. Read as [`judge`] reads a candidate: a refill, a redaction, a withholding or a pack the
+/// store cannot list leaves an absence undecided, which is not this. Bytes held whole, held
+/// damaged, of another kind or of a newer build are not absent, and a head the taint covers is not
+/// read at all, since the taint recovery may yet restore it.
+fn head_decided_absent(head: &str, tainted: &Tainted) -> bool {
+    use crate::util::file_utils::{Decided, ReadFault};
+
+    !tainted.covers(head) && matches!(object_utils::load_parcel_judged(head), Err((_, ReadFault::Decided(Decided::Absent))))
+}
+
+/// Whether the store gives `head` as a whole parcel, and the durability taint does not cover it.
+fn head_held(head: &str, tainted: &Tainted) -> bool {
+    !tainted.covers(head) && matches!(object_utils::load_parcel_judged(head), Ok(Ok(_)))
+}
+
 /// Gather what every checkout and the ref's own bytes say about `damaged`'s head.
 fn gather(damaged: &DamagedRef, tainted: &Tainted, notes: &mut Vec<String>) -> Evidence {
     let pallet = damaged.pallet.as_str();
@@ -1259,6 +1275,11 @@ struct MetaState {
     reference: Option<Vec<u8>>,
 
     copy: pallet_utils::MetaCopyState,
+
+    /// Whether the ref's bytes name a head the store has decided is absent, beside a copy naming
+    /// another head the store holds; never for the office. Judged once, when the state is read, so
+    /// every reader of [`MetaState::damage`] sees the same answer.
+    stale: bool,
 }
 
 impl MetaState {
@@ -1266,10 +1287,12 @@ impl MetaState {
         meta_wire(&self.name)
     }
 
-    /// How the ref is damaged: lost beside a copy, or holding bytes that are not a head. `None`
-    /// for an intact ref, and for a pallet with neither a ref nor a copy, which is unborn.
+    /// How the ref is damaged: lost beside a copy, holding bytes that are not a head, or naming a
+    /// head the store decided is gone beside a copy whose head it holds. `None` for an intact ref,
+    /// and for a pallet with neither a ref nor a copy, which is unborn.
     fn damage(&self) -> Option<RefDamage> {
         match &self.reference {
+            Some(bytes) if self.stale => Some(RefDamage::AbsentHead(bytes.clone())),
             Some(bytes) if pallet_utils::parse_ref_bytes(bytes).is_some() => None,
             Some(bytes) => Some(RefDamage::Unreadable(bytes.clone())),
             None if self.copy == pallet_utils::MetaCopyState::Absent => None,
@@ -1333,11 +1356,32 @@ fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaS
                 "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), which has no ref: it names no head, so heal did not judge that ref.",
                 meta_wire(&name), pallet_utils::get_meta_copy_path(&name).to_string_lossy()
             ))),
-            Ok(copy) => states.push(MetaState { name, reference, copy }),
+            Ok(copy) => states.push(MetaState { name, reference, copy, stale: false }),
             Err(error) => skipped.push((name.clone(), format!(
                 "The copy of pallet \"{}\"'s ref could not be read, so heal did not judge that ref: {}", meta_wire(&name), error
             ))),
         }
+    }
+
+    // Only a ref and a copy naming two heads can be stale, so a warehouse whose copies agree reads
+    // neither the taint nor the store here. The office is never judged stale: what heal does with
+    // an office whose head is gone beside a stored copy is not decided, so it is left to the copy
+    // mend's refusal, which keeps both files. A taint that cannot be read covers every head, so
+    // nothing is judged stale beside it; its note is for the passes that salvage, which read it
+    // themselves, and would say here that salvaged objects count as lost where none was salvaged.
+    let mut tainted: Option<Tainted> = None;
+    for state in &mut states {
+        if is_office(state) {
+            continue;
+        }
+        let (Some(head), Some(copy)) = (state.reference.as_deref().and_then(pallet_utils::parse_ref_bytes), state.copy_head()) else {
+            continue;
+        };
+        if head == copy {
+            continue;
+        }
+        let tainted = tainted.get_or_insert_with(|| Tainted::read(&mut Vec::new()));
+        state.stale = head_decided_absent(&head, tainted) && head_held(&copy, tainted);
     }
 
     Ok(states)
@@ -1432,7 +1476,11 @@ type MetaRefusal = (String, Vec<Candidate>, Owner);
 /// journaled command's refs are put back, and none of `journal_op`'s commands (stack, consolidate,
 /// pick, shift) writes a meta ref: `git grep -l -E 'update_meta_pallet_head|PalletNamespace::Meta'`
 /// over their command and util modules finds none. A ref ahead of its copy (a write whose copy
-/// was not mended, a copy restored from an older backup) is rebuilt at what its own bytes name.
+/// was not mended, a copy restored from an older backup) is rebuilt at what its own bytes name,
+/// while the store holds that head. A ref whose head the store decided is gone beside a copy whose
+/// head it holds ([`RefDamage::AbsentHead`]) salvages nothing, so it is rebuilt at the copy's head,
+/// even where the copy is the older of the two: the ref goes back to the last head that can be
+/// read, and the note [`write_meta_rebuild`] leaves names the head it named.
 fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), MetaRefusal> {
     let copy = state.copy_head();
     let mut candidates: Vec<Candidate> = copy.iter()
@@ -1662,7 +1710,8 @@ impl Drop for RemedyScope {
 /// the ways out: they are in the reason, so the step does not restate them.
 const TRUST_REFUSED_STEP: &str = "Take one of the ways out the trust file's refusal names, then run \"forklift heal\" again.";
 
-/// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs.
+/// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs and the
+/// store gives the ref's head whole.
 fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>) {
     let reference = state.reference.as_deref().unwrap_or_default();
 
@@ -1672,6 +1721,36 @@ fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>)
                 "Something that is not a file stands at the copy of pallet \"{}\"'s ref (\"{}\"), so the copy was not set to the ref's head {}; move it aside and run \"forklift heal\" again.",
                 state.wire(), pallet_utils::get_meta_copy_path(&state.name).to_string_lossy(), head
             ));
+        }
+        return;
+    }
+
+    // The copy is set only toward a head the store gives whole: over any other answer, it may be
+    // the one file still naming a head a reader can load. The store's outer error is only a
+    // decided answer or an untold one, never bytes of a newer build, which come back inside `Ok`.
+    // Before the taint the refusal is silent, as the error arm below is: the pass after the taint
+    // recovery reads the store again and mends a head the recovery made readable, or says why
+    // not. A run that returns before that pass reports nothing of this copy; the next run does.
+    let refused = match object_utils::load_parcel_judged(head) {
+        Ok(Ok(_)) | Ok(Err(object_utils::NotAParcel::Newer(_))) => None,
+        Ok(Err(object_utils::NotAParcel::Other(_))) => Some("is not a parcel".to_string()),
+        Err((_, crate::util::file_utils::ReadFault::Decided(crate::util::file_utils::Decided::Absent))) => Some("is not in the store".to_string()),
+        Err((error, crate::util::file_utils::ReadFault::Decided(_))) => Some(format!("cannot be read: {}", error)),
+        Err((error, _)) => Some(format!("could not be read from the store: {}", error)),
+    };
+
+    if let Some(said) = refused {
+        if pass == Pass::AfterTaint {
+            push_note(notes, match state.copy_head() {
+                Some(other) => format!(
+                    "The copy of pallet \"{}\"'s ref names {}, and was left as it is: the ref's head {} {}, so the copy was not set to it.",
+                    state.wire(), other, head, said
+                ),
+                None => format!(
+                    "The copy of pallet \"{}\"'s ref is lost or damaged, and was left as it is: the ref's head {} {}, so the copy was not set to it.",
+                    state.wire(), head, said
+                ),
+            });
         }
         return;
     }
@@ -1752,8 +1831,10 @@ fn is_redactions(state: &MetaState) -> bool {
 ///    left it, so a trust file lost beside a lost office is restored once the office stands.
 /// 3. A lost or damaged `@redactions` ref is rebuilt first, while the office reads, verified
 ///    against the anchor and the office as step 2 left them, and checked against the head it is
-///    rebuilt at. Then every meta ref that reads has a lost or differing copy set to it, and
-///    every other lost or damaged one is rebuilt the same way, checked against the redactions
+///    rebuilt at. Then every meta ref that reads has a lost or differing copy set to it, where
+///    the store gives its head whole, and every other lost or damaged one, a ref naming a head
+///    the store decided is gone beside a copy whose head it holds among them, is rebuilt the
+///    same way, checked against the redactions
 ///    as `@redactions` then reads. One beside an office or a `@redactions` still damaged is
 ///    refused, since each is verified against the office and checked against the redactions.
 ///
@@ -2039,6 +2120,21 @@ fn write_meta_rebuild(state: &MetaState,
                       pass: Pass,
                       report: &mut Repair) -> bool {
     let damage = state.damage().expect("only a damaged ref is rebuilt");
+    // A ref rebuilt over a head the store decided is gone loses the only record of that head. So
+    // the head it named is noted before the write, in the past tense: the state heal judged and
+    // what it set out to do. That holds whichever way the write then goes. What this pass learned
+    // of the write is reported beside it; for a write it could not read back, that is the attempt,
+    // not where the ref ended.
+    let gone = match &damage {
+        RefDamage::AbsentHead(bytes) => pallet_utils::parse_ref_bytes(bytes),
+        _ => None,
+    };
+    if let Some(gone) = gone {
+        push_note(&mut report.notes, format!(
+            "The ref of pallet \"{}\" named {}, which was not in the store, when heal set out to rebuild it at {} from {}.",
+            state.wire(), gone, head, source
+        ));
+    }
     let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged);
 
     let read = read_back(PalletNamespace::Meta, &state.name, &head);
@@ -2086,6 +2182,14 @@ fn write_meta_rebuild(state: &MetaState,
         Ok(()) => (format!("the rebuild at {} did not read back", head), Owner::Again),
     };
 
+    // The pass after the taint recovery keeps a deferral only for a ref it leaves unjudged, so a
+    // deferral is not where the outcome of a write this pass attempted can rest: it is noted too.
+    if pass == Pass::BeforeTaint {
+        push_note(&mut report.notes, format!(
+            "The pass before the taint recovery left the ref of pallet \"{}\" for the pass after it: {}.",
+            state.wire(), crate::error::frames_without_steps(&reason).trim_end_matches('.')
+        ));
+    }
     refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }], owner);
     false
 }
@@ -2346,7 +2450,7 @@ mod tests {
         let framed = |step: &str| -> String {
             crate::error::CoreError::refusal(crate::error::RefusalCode::TrustDamaged, "the store could not give it", step).into()
         };
-        let state = MetaState { name: "tags".to_string(), reference: None, copy: pallet_utils::MetaCopyState::Bytes(b"x\n".to_vec()) };
+        let state = MetaState { name: "tags".to_string(), reference: None, copy: pallet_utils::MetaCopyState::Bytes(b"x\n".to_vec()), stale: false };
         let rows = [
             ("a concrete step", format!("parcel p does not pass verification: {}", framed("Restore the parcel from a backup")), Some("Restore the parcel from a backup")),
             ("heal first, then a concrete one", format!("{} and {}", framed("forklift heal"), framed("Restore the parcel from a backup")), Some("Restore the parcel from a backup")),
@@ -2363,6 +2467,55 @@ mod tests {
             let expected = step.map_or_else(|| unread_step("@tags"), str::to_string);
             assert_eq!(meta_step(refused, &report.refused), expected, "{}", row);
         }
+    }
+
+    // Mutation: drop the taint check from the predicate → a covered head reads as decided
+    // absent, red. The clean half shows the fixture reaches the decided answer.
+    #[test]
+    fn a_head_the_taint_covers_is_never_decided_absent() {
+        let (_root, _scope) = scratch("ref-heal-absent-tainted");
+        let absent = blake3::hash(b"never stored here").to_hex().to_string();
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        let covering = Tainted { hashes: BTreeSet::from([absent.clone()]), torn: false, unread: false };
+
+        assert!(head_decided_absent(&absent, &clean), "the store decided it is absent");
+        assert!(!head_decided_absent(&absent, &covering), "the taint may yet restore it");
+    }
+
+    // A meta ref whose head the store cannot tell of, beside a copy naming a held head, is no
+    // stale ref, and its copy is not set to that head. Mutations: let the predicate take an untold
+    // answer → the ref reads as damaged, red; drop the copy mend's refusal → the copy takes the
+    // ref's head, red.
+    #[test]
+    fn a_meta_ref_whose_head_the_store_cannot_tell_of_is_not_stale_and_keeps_its_copy() {
+        let (_root, _scope) = scratch("ref-heal-untold");
+        let held = stub_parcel("held");
+        let absent = blake3::hash(b"never stored here").to_hex().to_string();
+        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, "tags");
+        let copy_path = pallet_utils::get_meta_copy_path("tags");
+        for path in [&ref_path, &copy_path] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&ref_path, format!("{}\n", absent)).unwrap();
+        std::fs::write(&copy_path, format!("{}\n", held)).unwrap();
+
+        // With the store answering, the same files are a stale ref: the fixture reaches the verdict.
+        let tags = |notes: &mut Vec<String>| meta_states(notes).unwrap().into_iter().find(|state| state.name == "tags").unwrap();
+        assert_eq!(tags(&mut Vec::new()).damage(), Some(RefDamage::AbsentHead(format!("{}\n", absent).into_bytes())));
+
+        let _failing = crate::util::pack_utils::fail_unindexed_holders("the pack registry could not be read");
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        assert!(head_held(&held, &clean), "the copy's head still reads whole");
+        let state = tags(&mut Vec::new());
+        assert_eq!(state.damage(), None);
+
+        let mut notes = Vec::new();
+        mend_copy(&state, &absent, Pass::AfterTaint, &mut notes);
+        assert_eq!(std::fs::read(&copy_path).unwrap(), format!("{}\n", held).into_bytes());
+        assert_eq!(std::fs::read(&ref_path).unwrap(), format!("{}\n", absent).into_bytes());
+        assert!(notes.iter().any(|note| note.starts_with(&format!(
+            "The copy of pallet \"@tags\"'s ref names {}, and was left as it is: the ref's head {} could not be read from the store:", held, absent
+        ))), "{:?}", notes);
     }
 
     // Mutation: judge two matching parcels as Nothing → the ref's bytes stop being a floor and
@@ -2648,6 +2801,165 @@ mod tests {
         assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(child.as_str()));
     }
 
+    // A stale meta ref's rebuild names the head the ref named before it writes, so the note is the
+    // same on every outcome, in either pass: rebuilt, rebuilt though its folder sync failed once,
+    // landed but not durable, written with its ref unread back, refused in a folder heal may not
+    // write, and refused because the ref moved to another head before the hold. Each outcome is
+    // reported outside the pass's deferrals, which a later pass may drop: the pass before the taint
+    // recovery notes what it left for the pass after it. Mutations: name the head only from the
+    // outcomes in which the write landed or may have → the not-written and moved rows carry no
+    // note, red; name it after the write's match → the landed rows carry none, red; name it in the
+    // landed arm after the landed-despite note → that row's order, red; note no deferral → the
+    // refused rows of the first pass have no outcome outside the deferrals, red.
+    #[test]
+    fn a_stale_meta_ref_rebuild_names_the_head_it_named_whatever_the_write_does() {
+        use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
+        use crate::util::tag_utils::TAGS_PALLET_NAME;
+
+        #[derive(Debug, Clone, Copy)]
+        enum Row { Clean, #[cfg(unix)] LandedDespite, #[cfg(unix)] Undurable, Unread, #[cfg(unix)] ReadOnly, Moved }
+        #[allow(unused_mut)]
+        let mut rows = vec![Row::Clean, Row::Unread, Row::Moved];
+        // A folder sync is a no-op off unix, so no injected sync failure can fire there; nor does
+        // a 0o555 folder refuse a write.
+        #[cfg(unix)]
+        rows.extend([Row::LandedDespite, Row::Undurable, Row::ReadOnly]);
+        const DEFERRAL: &str = "The pass before the taint recovery left the ref of pallet \"@tags\" for the pass after it: ";
+
+        // Every row is run before the note is judged, so a failure names each row that misses it.
+        let mut misnamed = Vec::new();
+        for pass in [Pass::BeforeTaint, Pass::AfterTaint] {
+            for row in rows.clone() {
+                // A 0o555 folder does not refuse a write made as root.
+                #[cfg(unix)]
+                if matches!(row, Row::ReadOnly) && unsafe { libc::geteuid() } == 0 {
+                    eprintln!("skipped the read-only row under {:?}: a read-only folder does not refuse root", pass);
+                    continue;
+                }
+                // A root per row: a taint a row's fault leaves stands under its root for this
+                // process.
+                let (_root, _scope) = scratch(&format!("ref-heal-stale-gone-head-{:?}-{:?}", pass, row));
+                let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+                let held = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "held", None).unwrap();
+                let other = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "other", None).unwrap();
+                let gone = format!("{}{}", &held[..63], if held.ends_with('0') { '1' } else { '0' });
+                let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
+                let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
+                for path in [&ref_path, &copy_path] {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                }
+                std::fs::write(&copy_path, format!("{}\n", held)).unwrap();
+                std::fs::write(&ref_path, format!("{}\n", gone)).unwrap();
+                #[cfg(unix)]
+                let folder = ref_path.parent().unwrap().to_path_buf();
+                let said = format!(
+                    "The ref of pallet \"@tags\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.",
+                    gone, held
+                );
+
+                let repair = {
+                    let _sync: Option<crate::util::file_utils::SyncDirFaultGuard> = match row {
+                        #[cfg(unix)]
+                        Row::LandedDespite => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder)),
+                        #[cfg(unix)]
+                        Row::Undurable => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder)),
+                        _ => None,
+                    };
+                    #[cfg(unix)]
+                    let _taint = matches!(row, Row::Undurable).then(crate::util::file_utils::TaintRecordFaultGuard::failing);
+                    match row {
+                        Row::Unread => READ_BACK_UNREAD.with(|unread| unread.set(true)),
+                        #[cfg(unix)]
+                        Row::ReadOnly => {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+                        }
+                        Row::Moved => {
+                            let (moved, other) = (ref_path.clone(), other.clone());
+                            pallet_utils::tests::set_before_hold(move || std::fs::write(&moved, format!("{}\n", other)).unwrap());
+                        }
+                        _ => {}
+                    }
+                    let repair = repair_meta(pass);
+                    READ_BACK_UNREAD.with(|unread| unread.set(false));
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    }
+                    repair.unwrap().repair
+                };
+
+                let naming: Vec<_> = repair.notes.iter().filter(|note| note.contains(&gone)).cloned().collect();
+                if naming != vec![said.clone()] {
+                    misnamed.push((pass, row, naming));
+                }
+                let rebuilt: Vec<_> = repair.rebuilt.iter().filter(|rebuilt| rebuilt.pallet == "@tags").map(|rebuilt| rebuilt.head.as_str()).collect();
+                let refused = repair.refused.iter().find(|refused| refused.pallet == "@tags");
+                let deferred = repair.deferred.iter().find(|refused| refused.pallet == "@tags");
+                let deferrals: Vec<_> = repair.notes.iter().filter(|note| note.starts_with("The pass before the taint recovery left")).collect();
+                // The refusal of a write this pass attempted: in the pass after the taint recovery
+                // it is refused; in the pass before it, it is deferred and noted once, whose reason
+                // starts as `reason` says, and so must be the whole note when `whole` is set.
+                let not_landed = |reason: &str, whole: bool| match pass {
+                    Pass::AfterTaint => {
+                        let tags = refused.expect("@tags is refused");
+                        assert!(tags.reason.starts_with(reason), "{:?} {:?}: {:?}", pass, row, tags);
+                        assert!(deferrals.is_empty(), "{:?} {:?}: {:?}", pass, row, deferrals);
+                        tags.meta.as_ref().unwrap().owner.clone()
+                    }
+                    Pass::BeforeTaint => {
+                        let note = format!("{}{}", DEFERRAL, reason);
+                        assert_eq!(deferrals.len(), 1, "{:?} {:?}: {:?}", pass, row, repair.notes);
+                        match whole {
+                            true => assert_eq!(deferrals[0], &format!("{}.", note), "{:?} {:?}", pass, row),
+                            false => assert!(deferrals[0].starts_with(&note) && deferrals[0].ends_with('.') && !deferrals[0].ends_with(".."), "{:?} {:?}: {}", pass, row, deferrals[0]),
+                        }
+                        assert!(refused.is_none(), "{:?} {:?}: {:?}", pass, row, refused);
+                        deferred.expect("@tags is deferred, so the pass after the taint recovery judges it again").meta.as_ref().unwrap().owner.clone()
+                    }
+                };
+                match row {
+                    Row::Clean => assert_eq!(rebuilt, vec![held.as_str()], "{:?} {:?}: {:?}", pass, row, repair),
+                    #[cfg(unix)]
+                    Row::LandedDespite => {
+                        assert_eq!(rebuilt, vec![held.as_str()], "{:?} {:?}: {:?}", pass, row, repair);
+                        let landed = repair.notes.iter().position(|note| note.starts_with("The ref of pallet \"@tags\" was rebuilt at"));
+                        let named = repair.notes.iter().position(|note| *note == said);
+                        assert!(landed.is_some(), "{:?}: the landed-despite arm ran: {:?}", pass, repair.notes);
+                        assert!(named.is_some() && named < landed, "{:?}: the gone head is named before the write: {:?}", pass, repair.notes);
+                    }
+                    #[cfg(unix)]
+                    Row::Undurable => assert_eq!(repair.undurable.len(), 1, "{:?} {:?}: {:?}", pass, row, repair),
+                    Row::Unread => {
+                        let reason = format!("the rebuild at {} was written, but its ref could not be read back: the read was refused for the test", held);
+                        not_landed(&reason, true);
+                    }
+                    #[cfg(unix)]
+                    Row::ReadOnly => {
+                        let owner = not_landed(&format!("the rebuild at {} was not written: ", held), false);
+                        assert_eq!(owner, Owner::Unwritten(None), "{:?}", pass);
+                    }
+                    Row::Moved => {
+                        let owner = not_landed(&format!("the rebuild at {} was not written: ", held), false);
+                        assert_eq!(owner, Owner::Again, "{:?}", pass);
+                        assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(other.as_str()), "{:?}: nothing was written over the move", pass);
+                    }
+                }
+                let landed = match row {
+                    Row::Clean => true,
+                    #[cfg(unix)]
+                    Row::LandedDespite | Row::Undurable => true,
+                    _ => false,
+                };
+                if landed {
+                    assert!(deferrals.is_empty() && repair.refused.is_empty() && repair.deferred.is_empty(), "{:?} {:?}: {:?}", pass, row, repair);
+                }
+            }
+        }
+        assert!(misnamed.is_empty(), "rows whose notes do not name the gone head exactly once, as said: {:?}", misnamed);
+    }
+
     // A head in a format this build does not know reads whole and is no verdict on the ref: a
     // newer Forklift may have written it. Its step is the upgrade. Mutation: judge a newer format
     // as the ref's own → the step is the backup, red.
@@ -2729,30 +3041,46 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         }
         std::fs::write(&copy_path, format!("{}\n", parcel)).unwrap();
-        // The ref is lost beside a copy that names its head, in a folder heal may not write.
+        // The ref is lost beside a copy that names its head, in a folder heal may not write. A
+        // 0o555 folder does not refuse a write made as root, so those cases are skipped there.
         let folder = ref_path.parent().unwrap().to_path_buf();
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped the read-only cases: a read-only folder does not refuse root");
+        } else {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
-        assert!(tags.reason.contains(&format!("the rebuild at {} was not written", parcel)), "{:?}", tags);
-        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
-        assert_eq!(meta_step(tags, &refused), "Settle why heal could not write the ref of @tags, as its refusal says, then run \"forklift heal\" again.");
-        assert!(copy_path.exists(), "the copy is kept");
+            let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+            assert!(tags.reason.contains(&format!("the rebuild at {} was not written", parcel)), "{:?}", tags);
+            assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+            assert_eq!(meta_step(tags, &refused), "Settle why heal could not write the ref of @tags, as its refusal says, then run \"forklift heal\" again.");
+            assert!(copy_path.exists(), "the copy is kept");
 
-        // A write that failed may have landed: with its ref unread back, it is not said to be
-        // unwritten, and its way out stays settling why. Mutation: judge the reason without the
-        // read back → "was not written", red.
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
-        READ_BACK_UNREAD.with(|unread| unread.set(true));
-        let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
-        READ_BACK_UNREAD.with(|unread| unread.set(false));
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
-        assert!(tags.reason.contains(&format!("the rebuild at {} may have been written: the write reported", parcel)), "{:?}", tags);
-        assert!(tags.reason.contains("and its ref could not be read back: the read was refused for the test"), "{:?}", tags);
-        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+            // A write that failed may have landed: with its ref unread back, it is not said to be
+            // unwritten, and its way out stays settling why. Mutation: judge the reason without the
+            // read back → "was not written", red.
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+            READ_BACK_UNREAD.with(|unread| unread.set(true));
+            let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+            READ_BACK_UNREAD.with(|unread| unread.set(false));
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+            assert!(tags.reason.contains(&format!("the rebuild at {} may have been written: the write reported", parcel)), "{:?}", tags);
+            assert!(tags.reason.contains("and its ref could not be read back: the read was refused for the test"), "{:?}", tags);
+            assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+
+            // The pass before the taint recovery defers the refusal and notes it too, for a lost
+            // ref as for a stale one, since the pass after it may drop the deferral. Mutation:
+            // note the deferral only for a stale ref → none here, red.
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let before = repair_meta(Pass::BeforeTaint).unwrap().repair;
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let deferral = format!("The pass before the taint recovery left the ref of pallet \"@tags\" for the pass after it: the rebuild at {} was not written: ", parcel);
+            let deferrals: Vec<_> = before.notes.iter().filter(|note| note.starts_with("The pass before the taint recovery left")).collect();
+            assert!(deferrals.len() == 1 && deferrals[0].starts_with(&deferral), "{:?}", before.notes);
+            assert!(before.deferred.iter().any(|refused| refused.pallet == "@tags") && before.refused.is_empty(), "{:?}", before);
+        }
 
         // Landed with its folder not synced and no taint recording that, and so again when heal
         // syncs it: the pass that wrote it, the first as heal runs them, says so, since the pass

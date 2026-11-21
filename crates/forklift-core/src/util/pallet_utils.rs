@@ -1628,7 +1628,7 @@ pub fn update_pallet_head_verified(
     update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None, None, None, None, WriteOrder::Forward)
 }
 
-/// How a user pallet's ref is damaged, as [`repair_pallet_head`] expects to find it.
+/// How a pallet's ref is damaged, as the repairs expect to find it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefDamage {
     /// No ref file stands where the ref belongs.
@@ -1636,6 +1636,10 @@ pub enum RefDamage {
 
     /// The ref file holds these bytes, which are not a head the reader accepts.
     Unreadable(Vec<u8>),
+
+    /// The ref file holds these bytes, which parse as a head the store has decided is absent.
+    /// Only a meta ref is judged so, and only beside a copy naming another head the store holds.
+    AbsentHead(Vec<u8>),
 }
 
 /// Set damaged user pallet `name` to `new`: the repair of a ref that is missing or does not hold
@@ -1773,7 +1777,7 @@ fn require_damage(namespace: PalletNamespace, name: &str, damage: &RefDamage) ->
         )))?,
         // Nor is one whose state cannot be read known to have moved: a stat that fails is no
         // answer, and filed as moved it would be judged again into the same failure.
-        RefDamage::Unreadable(bytes) => match std::fs::symlink_metadata(&path) {
+        RefDamage::Unreadable(bytes) | RefDamage::AbsentHead(bytes) => match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => std::fs::read(&path).map_err(|e| RefUpdateError::Failed(format!(
                 "Error while reading the ref of pallet \"{}\": {}", name, e
             )))? == *bytes,
@@ -2870,6 +2874,12 @@ pub(crate) mod tests {
     thread_local! {
         /// Run once by the next head write on this thread, between its closure check and its hold.
         static BEFORE_HOLD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Set what the next head write on this thread runs between its closure check and its hold,
+    /// for tests outside this module.
+    pub(crate) fn set_before_hold(run: impl FnOnce() + 'static) {
+        BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
     }
 
     /// The seam [`update_pallet_head_checked`] calls before each hold.

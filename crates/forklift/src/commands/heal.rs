@@ -163,7 +163,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         let error = stopped.rebuilt.iter().fold(config_said(stopped.error), |error, rebuilt| forklift_core::error::append_to_message(error, &rebuilt_sentence(rebuilt)));
         let error = deferred_sentences(&stopped.deferred, stopped.held.as_ref()).iter().chain(&unjudged_sentences(&stopped.unjudged))
             .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence));
-        stopped.notes.iter().fold(error, |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))
+        append_notes(error, &stopped.notes)
     })?;
     let trust_repair = meta_first.trust;
     ref_notes.extend(trust_repair.notes);
@@ -197,14 +197,14 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // A rebuild left not durable is said by the pass that wrote it alone: every later pass reads
     // its ref as undamaged. So it ends the run, in each pass below as here.
     if let Some(error) = undurable_error(&meta_undurable) {
-        return Err(config_said(ref_notes.iter().fold(error, |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))));
+        return Err(config_said(append_notes(error, &ref_notes)));
     }
 
     let record_rebuilt = sealed_utils::rebuild()
-        .map_err(|error| config_said(ref_notes.iter().fold(format!(
+        .map_err(|error| config_said(append_notes(format!(
             "{}{} Heal went no further: once that is fixed, run \"forklift heal\" again.",
             error, if error.ends_with('.') { "" } else { "." },
-        ), |error, note| forklift_core::error::append_to_message(error, &format!("Note: {}", note)))))?
+        ), &ref_notes)))?
         .map(RecordRebuilt::from);
 
     // Before the taint recovery too, whose walks read the record of content this warehouse cannot
@@ -247,10 +247,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         for sentence in sentences {
             error = forklift_core::error::append_to_message(error, &sentence);
         }
-        for note in notes {
-            error = forklift_core::error::append_to_message(error, &format!("Note: {}", note));
-        }
-        error
+        append_notes(error, notes)
     };
 
     // The bay's position, before the checkout's scope, whose stranding guard reads the tree the
@@ -389,10 +386,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         for removed in removed {
             error = forklift_core::error::append_to_message(error, &removed_sentence(removed));
         }
-        for note in notes {
-            error = forklift_core::error::append_to_message(error, &format!("Note: {}", note));
-        }
-        error
+        append_notes(error, notes)
     };
 
     for (pallet, parcel) in set_ref {
@@ -473,18 +467,18 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             return Err(changed_after(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes));
         }
     };
-    // The trust repair runs in both passes; what it noted in the first is said once. After a
-    // first write the two files agree, so a second one means they moved between the passes: the
-    // report names the first, and the second is noted.
+    // The trust repair runs in both passes, and may note the same thing in each: a refusal and
+    // the report say each note once.
+    //
+    // After a first write the two files agree, so a second one means they moved between the
+    // passes: the report names the first, and the second is noted.
     let trust_restored_after = meta_second.trust.restored;
     if let (Some(_), Some(after)) = (&trust_repair.restored, &trust_restored_after) {
         ref_notes.push(format!("{} (after the taint recovery).", after.sentence().trim_end_matches('.')));
     }
-    for note in meta_second.trust.notes {
-        if !ref_notes.contains(&note) {
-            ref_notes.push(note);
-        }
-    }
+    ref_notes.extend(meta_second.trust.notes);
+    // So for the meta refs: one still damaged when this pass reads it was judged by the first
+    // too, and may be noted the same way again.
     let meta_second = meta_second.repair;
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
@@ -1609,6 +1603,20 @@ fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
     sentence
 }
 
+/// Append each of `notes` to `error` as a "Note: …" sentence, skipping one equal to a note this
+/// call already appended: a ref both meta passes judge may be noted the same way by each, and
+/// more than one pass adds to the notes a refusal carries, so a refusal says each note once.
+fn append_notes(error: String, notes: &[String]) -> String {
+    let mut said: Vec<&str> = Vec::new();
+    notes.iter().fold(error, |error, note| {
+        if said.contains(&note.as_str()) {
+            return error;
+        }
+        said.push(note);
+        forklift_core::error::append_to_message(error, &format!("Note: {}", note))
+    })
+}
+
 /// The sentences a refusal carries for the meta refs `deferred` that the pass before the taint
 /// recovery left for the pass after it, which the run did not reach; none for none. A ref `held`
 /// names says why a later heal does not settle it, or what it waits on.
@@ -2329,7 +2337,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deferred_sentences, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
+    use super::{append_notes, deferred_sentences, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
 
     // A pallet whose ref could not be read may be the one whose history reaches the lost
     // objects, so the report names it and never says no pallet's history reaches them.
@@ -2358,6 +2366,18 @@ mod tests {
 
         // With every ref read, the line stands.
         assert!(report(Vec::new()).contains(&nothing.to_string()));
+    }
+
+    // Both meta passes may make the same note, so a refusal says each note once, in the order
+    // first made. Mutations: append every note, or skip only a note equal to the one just
+    // appended → red (the repeated note is said twice).
+    #[test]
+    fn a_refusal_says_each_note_once_in_the_order_first_made() {
+        // The repeat is not beside its first making: between them come the other notes of a pass.
+        let notes = ["The first.".to_string(), "The both.".to_string(), "The second.".to_string(), "The both.".to_string()];
+        assert_eq!(append_notes("It was refused.".to_string(), &notes), "It was refused. Note: The first. Note: The both. Note: The second.");
+        // Distinct notes are each said.
+        assert_eq!(append_notes("It was refused.".to_string(), &notes[..2]), "It was refused. Note: The first. Note: The both.");
     }
 
     #[test]

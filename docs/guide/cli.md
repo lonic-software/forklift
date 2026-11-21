@@ -2916,15 +2916,29 @@ parents, which is where a write interrupted moving the pallet forward leaves it,
 damaged file names is taken when it descends from the copy, which is where a copy left behind
 leaves it; otherwise `heal` changes nothing and refuses with `ref_damaged`, naming both. The head chosen must verify as that
 pallet's history, against the office, before it is written. A copy that is lost or names another
-head beside a ref that reads is set to the ref's head, with a `Note:`.
+head beside a ref that reads is set to the ref's head, with a `Note:`, but only when the store
+holds that head; otherwise both files are left as they are, and the note says what the store said
+of the ref's head.
 
-Until then, every other command that reads such a ref refuses with `ref_damaged` (exit 53) rather
+Until then, every other command that reads a lost or damaged ref refuses with `ref_damaged` (exit 53) rather
 than read it as a pallet never written, and names `forklift heal`, which judges it, except beside a copy that
 cannot be read, or something not a file at the ref's or the copy's path, where it names that. A ref lost together with its copy leaves
 nothing to tell it from one never written, and reads as empty. A link at any pallet's ref path is
 never followed: the read refuses it as blocked, naming moving it aside, and `heal` leaves it with
 a `Note:` naming the same. A ref whose path cannot be read is refused, never read as a pallet never
 written, naming making the ref's file and the folders on the way to it readable.
+
+A ref that reads but names a head the store has decided it does not hold, beside a copy naming a
+head the store does hold, is rebuilt at the copy's head, even where that is the older of the two,
+with a `Note:` naming the head the ref named. `heal` makes that note before it writes, so it is
+reported whatever the write's outcome. A meta ref's rebuild that the pass before the taint recovery
+wrote or tried to write, and left for the pass after it, gets a `Note:` saying so and why; a refusal
+says each note once. The store has not decided while something could yet account for the missing head,
+such as a refill from the origin, a redaction or a withholding, a pack or record it cannot read in
+full, or the durability taint; `heal` then leaves the ref as it is. The office's ref is never
+rebuilt this way: it is left as it is, with its copy. Other commands do not judge such a ref: they
+read it like any ref whose head is missing, and refuse on the missing object, not with
+`ref_damaged`.
 
 The office's ref (`@office`) is rebuilt first, and its head must verify against the anchor of the
 trust file or, when that file is lost, is not a file, does not read as an anchor or does not
