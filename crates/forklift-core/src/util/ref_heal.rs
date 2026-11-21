@@ -2122,8 +2122,9 @@ fn write_meta_rebuild(state: &MetaState,
     let damage = state.damage().expect("only a damaged ref is rebuilt");
     // A ref rebuilt over a head the store decided is gone loses the only record of that head. So
     // the head it named is noted before the write, in the past tense: the state heal judged and
-    // what it set out to do. That holds whichever way the write then goes, and the outcome is
-    // reported beside it.
+    // what it set out to do. That holds whichever way the write then goes. What this pass learned
+    // of the write is reported beside it; for a write it could not read back, that is the attempt,
+    // not where the ref ended.
     let gone = match &damage {
         RefDamage::AbsentHead(bytes) => pallet_utils::parse_ref_bytes(bytes),
         _ => None,
