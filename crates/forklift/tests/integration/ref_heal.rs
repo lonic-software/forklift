@@ -2618,7 +2618,7 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
     plant_taint(&root, &[side.as_str(), other.as_str()]);
     damage(&root, "side", Damage::Zero);
     // The checkout standing on a lost ref is what makes "other" damaged.
-    forklift_core::util::file_utils::remove_file(&ref_path(&root, "other")).unwrap();
+    forklift_core::util::file_utils::remove_file(ref_path(&root, "other")).unwrap();
 
     let promise = "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.";
     let way_out = |pallet: &str| format!("The ref of pallet \"{}\" is damaged. While it cannot be read, the durability \
