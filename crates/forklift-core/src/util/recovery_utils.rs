@@ -3962,7 +3962,8 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
         good copy, move an index that does not parse out of the pack folder only if it holds \
         nothing this warehouse needs, or re-create the warehouse for one of another format \
         version; for the sealed-object record: make it readable again, restoring it from a good \
-        copy or, if another version of Forklift wrote it, using that version), then run \
+        copy or, if another version of Forklift wrote it, using that version; for a pallet ref: \
+        restore it, with the parcels it names, from a backup of the warehouse), then run \
         \"forklift heal\" again — the rescan restages idempotently and simply starts over; it \
         can only replace the torn record once everything it walks is readable.",
     )
@@ -4039,7 +4040,8 @@ fn dangling_refusal(root: &Path, lines: &[String], degraded: &[String]) -> CoreE
             objects they reach, could not be read this run — fix it (for a pack index: restore its pack files from a good \
             copy, move an index that does not parse out of the pack folder only if it holds \
             nothing this warehouse needs, or re-create the \
-            warehouse for one of another format version), then re-run \
+            warehouse for one of another format version; for a pallet ref: restore it, with the \
+            parcels it names, from a backup of the warehouse), then re-run \
             \"forklift heal\"; it may resolve on its own once everything is readable. Whatever \
             is still dangling after that needs a heavyweight resolution: {}",
             HEAVYWEIGHT_EXITS
