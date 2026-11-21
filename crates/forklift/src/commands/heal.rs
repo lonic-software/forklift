@@ -492,12 +492,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     if let (Some(_), Some(after)) = (&trust_repair.restored, &trust_restored_after) {
         ref_notes.push(format!("{} (after the taint recovery).", after.sentence().trim_end_matches('.')));
     }
-    // A trust file only this pass restored is said by every failure after it, as the first
-    // pass's is; one both restored is the note above.
-    let mut since_taint: Vec<String> = match (&trust_repair.restored, &trust_restored_after) {
-        (None, Some(after)) => vec![after.sentence()],
-        _ => Vec::new(),
-    };
+    let mut since_taint: Vec<String> = trust_after_said(trust_repair.restored.as_ref(), trust_restored_after.as_ref()).into_iter().collect();
     ref_notes.extend(meta_second.trust.notes);
     // So for the meta refs: one still damaged when this pass reads it was judged by the first
     // too, and may be noted the same way again.
@@ -2383,6 +2378,15 @@ impl OperationRecovery {
 const UNHELD: &str =
     "These tracked files do not hold their recorded content and show as local changes (\"forklift restore --confirm <path>\" brings one back)";
 
+/// The trust file the meta pass after the taint recovery restored, as the sentence a failure after
+/// it says: only when the pass before it restored none, since a second restore is a note of its own.
+fn trust_after_said(before: Option<&office_utils::TrustRestored>, after: Option<&office_utils::TrustRestored>) -> Option<String> {
+    match (before, after) {
+        (None, Some(after)) => Some(after.sentence()),
+        _ => None,
+    }
+}
+
 /// The taint a recovery cleared, as one sentence of a failure's message: the paths it restaged and
 /// resolved listed inline, as the report lists them. None when no taint stood.
 fn taint_sentence(outcome: &recovery_utils::HealOutcome) -> Option<String> {
@@ -2412,7 +2416,70 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_notes, deferred_sentences, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
+    use super::{append_notes, deferred_sentences, ref_heal, taint_sentence, trust_after_said, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, OperationOutcome, OperationRecovery, UnreadPallet};
+    use forklift_core::util::office_utils::{TrustFileWritten, TrustRestored};
+    use forklift_core::util::recovery_utils::HealOutcome;
+
+    // A failure after the taint recovery says the taint it cleared, with the paths it restaged and
+    // resolved, and nothing when no taint stood.
+    #[test]
+    fn a_cleared_taint_is_one_sentence_naming_what_it_restaged_and_resolved() {
+        let outcome = |was_tainted: bool, restaged: &[&str], resolved: &[&str]| HealOutcome {
+            was_tainted,
+            restaged: restaged.iter().map(|path| path.to_string()).collect(),
+            resolved: resolved.iter().map(|path| path.to_string()).collect(),
+            notes: Vec::new(),
+            index_rebuild_skipped: false,
+        };
+        assert_eq!(taint_sentence(&outcome(false, &[], &[])), None);
+        assert_eq!(taint_sentence(&outcome(true, &[], &[])).as_deref(), Some("Durability taint cleared."));
+        assert_eq!(
+            taint_sentence(&outcome(true, &["objects/aa/1", "objects/bb/2"], &["objects/cc/3"])).as_deref(),
+            Some("Durability taint cleared: restaged objects/aa/1, objects/bb/2; resolved (absent and unreferenced) objects/cc/3."),
+        );
+        assert_eq!(
+            taint_sentence(&outcome(true, &[], &["objects/cc/3"])).as_deref(),
+            Some("Durability taint cleared: resolved (absent and unreferenced) objects/cc/3."),
+        );
+    }
+
+    // The recovery's outcome and the files it left unheld, in one sentence: its marker is lowered,
+    // so a failure after it is the only place a run says it.
+    #[test]
+    fn an_operation_recovery_is_one_sentence_naming_the_files_it_left_unheld() {
+        let recovery = |unheld: &[&str]| OperationRecovery {
+            operation: "shift".to_string(),
+            outcome: OperationOutcome::RolledBack,
+            pallet: "main".to_string(),
+            base: Some("abc".to_string()),
+            unheld: unheld.iter().map(|path| path.to_string()).collect(),
+        };
+        assert_eq!(recovery(&[]).sentence(), "Undid the interrupted shift; the bay is back on \"main\" at abc.");
+        assert_eq!(
+            recovery(&["a.txt", "b.txt"]).sentence(),
+            "Undid the interrupted shift; the bay is back on \"main\" at abc. These tracked files do not hold their recorded content \
+            and show as local changes (\"forklift restore --confirm <path>\" brings one back): a.txt, b.txt.",
+        );
+    }
+
+    // A trust file the pass after the taint restored is said only when the pass before restored
+    // none: a second restore is noted on its own.
+    #[test]
+    fn a_trust_file_restored_after_the_taint_is_said_only_when_the_first_pass_restored_none() {
+        let restored = |written: TrustFileWritten| TrustRestored {
+            written,
+            path: std::path::PathBuf::from("t"),
+            from: std::path::PathBuf::from("c"),
+        };
+        let after = restored(TrustFileWritten::Trust);
+        assert_eq!(
+            trust_after_said(None, Some(&after)).as_deref(),
+            Some("The trust file \"t\" was missing or did not hold the anchor, and is restored from its copy \"c\"."),
+        );
+        assert_eq!(trust_after_said(Some(&restored(TrustFileWritten::Copy)), Some(&after)), None);
+        assert_eq!(trust_after_said(Some(&after), None), None);
+        assert_eq!(trust_after_said(None, None), None);
+    }
 
     // A pallet whose ref could not be read may be the one whose history reaches the lost
     // objects, so the report names it and never says no pallet's history reaches them.
