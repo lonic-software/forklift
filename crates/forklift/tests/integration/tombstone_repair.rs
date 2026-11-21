@@ -514,8 +514,10 @@ fn heal_over_damaged_tombstones_after_the_taint_recovery_names_every_ref_it_judg
     std::fs::write(pallets.join("zeta"), b"not a head\n").unwrap();
     let taint = forklift_core::util::taint_utils::taint_dir_path_under(&root);
     std::fs::create_dir_all(&taint).unwrap();
+    // A staged shard the taint names that is gone is a note of the taint recovery's own.
+    let shard = std::path::Path::new("inventory").join(forklift_core::util::file_utils::shard_folder_relative("gone")).join("data");
     std::fs::write(taint.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(
-        [format!("objects/{}/{}", &main[..2], &main[2..])],
+        [format!("objects/{}/{}", &main[..2], &main[2..]), shard.to_string_lossy().replace('\\', "/")],
     )).unwrap();
     std::fs::write(list_path(&root), b"\xff\xfe not a list").unwrap();
 
@@ -528,8 +530,13 @@ fn heal_over_damaged_tombstones_after_the_taint_recovery_names_every_ref_it_judg
     assert!(message.contains("The ref of pallet \"zeta\" was not rebuilt: nothing in this warehouse names its head"), "{}", message);
     assert!(!message.contains("this run stopped before judging it"), "{}", message);
     // The taint it cleared is said too: its files are gone, so no later run reports it.
-    let cleared = format!("Durability taint cleared: restaged objects/{}/{}.", &main[..2], &main[2..]);
+    // Up to the shard's path, whose separators are the platform's.
+    let cleared = format!(
+        "Durability taint cleared: restaged objects/{}/{}; resolved (absent and unreferenced) inventory",
+        &main[..2], &main[2..],
+    );
     assert!(message.contains(&cleared), "{}", message);
+    assert!(message.contains("Note: the staged inventory shard"), "{}", message);
 }
 
 /// Revert: leave kept heads out of the holder census → the redaction applies and deletes content
