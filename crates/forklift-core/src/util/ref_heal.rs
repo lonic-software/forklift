@@ -180,8 +180,9 @@ pub struct Repair {
     /// The refs it rebuilt.
     pub rebuilt: Vec<Rebuilt>,
 
-    /// The refs it refused to rebuild. Only [`Pass::AfterTaint`] refuses, the first pass deferring,
-    /// except a user ref whose write met damaged tombstones: that stop ends the run in either pass.
+    /// The refs it refused to rebuild. A meta pass refuses only in [`Pass::AfterTaint`], the first
+    /// deferring; a user pass refuses in either pass, deferring from the first only what the taint
+    /// recovery may settle.
     pub refused: Vec<Refused>,
 
     /// The meta refs [`Pass::BeforeTaint`] judged and left for [`Pass::AfterTaint`], each with
@@ -787,8 +788,8 @@ fn choose(pallet: &str, evidence: &Evidence, pass: Pass) -> Choice {
 /// Run one repair pass over every damaged user ref.
 ///
 /// # Returns
-/// * `Ok(Repair)`  - What it rebuilt, and in [`Pass::AfterTaint`] what it refused; in either
-///                   pass, the ref whose write met damaged tombstones, where it stopped.
+/// * `Ok(Repair)`  - What it rebuilt and what it refused, the ref whose write met damaged
+///                   tombstones included, where it stopped.
 /// * `Err(String)` - If the user refs could not be listed.
 pub fn repair(pass: Pass) -> Result<Repair, String> {
     let mut report = Repair::default();

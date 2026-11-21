@@ -424,7 +424,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
-    // The first pass refuses only a ref whose write met the stop that ends the run here.
+    // What the first pass refused, the ref whose write met the stop included, is said here: the
+    // second pass, which would refuse it again, never runs.
     if let Some(error) = stopped_with(first.stopped, &first.undurable) {
         return Err(changed_after(refused_too(error, &first.refused), &refs_rebuilt, &refs_removed, &ref_notes));
     }
