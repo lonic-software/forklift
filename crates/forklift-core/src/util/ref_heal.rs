@@ -2645,7 +2645,7 @@ mod tests {
         // before it, and neither stops.
         match mark {
             Some(mark) => std::fs::write(&served, mark).unwrap(),
-            None => std::fs::remove_file(&served).unwrap(),
+            None => crate::util::file_utils::remove_file(&served).unwrap(),
         }
         std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
         let damage = crate::util::tombstone_utils::damaged("Damaged for the test.");
