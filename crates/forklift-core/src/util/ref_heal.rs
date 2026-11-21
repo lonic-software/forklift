@@ -555,9 +555,11 @@ fn is_hex(byte: u8) -> bool {
 }
 
 /// What a damaged ref's `bytes` still name: the full hash when its 64 leading characters are hex
-/// (a damaged newline), the one parcel matching at every position but the one non-hex character
-/// among the first 64 (a flipped byte), else the one parcel a leading hex run of at least 8
-/// characters is a prefix of (a truncation). A hash the taint records as possibly lost matches
+/// (a damaged newline), or, where the store decided that hash is gone, the one parcel one
+/// character from it or one inserted hex character from it (damage inside the hash); the one
+/// parcel matching at every position but the one non-hex character among the first 64 (a flipped
+/// byte); else the one parcel a leading hex run of at least 8 characters is a prefix of (a
+/// truncation). A hash the taint records as possibly lost matches
 /// as well as a stored one, so an object a crash took is an unknown answer rather than none.
 fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     // Bytes that name no prefix salvage to nothing, whatever the store holds, which a read of the
@@ -593,8 +595,38 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     if let Some(hash) = named_hash(bytes) {
         return Ok(match matching(&hash)? {
             // Only an absence the store decided, with no taint accounting for it, names the hash
-            // as gone; any other empty answer is as before, nothing.
-            Ok(matches) if matches.is_empty() && head_decided_absent(&hash, tainted) => Salvage::Absent(hash),
+            // as gone, and only once no hash the damage may have made it from matches: one
+            // character changed, or one hex character inserted ahead of the 65th. Any other empty
+            // answer is as before, nothing.
+            Ok(matches) if matches.is_empty() && head_decided_absent(&hash, tainted) => {
+                let mut near = Vec::new();
+                for at in 0..HASH_LENGTH {
+                    for digit in b"0123456789abcdef".iter().filter(|digit| **digit != bytes[at]) {
+                        let mut changed = bytes[..HASH_LENGTH].to_vec();
+                        changed[at] = *digit;
+                        match matching(&String::from_utf8_lossy(&changed))? {
+                            Ok(found) => near.extend(found),
+                            Err(untold) => return Ok(untold),
+                        }
+                    }
+                }
+                if run > HASH_LENGTH {
+                    for at in 0..=HASH_LENGTH {
+                        let mut kept = bytes[..=HASH_LENGTH].to_vec();
+                        kept.remove(at);
+                        match matching(&String::from_utf8_lossy(&kept))? {
+                            Ok(found) => near.extend(found),
+                            Err(untold) => return Ok(untold),
+                        }
+                    }
+                }
+                near.sort();
+                near.dedup();
+                match near.is_empty() {
+                    true => Salvage::Absent(hash),
+                    false => judge(near, tainted),
+                }
+            }
             Ok(matches) => judge(matches, tainted),
             Err(untold) => untold,
         });
@@ -761,12 +793,12 @@ fn choose(pallet: &str, evidence: &Evidence, pass: Pass) -> Choice {
     }
 
     // The ref's own bytes stand on a parcel the store has decided is gone, a floor that no head
-    // whose history verifies descends from: a rebuild at any other head would land below it. No
-    // taint accounts for the parcel, so the taint recovery cannot settle it, and either pass
-    // refuses. Damage that reached the hash itself reads the same way, so the reason says both.
+    // whose history verifies descends from: a rebuild at any other head would land below it. The
+    // taint this pass read covers no such parcel, so either pass refuses. Damage of more than one
+    // character inside the hash reads the same way, so the reason allows for it.
     if let Some(parcel) = &evidence.salvage_absent {
         return Choice::Refuse(format!(
-            "its own bytes name {}, which is not in the store (the parcel is gone, or the damage reached the hash itself), so it is not rebuilt at another head in that parcel's place: restore the parcel from a backup of the warehouse, or clone it afresh from a remote that holds it, and run \"forklift heal\" again; or set its head yourself",
+            "its own bytes name {}, which is not in the store, nor is a parcel one character from it, so it is not rebuilt at another head in that parcel's place: if the parcel was lost, restore it from a backup of the warehouse, or clone it afresh from a remote that holds it, and run \"forklift heal\" again; otherwise set its head yourself",
             parcel
         ));
     }
@@ -1196,6 +1228,15 @@ fn admit_set(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<(Dam
 
     if served {
         refuse_below_a_floor(&damaged, &head, notes)?;
+    } else if let RefDamage::Unreadable(bytes) = &damaged.damage {
+        // The write replaces the only record of a parcel the bytes name and the store does not
+        // hold, so the note keeps it. A lookup that fails only leaves the note out.
+        if let Ok(Salvage::Absent(parcel)) = salvage(bytes, &Tainted::read(notes)) {
+            push_note(notes, format!(
+                "The ref of pallet \"{}\" named {}, which is not in the store; its bytes are replaced and not kept.",
+                damaged.pallet, parcel
+            ));
+        }
     }
 
     let preconditions = trusted(&damaged.pallet, &head)?;
@@ -1326,7 +1367,8 @@ const FOLDER_NAME_REMOVED_REFS: &str = "removed-refs";
 
 /// `forklift heal --remove-ref <pallet>`: remove damaged `pallet`'s unreadable ref, keeping its
 /// bytes in a file of their own. Allowed only when no checkout stands on the pallet, nothing names
-/// a head for it (its own bytes included), and every checkout's state could be read.
+/// a head the store holds for it (its own bytes included: bytes naming a parcel the store decided
+/// is gone are kept, so they allow it), and every checkout's state could be read.
 pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Removed, String> {
     let damaged = admit_remove(pallet, notes)?;
     let RefDamage::Unreadable(bytes) = &damaged.damage else {

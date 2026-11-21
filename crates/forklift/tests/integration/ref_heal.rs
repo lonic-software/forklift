@@ -272,18 +272,15 @@ fn a_prefix_too_short_or_naming_no_parcel_salvages_nothing() {
 
 }
 
-// A damaged ref whose bytes begin with the full hash of a parcel the store decided is gone stands
-// on that parcel, which nothing heal could rebuild at descends from: heal refuses and names it,
-// with nothing else naming a head, and with a bay standing on the pallet, which it would otherwise
-// be rebuilt at. Here the bytes are damaged after the bay's base, so that base is the right
-// answer, but heal cannot tell that damage from a gone parcel; it lists the base for `--ref`.
-// `--remove-ref` (nothing standing on the pallet) or `--ref` then settles it; served, `--ref`
-// notes that the head could not be checked against the parcel. Mutation: salvage such bytes to
-// nothing → the bay row rebuilds at the bay's base with exit 0, and the no-evidence row refuses
-// as "nothing in this warehouse names its head", red.
+// A damaged ref whose bytes begin with the full hash of a parcel the store decided is gone, with no
+// parcel one character from it, stands on that parcel, which nothing heal could rebuild at descends
+// from: heal refuses and names it, with nothing else naming a head and with a bay standing on the
+// pallet, which it would otherwise be rebuilt at. `--remove-ref` (nothing standing on the pallet)
+// or `--ref` then settles it, and `--ref` notes the parcel, served or not. Mutation: salvage such
+// bytes to nothing → the bay row rebuilds at the bay's base with exit 0, red.
 #[test]
 fn a_ref_whose_bytes_name_a_gone_parcel_is_refused_naming_it() {
-    for row in ["a bay on it", "nothing else"] {
+    for row in ["a bay on it", "nothing else", "served"] {
         let area = Area::new(&format!("salvage-gone-{}", row.replace(' ', "-")));
         let (root, side) = side_only_its_bytes_name(&area);
         let candidates = match row {
@@ -295,7 +292,7 @@ fn a_ref_whose_bytes_name_a_gone_parcel_is_refused_naming_it() {
             }
             _ => 0,
         };
-        let gone = flip_digit(&side, 63);
+        let gone = gone_from(&side, 63);
         let bytes = format!("{}torn", gone).into_bytes();
         std::fs::write(ref_path(&root, "side"), &bytes).unwrap();
 
@@ -303,7 +300,7 @@ fn a_ref_whose_bytes_name_a_gone_parcel_is_refused_naming_it() {
         let refs = &refused["error"]["details"]["refs_refused"];
         assert_eq!(refs[0]["pallet"], "side", "{}: {}", row, refused);
         assert_eq!(refs[0]["reason"], format!(
-            "its own bytes name {}, which is not in the store (the parcel is gone, or the damage reached the hash itself), so it is not rebuilt at another head in that parcel's place: restore the parcel from a backup of the warehouse, or clone it afresh from a remote that holds it, and run \"forklift heal\" again; or set its head yourself",
+            "its own bytes name {}, which is not in the store, nor is a parcel one character from it, so it is not rebuilt at another head in that parcel's place: if the parcel was lost, restore it from a backup of the warehouse, or clone it afresh from a remote that holds it, and run \"forklift heal\" again; otherwise set its head yourself",
             gone
         ), "{}: {}", row, refused);
         assert_eq!(refs[0]["candidates"].as_array().unwrap().len(), candidates, "{}: {}", row, refused);
@@ -313,24 +310,46 @@ fn a_ref_whose_bytes_name_a_gone_parcel_is_refused_naming_it() {
         assert_eq!(message.contains("No candidate head was found for it."), candidates == 0, "{}: {}", row, refused);
         assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), bytes, "{}: the ref must be left alone", row);
 
-        match row {
+        let note = match row {
             "nothing else" => {
                 area.run_ok(&root, &["heal", "--remove-ref", "side"]);
                 assert!(!ref_path(&root, "side").exists(), "{}", row);
+                continue;
             }
-            _ => {
+            "served" => {
                 {
                     let _scope = forklift_core::globals::StorageRootScope::enter(&root);
                     assert!(forklift_core::util::tombstone_utils::mark_served(true).unwrap());
                 }
-                let set = area.run_ok(&root, &["heal", "--ref", &format!("side={}", side)]);
-                assert!(text(&set.stdout).contains(&format!(
+                format!(
                     "This warehouse is served, and the ref of pallet \"side\" named {}, which is not in the store, so {} could not be checked against it",
                     gone, side
-                )), "{}", text(&set.stdout));
-                assert_eq!(head(&root, "side"), side, "{}", row);
+                )
             }
-        }
+            _ => format!("The ref of pallet \"side\" named {}, which is not in the store; its bytes are replaced and not kept.", gone),
+        };
+        let set = area.run_ok(&root, &["heal", "--ref", &format!("side={}", side)]);
+        assert!(text(&set.stdout).contains(&note), "{}: {}", row, text(&set.stdout));
+        assert_eq!(head(&root, "side"), side, "{}", row);
+    }
+}
+
+// Damage inside the hash itself (one digit changed, or one hex character inserted) leaves a full
+// hash the store does not hold, one character from the head it was: heal rebuilds the ref there.
+// Mutation: drop the one-character search → the bytes read as a gone parcel and heal refuses, red.
+#[test]
+fn a_ref_whose_hash_is_one_character_off_is_rebuilt_at_the_head_it_was() {
+    for (row, bytes) in [("changed", None), ("inserted", Some(()))] {
+        let area = Area::new(&format!("salvage-near-{}", row));
+        let (root, side) = side_only_its_bytes_name(&area);
+        let bytes = match bytes {
+            None => format!("{}torn", flip_digit(&side, 40)),
+            Some(()) => format!("{}7{}\n", &side[..30], &side[30..]),
+        };
+        std::fs::write(ref_path(&root, "side"), bytes).unwrap();
+
+        let data = healed(&area, &root);
+        assert_eq!(head(&root, "side"), side, "{}: {}", row, data);
     }
 }
 
@@ -2018,6 +2037,12 @@ fn flip_digit(head: &str, at: usize) -> String {
     digits.into_iter().collect()
 }
 
+/// A hash that differs from `head` at `at` and two more positions, so no parcel one character
+/// from it is `head`: a head the store holds nothing near, as a lost parcel's.
+fn gone_from(head: &str, at: usize) -> String {
+    flip_digit(&flip_digit(&flip_digit(head, at), at - 21), at - 42)
+}
+
 // A meta ref whose head the store decided is gone, beside a copy naming a head it holds, is
 // rebuilt at the copy's head, and the copy is left as it stands. Mutations: never judge a ref
 // that parses as damaged → the copy mend's refusal leaves both files, red at the ref; drop that
@@ -2027,14 +2052,14 @@ fn a_meta_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_copy()
     let area = Area::new("meta-absent-head");
     let (root, _, second) = tagged(&area);
     let copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
-    std::fs::write(meta_path(&root, "tags"), format!("{}\n", flip_digit(&second, 63))).unwrap();
+    std::fs::write(meta_path(&root, "tags"), format!("{}\n", gone_from(&second, 63))).unwrap();
 
     let data = healed(&area, &root);
     assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
     assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "{}", data);
     assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), copy, "{}", data);
     assert!(data["notes"].to_string().contains(&format!(
-        "The ref of pallet \\\"@tags\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", flip_digit(&second, 63), second
+        "The ref of pallet \\\"@tags\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", gone_from(&second, 63), second
     )), "the head the ref named is reported: {}", data);
     assert!(rebuilt_meta(&healed(&area, &root)).is_empty(), "a second heal finds nothing to do");
 }
@@ -2055,7 +2080,7 @@ fn a_refusal_after_both_meta_passes_says_each_note_once() {
     }
     let area = Area::new("meta-absent-noted-once");
     let (root, _, second) = tagged(&area);
-    let gone = flip_digit(&second, 63);
+    let gone = gone_from(&second, 63);
     std::fs::write(meta_path(&root, "tags"), format!("{}\n", gone)).unwrap();
     std::fs::write(root.join(".forklift").join("operation"), b"not an operation record\n").unwrap();
     let folder = meta_path(&root, "tags").parent().unwrap().to_path_buf();
@@ -2086,7 +2111,7 @@ fn a_redactions_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_
         }
         let redactions = redacted(&area, &root);
         let office = meta_head(&root, "office");
-        std::fs::write(meta_path(&root, "redactions"), format!("{}\n", flip_digit(&redactions, 63))).unwrap();
+        std::fs::write(meta_path(&root, "redactions"), format!("{}\n", gone_from(&redactions, 63))).unwrap();
         forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
         if office_lost {
             break_meta(&root, "office", true);
@@ -2102,7 +2127,7 @@ fn a_redactions_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_
         }
         assert_eq!(rebuilt_meta(&data), expected, "in the order rebuilt; office lost: {}: {}", office_lost, data);
         assert!(data["notes"].to_string().contains(&format!(
-            "The ref of pallet \\\"@redactions\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", flip_digit(&redactions, 63), redactions
+            "The ref of pallet \\\"@redactions\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", gone_from(&redactions, 63), redactions
         )), "office lost: {}: {}", office_lost, data);
         assert_eq!(meta_head(&root, "redactions").as_deref(), Some(redactions.as_str()), "office lost: {}", office_lost);
         assert_eq!(std::fs::read(meta_copy_path(&root, "redactions")).unwrap(), format!("{}\n", redactions).into_bytes());
@@ -2117,7 +2142,7 @@ fn a_redactions_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_
 fn a_meta_ref_naming_a_lost_head_beside_a_copy_naming_another_keeps_both() {
     let area = Area::new("meta-absent-both");
     let (root, _, second) = tagged(&area);
-    let (gone, other) = (flip_digit(&second, 63), flip_digit(&second, 62));
+    let (gone, other) = (gone_from(&second, 63), gone_from(&second, 62));
     std::fs::write(meta_path(&root, "tags"), format!("{}\n", gone)).unwrap();
     std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", other)).unwrap();
 
@@ -2144,7 +2169,7 @@ fn an_office_ref_naming_a_head_the_store_decided_is_gone_keeps_both_files() {
     area.run_ok(&root, &["office", "enroll"]);
     let office = meta_head(&root, "office").unwrap();
     let copy = std::fs::read(meta_copy_path(&root, "office")).unwrap();
-    let gone = flip_digit(&office, 63);
+    let gone = gone_from(&office, 63);
     std::fs::write(meta_path(&root, "office"), format!("{}\n", gone)).unwrap();
 
     let output = area.run(&root, &["--json", "heal"]);
@@ -2170,7 +2195,7 @@ fn a_damaged_meta_ref_whose_bytes_name_a_gone_head_is_rebuilt_from_its_copy_and_
         let area = Area::new(&format!("meta-absent-damaged-{}", tainted));
         let (root, _, second) = tagged(&area);
         let copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
-        let gone = flip_digit(&second, 63);
+        let gone = gone_from(&second, 63);
         std::fs::write(meta_path(&root, "tags"), format!("{}torn", gone)).unwrap();
         if tainted {
             plant_taint(&root, &[second.as_str()]);
@@ -2196,7 +2221,7 @@ fn a_damaged_office_ref_whose_bytes_name_a_gone_head_is_not_rolled_back_to_its_c
     area.run_ok(&root, &["office", "enroll"]);
     let office = meta_head(&root, "office").unwrap();
     let copy = std::fs::read(meta_copy_path(&root, "office")).unwrap();
-    let gone = flip_digit(&office, 63);
+    let gone = gone_from(&office, 63);
     let bytes = format!("{}torn", gone).into_bytes();
     std::fs::write(meta_path(&root, "office"), &bytes).unwrap();
 
@@ -2237,7 +2262,7 @@ fn a_meta_ref_naming_a_gone_parcel_with_no_copy_to_go_back_to_names_the_parcel()
     for (copy, close, blocks) in rows {
         let area = Area::new(&format!("meta-lost-{}", copy.replace(' ', "-")));
         let (root, _, second) = tagged(&area);
-        let gone = flip_digit(&second, 63);
+        let gone = gone_from(&second, 63);
         let bytes = format!("{}torn", gone).into_bytes();
         std::fs::write(meta_path(&root, "tags"), &bytes).unwrap();
         let copy_path = meta_copy_path(&root, "tags");
@@ -2270,8 +2295,8 @@ fn a_meta_ref_naming_a_gone_parcel_with_no_copy_to_go_back_to_names_the_parcel()
 fn a_meta_ref_naming_a_gone_parcel_beside_a_copy_whose_head_is_gone_too_waits_on_the_copy() {
     let area = Area::new("meta-lost-both");
     let (root, _, second) = tagged(&area);
-    let gone = flip_digit(&second, 63);
-    let copy_gone = flip_digit(&second, 62);
+    let gone = gone_from(&second, 63);
+    let copy_gone = gone_from(&second, 62);
     std::fs::write(meta_path(&root, "tags"), format!("{}torn", gone)).unwrap();
     std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", copy_gone)).unwrap();
 
