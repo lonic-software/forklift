@@ -15,7 +15,8 @@
 //! pallet, and an interrupted operation's starting base, plus a merge or pick's completing parcel
 //! unless the marker is rolling back. A damaged file adds what its own bytes still name: the full
 //! hash when it survives, the one stored parcel a hex prefix of at least 8 characters matches, or
-//! the one parcel that matches at every position but one.
+//! the one parcel that matches at every position but one. A full hash the store has decided is
+//! gone, with no taint accounting for it, is a floor and no candidate.
 //!
 //! The ref is rebuilt at the one candidate whose closure verifies, that equals or descends from
 //! every other verified candidate, and that descends from every floor: the bases, the marker
@@ -24,8 +25,10 @@
 //! head that still verifies and lies above every other candidate does win, although a rewind in
 //! another checkout may have moved past it: journals are not ordered across checkouts, and of the
 //! two wrong answers, a rebuild above a rewind loses nothing (the rewind can be run again) while
-//! one below lost work would. An answer that cannot be read (an ancestry walk that fails, a
-//! salvage match that is tainted, unreadable or one of several parcels) is unknown, never "no".
+//! one below lost work would. So a ref whose own bytes name a gone parcel is refused, naming it:
+//! nothing whose history verifies descends from that parcel. An answer that cannot be read (an
+//! ancestry walk that fails, a salvage match that is tainted, unreadable or one of several
+//! parcels) is unknown, never "no".
 //!
 //! A latest journal entry that deleted the pallet blocks the rebuild, unless a checkout stands on
 //! the pallet: the pallet was then made again after the delete (`pallet create` leaves no journal
@@ -275,7 +278,8 @@ enum Salvage {
 
     /// The bytes name this hash in full ([`named_hash`]), the store holds no object by it, and
     /// the store has decided it is gone with no taint accounting for it. Never a head to rebuild
-    /// at: the ref named it, and rebuilding elsewhere loses the only record of it.
+    /// at, and for a user ref a floor no rebuild can reach: the ref named it, and rebuilding
+    /// elsewhere loses the only record of it.
     Absent(String),
 
     /// A match whose kind cannot be read, where the store's read said nothing of the object (it
@@ -298,6 +302,10 @@ struct Evidence {
 
     /// Why the salvage is unknown, if it is.
     salvage_unknown: Option<String>,
+
+    /// The parcel the ref's own bytes name in full, which the store has decided is gone: a floor
+    /// no head heal could rebuild at descends from ([`Salvage::Absent`]).
+    salvage_absent: Option<String>,
 
     /// The parcels an ambiguous salvage may name.
     salvage_ambiguous: Vec<String>,
@@ -526,8 +534,8 @@ fn gather(damaged: &DamagedRef, tainted: &Tainted, notes: &mut Vec<String>) -> E
 
     if let RefDamage::Unreadable(bytes) = &damaged.damage {
         match salvage(bytes, tainted) {
-            // A user ref's bytes naming a gone parcel give heal no head, as bytes that name none.
-            Ok(Salvage::Nothing | Salvage::Absent(_)) => {}
+            Ok(Salvage::Nothing) => {}
+            Ok(Salvage::Absent(parcel)) => evidence.salvage_absent = Some(parcel),
             Ok(Salvage::Found(head)) => evidence.candidates.push((head, Source::Salvage)),
             Ok(Salvage::Unknown(reason) | Salvage::Untold(reason) | Salvage::Newer(reason)) => evidence.salvage_unknown = Some(reason),
             Ok(Salvage::Ambiguous(parcels, dropped)) => {
@@ -547,9 +555,11 @@ fn is_hex(byte: u8) -> bool {
 }
 
 /// What a damaged ref's `bytes` still name: the full hash when its 64 leading characters are hex
-/// (a damaged newline), the one parcel matching at every position but the one non-hex character
-/// among the first 64 (a flipped byte), else the one parcel a leading hex run of at least 8
-/// characters is a prefix of (a truncation). A hash the taint records as possibly lost matches
+/// (a damaged newline), or, where the store decided that hash is gone, the one parcel one
+/// character from it or one inserted hex character from it (damage inside the hash); the one
+/// parcel matching at every position but the one non-hex character among the first 64 (a flipped
+/// byte); else the one parcel a leading hex run of at least 8 characters is a prefix of (a
+/// truncation). A hash the taint records as possibly lost matches
 /// as well as a stored one, so an object a crash took is an unknown answer rather than none.
 fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     // Bytes that name no prefix salvage to nothing, whatever the store holds, which a read of the
@@ -585,8 +595,48 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     if let Some(hash) = named_hash(bytes) {
         return Ok(match matching(&hash)? {
             // Only an absence the store decided, with no taint accounting for it, names the hash
-            // as gone; any other empty answer is as before, nothing.
-            Ok(matches) if matches.is_empty() && head_decided_absent(&hash, tainted) => Salvage::Absent(hash),
+            // as gone, and only once no hash the damage may have made it from matches: one
+            // character changed, or one hex character inserted ahead of the 65th. Any other empty
+            // answer is as before, nothing.
+            Ok(matches) if matches.is_empty() && head_decided_absent(&hash, tainted) => {
+                let mut nearby: Vec<String> = Vec::new();
+                for at in 0..HASH_LENGTH {
+                    for digit in b"0123456789abcdef".iter().filter(|digit| **digit != bytes[at]) {
+                        let mut changed = bytes[..HASH_LENGTH].to_vec();
+                        changed[at] = *digit;
+                        nearby.push(String::from_utf8_lossy(&changed).into_owned());
+                    }
+                }
+                if run > HASH_LENGTH {
+                    for at in 0..=HASH_LENGTH {
+                        let mut kept = bytes[..=HASH_LENGTH].to_vec();
+                        kept.remove(at);
+                        nearby.push(String::from_utf8_lossy(&kept).into_owned());
+                    }
+                }
+                // Each of the ~1000 hashes is judged by its own pack answer, as a lookup would
+                // judge it, then looked up only where a stat of its loose path or a pack index
+                // holds it, or the taint names it, so no fan-out folder is listed per hash.
+                let mut near = Vec::new();
+                for candidate in nearby {
+                    if !tainted.hashes.contains(&candidate)
+                        && unlisted.get().is_some_and(|packs| packs.reason_for(&candidate).is_none())
+                        && !crate::util::file_utils::raw_object_present(&candidate)?
+                    {
+                        continue;
+                    }
+                    match matching(&candidate)? {
+                        Ok(found) => near.extend(found),
+                        Err(untold) => return Ok(untold),
+                    }
+                }
+                near.sort();
+                near.dedup();
+                match near.is_empty() {
+                    true => Salvage::Absent(hash),
+                    false => judge(near, tainted),
+                }
+            }
             Ok(matches) => judge(matches, tainted),
             Err(untold) => untold,
         });
@@ -749,6 +799,17 @@ fn choose(pallet: &str, evidence: &Evidence, pass: Pass) -> Choice {
         return Choice::Refuse(format!(
             "the latest journal entry of {} deleted the pallet, so a rebuild could undo that delete",
             evidence.deleted_in.join(" and ")
+        ));
+    }
+
+    // The ref's own bytes stand on a parcel the store has decided is gone, a floor that no head
+    // whose history verifies descends from: a rebuild at any other head would land below it. The
+    // taint this pass read covers no such parcel, so either pass refuses. Damage of more than one
+    // character inside the hash reads the same way, so the reason allows for it.
+    if let Some(parcel) = &evidence.salvage_absent {
+        return Choice::Refuse(format!(
+            "its own bytes name {}, which is not in the store, nor is a parcel one character from it, so it is not rebuilt at another head in that parcel's place: if the parcel was lost, restore it from a backup of the warehouse, or clone it afresh from a remote that holds it, and run \"forklift heal\" again; otherwise set its head yourself",
+            parcel
         ));
     }
 
@@ -1158,7 +1219,9 @@ pub fn check_set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>
 }
 
 /// Every refusal of [`set_damaged_ref`], before its write: the damaged ref, the parcel's full
-/// hash, and the preconditions the write holds it to.
+/// hash, and the preconditions the write holds it to. It also backs the dry run and comes before
+/// every refusal, so its `notes` say what was judged, or what the write would do, never what was
+/// done.
 fn admit_set(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<(DamagedRef, String, pallet_utils::RefPreconditions), String> {
     let damaged = damaged_ref(pallet, notes)?;
 
@@ -1177,6 +1240,15 @@ fn admit_set(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<(Dam
 
     if served {
         refuse_below_a_floor(&damaged, &head, notes)?;
+    } else if let RefDamage::Unreadable(bytes) = &damaged.damage {
+        // The write would replace the only record of a parcel the bytes name and the store does
+        // not hold, so the note keeps it. A lookup that fails only leaves the note out.
+        if let Ok(Salvage::Absent(parcel)) = salvage(bytes, &Tainted::read(notes)) {
+            push_note(notes, format!(
+                "The ref of pallet \"{}\" names {}, which is not in the store; setting the ref replaces those bytes, which are not kept.",
+                damaged.pallet, parcel
+            ));
+        }
     }
 
     let preconditions = trusted(&damaged.pallet, &head)?;
@@ -1219,7 +1291,8 @@ fn refuse_meta_history(pallet: &str, parcel: &str, head: &str, notes: &mut Vec<S
 /// ref's own bytes name) and, when those bytes match several parcels, from at least one of them.
 /// This is judged before the write's hold, and only over what can be read: a checkout whose state
 /// cannot be read, a salvage match that is lost, or an ancestry walk that fails adds a note
-/// instead, since refusing on them would leave the ref no way out. With no floor at all it passes:
+/// instead, since refusing on them would leave the ref no way out, as does a parcel the bytes name
+/// that the store does not hold. With no floor at all it passes:
 /// what clones fetched is then the operator's to know.
 fn refuse_below_a_floor(damaged: &DamagedRef, head: &str, notes: &mut Vec<String>) -> Result<(), String> {
     let evidence = gather(damaged, &Tainted::read(notes), notes);
@@ -1272,6 +1345,14 @@ fn refuse_below_a_floor(damaged: &DamagedRef, head: &str, notes: &mut Vec<String
         }
     }
 
+    // The bytes stand on a parcel the store does not hold, so no ancestry can be walked from it.
+    if let Some(parcel) = &evidence.salvage_absent {
+        push_note(notes, format!(
+            "This warehouse is served, and the ref of pallet \"{}\" names {}, which is not in the store, so {} could not be checked against it: its clones may rely on that parcel, and setting the ref replaces those bytes, which are not kept.",
+            damaged.pallet, parcel, head
+        ));
+    }
+
     if partial {
         push_note(notes, format!(
             "This warehouse is served, and not everything that records the head of pallet \"{}\" could be read, so {} was checked only against what could.",
@@ -1298,7 +1379,8 @@ const FOLDER_NAME_REMOVED_REFS: &str = "removed-refs";
 
 /// `forklift heal --remove-ref <pallet>`: remove damaged `pallet`'s unreadable ref, keeping its
 /// bytes in a file of their own. Allowed only when no checkout stands on the pallet, nothing names
-/// a head for it (its own bytes included), and every checkout's state could be read.
+/// a head the store holds for it (its own bytes included: bytes naming a parcel the store decided
+/// is gone are kept, so they allow it), and every checkout's state could be read.
 pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Removed, String> {
     let damaged = admit_remove(pallet, notes)?;
     let RefDamage::Unreadable(bytes) = &damaged.damage else {
@@ -2725,6 +2807,38 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
 mod tests {
     use super::*;
     use crate::util::pallet_utils::tests::{scratch, stub_parcel};
+
+    // A --ref the trust check refuses, over a ref whose bytes name a gone parcel, writes nothing,
+    // and its notes say what the write would do, never that it did, served or not. The check runs
+    // after every note, so the refusal shows each beside an unchanged ref.
+    #[test]
+    fn a_refused_set_over_a_gone_parcel_notes_only_what_the_write_would_do() {
+        for served in [false, true] {
+            let (_root, _scope) = scratch(&format!("ref-heal-set-gone-{}", served));
+            let head = stub_parcel("head");
+            if served {
+                assert!(crate::util::tombstone_utils::mark_served(true).unwrap());
+            }
+            let gone = blake3::hash(b"never stored here").to_hex().to_string();
+            let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = format!("{}torn", gone);
+            std::fs::write(&path, &bytes).unwrap();
+
+            TRUSTED_REFUSED.with(|refused| refused.set(true));
+            let mut notes = Vec::new();
+            let set = set_damaged_ref("main", &head, &mut notes);
+            TRUSTED_REFUSED.with(|refused| refused.set(false));
+
+            assert_eq!(set.err().as_deref(), Some("the trust check was refused for the test"), "served {}", served);
+            let note = match served {
+                true => format!("This warehouse is served, and the ref of pallet \"main\" names {}, which is not in the store, so {} could not be checked against it: its clones may rely on that parcel, and setting the ref replaces those bytes, which are not kept.", gone, head),
+                false => format!("The ref of pallet \"main\" names {}, which is not in the store; setting the ref replaces those bytes, which are not kept.", gone),
+            };
+            assert!(notes.contains(&note), "served {}: {:?}", served, notes);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes, "served {}: the ref is left alone", served);
+        }
+    }
 
     // A user rebuild whose head the trust check refuses was never written, whatever its ref
     // reads back as; one whose write landed though it reported an error is rebuilt, with what

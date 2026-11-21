@@ -2870,18 +2870,25 @@ pallet whose ref is still damaged is left for the next run, with a `Note:` line 
 
 When the heads disagree, none of them holds a complete history, or nothing names one, `heal`
 changes nothing on that ref, lists every head it found, and refuses with `ref_damaged` (the heads
-are in `details` under `--json`). Choose one yourself:
+are in `details` under `--json`). It refuses the same way, naming the parcel, when the ref's
+damaged bytes name in full a parcel the store has decided is gone, and no parcel one character
+from that hash is in the store either: no other head is taken in its place. If the parcel was
+lost, restore it from a backup or from a remote that holds it and run `heal` again; otherwise
+choose a head yourself:
 
 - `forklift heal --ref <pallet>=<parcel>` sets the ref to that parcel (any revision `history`
   accepts, but not a meta pallet's history), once its history checks out as complete and passes
   the trust check. In a served warehouse it must also lead up from every parcel the warehouse still
   records a checkout or the ref's own bytes standing on (at least one of them, when the bytes match
   several). The head the damage hid cannot be checked, and what cannot be read is skipped with a
-  `Note:`, as is a meta pallet whose history cannot be read, so
-  choose a parcel at or above what clones fetched. Repeatable.
-- `forklift heal --remove-ref <pallet>` drops a damaged ref that nothing names a head for and no
-  checkout stands on, once every checkout's saved state could be read. Its bytes are kept under `.forklift/removed-refs`, and whatever only that
-  ref reached is no longer kept by any pallet. Repeatable.
+  `Note:`, as are a parcel the bytes name that the store does not hold and a meta pallet whose
+  history cannot be read, so choose a parcel at or above what clones fetched. Served or not, a
+  `Note:` names a parcel the bytes name that the store does not hold, since setting the ref
+  replaces those bytes without keeping them. Repeatable.
+- `forklift heal --remove-ref <pallet>` drops a damaged ref that nothing names a head the store
+  holds for, its bytes included, and no checkout stands on, once every checkout's saved state could
+  be read. Its bytes are kept under `.forklift/removed-refs`, and whatever only that ref reached is
+  no longer kept by any pallet. Repeatable.
 - `--remove-ref` takes a user pallet only: `heal` never removes a metadata pallet's ref (`@<name>`),
   and refuses the option for one before it changes anything. Where `heal` has no head it can
   rebuild a metadata ref at (nothing names one, or what does is several parcels, one possibly lost,
