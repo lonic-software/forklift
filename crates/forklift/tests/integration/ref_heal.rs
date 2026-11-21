@@ -2617,7 +2617,7 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
 
         // A lost ref reads as no head, so nothing is left unread, and the ref is one of the rest.
         if case == "missing" {
-            std::fs::remove_file(ref_path(&root, "side")).unwrap();
+            forklift_core::util::file_utils::remove_file(&ref_path(&root, "side")).unwrap();
             let output = area.run(&root, &["--json", "heal"]);
             let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             let message = value["error"]["message"].as_str().unwrap_or_default();
