@@ -414,13 +414,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         false => position_heal::repair(position, &mut ref_notes).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?,
     };
 
-    // The repairs, then the notes on them.
-    let repairs_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed]| match &late_position {
-        Some(position) => forklift_core::error::append_to_message(repairs(error, rebuilt, removed), &position.sentence()),
-        None => repairs(error, rebuilt, removed),
-    };
     let changed_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
-        append_notes(repairs_after(error, rebuilt, removed), notes)
+        let mut error = changed(error, rebuilt, removed, notes);
+        if let Some(position) = &late_position {
+            error = forklift_core::error::append_to_message(error, &position.sentence());
+        }
+        error
     };
 
     // Before the taint recovery, whose closure walk reads every ref: a ref rebuilt here roots
@@ -428,7 +427,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
-    let rebuilt_before_taint = refs_rebuilt.len();
+    // What the run repaired before the taint recovery is said before it, by every failure after it.
+    let rebuilt_before_taint = refs_rebuilt.clone();
     // What the first pass refused, the ref whose write met the stop included, is said here: the
     // second pass, which would refuse it again, never runs. So are the damaged refs it stopped
     // before judging, beside the meta refs left.
@@ -462,13 +462,17 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     };
 
     // Every failure from here on says the taint this run cleared, and what its recovery noted:
-    // the taint's files are gone, so no later run reports them. It goes after the repairs before
-    // it, and `since_taint` holds what each step after it repaired, pushed as the step ends; the
-    // notes, the taint recovery's first, follow every repair.
+    // the taint's files are gone, so no later run reports them. It goes after the repairs made
+    // before it (with the refs any pass judged and left, which those sentences carry), and
+    // `since_taint` holds what each step after it repaired, pushed as the step ends; the notes,
+    // the taint recovery's first, follow every repair.
     let taint_notes = outcome.notes.clone();
     let mut since_taint: Vec<String> = taint_sentence(&outcome).into_iter().collect();
-    let changed_after_taint = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String], since_taint: &[String]| {
-        let error = repairs_after(error, &rebuilt[..rebuilt_before_taint], removed);
+    let changed_after_taint = |error: String, notes: &[String], since_taint: &[String]| {
+        let mut error = repairs(error, &rebuilt_before_taint, &refs_removed);
+        if let Some(position) = &late_position {
+            error = forklift_core::error::append_to_message(error, &position.sentence());
+        }
         let error = since_taint.iter().fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence));
         let notes: Vec<String> = taint_notes.iter().chain(notes).cloned().collect();
         append_notes(error, &notes)
@@ -487,7 +491,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             since_taint.extend(stopped.rebuilt.iter().map(rebuilt_sentence));
             refs_rebuilt.extend(stopped.rebuilt);
             ref_notes.extend(stopped.notes);
-            return Err(changed_after_taint(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint));
+            return Err(changed_after_taint(stopped.error, &ref_notes, &since_taint));
         }
     };
     // The trust repair runs in both passes, and may note the same thing in each: a refusal and
@@ -509,10 +513,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
     if let Some(error) = stopped_with(meta_second.stopped, &meta_second.undurable) {
-        return Err(changed_after_taint(error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint));
+        return Err(changed_after_taint(error, &ref_notes, &since_taint));
     }
 
-    let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after_taint(error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint))?;
+    let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after_taint(error, &ref_notes, &since_taint))?;
     since_taint.extend(second.rebuilt.iter().map(rebuilt_sentence));
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
@@ -520,7 +524,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     refs_refused.extend(meta_second.refused);
     refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: Vec::new(), held: None });
     if let Some(error) = stopped_with(second.stopped, &second.undurable) {
-        return Err(changed_after_taint(error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint));
+        return Err(changed_after_taint(error, &ref_notes, &since_taint));
     }
 
     // An operation on a pallet whose ref is still damaged waits: its landed test would read the
@@ -555,7 +559,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         Err(error) => inventory_error = Some(error),
     }
     let unreadable = inventory_error.is_some();
-    // A step that fails after a written rebuild says so beside every other repair.
+    // A rebuild written here is said by every failure after it, in its place among the repairs
+    // since the taint.
     since_taint.extend(inventory_rebuilt.iter().map(InventoryRebuilt::sentence));
     let held_park = partial_park.is_some() && inventory_held.is_some();
     if held_park {
@@ -578,7 +583,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let recovered = match waits.is_some() || held_park || unreadable {
         true => Ok(None),
         false => operation_utils::recover(),
-    }.map_err(|error| changed_after_taint(error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint))?;
+    }.map_err(|error| changed_after_taint(error, &ref_notes, &since_taint))?;
     let operation = recovered.map(|recovery| OperationRecovery {
         operation: recovery.operation.as_str().to_string(),
         outcome: match recovery.outcome {
@@ -603,7 +608,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 // Judged against the position that recovery left, which it may have moved.
                 let settled = merge_state_heal::agreement_in(&forklift_core::globals::bay_root());
                 let later = merge_state_heal::repair(settled.as_ref(), &mut ref_notes)
-                    .map_err(|error| changed_after_taint(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes, &since_taint))?;
+                    .map_err(|error| changed_after_taint(String::from(error), &ref_notes, &since_taint))?;
                 merge_repair = merge_repair.then(later);
                 if merge_note.is_none() {
                     merge_note = merge_note_of(&merge_repair.refusal);
