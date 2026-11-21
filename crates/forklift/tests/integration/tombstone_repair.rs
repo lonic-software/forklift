@@ -527,6 +527,9 @@ fn heal_over_damaged_tombstones_after_the_taint_recovery_names_every_ref_it_judg
     assert!(message.contains(&said), "{}", message);
     assert!(message.contains("The ref of pallet \"zeta\" was not rebuilt: nothing in this warehouse names its head"), "{}", message);
     assert!(!message.contains("this run stopped before judging it"), "{}", message);
+    // The taint it cleared is said too: its files are gone, so no later run reports it.
+    let cleared = format!("Durability taint cleared: restaged objects/{}/{}.", &main[..2], &main[2..]);
+    assert!(message.contains(&cleared), "{}", message);
 }
 
 /// Revert: leave kept heads out of the holder census → the redaction applies and deletes content
