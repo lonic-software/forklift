@@ -486,7 +486,7 @@ fn heal_over_damaged_tombstones_answers_with_the_repair_and_rebuilds_once_it_is_
         std::fs::write(&zeta_ref, b"not a head\n").unwrap();
         let refused = area.run(&root, &["--json", "heal"]);
         let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
-        let said = format!("The ref of pallet \"main\" was not rebuilt: the rebuild at {} was not attempted: the tombstones are damaged, and the pass stopped;", main);
+        let said = format!("The ref of pallet \"main\" was not rebuilt: the rebuild at {} was not attempted: the tombstones are damaged, which stop the run;", main);
         assert!(message.contains(&said), "{}: {}", what, message);
         assert!(message.contains("The ref of pallet \"zeta\" is lost or damaged; this run stopped before judging it."), "{}: {}", what, message);
         forklift_core::util::file_utils::remove_file(&zeta_ref).unwrap();
@@ -523,7 +523,7 @@ fn heal_over_damaged_tombstones_after_the_taint_recovery_names_every_ref_it_judg
     assert_eq!(refused.status.code(), Some(TOMBSTONES_DAMAGED_EXIT), "{}{}", text(&refused.stdout), text(&refused.stderr));
     assert_eq!(std::fs::read_dir(&taint).map(|entries| entries.count()).unwrap_or(0), 0, "the taint recovery ran first");
     let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
-    let said = format!("The ref of pallet \"main\" was not rebuilt: the rebuild at {} was not attempted: the tombstones are damaged, and the pass stopped;", main);
+    let said = format!("The ref of pallet \"main\" was not rebuilt: the rebuild at {} was not attempted: the tombstones are damaged, which stop the run;", main);
     assert!(message.contains(&said), "{}", message);
     assert!(message.contains("The ref of pallet \"zeta\" was not rebuilt: nothing in this warehouse names its head"), "{}", message);
     assert!(!message.contains("this run stopped before judging it"), "{}", message);

@@ -2353,10 +2353,9 @@ fn tombstones_stopped_reason(head: &str) -> String {
 }
 
 /// Why a user pass refuses the rebuild at `head` over damaged tombstones, which it read before
-/// writing anything and stopped on: their refusal, said where the pass stopped, carries the detail
-/// and the step.
+/// writing anything: their refusal, which ends the run, carries the detail and the step.
 fn tombstones_unattempted_reason(head: &str) -> String {
-    format!("the rebuild at {} was not attempted: the tombstones are damaged, and the pass stopped", head)
+    format!("the rebuild at {} was not attempted: the tombstones are damaged, which stop the run", head)
 }
 
 /// Step 3 of [`repair_meta`], over the meta refs as the steps before it left them. The office is
@@ -2617,7 +2616,7 @@ mod tests {
         let served = crate::util::tombstone_utils::served_path();
         let mark = std::fs::read(&served).ok();
         std::fs::write(&served, b"not a served mark").unwrap();
-        let reason = format!("the rebuild at {} was not attempted: the tombstones are damaged, and the pass stopped", head);
+        let reason = format!("the rebuild at {} was not attempted: the tombstones are damaged, which stop the run", head);
         let nothing = "nothing in this warehouse names its head";
         for (pass, refused, unjudged) in [
             (Pass::BeforeTaint, vec![("main", reason.as_str())], vec!["alpha", "zeta"]),
