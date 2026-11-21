@@ -2101,18 +2101,26 @@ fn an_office_ref_naming_a_head_the_store_decided_is_gone_keeps_both_files() {
 // old outcome) and leave them unjudged as stale → rebuilt with no note, red at the note.
 #[test]
 fn a_damaged_meta_ref_whose_bytes_name_a_gone_head_is_rebuilt_from_its_copy_and_names_it() {
-    let area = Area::new("meta-absent-damaged");
-    let (root, _, second) = tagged(&area);
-    let copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
-    let gone = flip_digit(&second, 63);
-    std::fs::write(meta_path(&root, "tags"), format!("{}torn", gone)).unwrap();
+    // A taint over the copy's head, which the store holds: the pass before the recovery waits on
+    // it, and the pass after reads the ref stale once the recovery cleared it, so one run
+    // converges.
+    for tainted in [false, true] {
+        let area = Area::new(&format!("meta-absent-damaged-{}", tainted));
+        let (root, _, second) = tagged(&area);
+        let copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
+        let gone = flip_digit(&second, 63);
+        std::fs::write(meta_path(&root, "tags"), format!("{}torn", gone)).unwrap();
+        if tainted {
+            plant_taint(&root, &[second.as_str()]);
+        }
 
-    let data = healed(&area, &root);
-    assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
-    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), copy, "{}", data);
-    assert!(data["notes"].to_string().contains(&format!(
-        "The ref of pallet \\\"@tags\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", gone, second
-    )), "the head its bytes named is reported: {}", data);
+        let data = healed(&area, &root);
+        assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
+        assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), copy, "{}", data);
+        assert!(data["notes"].to_string().contains(&format!(
+            "The ref of pallet \\\"@tags\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", gone, second
+        )), "the head its bytes named is reported: {}", data);
+    }
 }
 
 // The office's damaged ref whose bytes begin with the full hash of a parcel the store decided is
