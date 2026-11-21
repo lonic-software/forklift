@@ -1104,6 +1104,8 @@ fn a_reachability_walk_that_cannot_finish_claims_nothing_lost() {
     let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
     assert!(shown.contains("heal could not finish its reachability check"), "{}", shown);
     assert!(!shown.contains("objects_lost"), "{}", shown);
+    // A run that did nothing has nothing to add to its failure, least of all "nothing to heal".
+    assert!(!shown.contains("Nothing to heal"), "{}", shown);
 }
 
 #[test]
