@@ -2817,11 +2817,13 @@ mod tests {
         use crate::util::tag_utils::TAGS_PALLET_NAME;
 
         #[derive(Debug, Clone, Copy)]
-        enum Row { Clean, LandedDespite, Undurable, Unread, #[cfg(unix)] ReadOnly, Moved }
+        enum Row { Clean, #[cfg(unix)] LandedDespite, #[cfg(unix)] Undurable, Unread, #[cfg(unix)] ReadOnly, Moved }
         #[allow(unused_mut)]
-        let mut rows = vec![Row::Clean, Row::LandedDespite, Row::Undurable, Row::Unread, Row::Moved];
+        let mut rows = vec![Row::Clean, Row::Unread, Row::Moved];
+        // A folder sync is a no-op off unix, so no injected sync failure can fire there; nor does
+        // a 0o555 folder refuse a write.
         #[cfg(unix)]
-        rows.push(Row::ReadOnly);
+        rows.extend([Row::LandedDespite, Row::Undurable, Row::ReadOnly]);
         const DEFERRAL: &str = "The pass before the taint recovery left the ref of pallet \"@tags\" for the pass after it: ";
 
         // Every row is run before the note is judged, so a failure names each row that misses it.
@@ -2848,6 +2850,7 @@ mod tests {
                 }
                 std::fs::write(&copy_path, format!("{}\n", held)).unwrap();
                 std::fs::write(&ref_path, format!("{}\n", gone)).unwrap();
+                #[cfg(unix)]
                 let folder = ref_path.parent().unwrap().to_path_buf();
                 let said = format!(
                     "The ref of pallet \"@tags\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.",
@@ -2855,11 +2858,14 @@ mod tests {
                 );
 
                 let repair = {
-                    let _sync = match row {
+                    let _sync: Option<crate::util::file_utils::SyncDirFaultGuard> = match row {
+                        #[cfg(unix)]
                         Row::LandedDespite => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder)),
+                        #[cfg(unix)]
                         Row::Undurable => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder)),
                         _ => None,
                     };
+                    #[cfg(unix)]
                     let _taint = matches!(row, Row::Undurable).then(crate::util::file_utils::TaintRecordFaultGuard::failing);
                     match row {
                         Row::Unread => READ_BACK_UNREAD.with(|unread| unread.set(true)),
@@ -2915,6 +2921,7 @@ mod tests {
                 };
                 match row {
                     Row::Clean => assert_eq!(rebuilt, vec![held.as_str()], "{:?} {:?}: {:?}", pass, row, repair),
+                    #[cfg(unix)]
                     Row::LandedDespite => {
                         assert_eq!(rebuilt, vec![held.as_str()], "{:?} {:?}: {:?}", pass, row, repair);
                         let landed = repair.notes.iter().position(|note| note.starts_with("The ref of pallet \"@tags\" was rebuilt at"));
@@ -2922,6 +2929,7 @@ mod tests {
                         assert!(landed.is_some(), "{:?}: the landed-despite arm ran: {:?}", pass, repair.notes);
                         assert!(named.is_some() && named < landed, "{:?}: the gone head is named before the write: {:?}", pass, repair.notes);
                     }
+                    #[cfg(unix)]
                     Row::Undurable => assert_eq!(repair.undurable.len(), 1, "{:?} {:?}: {:?}", pass, row, repair),
                     Row::Unread => {
                         let reason = format!("the rebuild at {} was written, but its ref could not be read back: the read was refused for the test", held);
@@ -2938,7 +2946,13 @@ mod tests {
                         assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(other.as_str()), "{:?}: nothing was written over the move", pass);
                     }
                 }
-                if matches!(row, Row::Clean | Row::LandedDespite | Row::Undurable) {
+                let landed = match row {
+                    Row::Clean => true,
+                    #[cfg(unix)]
+                    Row::LandedDespite | Row::Undurable => true,
+                    _ => false,
+                };
+                if landed {
                     assert!(deferrals.is_empty() && repair.refused.is_empty() && repair.deferred.is_empty(), "{:?} {:?}: {:?}", pass, row, repair);
                 }
             }
