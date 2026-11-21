@@ -274,19 +274,21 @@ fn a_prefix_too_short_or_naming_no_parcel_salvages_nothing() {
 
 // A damaged ref whose bytes begin with the full hash of a parcel the store decided is gone stands
 // on that parcel, which nothing heal could rebuild at descends from: heal refuses and names it,
-// with nothing else naming a head, and with a bay standing on an older head of the pallet, which
-// it would otherwise be rebuilt at. `--remove-ref` (nothing standing on the pallet) or `--ref`
-// then settles it; served, `--ref` notes that the head could not be checked against the parcel.
-// Mutation: salvage such bytes to nothing → the no-evidence row refuses as "nothing in this
-// warehouse names its head", and the bay row rebuilds at the bay's base, red.
+// with nothing else naming a head, and with a bay standing on the pallet, which it would otherwise
+// be rebuilt at. Here the bytes are damaged after the bay's base, so that base is the right
+// answer, but heal cannot tell that damage from a gone parcel; it lists the base for `--ref`.
+// `--remove-ref` (nothing standing on the pallet) or `--ref` then settles it; served, `--ref`
+// notes that the head could not be checked against the parcel. Mutation: salvage such bytes to
+// nothing → the bay row rebuilds at the bay's base with exit 0, and the no-evidence row refuses
+// as "nothing in this warehouse names its head", red.
 #[test]
 fn a_ref_whose_bytes_name_a_gone_parcel_is_refused_naming_it() {
-    for row in ["a bay below it", "nothing else"] {
+    for row in ["a bay on it", "nothing else"] {
         let area = Area::new(&format!("salvage-gone-{}", row.replace(' ', "-")));
         let (root, side) = side_only_its_bytes_name(&area);
         let candidates = match row {
-            "a bay below it" => {
-                let bay = area.bay(&root, "below");
+            "a bay on it" => {
+                let bay = area.bay(&root, "on");
                 area.run_ok(&bay, &["shift", "side"]);
                 // Its base, and its journal's entry for the shift.
                 2
