@@ -2905,7 +2905,8 @@ In a served warehouse whose tombstone list or `served` mark is lost or damaged, 
 rebuild a ref: the list may record the pallet's deletion. It refuses with `tombstones_damaged`
 (exit 55) and names `forklift-server tombstone repair`, which the server's operator runs; heal the
 refs after that. The refusal names the ref whose rebuild the damage refused, and each other damaged
-ref the run stopped before judging.
+ref the run stopped before judging; a ref it refused before the stop is named with its own way out,
+which the tombstone repair does not settle.
 
 #### Damaged metadata pallet refs
 

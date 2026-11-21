@@ -189,9 +189,10 @@ pub struct Repair {
     /// why and every head it found: a run that stops before that pass names them.
     pub deferred: Vec<Refused>,
 
-    /// The lost or damaged refs that a pass which stopped never judged, meta refs as `@<name>`:
-    /// neither rebuilt, refused nor deferred. A user pass lists too those it left for the pass
-    /// after the taint recovery.
+    /// The lost or damaged refs that a pass which stopped never judged, meta refs as `@<name>`. A
+    /// meta pass lists those it neither rebuilt, refused nor deferred; a user pass, those it
+    /// neither rebuilt, refused nor named as perhaps rebuilt, the ones it left for the pass after
+    /// the taint recovery among them.
     pub unjudged: Vec<String>,
 
     /// The deferred meta refs, as `@<name>`, whose own bytes name only objects that a taint whose
@@ -802,6 +803,8 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
     }
 
     let tainted = Tainted::read(&mut report.notes);
+    // The refs whose write this pass could not read back, which it names as perhaps rebuilt.
+    let mut unread: Vec<&str> = Vec::new();
 
     for damaged in &detected {
         let evidence = gather(damaged, &tainted, &mut report.notes);
@@ -828,9 +831,18 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                     }
                 };
 
-                match pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions) {
+                #[cfg(test)]
+                let refused = USER_WRITE_REFUSED.with(|refused| refused.borrow_mut().take());
+                #[cfg(not(test))]
+                let refused: Option<String> = None;
+                let written = match refused {
+                    Some(error) => Err(RefUpdateError::Failed(error)),
+                    None => pallet_utils::repair_pallet_head(&damaged.pallet, &damaged.damage, &head, &preconditions),
+                };
+
+                match written {
                     Ok(()) => report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source }),
-                    // Damaged tombstones refuse every ref write alike, and only the operator's
+                    // Damaged tombstones refuse every user ref repair alike, and only the operator's
                     // repair mends them, so the refusal is the answer, with its own next step.
                     // What this pass already rebuilt stays reported, and so does the ref it was
                     // writing, refused in either pass, since the run ends on the stop.
@@ -843,10 +855,12 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                         });
                         report.stopped = Some(error);
                         // The run ends here, so every damaged ref it did not judge is named: the
-                        // refs after this one, and those the first pass left for the second. The
-                        // tombstones refuse every write alike, so none before this one was written.
+                        // refs after this one, and those the first pass left for the second. Not
+                        // one it already spoke of: refused, rebuilt, or perhaps rebuilt.
                         report.unjudged = detected.iter().map(|damaged| damaged.pallet.as_str())
                             .filter(|pallet| !report.refused.iter().any(|refused| refused.pallet == *pallet))
+                            .filter(|pallet| !report.rebuilt.iter().any(|rebuilt| rebuilt.pallet == *pallet))
+                            .filter(|pallet| !unread.contains(pallet))
                             .map(str::to_string).collect();
                         break;
                     }
@@ -862,10 +876,13 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                             ReadBack::Landed => landed(&mut report, PalletNamespace::User, &damaged.pallet, head, source, Some(&error)),
                             // The pass after the taint recovery may read a write that landed as an
                             // undamaged ref, and then says nothing of it: the head is named here.
-                            ReadBack::Unread(why) if attempted => push_note(&mut report.notes, format!(
-                                "The ref of pallet \"{}\" may have been rebuilt at {}: the write reported {}, and its ref could not be read back: {}.",
-                                damaged.pallet, head, error, why.trim_end_matches('.')
-                            )),
+                            ReadBack::Unread(why) if attempted => {
+                                unread.push(&damaged.pallet);
+                                push_note(&mut report.notes, format!(
+                                    "The ref of pallet \"{}\" may have been rebuilt at {}: the write reported {}, and its ref could not be read back: {}.",
+                                    damaged.pallet, head, error, why.trim_end_matches('.')
+                                ));
+                            }
                             // The first pass leaves a failed write to the second, which reports it.
                             _ if pass == Pass::BeforeTaint => {}
                             read => report.refused.push(Refused {
@@ -2202,6 +2219,10 @@ thread_local! {
     /// The refusal the next meta rebuild's write answers instead of writing, once: a repair writes
     /// as a creation, and no fixture makes one meet damaged tombstones.
     static META_WRITE_REFUSED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+
+    /// The refusal the next user rebuild's write answers instead of writing, once: no fixture fails
+    /// one write of a pass whose later write meets damaged tombstones.
+    static USER_WRITE_REFUSED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Read back the ref of pallet `name` after heal wrote it at `head`.
@@ -2600,6 +2621,31 @@ mod tests {
             assert_eq!(stopped.refused.iter().any(|refused| refused.pallet == "alpha"), alpha, "{:?}: {:?}", pass, stopped.refused);
             assert_eq!(stopped.unjudged, unjudged, "{:?}", pass);
             assert_eq!(std::fs::read(&path).unwrap(), &head.as_bytes()[..20], "{:?}: the ref is left alone", pass);
+        }
+
+        // A ref the pass already spoke of before the stop is not named as unjudged as well:
+        // "alpha", now naming the head, is written first, its write failing for the test. Landed
+        // all the same, it is rebuilt; unread, it may have been. Mutations: drop the rebuilt
+        // filter → alpha named twice, red; drop the unread filter → the same, red.
+        let alpha_path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "alpha");
+        for landed in [true, false] {
+            std::fs::write(&alpha_path, &head.as_bytes()[..20]).unwrap();
+            USER_WRITE_REFUSED.with(|refused| *refused.borrow_mut() = Some("the write was refused for the test".to_string()));
+            match landed {
+                true => {
+                    let (alpha_path, head) = (alpha_path.clone(), head.clone());
+                    BEFORE_READ_BACK.with(|before| before.set(Some(Box::new(move || std::fs::write(&alpha_path, format!("{}\n", head)).unwrap()))));
+                }
+                false => READ_BACK_UNREAD.with(|unread| unread.set(usize::MAX)),
+            }
+            let stopped = repair(Pass::BeforeTaint);
+            READ_BACK_UNREAD.with(|unread| unread.set(0));
+            let stopped = stopped.unwrap();
+            assert!(stopped.stopped.as_deref().is_some_and(crate::util::tombstone_utils::is_damage), "landed {}: {:?}", landed, stopped.stopped);
+            assert_eq!(stopped.rebuilt.iter().any(|rebuilt| rebuilt.pallet == "alpha"), landed, "{:?}", stopped.rebuilt);
+            let maybe = format!("The ref of pallet \"alpha\" may have been rebuilt at {}", head);
+            assert_eq!(stopped.notes.iter().any(|note| note.starts_with(&maybe)), !landed, "{:?}", stopped.notes);
+            assert_eq!(stopped.unjudged, vec!["zeta"], "landed {}", landed);
         }
     }
 
