@@ -319,7 +319,8 @@ pub struct RunRefused {
     /// The wire name of every pallet ref whose head this run's walk could not read, when that left
     /// the taint standing: a torn taint's rescan refused because the walk was incomplete, or an
     /// object was kept because the walk could not prove nothing references it. Empty for every
-    /// other refusal. While one of these refs stays unread, no run's walk is complete.
+    /// other refusal. While one of these refs stays unread, no run's walk is complete. The list
+    /// is not filtered against the refs a torn or unread taint holds ([`crate::util::ref_heal::TaintHold`]).
     pub kept_by_unread_refs: Vec<String>,
 }
 
