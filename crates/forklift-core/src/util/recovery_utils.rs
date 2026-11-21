@@ -312,6 +312,35 @@ pub struct HealOutcome {
     pub index_rebuild_skipped: bool,
 }
 
+/// Why [`run`] left the taint standing, or could not run.
+#[derive(Debug)]
+pub struct RunRefused {
+    pub error: CoreError,
+    /// The wire name of every pallet ref whose head this run's walk could not read, when the
+    /// taint stands with an object kept only because the walk was incomplete: it could not prove
+    /// nothing references the object. Empty otherwise. While one of these refs stays unread,
+    /// every run's walk is incomplete again and keeps the object again.
+    pub kept_by_unread_refs: Vec<String>,
+}
+
+impl From<CoreError> for RunRefused {
+    fn from(error: CoreError) -> RunRefused {
+        RunRefused { error, kept_by_unread_refs: Vec::new() }
+    }
+}
+
+impl From<RunRefused> for CoreError {
+    fn from(refused: RunRefused) -> CoreError {
+        refused.error
+    }
+}
+
+impl std::fmt::Display for RunRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
 impl HealOutcome {
     fn nothing() -> HealOutcome {
         HealOutcome {
@@ -348,11 +377,11 @@ impl HealOutcome {
 /// * `Ok(HealOutcome)` - Nothing was tainted, or the taint is now **fully** cleared (every
 ///                       recorded path reached restaged, or vanished-and-unreferenced/a resolved
 ///                       shard note). The in-memory gate is cleared too.
-/// * `Err(CoreError)`  - A [`RefusalCode::DurabilityTaint`] refusal: at least one reference remains
+/// * `Err(RunRefused)` - A [`RefusalCode::DurabilityTaint`] refusal: at least one reference remains
 ///                       genuinely dangling after the walk (torn or not). The taint is rewritten to
 ///                       record exactly the unresolved remainder (never the original full set,
 ///                       never nothing) and the gate is left standing.
-pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreError> {
+pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, RunRefused> {
     let root = forklift_root();
 
     // Computed once, here, ahead of everything else — see this function's own doc comment. An
@@ -382,7 +411,7 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
             outcome.index_rebuild_skipped = rebuild.skipped.is_some();
             Ok(outcome)
         }
-        Err(error) => Err(with_pack_warnings(error, &pack_warnings)),
+        Err(refused) => Err(RunRefused { error: with_pack_warnings(refused.error, &pack_warnings), ..refused }),
     }
 }
 
@@ -392,7 +421,7 @@ pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreErr
 /// callees) uniformly, without threading an extra parameter through `resolve_the_rest`,
 /// `rescan_torn_taint`, and every refusal constructor they call — a change to this function's own
 /// control flow can never accidentally create a return path pack-health warnings fail to reach.
-async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, CoreError> {
+async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, RunRefused> {
     let state = taint_utils::read_taints(root).map_err(|e| read_failure_refusal(root, &e))?;
 
     // §8.3 (I5): a torn taint's own recorded set is an untrusted lower bound, so it is never
@@ -401,7 +430,7 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
     // (`heal_utils::heal_if_tainted`) is completely unaffected by this — it still refuses torn
     // immediately, lock-free; only this locked verb rescans.
     if state.torn {
-        return rescan_torn_taint(root, &state.files, progress);
+        return Ok(rescan_torn_taint(root, &state.files, progress)?);
     }
     if state.recorded.is_empty() {
         // Companion fix (DESIGN.html §3.1.1): "nothing recorded" says nothing about the gate — a
@@ -588,7 +617,7 @@ async fn resolve_the_rest(
     recorded: &BTreeSet<PathBuf>,
     attempt: &heal_utils::RestageAttempt,
     taint_files: &[PathBuf],
-) -> Result<HealOutcome, CoreError> {
+) -> Result<HealOutcome, RunRefused> {
     let mut remainder: BTreeSet<PathBuf> = BTreeSet::new();
     let mut dangling_lines: Vec<String> = Vec::new();
 
@@ -862,6 +891,7 @@ async fn resolve_the_rest(
     // unknown, so a target the walk did not find may be referenced beneath it.
     let incomplete_reasons: Vec<String> = walk.degraded_sources.iter().chain(&walk.unwalked).cloned().collect();
     let roots_incomplete = !incomplete_reasons.is_empty();
+    let mut kept_for_an_incomplete_walk = false;
 
     for hash in &truly_missing {
         if referenced.contains(hash) {
@@ -878,6 +908,7 @@ async fn resolve_the_rest(
             });
         } else if roots_incomplete {
             mark_still_dangling(hash, &loose_candidates, &pack_candidates, recorded, &mut remainder);
+            kept_for_an_incomplete_walk = true;
             dangling_lines.push(match unverifiable_reasons.get(hash) {
                 Some(reason) => format!(
                     "cannot be read back verified, and this run could not confirm it is safe to \
@@ -1043,7 +1074,11 @@ async fn resolve_the_rest(
             index_rebuild_skipped: false,
         })
     } else {
-        Err(dangling_refusal(root, &dangling_lines, &incomplete_reasons))
+        let kept_by_unread_refs = match kept_for_an_incomplete_walk {
+            true => walk.unread_refs.clone(),
+            false => Vec::new(),
+        };
+        Err(RunRefused { error: dangling_refusal(root, &dangling_lines, &incomplete_reasons), kept_by_unread_refs })
     }
 }
 
@@ -1631,6 +1666,8 @@ struct WalkRoots {
     /// `adopts`/`boundary` pins (which come from the local trust file, not the office record, and
     /// so are unaffected).
     degraded_sources: Vec<String>,
+    /// [`GcRootSources::unread_refs`].
+    unread_refs: Vec<String>,
 }
 
 /// Every user and every meta pallet head, for [`gc_root_sources`] and [`durable_root_sources`]. A
@@ -1642,7 +1679,9 @@ struct WalkRoots {
 /// head must outlive the grace period until the copy is mended. A copy that does not parse adds
 /// nothing and fails nothing; one that cannot be read is an error under `FailClosed` and a note
 /// under `Tolerate`, as a ref is. The copy of a ref that does not read is not consulted here.
-fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<String>) -> Result<(Vec<String>, Vec<String>), String> {
+fn pallet_ref_heads(
+    bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<String>, unread: &mut Vec<String>,
+) -> Result<(Vec<String>, Vec<String>), String> {
     let mut parcels: Vec<String> = Vec::new();
     let mut meta_heads: Vec<String> = Vec::new();
 
@@ -1655,12 +1694,13 @@ fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<St
                 Err(e) => match bay_policy {
                     bay_utils::BayReadPolicy::FailClosed => return Err(e),
                     bay_utils::BayReadPolicy::Tolerate => {
+                        let wire = pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire();
                         degraded.push(format!(
                             "the ref of pallet \"{}\" could not be read this run ({}); what only it \
                             reaches was treated as held by nothing rather than blocking this command.",
-                            pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire(),
-                            crate::error::CoreError::from(e)
+                            wire, crate::error::CoreError::from(e)
                         ));
+                        unread.push(wire);
                         None
                     }
                 },
@@ -1705,7 +1745,8 @@ fn pallet_ref_heads(bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<St
 /// reaches is what a tombstone repair must still find unheld, because the record expires.
 pub(crate) fn durable_root_sources(tombstone_heads: Vec<String>) -> Result<GcRootSources, String> {
     let mut degraded: Vec<String> = Vec::new();
-    let (parcels, meta_heads) = pallet_ref_heads(&bay_utils::BayReadPolicy::Tolerate, &mut degraded)?;
+    let mut unread_refs: Vec<String> = Vec::new();
+    let (parcels, meta_heads) = pallet_ref_heads(&bay_utils::BayReadPolicy::Tolerate, &mut degraded, &mut unread_refs)?;
     let trust_pins = office_utils::collect_trust_pin_roots(office_utils::TrustPinReadPolicy::FailClosed)?;
 
     Ok(GcRootSources {
@@ -1717,6 +1758,7 @@ pub(crate) fn durable_root_sources(tombstone_heads: Vec<String>) -> Result<GcRoo
         pin_parcels: trust_pins.roots,
         shard_leaves: Vec::new(),
         degraded,
+        unread_refs,
     })
 }
 
@@ -1755,6 +1797,9 @@ pub(crate) struct GcRootSources {
     /// had to skip rather than abort on: a haul, bay or mirror note only under `bay_policy`'s
     /// `Tolerate`, an office-record note only under `pin_policy`'s.
     pub degraded: Vec<String>,
+    /// The wire name of every pallet ref whose head could not be read, each also noted in
+    /// `degraded`: what only that ref reaches stays unheld until the ref reads again.
+    pub unread_refs: Vec<String>,
 }
 
 impl GcRootSources {
@@ -1837,7 +1882,8 @@ pub(crate) fn gc_root_sources(
     pin_policy: office_utils::TrustPinReadPolicy,
 ) -> Result<GcRootSources, String> {
     let mut degraded: Vec<String> = Vec::new();
-    let (mut parcels, meta_heads) = pallet_ref_heads(&bay_policy, &mut degraded)?;
+    let mut unread_refs: Vec<String> = Vec::new();
+    let (mut parcels, meta_heads) = pallet_ref_heads(&bay_policy, &mut degraded, &mut unread_refs)?;
 
     // A haul's proposed head is merged from the recorded hash, whatever its source pallet holds
     // now. Read under `bay_policy`: like a bay's state, it is a record outside the pallet refs
@@ -1922,7 +1968,7 @@ pub(crate) fn gc_root_sources(
         walk_shard_files(&dir.join(FOLDER_NAME_INVENTORY_ROOT), &mut shard_leaves)?;
     }
 
-    Ok(GcRootSources { parcels, meta_heads, haul_heads, tombstone_heads, mirror_roots, pin_parcels: trust_pins.roots, shard_leaves, degraded })
+    Ok(GcRootSources { parcels, meta_heads, haul_heads, tombstone_heads, mirror_roots, pin_parcels: trust_pins.roots, shard_leaves, degraded, unread_refs })
 }
 
 /// Collect every durable ref source's roots — see [`WalkRoots`].
@@ -2008,6 +2054,7 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
         mirror_roots: sources.mirror_roots,
         shard_referenced: sources.shard_leaves,
         degraded_sources: sources.degraded,
+        unread_refs: sources.unread_refs,
     })
 }
 
@@ -2209,6 +2256,9 @@ pub(crate) struct ClosureWalkResult {
     pub file_hashes: BTreeSet<String>,
     /// Plain-language notes, one per degraded source — see [`collect_walk_roots`]'s doc comment.
     pub degraded_sources: Vec<String>,
+    /// [`GcRootSources::unread_refs`]: of `degraded_sources`, the pallet refs whose head could not
+    /// be read.
+    pub unread_refs: Vec<String>,
     /// Plain-language notes, one per node the walk could not descend because only an unreadable
     /// pack index might hold it (FORK-217) — see [`WalkClosureOutcome::unwalked`]. Like
     /// `degraded_sources`, a non-empty list makes `hashes` conservative: a target missing from it
@@ -2260,7 +2310,7 @@ pub(crate) struct ClosureWalkResult {
 pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<ClosureWalkResult, String> {
     if targets.is_empty() {
         return Ok(ClosureWalkResult {
-            hashes: BTreeSet::new(), degraded_sources: Vec::new(), unwalked: Vec::new(),
+            hashes: BTreeSet::new(), degraded_sources: Vec::new(), unread_refs: Vec::new(), unwalked: Vec::new(),
             unwalked_hashes: BTreeMap::new(), never_held_pins: BTreeSet::new(), never_held_tags: Vec::new(), tags_unread: None,
             redacted_absent: 0,
             unavailable_absent: 0,
@@ -2282,6 +2332,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     Ok(ClosureWalkResult {
         hashes: outcome.referenced,
         degraded_sources: roots.degraded_sources,
+        unread_refs: roots.unread_refs,
         unwalked: unwalked_notes(&outcome.unwalked),
         unwalked_hashes: outcome.unwalked,
         never_held_pins: outcome.never_held_pins,
@@ -2391,6 +2442,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         hashes: absent,
         file_hashes: files,
         degraded_sources: roots.degraded_sources,
+        unread_refs: roots.unread_refs,
         unwalked: unwalked_notes(&outcome.unwalked),
         unwalked_hashes: outcome.unwalked,
         never_held_pins: outcome.never_held_pins,
@@ -2664,7 +2716,7 @@ pub fn pallets_reaching(hashes: &BTreeSet<String>) -> Result<PalletsReaching, St
             let roots = WalkRoots {
                 parcels, meta_heads, tag_subjects: Vec::new(), tags_unread: None, pin_parcels: Vec::new(),
                 haul_heads: Vec::new(), tombstone_heads: Vec::new(), mirror_roots: Vec::new(),
-                shard_referenced: Vec::new(), degraded_sources: Vec::new(),
+                shard_referenced: Vec::new(), degraded_sources: Vec::new(), unread_refs: Vec::new(),
             };
             let outcome = walk_closure_for(hashes, &roots, &BTreeSet::new(), &scope, Some(&sealed), None)?;
             if !outcome.referenced.is_empty() {
@@ -4825,7 +4877,7 @@ mod tests {
             tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
-            degraded_sources: Vec::new(),
+            degraded_sources: Vec::new(), unread_refs: Vec::new(),
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
@@ -4869,7 +4921,7 @@ mod tests {
             tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
-            degraded_sources: Vec::new(),
+            degraded_sources: Vec::new(), unread_refs: Vec::new(),
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
@@ -4910,7 +4962,7 @@ mod tests {
             tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
-            degraded_sources: Vec::new(),
+            degraded_sources: Vec::new(), unread_refs: Vec::new(),
         }
     }
 
@@ -5164,7 +5216,7 @@ mod tests {
             tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: vec![(staged.clone(), DirEntryType::Normal)],
-            degraded_sources: Vec::new(),
+            degraded_sources: Vec::new(), unread_refs: Vec::new(),
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
@@ -5203,7 +5255,7 @@ mod tests {
             shard_referenced: vec![
                 (sealed.clone(), DirEntryType::Normal), (withheld, DirEntryType::Normal), (redacted.clone(), DirEntryType::Normal),
             ],
-            degraded_sources: Vec::new(),
+            degraded_sources: Vec::new(), unread_refs: Vec::new(),
         };
         let mut reported: BTreeSet<String> = BTreeSet::new();
         {
@@ -6407,7 +6459,7 @@ mod tests {
     /// chatter.
     fn run_heal() -> Result<HealOutcome, CoreError> {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime.block_on(run(None))
+        runtime.block_on(run(None)).map_err(CoreError::from)
     }
 
     fn assert_durability_taint(error: &CoreError, contains: &[&str]) {
@@ -6668,7 +6720,7 @@ mod tests {
             tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
-            degraded_sources: Vec::new(),
+            degraded_sources: Vec::new(), unread_refs: Vec::new(),
         };
         let mut reported: Vec<String> = Vec::new();
         {
@@ -6708,7 +6760,7 @@ mod tests {
             tombstone_heads: vec![lost.clone()],
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
-            degraded_sources: Vec::new(),
+            degraded_sources: Vec::new(), unread_refs: Vec::new(),
         };
         let mut reported: Vec<String> = Vec::new();
         {
@@ -6773,7 +6825,7 @@ mod tests {
             tombstone_heads: Vec::new(),
             mirror_roots: Vec::new(),
             shard_referenced: Vec::new(),
-            degraded_sources: Vec::new(),
+            degraded_sources: Vec::new(), unread_refs: Vec::new(),
         };
         let mut reported: Vec<String> = Vec::new();
         let outcome = {
@@ -7955,7 +8007,8 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let error = runtime
             .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
-            .expect_err("B's own read error must still leave it unrecovered");
+            .expect_err("B's own read error must still leave it unrecovered")
+            .error;
 
         // The refusal must name B specifically, by the per-candidate wording this fix introduces —
         // never the generic, whole-walk-aborted wording `walk_failure_refusal` produces (that
@@ -8054,7 +8107,8 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let error = runtime
             .block_on(resolve_the_rest(&forklift, &state.recorded, &attempt, &state.files))
-            .expect_err("C's own read error must still leave it unrecovered");
+            .expect_err("C's own read error must still leave it unrecovered")
+            .error;
 
         // The refusal must name C specifically, by the per-candidate wording this fix
         // introduces — never the generic, whole-walk-aborted wording `walk_failure_refusal`
