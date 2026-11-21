@@ -2369,10 +2369,12 @@ mod tests {
     }
 
     // Both meta passes may make the same note, so a refusal says each note once, in the order
-    // first made. Mutation: append every note → red (the repeated note is said twice).
+    // first made. Mutations: append every note, or skip only a note equal to the one just
+    // appended → red (the repeated note is said twice).
     #[test]
     fn a_refusal_says_each_note_once_in_the_order_first_made() {
-        let notes = ["The first.".to_string(), "The both.".to_string(), "The both.".to_string(), "The second.".to_string()];
+        // The repeat is not beside its first making: between them come the other notes of a pass.
+        let notes = ["The first.".to_string(), "The both.".to_string(), "The second.".to_string(), "The both.".to_string()];
         assert_eq!(append_notes("It was refused.".to_string(), &notes), "It was refused. Note: The first. Note: The both. Note: The second.");
         // Distinct notes are each said.
         assert_eq!(append_notes("It was refused.".to_string(), &notes[..2]), "It was refused. Note: The first. Note: The both.");
