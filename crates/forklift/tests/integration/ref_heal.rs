@@ -2095,6 +2095,49 @@ fn an_office_ref_naming_a_head_the_store_decided_is_gone_keeps_both_files() {
     )), "{}", value);
 }
 
+// A damaged meta ref whose bytes begin with the full hash of a parcel the store decided is gone
+// is judged as one naming that head: beside a copy naming a head the store holds it is rebuilt
+// there, and the head its bytes named is reported. Mutation: salvage such bytes to nothing (the
+// old outcome) and leave them unjudged as stale → rebuilt with no note, red at the note.
+#[test]
+fn a_damaged_meta_ref_whose_bytes_name_a_gone_head_is_rebuilt_from_its_copy_and_names_it() {
+    let area = Area::new("meta-absent-damaged");
+    let (root, _, second) = tagged(&area);
+    let copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
+    let gone = flip_digit(&second, 63);
+    std::fs::write(meta_path(&root, "tags"), format!("{}torn", gone)).unwrap();
+
+    let data = healed(&area, &root);
+    assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), copy, "{}", data);
+    assert!(data["notes"].to_string().contains(&format!(
+        "The ref of pallet \\\"@tags\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", gone, second
+    )), "the head its bytes named is reported: {}", data);
+}
+
+// The office's damaged ref whose bytes begin with the full hash of a parcel the store decided is
+// gone is never rebuilt at its copy, which would roll the trust root back: heal refuses, names
+// both heads, and leaves both files. Mutation: salvage such bytes to nothing → rebuilt at the
+// copy, red.
+#[test]
+fn a_damaged_office_ref_whose_bytes_name_a_gone_head_is_not_rolled_back_to_its_copy() {
+    let area = Area::new("meta-absent-damaged-office");
+    let (root, _, _) = tagged(&area);
+    area.run_ok(&root, &["office", "enroll"]);
+    let office = meta_head(&root, "office").unwrap();
+    let copy = std::fs::read(meta_copy_path(&root, "office")).unwrap();
+    let gone = flip_digit(&office, 63);
+    let bytes = format!("{}torn", gone).into_bytes();
+    std::fs::write(meta_path(&root, "office"), &bytes).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert_eq!(std::fs::read(meta_path(&root, "office")).unwrap(), bytes, "{}", refused);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "office")).unwrap(), copy, "{}", refused);
+    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: its own bytes name {}, which is not in the store", gone)), "{}", refused);
+    assert!(message.contains(&office), "the copy's head is named: {}", refused);
+}
+
 // A folder planted at the copy's path fails the first write's copy, after its ref landed.
 // Mutation: skip the copy mend → the copy stays absent, red.
 #[test]
