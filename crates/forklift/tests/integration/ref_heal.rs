@@ -2147,10 +2147,10 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
 /// is more than one fault, and the taint stands.
 // Mutations: file a vanished copy as unrecognized again → "copy" red (the run refuses, the
 // taint stands); resolve a vanished copy whatever its ref holds → "copy-ref-damaged" red (the
-// taint clears).
+// taint clears; "both" red too, its refusal no longer naming the copy).
 #[test]
 fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
-    for case in ["copy", "ref", "both", "copy-ref-damaged"] {
+    for case in ["copy", "ref", "copy-ref-damaged", "both"] {
         let area = Area::new(&format!("meta-vanished-{}", case));
         let (root, _, second) = tagged(&area);
         let (copy, reference) = (meta_copy_path(&root, "tags"), meta_path(&root, "tags"));
