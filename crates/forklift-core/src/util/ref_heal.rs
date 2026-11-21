@@ -538,6 +538,11 @@ fn is_hex(byte: u8) -> bool {
 /// characters is a prefix of (a truncation). A hash the taint records as possibly lost matches
 /// as well as a stored one, so an object a crash took is an unknown answer rather than none.
 fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
+    // Bytes that name no prefix salvage to nothing, whatever the store holds, which a read of the
+    // ref relies on (`read_step`).
+    if !names_a_prefix(bytes) {
+        return Ok(Salvage::Nothing);
+    }
     let run = bytes.iter().take_while(|byte| is_hex(**byte)).count();
     // A pack the store cannot list may hold a match, found or not, so no answer stands beside it.
     // What the packs cannot list is read once, at the first lookup, for every prefix the bytes
@@ -592,6 +597,15 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     }
 
     Ok(judge(matches, tainted))
+}
+
+/// Whether a damaged ref's `bytes` name a hash, or a prefix of one, that [`salvage`] looks up: 64
+/// characters with at most one of them not hex, or a leading hex run of at least
+/// [`MIN_SALVAGE_PREFIX`] characters.
+fn names_a_prefix(bytes: &[u8]) -> bool {
+    let run = bytes.iter().take_while(|byte| is_hex(**byte)).count();
+    run >= MIN_SALVAGE_PREFIX
+        || (bytes.len() >= HASH_LENGTH && bytes[..HASH_LENGTH].iter().filter(|byte| !is_hex(**byte)).count() == 1)
 }
 
 /// Whether a damaged ref's `bytes` name the one parcel heal rebuilds it at.
@@ -1346,38 +1360,18 @@ pub fn unrebuildable_step(wire: &str, rerun: &str) -> String {
     format!("Restore the ref of {} and its copy from a backup, then {}.", wire, rerun)
 }
 
-/// The step a read of damaged meta ref `name` names where heal would refuse it with no head it
-/// can rebuild it at: the backup restore heal names, closed by `rerun`. `None` wherever heal's
-/// own step could be another, so the read names heal: an intact ref, a durability taint that
-/// stands or cannot be read (the taint recovery may restore what the ref names), another meta ref
-/// damaged beside it (its refusal may be the one this waits on), a blocked copy path, and every
-/// choice of a head, or refusal, [`choose_meta`] and [`choice_owner`] give otherwise. A head heal
-/// chooses but cannot verify is left to heal, since only it verifies.
-pub fn read_step(name: &str, rerun: &str) -> Option<String> {
-    let taint = taint_utils::read_taints(&forklift_root()).ok()?;
-    if taint.torn || !taint.recorded.is_empty() {
-        return None;
+/// The step a read of meta ref `name` names where neither its copy nor its own bytes
+/// (`reference`, `None` where the ref is lost) name a head: the backup restore heal names, closed
+/// by `rerun`. The caller has found the copy absent or holding no parcel hash. Heal rebuilds a meta
+/// ref only at a head its copy or its bytes name, so where both name none, no other repair gives it
+/// one and its verdict on this ref is that restore, whatever else it stops on first. `None` where
+/// the bytes name a hash, or a prefix [`salvage`] looks up: whether the store holds a match is
+/// heal's to judge, so the read names heal.
+pub fn read_step(name: &str, reference: Option<&[u8]>, rerun: &str) -> Option<String> {
+    match reference {
+        Some(bytes) if names_a_prefix(bytes) => None,
+        _ => Some(unrebuildable_step(&meta_wire(name), rerun)),
     }
-    let tainted = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
-
-    let states = meta_states_skipping(&mut Vec::new()).ok()?;
-    let state = states.iter().find(|state| state.name == name)?;
-    if state.damage().is_none() || pallet_utils::copy_blocks(name, &state.copy) {
-        return None;
-    }
-    if states.iter().any(|other| other.name != name && other.damage().is_some()) {
-        return None;
-    }
-
-    let Err((_, _, Owner::Unrebuildable)) = choose_meta(state, &tainted) else {
-        return None;
-    };
-    // The office's own refusal is never another's; every other ref's waits on the office and the
-    // trust state, read as heal reads them.
-    if !is_office(state) && choice_owner(Owner::Unrebuildable, &[]) != Owner::Unrebuildable {
-        return None;
-    }
-    Some(unrebuildable_step(&state.wire(), rerun))
 }
 
 /// `step`, a command or sentences from [`meta_step`], as a sentence of its own.

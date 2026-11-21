@@ -865,10 +865,10 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
             blocked_copy_step(name, RERUN),
         ),
         Ok(MetaCopyState::Bytes(bytes)) if parse_ref_bytes(&bytes).is_some() => (format!("its copy (\"{}\") still stands", shown), HEAL_STEP.to_string()),
-        // With no head to rebuild at, the backup heal would name; otherwise heal, which judges.
+        // Neither the lost ref nor its copy names a head, so the backup heal names too.
         Ok(MetaCopyState::Bytes(_)) => (
             format!("its copy (\"{}\") stands but does not hold a parcel hash", shown),
-            crate::util::ref_heal::read_step(name, RERUN).unwrap_or_else(|| HEAL_STEP.to_string()),
+            crate::util::ref_heal::read_step(name, None, RERUN).unwrap_or_else(|| HEAL_STEP.to_string()),
         ),
         // Whether the ref was lost or never written cannot be told until the copy reads.
         Err(error) => (
@@ -947,10 +947,10 @@ fn read_ref_file(namespace: PalletNamespace, name: &str, path: &Path) -> Result<
                 Err(_) => COPY_READABLE_STEP.to_string(),
                 // What is not a file at the copy's path is replaced, or the ref restored, first.
                 Ok(copy) if copy_blocks(name, &copy) => blocked_copy_step(name, RERUN),
-                // Whose the refusal is, and so its step, rests on what heal judges: what the
-                // bytes name, the trust state, the other meta refs. Where heal would have no head
-                // to rebuild at, the read names the backup it would name; otherwise heal.
-                _ => crate::util::ref_heal::read_step(name, RERUN).unwrap_or_else(|| HEAL_STEP.to_string()),
+                // With no head named by the copy, the bytes decide: where they name none, the
+                // backup heal names too; where they name a prefix, heal, which judges what the
+                // store holds for it.
+                _ => crate::util::ref_heal::read_step(name, Some(&bytes), RERUN).unwrap_or_else(|| HEAL_STEP.to_string()),
             }
         }
     };
@@ -3257,16 +3257,25 @@ pub(crate) mod tests {
             );
             assert!(notes.contains(&said), "{:?}", notes);
         }
-        /// A read of a damaged meta ref names the backup heal names where heal has no head to
-        /// rebuild it at, and heal wherever heal's own step could be another.
-        /// Revert: drop the taint check in `read_step` → the taint row names the backup → red.
-        /// Revert: drop its check of the other meta refs → the @redactions row names the backup → red.
-        /// Revert: drop its `choice_owner` check → the trust row names the backup → red.
+        /// A read of a damaged meta ref names the backup heal names where neither its copy nor its
+        /// own bytes name a head, whatever else stands damaged, and heal where the bytes name a
+        /// prefix, whose match only heal judges. Where nothing else stands in heal's way, heal's
+        /// own step for the ref is that backup too.
+        /// Revert: name the backup for any bytes → the prefix rows name the backup → red.
+        /// Revert: name heal at the lost-ref site → the first row names heal → red.
+        /// Revert: name heal at the damaged-ref site → the second row names heal → red.
         #[test]
-        fn a_read_names_the_backup_only_where_heal_would() {
+        fn a_read_names_the_backup_where_nothing_names_a_head() {
+            use crate::util::ref_heal::{self, Pass};
             let step = |name: &str| crate::error::deframe(&get_meta_pallet_head(name).unwrap_err())
                 .map(|(_, _, step)| step.to_string()).unwrap();
             let backup = |wire: &str| format!("Restore the ref of {} and its copy from a backup, then run the command again.", wire);
+            let heal_step = |wire: &str| {
+                let refused = ref_heal::repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+                let at = refused.iter().find(|refused| refused.pallet == wire).expect(wire);
+                ref_heal::meta_step(at, &refused)
+            };
+            let heal_backup = |wire: &str| format!("Restore the ref of {} and its copy from a backup, then run \"forklift heal\" again.", wire);
             let lost_beside_a_bad_copy = |name: &str| {
                 let path = get_pallet_ref_path(PalletNamespace::Meta, name);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3276,43 +3285,50 @@ pub(crate) mod tests {
                 std::fs::create_dir_all(get_meta_copy_path(name).parent().unwrap()).unwrap();
                 std::fs::write(get_meta_copy_path(name), "not a hash\n").unwrap();
             };
+            let damaged = |name: &str, bytes: &str| std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, name), bytes).unwrap();
 
             // Nothing names a head: lost beside a copy that does not parse, damaged beside it, and
-            // damaged with no copy; for the office as for any other.
+            // damaged with no copy; heal names the same backup.
             let (_root, _scope) = scratch("meta-read-backup");
             lost_beside_a_bad_copy("tags");
             assert_eq!(step("tags"), backup("@tags"));
-            std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "tags"), "not a hash\n").unwrap();
+            assert_eq!(heal_step("@tags"), heal_backup("@tags"));
+            damaged("tags", "not a hash\n");
             assert_eq!(step("tags"), backup("@tags"));
             file_utils::remove_file(get_meta_copy_path("tags")).unwrap();
             assert_eq!(step("tags"), backup("@tags"));
+            assert_eq!(heal_step("@tags"), heal_backup("@tags"));
+
+            // Bytes that name a prefix, a leading hex run or 64 characters with one flipped: the
+            // store may hold a match, so the read names heal, which judges it.
+            damaged("tags", "abcdef0123\n");
+            assert_eq!(step("tags"), "forklift heal");
+            damaged("tags", &format!("{}x{}\n", "a".repeat(5), "b".repeat(58)));
+            assert_eq!(step("tags"), "forklift heal");
             drop(_scope);
 
-            // A standing taint: its recovery may restore what the ref names.
+            // A standing taint leaves the bytes naming nothing, so the read and heal still name
+            // the backup.
             let (_root, _scope) = scratch("meta-read-backup-taint");
             lost_beside_a_bad_copy("tags");
             let _taint = plant_taint(&["objects/ab/cdef"]);
-            assert_eq!(step("tags"), "forklift heal");
+            assert_eq!(step("tags"), backup("@tags"));
+            assert_eq!(heal_step("@tags"), heal_backup("@tags"));
             drop(_taint);
             drop(_scope);
 
-            // Another meta ref damaged beside it: that ref's refusal may be the one it waits on.
-            let (_root, _scope) = scratch("meta-read-backup-redactions");
+            // Another meta ref damaged, or the trust file's anchor beside an unborn office: heal
+            // may name their step first, and this ref's way out is still the backup.
+            let (_root, _scope) = scratch("meta-read-backup-others");
             lost_beside_a_bad_copy("tags");
-            std::fs::write(get_pallet_ref_path(PalletNamespace::Meta, "redactions"), "not a hash\n").unwrap();
-            assert_eq!(step("tags"), "forklift heal");
-            drop(_scope);
-
-            // The trust file's anchor beside an unborn office: the ref waits on the office, whose
-            // own refusal waits on nothing, so a lost office names its backup.
-            let (_root, _scope) = scratch("meta-read-backup-trust");
-            lost_beside_a_bad_copy("tags");
+            damaged("redactions", "not a hash\n");
+            assert_eq!(step("tags"), backup("@tags"));
+            file_utils::remove_file(get_pallet_ref_path(PalletNamespace::Meta, "redactions")).unwrap();
             std::fs::write(
                 forklift_root().join(crate::util::office_utils::FILE_NAME_TRUST),
                 "version = 1\ngenesis = \"genesis-hash\"\nenabled_at = 1\nboundary = []\n",
             ).unwrap();
-            assert_eq!(step("tags"), "forklift heal");
-            file_utils::remove_file(get_meta_copy_path("tags")).unwrap();
+            assert_eq!(step("tags"), backup("@tags"));
             lost_beside_a_bad_copy("office");
             assert_eq!(step("office"), backup("@office"));
         }
