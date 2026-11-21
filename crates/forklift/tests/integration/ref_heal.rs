@@ -1934,6 +1934,39 @@ fn a_meta_ref_naming_a_head_the_store_decided_is_gone_is_rebuilt_from_its_copy()
     assert!(rebuilt_meta(&healed(&area, &root)).is_empty(), "a second heal finds nothing to do");
 }
 
+// A stale meta ref heal may not write is judged by both meta passes, which note its gone head the
+// same way; a refusal later in the run says that note once. Here the later refusal is the
+// operation recovery's, over a record that does not parse. Mutation: append every note at the
+// refusal → the note twice, red.
+#[cfg(unix)]
+#[test]
+fn a_refusal_after_both_meta_passes_says_each_note_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A read-only folder does not refuse a write made as root.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: a read-only folder does not refuse root");
+        return;
+    }
+    let area = Area::new("meta-absent-noted-once");
+    let (root, _, second) = tagged(&area);
+    let gone = flip_digit(&second, 63);
+    std::fs::write(meta_path(&root, "tags"), format!("{}\n", gone)).unwrap();
+    std::fs::write(root.join(".forklift").join("operation"), b"not an operation record\n").unwrap();
+    let folder = meta_path(&root, "tags").parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let output = area.run(&root, &["heal"]);
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let said = text(&output.stderr);
+    assert!(!output.status.success(), "{}", said);
+    assert!(said.contains("The operation record"), "the recovery's refusal: {}", said);
+    let note = format!(
+        "Note: The ref of pallet \"@tags\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", gone, second
+    );
+    assert_eq!(said.matches(&note).count(), 1, "{}", said);
+}
+
 // A stale @redactions is rebuilt at its copy's head ahead of the refs checked against it, beside
 // an office that reads and beside one lost with it, and the head it named is reported. Mutation:
 // never judge a meta ref stale → the ref stays at the gone head and heal refuses on the objects it

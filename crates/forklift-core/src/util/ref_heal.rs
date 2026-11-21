@@ -2120,9 +2120,10 @@ fn write_meta_rebuild(state: &MetaState,
                       pass: Pass,
                       report: &mut Repair) -> bool {
     let damage = state.damage().expect("only a damaged ref is rebuilt");
-    // A ref rebuilt over a head the store decided is gone loses the only record of that head, so
-    // the head it named is said before the write, as the state heal judged and what it set out to
-    // do: true whichever way the write then goes, which what is reported beside it says.
+    // A ref rebuilt over a head the store decided is gone loses the only record of that head. So
+    // the head it named is noted before the write, in the past tense: the state heal judged and
+    // what it set out to do. That holds whichever way the write then goes, and the outcome is
+    // reported beside it.
     let gone = match &damage {
         RefDamage::AbsentHead(bytes) => pallet_utils::parse_ref_bytes(bytes),
         _ => None,
@@ -2180,6 +2181,14 @@ fn write_meta_rebuild(state: &MetaState,
         Ok(()) => (format!("the rebuild at {} did not read back", head), Owner::Again),
     };
 
+    // The pass after the taint recovery keeps a deferral only for a ref it leaves unjudged, so a
+    // deferral is not where the outcome of a write this pass attempted can rest: it is noted too.
+    if pass == Pass::BeforeTaint {
+        push_note(&mut report.notes, format!(
+            "The pass before the taint recovery left the ref of pallet \"{}\" for the pass after it: {}.",
+            state.wire(), crate::error::frames_without_steps(&reason).trim_end_matches('.')
+        ));
+    }
     refuse_in(report, state, pass, reason, vec![Candidate { head, source: source.to_string() }], owner);
     false
 }
@@ -2792,11 +2801,15 @@ mod tests {
     }
 
     // A stale meta ref's rebuild names the head the ref named before it writes, so the note is the
-    // same on every outcome: rebuilt, rebuilt though its folder sync failed once, landed but not
-    // durable, written with its ref unread back, refused in a folder heal may not write, and
-    // refused because the ref moved to another head before the hold. Mutation: name the head only
-    // from the outcomes in which the write landed or may have → the not-written and moved rows
-    // carry no note, red.
+    // same on every outcome, in either pass: rebuilt, rebuilt though its folder sync failed once,
+    // landed but not durable, written with its ref unread back, refused in a folder heal may not
+    // write, and refused because the ref moved to another head before the hold. Each outcome is
+    // reported outside the pass's deferrals, which a later pass may drop: the pass before the taint
+    // recovery notes what it left for the pass after it. Mutations: name the head only from the
+    // outcomes in which the write landed or may have → the not-written and moved rows carry no
+    // note, red; name it after the write's match → the landed rows carry none, red; name it in the
+    // landed arm after the landed-despite note → that row's order, red; note no deferral → the
+    // refused rows of the first pass have no outcome outside the deferrals, red.
     #[test]
     fn a_stale_meta_ref_rebuild_names_the_head_it_named_whatever_the_write_does() {
         use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
@@ -2808,87 +2821,124 @@ mod tests {
         let mut rows = vec![Row::Clean, Row::LandedDespite, Row::Undurable, Row::Unread, Row::Moved];
         #[cfg(unix)]
         rows.push(Row::ReadOnly);
+        const DEFERRAL: &str = "The pass before the taint recovery left the ref of pallet \"@tags\" for the pass after it: ";
 
         // Every row is run before the note is judged, so a failure names each row that misses it.
         let mut misnamed = Vec::new();
-        for row in rows {
-            // A root per row: a taint a row's fault leaves stands under its root for this process.
-            let (_root, _scope) = scratch(&format!("ref-heal-stale-gone-head-{:?}", row));
-            let operator = crate::model::operator::Operator { identifier: "test".to_string() };
-            let held = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "held", None).unwrap();
-            let other = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "other", None).unwrap();
-            let gone = format!("{}{}", &held[..63], if held.ends_with('0') { '1' } else { '0' });
-            let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
-            let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
-            for path in [&ref_path, &copy_path] {
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            }
-            std::fs::write(&copy_path, format!("{}\n", held)).unwrap();
-            std::fs::write(&ref_path, format!("{}\n", gone)).unwrap();
-            let folder = ref_path.parent().unwrap().to_path_buf();
-            let said = format!(
-                "The ref of pallet \"@tags\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.",
-                gone, held
-            );
+        for pass in [Pass::BeforeTaint, Pass::AfterTaint] {
+            for row in rows.clone() {
+                // A 0o555 folder does not refuse a write made as root.
+                #[cfg(unix)]
+                if matches!(row, Row::ReadOnly) && unsafe { libc::geteuid() } == 0 {
+                    eprintln!("skipped the read-only row under {:?}: a read-only folder does not refuse root", pass);
+                    continue;
+                }
+                // A root per row: a taint a row's fault leaves stands under its root for this
+                // process.
+                let (_root, _scope) = scratch(&format!("ref-heal-stale-gone-head-{:?}-{:?}", pass, row));
+                let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+                let held = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "held", None).unwrap();
+                let other = stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, "other", None).unwrap();
+                let gone = format!("{}{}", &held[..63], if held.ends_with('0') { '1' } else { '0' });
+                let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, TAGS_PALLET_NAME);
+                let copy_path = pallet_utils::get_meta_copy_path(TAGS_PALLET_NAME);
+                for path in [&ref_path, &copy_path] {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                }
+                std::fs::write(&copy_path, format!("{}\n", held)).unwrap();
+                std::fs::write(&ref_path, format!("{}\n", gone)).unwrap();
+                let folder = ref_path.parent().unwrap().to_path_buf();
+                let said = format!(
+                    "The ref of pallet \"@tags\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.",
+                    gone, held
+                );
 
-            let repair = {
-                let _sync = match row {
-                    Row::LandedDespite => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder)),
-                    Row::Undurable => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder)),
-                    _ => None,
+                let repair = {
+                    let _sync = match row {
+                        Row::LandedDespite => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder)),
+                        Row::Undurable => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder)),
+                        _ => None,
+                    };
+                    let _taint = matches!(row, Row::Undurable).then(crate::util::file_utils::TaintRecordFaultGuard::failing);
+                    match row {
+                        Row::Unread => READ_BACK_UNREAD.with(|unread| unread.set(true)),
+                        #[cfg(unix)]
+                        Row::ReadOnly => {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+                        }
+                        Row::Moved => {
+                            let (moved, other) = (ref_path.clone(), other.clone());
+                            pallet_utils::tests::set_before_hold(move || std::fs::write(&moved, format!("{}\n", other)).unwrap());
+                        }
+                        _ => {}
+                    }
+                    let repair = repair_meta(pass);
+                    READ_BACK_UNREAD.with(|unread| unread.set(false));
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    }
+                    repair.unwrap().repair
                 };
-                let _taint = matches!(row, Row::Undurable).then(crate::util::file_utils::TaintRecordFaultGuard::failing);
+
+                let naming: Vec<_> = repair.notes.iter().filter(|note| note.contains(&gone)).cloned().collect();
+                if naming != vec![said.clone()] {
+                    misnamed.push((pass, row, naming));
+                }
+                let rebuilt: Vec<_> = repair.rebuilt.iter().filter(|rebuilt| rebuilt.pallet == "@tags").map(|rebuilt| rebuilt.head.as_str()).collect();
+                let refused = repair.refused.iter().find(|refused| refused.pallet == "@tags");
+                let deferred = repair.deferred.iter().find(|refused| refused.pallet == "@tags");
+                let deferrals: Vec<_> = repair.notes.iter().filter(|note| note.starts_with("The pass before the taint recovery left")).collect();
+                // The refusal of a write this pass attempted: in the pass after the taint recovery
+                // it is refused; in the pass before it, it is deferred and noted once, whose reason
+                // starts as `reason` says, and so must be the whole note when `whole` is set.
+                let not_landed = |reason: &str, whole: bool| match pass {
+                    Pass::AfterTaint => {
+                        let tags = refused.expect("@tags is refused");
+                        assert!(tags.reason.starts_with(reason), "{:?} {:?}: {:?}", pass, row, tags);
+                        assert!(deferrals.is_empty(), "{:?} {:?}: {:?}", pass, row, deferrals);
+                        tags.meta.as_ref().unwrap().owner.clone()
+                    }
+                    Pass::BeforeTaint => {
+                        let note = format!("{}{}", DEFERRAL, reason);
+                        assert_eq!(deferrals.len(), 1, "{:?} {:?}: {:?}", pass, row, repair.notes);
+                        match whole {
+                            true => assert_eq!(deferrals[0], &format!("{}.", note), "{:?} {:?}", pass, row),
+                            false => assert!(deferrals[0].starts_with(&note) && deferrals[0].ends_with('.') && !deferrals[0].ends_with(".."), "{:?} {:?}: {}", pass, row, deferrals[0]),
+                        }
+                        assert!(refused.is_none(), "{:?} {:?}: {:?}", pass, row, refused);
+                        deferred.expect("@tags is deferred, so the pass after the taint recovery judges it again").meta.as_ref().unwrap().owner.clone()
+                    }
+                };
                 match row {
-                    Row::Unread => READ_BACK_UNREAD.with(|unread| unread.set(true)),
+                    Row::Clean => assert_eq!(rebuilt, vec![held.as_str()], "{:?} {:?}: {:?}", pass, row, repair),
+                    Row::LandedDespite => {
+                        assert_eq!(rebuilt, vec![held.as_str()], "{:?} {:?}: {:?}", pass, row, repair);
+                        let landed = repair.notes.iter().position(|note| note.starts_with("The ref of pallet \"@tags\" was rebuilt at"));
+                        let named = repair.notes.iter().position(|note| *note == said);
+                        assert!(landed.is_some(), "{:?}: the landed-despite arm ran: {:?}", pass, repair.notes);
+                        assert!(named < landed, "{:?}: the gone head is named before the write: {:?}", pass, repair.notes);
+                    }
+                    Row::Undurable => assert_eq!(repair.undurable.len(), 1, "{:?} {:?}: {:?}", pass, row, repair),
+                    Row::Unread => {
+                        let reason = format!("the rebuild at {} was written, but its ref could not be read back: the read was refused for the test", held);
+                        not_landed(&reason, true);
+                    }
                     #[cfg(unix)]
                     Row::ReadOnly => {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+                        let owner = not_landed(&format!("the rebuild at {} was not written: ", held), false);
+                        assert_eq!(owner, Owner::Unwritten(None), "{:?}", pass);
                     }
                     Row::Moved => {
-                        let (moved, other) = (ref_path.clone(), other.clone());
-                        pallet_utils::tests::set_before_hold(move || std::fs::write(&moved, format!("{}\n", other)).unwrap());
+                        let owner = not_landed(&format!("the rebuild at {} was not written: ", held), false);
+                        assert_eq!(owner, Owner::Again, "{:?}", pass);
+                        assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(other.as_str()), "{:?}: nothing was written over the move", pass);
                     }
-                    _ => {}
                 }
-                let repair = repair_meta(Pass::AfterTaint);
-                READ_BACK_UNREAD.with(|unread| unread.set(false));
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-                }
-                repair.unwrap().repair
-            };
-
-            let naming: Vec<_> = repair.notes.iter().filter(|note| note.contains(&gone)).cloned().collect();
-            if naming != vec![said] {
-                misnamed.push((row, naming));
-            }
-            let rebuilt: Vec<_> = repair.rebuilt.iter().filter(|rebuilt| rebuilt.pallet == "@tags").map(|rebuilt| rebuilt.head.as_str()).collect();
-            let refused = repair.refused.iter().find(|refused| refused.pallet == "@tags");
-            match row {
-                Row::Clean => assert_eq!(rebuilt, vec![held.as_str()], "{:?}", repair),
-                Row::LandedDespite => {
-                    assert_eq!(rebuilt, vec![held.as_str()], "{:?}", repair);
-                    assert!(repair.notes.iter().any(|note| note.starts_with("The ref of pallet \"@tags\" was rebuilt at")), "the landed-despite arm ran: {:?}", repair.notes);
-                }
-                Row::Undurable => assert_eq!(repair.undurable.len(), 1, "{:?}", repair),
-                Row::Unread => {
-                    let tags = refused.expect("@tags is refused");
-                    assert!(tags.reason.contains(&format!("the rebuild at {} was written, but its ref could not be read back", held)), "{:?}", tags);
-                }
-                #[cfg(unix)]
-                Row::ReadOnly => {
-                    let tags = refused.expect("@tags is refused");
-                    assert!(tags.reason.contains(&format!("the rebuild at {} was not written", held)), "{:?}", tags);
-                    assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
-                }
-                Row::Moved => {
-                    let tags = refused.expect("@tags is refused");
-                    assert!(tags.reason.contains(&format!("the rebuild at {} was not written", held)), "{:?}", tags);
-                    assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Again, "{:?}", tags);
-                    assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(other.as_str()), "nothing was written over the move");
+                if matches!(row, Row::Clean | Row::LandedDespite | Row::Undurable) {
+                    assert!(deferrals.is_empty() && repair.refused.is_empty() && repair.deferred.is_empty(), "{:?} {:?}: {:?}", pass, row, repair);
                 }
             }
         }
@@ -2976,30 +3026,46 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         }
         std::fs::write(&copy_path, format!("{}\n", parcel)).unwrap();
-        // The ref is lost beside a copy that names its head, in a folder heal may not write.
+        // The ref is lost beside a copy that names its head, in a folder heal may not write. A
+        // 0o555 folder does not refuse a write made as root, so those cases are skipped there.
         let folder = ref_path.parent().unwrap().to_path_buf();
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped the read-only cases: a read-only folder does not refuse root");
+        } else {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
-        assert!(tags.reason.contains(&format!("the rebuild at {} was not written", parcel)), "{:?}", tags);
-        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
-        assert_eq!(meta_step(tags, &refused), "Settle why heal could not write the ref of @tags, as its refusal says, then run \"forklift heal\" again.");
-        assert!(copy_path.exists(), "the copy is kept");
+            let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+            assert!(tags.reason.contains(&format!("the rebuild at {} was not written", parcel)), "{:?}", tags);
+            assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+            assert_eq!(meta_step(tags, &refused), "Settle why heal could not write the ref of @tags, as its refusal says, then run \"forklift heal\" again.");
+            assert!(copy_path.exists(), "the copy is kept");
 
-        // A write that failed may have landed: with its ref unread back, it is not said to be
-        // unwritten, and its way out stays settling why. Mutation: judge the reason without the
-        // read back → "was not written", red.
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
-        READ_BACK_UNREAD.with(|unread| unread.set(true));
-        let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
-        READ_BACK_UNREAD.with(|unread| unread.set(false));
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
-        assert!(tags.reason.contains(&format!("the rebuild at {} may have been written: the write reported", parcel)), "{:?}", tags);
-        assert!(tags.reason.contains("and its ref could not be read back: the read was refused for the test"), "{:?}", tags);
-        assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+            // A write that failed may have landed: with its ref unread back, it is not said to be
+            // unwritten, and its way out stays settling why. Mutation: judge the reason without the
+            // read back → "was not written", red.
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+            READ_BACK_UNREAD.with(|unread| unread.set(true));
+            let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
+            READ_BACK_UNREAD.with(|unread| unread.set(false));
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
+            assert!(tags.reason.contains(&format!("the rebuild at {} may have been written: the write reported", parcel)), "{:?}", tags);
+            assert!(tags.reason.contains("and its ref could not be read back: the read was refused for the test"), "{:?}", tags);
+            assert_eq!(tags.meta.as_ref().unwrap().owner, Owner::Unwritten(None), "{:?}", tags);
+
+            // The pass before the taint recovery defers the refusal and notes it too, for a lost
+            // ref as for a stale one, since the pass after it may drop the deferral. Mutation:
+            // note the deferral only for a stale ref → none here, red.
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let before = repair_meta(Pass::BeforeTaint).unwrap().repair;
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let deferral = format!("The pass before the taint recovery left the ref of pallet \"@tags\" for the pass after it: the rebuild at {} was not written: ", parcel);
+            let deferrals: Vec<_> = before.notes.iter().filter(|note| note.starts_with("The pass before the taint recovery left")).collect();
+            assert!(deferrals.len() == 1 && deferrals[0].starts_with(&deferral), "{:?}", before.notes);
+            assert!(before.deferred.iter().any(|refused| refused.pallet == "@tags") && before.refused.is_empty(), "{:?}", before);
+        }
 
         // Landed with its folder not synced and no taint recording that, and so again when heal
         // syncs it: the pass that wrote it, the first as heal runs them, says so, since the pass
