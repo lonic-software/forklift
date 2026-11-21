@@ -2942,9 +2942,12 @@ says each note once. The store has not decided while something could yet account
 such as a refill from the origin, a redaction or a withholding, a pack or record it cannot read in
 full, or the durability taint; `heal` then leaves the ref as it is. The office's ref is never
 rebuilt this way: it is left as it is, with its copy. A damaged ref whose bytes name such a head
-and that is not rebuilt at its copy (it has none, its copy names that same head, or it is the
-office's) is refused, naming the head, and the step is to restore that parcel from a backup of the
-warehouse or a fresh clone of a remote that holds it, or the ref and its copy from a backup. Other commands do not judge such a ref: they
+and that is not rebuilt at its copy (it has none, its copy names no head or that same head, or it
+is the office's) is refused, naming the head, and the step is to restore that parcel from a backup
+of the warehouse or a fresh clone of a remote that holds it, or the ref and its copy from a backup;
+while something that is not a file stands at the copy's path, replacing it comes first. Beside a
+copy whose own head the store does not hold either, the ref waits on that head as any rebuild at
+its copy does. Other commands do not judge such a ref: they
 read it like any ref whose head is missing, and refuse on the missing object, not with
 `ref_damaged`.
 

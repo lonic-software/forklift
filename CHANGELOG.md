@@ -68,8 +68,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   is several parcels, one possibly lost, a copy and bytes that diverge, or a head whose history does
   not verify), the step is to restore the ref and its copy from a backup. Where its damaged bytes
   name in full a parcel the store has decided is gone and `heal` does not rebuild it at its copy
-  (it has none, the copy names that parcel too, or it is the office's ref, which is never taken back
-  to an older head this way), `heal` names that parcel, and the step is to restore it from a backup
+  (it has none, the copy names no head or that parcel too, or it is the office's ref, which is never
+  taken back to an older head this way), `heal` names that parcel, and the step is to restore it from a backup
   or a fresh clone, or the ref and its copy from a backup. `heal --remove-ref
   @<name>` is refused before anything changes. Where the refusal is no verdict on the ref, the step
   is the one `heal` names: for a ref that waits on the office's or `@redactions`' refusal, or on an

@@ -163,9 +163,11 @@ pub enum Owner {
     Unwritten(Option<String>),
 
     /// Its own bytes name this parcel in full, which the store has decided is gone, and heal may
-    /// not rebuild it at its copy: there is none, it names the same parcel, or the ref is the
-    /// office, whose rebuild at an older head would take back what the office has since revoked.
-    /// The way out is the parcel restored, or the ref and its copy ([`lost_step`]).
+    /// not rebuild it at its copy: there is none (or it names no head), it names the same parcel,
+    /// or the ref is the office, whose rebuild at an older head would take back what the office
+    /// has since revoked. The way out is the parcel restored, or the ref and its copy
+    /// ([`lost_step`]); first replacing what stands at the copy's path, while that blocks it. Not
+    /// the office's while the office is refused: nothing here was judged against it.
     Lost(String),
 
     /// Its files moved while heal ran: a later heal judges it again.
@@ -1346,7 +1348,10 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
                 true => pallet_utils::blocked_copy_step(&at.pallet[1..], "run \"forklift heal\" again"),
                 false => unrebuildable_step(&at.pallet, "run \"forklift heal\" again"),
             },
-            Some(Owner::Lost(parcel)) => return lost_step(&at.pallet, parcel, "run \"forklift heal\" again"),
+            Some(Owner::Lost(parcel)) => return match at.meta.as_ref().is_some_and(|meta| pallet_utils::copy_blocks(&at.pallet[1..], &meta.copy)) {
+                true => pallet_utils::blocked_copy_step(&at.pallet[1..], "run \"forklift heal\" again"),
+                false => lost_step(&at.pallet, parcel, "run \"forklift heal\" again"),
+            },
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
             Some(Owner::Newer) => return newer_step(),
             Some(Owner::Trust(step)) => return step.clone(),
@@ -1682,8 +1687,9 @@ type MetaRefusal = (String, Vec<Candidate>, Owner);
 /// even where the copy is the older of the two: the ref goes back to the last head that can be
 /// read, and the note [`write_meta_rebuild`] leaves names the head it named. Bytes that do not
 /// parse but name such a head in full ([`named_hash`]) are judged the same way. Otherwise a head
-/// the store decided is gone is never rebuilt over: with no copy, a copy naming the same parcel,
-/// or on the office, heal refuses and names the parcel ([`Owner::Lost`]).
+/// the store decided is gone is never rebuilt over: with no copy that names a head, a copy naming
+/// the same parcel, or on the office, heal refuses and names the parcel ([`Owner::Lost`]); beside
+/// a copy whose own head the store does not give whole, the copy's head is what it waits on.
 fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), MetaRefusal> {
     let copy = state.copy_head();
     let mut candidates: Vec<Candidate> = copy.iter()
@@ -1709,14 +1715,33 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
             None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates, Owner::Unrebuildable)),
         },
         // Never a head to rebuild at. A stale ref goes back to its copy's head, which the store
-        // holds, and its note names the parcel; otherwise the parcel is what it waits on.
-        Salvage::Absent(parcel) => match (state.stale, copy) {
-            (true, Some(head)) => Ok((head, FROM_COPY)),
-            (_, copy) => Err((match copy {
-                Some(copy) => format!("its own bytes name {}, which is not in the store, and it is not rebuilt at its copy's head {} in its place", parcel, copy),
-                None => format!("its own bytes name {}, which is not in the store, and it has no copy", parcel),
-            }, candidates, Owner::Lost(parcel))),
-        },
+        // holds, and its note names the parcel. With no copy to go back to, one naming the same
+        // parcel, or on the office, the parcel is what it waits on.
+        Salvage::Absent(parcel) => {
+            let lost = |why: String| Err((
+                format!("its own bytes name {}, which is not in the store, and {}", parcel, why), candidates.clone(), Owner::Lost(parcel.clone())
+            ));
+            match copy {
+                Some(head) if state.stale => Ok((head, FROM_COPY)),
+                Some(head) if head == parcel => lost("its copy names it too".to_string()),
+                Some(head) if is_office(state) => lost(format!("it is not rebuilt at its copy's head {} in its place", head)),
+                // A copy whose head the store did not give whole when the state was read: one the
+                // taint covers may yet be restored, and one held now was not then, so neither is
+                // gone back to here. Any other is verified as before, and refuses as its read says.
+                Some(head) if tainted.covers(&head) => Err((format!(
+                    "its own bytes name {}, which is not in the store, and its copy's head {} is one the durability taint covers", parcel, head
+                ), candidates, Owner::Unread(None))),
+                Some(head) if matches!(object_utils::load_parcel_judged(&head), Ok(Ok(_))) => Err((format!(
+                    "its own bytes name {}, which is not in the store, and its copy's head {} was not in the store when heal read the ref", parcel, head
+                ), candidates, Owner::Again)),
+                Some(head) => Ok((head, FROM_COPY)),
+                None => lost(match state.copy {
+                    pallet_utils::MetaCopyState::Absent => "it has no copy",
+                    pallet_utils::MetaCopyState::Other => "what stands at its copy's path is not a file",
+                    pallet_utils::MetaCopyState::Bytes(_) => "its copy does not name a head",
+                }.to_string()),
+            }
+        }
         Salvage::Found(salvaged) => {
             candidates.push(Candidate { head: salvaged.clone(), source: Source::Salvage.describe() });
 
@@ -1797,7 +1822,8 @@ fn verify_meta_head(name: &str, head: &str) -> Result<pallet_utils::RefPrecondit
 /// Whose a refusal of a meta ref other than the office is, when heal chose no head for it for a
 /// reason `owner` says: no head it can rebuild at ([`Owner::Unrebuildable`]) is still the office's
 /// while the office is refused (`blocking`) or unborn beside the trust file's anchor, since heal
-/// then judged it against no office, and once the office stands a later heal may rebuild it.
+/// then judged it against no office, and once the office stands a later heal may rebuild it. A
+/// gone parcel ([`Owner::Lost`]) stays the ref's own: no office judged it gone.
 fn choice_owner(owner: Owner, blocking: &[String]) -> Owner {
     if owner != Owner::Unrebuildable {
         return owner;
@@ -2900,6 +2926,30 @@ mod tests {
         let bytes = format!("{}torn", absent).into_bytes();
         assert!(matches!(salvage(&bytes, &clean), Ok(Salvage::Absent(ref gone)) if *gone == absent));
         assert!(matches!(salvage(&bytes, &torn), Ok(Salvage::Nothing)));
+    }
+
+    // Beside a copy whose head was not judged held when the state was read, a ref naming a gone
+    // parcel goes back to no copy: one the taint covers is unread, one held now moved, and one
+    // gone too is verified as before. Mutations: take the copy's head for either of the first two →
+    // the rebuild is chosen, red; refuse the third as lost → the owner is the parcel's, red.
+    #[test]
+    fn a_gone_parcel_beside_a_copy_not_judged_held_waits_on_the_copy() {
+        let (_root, _scope) = scratch("ref-heal-absent-copy-unheld");
+        let gone = blake3::hash(b"never stored here").to_hex().to_string();
+        let copy_gone = blake3::hash(b"nor this").to_hex().to_string();
+        let held = stub_parcel("held");
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        let state = |copy: &str| MetaState {
+            name: "tags".to_string(),
+            reference: Some(format!("{}torn", gone).into_bytes()),
+            copy: pallet_utils::MetaCopyState::Bytes(format!("{}\n", copy).into_bytes()),
+            stale: false,
+        };
+
+        let covering = Tainted { hashes: BTreeSet::from([copy_gone.clone()]), torn: false, unread: false };
+        assert!(matches!(choose_meta(&state(&copy_gone), &covering), Err((ref why, _, Owner::Unread(None))) if why.contains("the durability taint covers")));
+        assert!(matches!(choose_meta(&state(&held), &clean), Err((_, _, Owner::Again))));
+        assert!(matches!(choose_meta(&state(&copy_gone), &clean), Ok((ref head, FROM_COPY)) if *head == copy_gone));
     }
 
     // A meta ref whose head the store cannot tell of, beside a copy naming a held head, is no
