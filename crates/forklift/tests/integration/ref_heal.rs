@@ -2140,6 +2140,56 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
     std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
 }
 
+/// A meta pallet's first write whose sync failed and whose birth a power loss then undid: the
+/// taint records the vanished file. A copy gone beside a ref that holds a head resolves in the
+/// taint recovery and is set to the ref's bytes after it; a ref gone beside its copy is rebuilt
+/// from the copy before the recovery. Either file gone with the other one gone or damaged too
+/// is more than one fault, and the taint stands.
+// Mutations: file a vanished copy as unrecognized again → "copy" red (the run refuses, the
+// taint stands); resolve a vanished copy whatever its ref holds → "copy-ref-damaged" red (the
+// taint clears).
+#[test]
+fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
+    for case in ["copy", "ref", "both", "copy-ref-damaged"] {
+        let area = Area::new(&format!("meta-vanished-{}", case));
+        let (root, _, second) = tagged(&area);
+        let (copy, reference) = (meta_copy_path(&root, "tags"), meta_path(&root, "tags"));
+        let recorded: &[&str] = match case {
+            "copy" | "copy-ref-damaged" => &["meta-copy/tags"],
+            "ref" => &["meta/tags"],
+            _ => &["meta/tags", "meta-copy/tags"],
+        };
+        let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(recorded.iter().map(|path| path.to_string()))).unwrap();
+        if case != "ref" {
+            forklift_core::util::file_utils::remove_file(&copy).unwrap();
+        }
+        match case {
+            "ref" | "both" => forklift_core::util::file_utils::remove_file(&reference).unwrap(),
+            "copy-ref-damaged" => std::fs::write(&reference, b"not a hash").unwrap(),
+            _ => {}
+        }
+
+        let output = area.run(&root, &["--json", "heal"]);
+        let said = format!("{}{}", text(&output.stdout), text(&output.stderr));
+        let taint_left = std::fs::read_dir(&dir).map(|mut entries| entries.next().is_some()).unwrap_or(false);
+        match case {
+            "copy" | "ref" => {
+                assert!(output.status.success(), "{}: {}", case, said);
+                assert!(!taint_left, "{}: the taint clears: {}", case, said);
+                assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "{}: {}", case, said);
+                assert_eq!(std::fs::read(&copy).unwrap(), format!("{}\n", second).into_bytes(), "{}: the copy holds the ref's bytes: {}", case, said);
+            }
+            _ => {
+                assert!(!output.status.success(), "{}: {}", case, said);
+                assert!(taint_left, "{}: the taint stands: {}", case, said);
+                assert!(said.contains("meta-copy"), "{}: the refusal names the copy: {}", case, said);
+            }
+        }
+    }
+}
+
 /// A meta ref and a taint. Lost beside a copy that verifies, the ref is rebuilt before the taint
 /// recovery, and a refusal there names the rebuild. One heal cannot settle before the recovery
 /// (its bytes name an object the taint records, or its copy names a parcel the taint took) is

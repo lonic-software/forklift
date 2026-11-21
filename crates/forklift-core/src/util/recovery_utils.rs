@@ -656,6 +656,32 @@ async fn resolve_the_rest(
                     ));
                 }
             },
+            // A copy is a second record of its ref's head, which the meta pass after the recovery
+            // sets it to. So its absence is made durable and resolved, but only beside a ref that
+            // holds a head: with the ref gone or damaged too, nothing is left to set it from.
+            VanishedClass::MetaCopy(reference) => {
+                let holds_head = std::fs::read(root.join(&reference)).ok()
+                    .and_then(|bytes| pallet_utils::parse_ref_bytes(&bytes)).is_some();
+                match holds_head {
+                    true => match sync_nearest_ancestor(root, relative) {
+                        Ok(()) => refs_resolved.push(relative.to_string_lossy().into_owned()),
+                        Err(error) => {
+                            remainder.insert(relative.clone());
+                            dangling_lines.push(format!(
+                                "a lost meta pallet ref copy whose loss could not be made durable: \"{}\" ({})",
+                                relative.to_string_lossy(), error
+                            ));
+                        }
+                    },
+                    false => {
+                        remainder.insert(relative.clone());
+                        dangling_lines.push(format!(
+                            "a lost meta pallet ref copy whose ref (\"{}\") does not hold a head either: \"{}\"",
+                            reference.to_string_lossy(), relative.to_string_lossy()
+                        ));
+                    }
+                }
+            }
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1456,6 +1482,10 @@ enum VanishedClass {
     /// A user pallet's ref, removed since the taint was recorded (a delete whose directory sync
     /// failed, or a later delete of the same pallet).
     Ref,
+    /// The copy of a meta pallet's ref (`meta-copy/<name>`), gone since the taint was recorded:
+    /// the first write of a meta pallet whose copy's directory sync failed, then a power loss that
+    /// undid the copy's birth. The path of the ref it copies, root-relative (`meta/<name>`).
+    MetaCopy(PathBuf),
     /// A shape none of the above recognizes.
     Unrecognized,
 }
@@ -1472,6 +1502,12 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
     if matches!(relative.components().next(),
                 Some(std::path::Component::Normal(first)) if first == pallet_utils::FOLDER_NAME_PALLETS_ROOT) {
         return VanishedClass::Ref;
+    }
+
+    if let Ok(name) = relative.strip_prefix(pallet_utils::FOLDER_NAME_META_COPY_ROOT) {
+        if name.components().next().is_some() {
+            return VanishedClass::MetaCopy(Path::new(pallet_utils::FOLDER_NAME_META_ROOT).join(name));
+        }
     }
 
     // `<fan-out>/<rest>.sig`: the sidecar of the parcel whose loose path that is.
@@ -6183,7 +6219,13 @@ mod tests {
         ));
         assert!(matches!(classify_vanished(Path::new("pallets/main")), VanishedClass::Ref));
         assert!(matches!(classify_vanished(Path::new("pallets/team/feature")), VanishedClass::Ref));
-        // A meta ref is never removed, so its absence stays unexplained.
+        assert!(matches!(
+            classify_vanished(Path::new("meta-copy/office")),
+            VanishedClass::MetaCopy(reference) if reference == Path::new("meta/office")
+        ));
+        assert!(matches!(classify_vanished(Path::new("meta-copy")), VanishedClass::Unrecognized));
+        // A meta ref gone beside its copy is rebuilt from it before the recovery restages, so
+        // one that is still gone has no copy to rebuild from: more than one fault.
         assert!(matches!(classify_vanished(Path::new("meta/office")), VanishedClass::Unrecognized));
         assert!(matches!(
             classify_vanished(Path::new("something/unexpected.txt")),
