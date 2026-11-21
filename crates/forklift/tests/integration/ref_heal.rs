@@ -2449,9 +2449,13 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
 /// recovery, and a refusal there names the rebuild. One heal cannot settle before the recovery
 /// (its bytes name an object the taint records, or its copy names a parcel the taint took) is
 /// left for the pass after it: a refusal at a taint that stands names it with its heads, and when
-/// the recovery resolves the taint, the pass after it rebuilds the ref.
+/// the recovery resolves the taint, the pass after it rebuilds the ref. One whose unread head
+/// keeps the taint standing, or keeps a torn taint's rescan from finishing, is judged again only
+/// once the taint is resolved, and the refusal gives the way out for when it is not.
 // Mutations: drop the deferred sentences → "deferred" and "lost-deferred" red; record only an
-// unreadable ref as deferred → "lost-deferred" red; read a write that landed under the taint and
+// unreadable ref as deferred → "lost-deferred" red; never name the refs whose unread head kept
+// the taint → "lost-deferred" red; name them whenever the walk is incomplete → "deferred" red;
+// never name them at a torn taint's rescan → "torn-lost" red; read a write that landed under the taint and
 // reported its error as not landed → "rebuilt" red (written, never named); skip the meta pass
 // after the taint → "resolved" red; never say the taint holds a ref → "torn" and "unread" red; take
 // an unreadable taint for a torn one → "unread" red.
@@ -2459,10 +2463,12 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
 fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once_it_is_resolved() {
     // A taint file nobody can read needs a permission bit Windows does not have.
     let unread: &[&str] = if cfg!(unix) { &["unread"] } else { &[] };
-    for case in ["rebuilt", "deferred", "lost-deferred", "torn", "resolved"].iter().chain(unread).copied() {
+    for case in ["rebuilt", "deferred", "lost-deferred", "torn", "torn-lost", "resolved"].iter().chain(unread).copied() {
         let area = Area::new(&format!("meta-taint-{}", case));
         let (root, _, second) = tagged(&area);
         let mut tainted = vec![second.clone()];
+        let mut side_object = None;
+        let mut second_object = None;
 
         // A parcel only `side` reaches, gone and recorded: no remote can give it back, so the
         // taint stands and the run stops there.
@@ -2472,14 +2478,16 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
             area.stack(&root, "d.txt", "side only");
             area.run_ok(&root, &["shift", "main"]);
             let side = head(&root, "side");
+            side_object = Some((loose_object(&root, &side), std::fs::read(loose_object(&root, &side)).unwrap()));
             forklift_core::util::file_utils::remove_file(&loose_object(&root, &side)).unwrap();
             tainted.push(side);
         }
 
         match case {
             "rebuilt" => break_meta(&root, "tags", true),
-            "lost-deferred" => {
+            "lost-deferred" | "torn-lost" => {
                 break_meta(&root, "tags", true);
+                second_object = Some(std::fs::read(loose_object(&root, &second)).unwrap());
                 forklift_core::util::file_utils::remove_file(&loose_object(&root, &second)).unwrap();
             }
             _ => std::fs::write(meta_path(&root, "tags"), &second.as_bytes()[..32]).unwrap(),
@@ -2487,7 +2495,7 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
         let broken = std::fs::read(meta_path(&root, "tags")).ok();
         match case {
             // Bytes that are not UTF-8: a torn record, of which nothing is trusted.
-            "torn" => {
+            "torn" | "torn-lost" => {
                 let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(dir.join("taint-1-0"), [0xff, 0xfe, b'\n']).unwrap();
@@ -2521,6 +2529,11 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
         let left = "The ref of pallet \"@tags\" was not rebuilt yet: ";
         let heads = format!("; candidates: {} (the ref's copy).", second);
         let again = "This run stopped before judging that ref a second time; a later heal judges it again.";
+        // Its copy's head is gone, and the recovery cannot check whether only the unread ref
+        // reaches it; a torn taint's rescan cannot finish past the unread ref at all.
+        let stuck = " While this ref cannot be read, the durability taint's recovery cannot check what it reaches, and heal \
+            judges the ref again only once the taint is resolved; if it is not, restore the warehouse from a backup, or clone \
+            it afresh, then run \"forklift heal\" again.";
 
         match case {
             "rebuilt" => {
@@ -2531,11 +2544,41 @@ fn a_meta_ref_heal_cannot_settle_before_the_taint_waits_on_it_and_is_judged_once
                 let closing = match case {
                     "torn" => " The durability taint's record is torn, so every object the ref's bytes name counts as possibly lost, and a later heal leaves it again; ",
                     "unread" => " The durability taint could not be read, so every object the ref's bytes name counted as possibly lost; a later heal that can read the taint judges it again.",
+                    "lost-deferred" | "torn-lost" => stuck,
                     _ => again,
                 };
                 assert!(message.contains(left) && message.contains(&heads) && message.contains(closing), "{}: {}", case, message);
+                assert_eq!(message.contains(again), case == "deferred", "{}: {}", case, message);
+                assert_eq!(message.contains(stuck), ["lost-deferred", "torn-lost"].contains(&case), "{}: {}", case, message);
                 assert!(!message.contains("Rebuilt the ref of pallet \"@tags\""), "{}: {}", case, message);
                 assert_eq!(std::fs::read(meta_path(&root, "tags")).ok(), broken, "{}: the deferred ref is left as it was", case);
+            }
+        }
+
+        // With the parcel only `side` reaches back, nothing else holds the taint: the deferred
+        // ref is judged and rebuilt, but the one whose unread head keeps the taint, or keeps a
+        // torn taint's rescan from finishing, stops the next heal the same way, until its copy's
+        // head is back too and the taint resolves.
+        if let ("deferred" | "lost-deferred" | "torn-lost", Some((path, bytes))) = (case, &side_object) {
+            std::fs::write(path, bytes).unwrap();
+            let output = area.run(&root, &["--json", "heal"]);
+            match case {
+                "deferred" => {
+                    assert_eq!(output.status.code(), Some(0), "{}{}", text(&output.stdout), text(&output.stderr));
+                    assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
+                }
+                _ => {
+                    assert_eq!(output.status.code(), Some(21), "{}{}", text(&output.stdout), text(&output.stderr));
+                    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                    let message = value["error"]["message"].as_str().unwrap();
+                    assert!(message.contains(&heads) && message.contains(stuck) && !message.contains(again), "{}", message);
+                    assert_eq!(std::fs::read(meta_path(&root, "tags")).ok(), broken, "the deferred ref is left as it was");
+
+                    std::fs::write(loose_object(&root, &second), second_object.as_ref().unwrap()).unwrap();
+                    let output = area.run(&root, &["--json", "heal"]);
+                    assert_eq!(output.status.code(), Some(0), "{}{}", text(&output.stdout), text(&output.stderr));
+                    assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()));
+                }
             }
         }
     }
