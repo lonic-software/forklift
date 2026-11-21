@@ -15,7 +15,8 @@
 //! pallet, and an interrupted operation's starting base, plus a merge or pick's completing parcel
 //! unless the marker is rolling back. A damaged file adds what its own bytes still name: the full
 //! hash when it survives, the one stored parcel a hex prefix of at least 8 characters matches, or
-//! the one parcel that matches at every position but one.
+//! the one parcel that matches at every position but one. A full hash the store has decided is
+//! gone, with no taint accounting for it, is a floor and no candidate.
 //!
 //! The ref is rebuilt at the one candidate whose closure verifies, that equals or descends from
 //! every other verified candidate, and that descends from every floor: the bases, the marker
@@ -24,8 +25,10 @@
 //! head that still verifies and lies above every other candidate does win, although a rewind in
 //! another checkout may have moved past it: journals are not ordered across checkouts, and of the
 //! two wrong answers, a rebuild above a rewind loses nothing (the rewind can be run again) while
-//! one below lost work would. An answer that cannot be read (an ancestry walk that fails, a
-//! salvage match that is tainted, unreadable or one of several parcels) is unknown, never "no".
+//! one below lost work would. So a ref whose own bytes name a gone parcel is refused, naming it:
+//! nothing whose history verifies descends from that parcel. An answer that cannot be read (an
+//! ancestry walk that fails, a salvage match that is tainted, unreadable or one of several
+//! parcels) is unknown, never "no".
 //!
 //! A latest journal entry that deleted the pallet blocks the rebuild, unless a checkout stands on
 //! the pallet: the pallet was then made again after the delete (`pallet create` leaves no journal
@@ -275,7 +278,8 @@ enum Salvage {
 
     /// The bytes name this hash in full ([`named_hash`]), the store holds no object by it, and
     /// the store has decided it is gone with no taint accounting for it. Never a head to rebuild
-    /// at: the ref named it, and rebuilding elsewhere loses the only record of it.
+    /// at, and for a user ref a floor no rebuild can reach: the ref named it, and rebuilding
+    /// elsewhere loses the only record of it.
     Absent(String),
 
     /// A match whose kind cannot be read, where the store's read said nothing of the object (it
@@ -298,6 +302,10 @@ struct Evidence {
 
     /// Why the salvage is unknown, if it is.
     salvage_unknown: Option<String>,
+
+    /// The parcel the ref's own bytes name in full, which the store has decided is gone: a floor
+    /// no head heal could rebuild at descends from ([`Salvage::Absent`]).
+    salvage_absent: Option<String>,
 
     /// The parcels an ambiguous salvage may name.
     salvage_ambiguous: Vec<String>,
@@ -526,8 +534,8 @@ fn gather(damaged: &DamagedRef, tainted: &Tainted, notes: &mut Vec<String>) -> E
 
     if let RefDamage::Unreadable(bytes) = &damaged.damage {
         match salvage(bytes, tainted) {
-            // A user ref's bytes naming a gone parcel give heal no head, as bytes that name none.
-            Ok(Salvage::Nothing | Salvage::Absent(_)) => {}
+            Ok(Salvage::Nothing) => {}
+            Ok(Salvage::Absent(parcel)) => evidence.salvage_absent = Some(parcel),
             Ok(Salvage::Found(head)) => evidence.candidates.push((head, Source::Salvage)),
             Ok(Salvage::Unknown(reason) | Salvage::Untold(reason) | Salvage::Newer(reason)) => evidence.salvage_unknown = Some(reason),
             Ok(Salvage::Ambiguous(parcels, dropped)) => {
@@ -749,6 +757,17 @@ fn choose(pallet: &str, evidence: &Evidence, pass: Pass) -> Choice {
         return Choice::Refuse(format!(
             "the latest journal entry of {} deleted the pallet, so a rebuild could undo that delete",
             evidence.deleted_in.join(" and ")
+        ));
+    }
+
+    // The ref's own bytes stand on a parcel the store has decided is gone, a floor that no head
+    // whose history verifies descends from: a rebuild at any other head would land below it. No
+    // taint accounts for the parcel, so the taint recovery cannot settle it, and either pass
+    // refuses. Damage that reached the hash itself reads the same way, so the reason says both.
+    if let Some(parcel) = &evidence.salvage_absent {
+        return Choice::Refuse(format!(
+            "its own bytes name {}, which is not in the store (the parcel is gone, or the damage reached the hash itself), so it is not rebuilt at another head in that parcel's place: restore the parcel from a backup of the warehouse, or clone it afresh from a remote that holds it, and run \"forklift heal\" again; or set its head yourself",
+            parcel
         ));
     }
 
@@ -1219,7 +1238,8 @@ fn refuse_meta_history(pallet: &str, parcel: &str, head: &str, notes: &mut Vec<S
 /// ref's own bytes name) and, when those bytes match several parcels, from at least one of them.
 /// This is judged before the write's hold, and only over what can be read: a checkout whose state
 /// cannot be read, a salvage match that is lost, or an ancestry walk that fails adds a note
-/// instead, since refusing on them would leave the ref no way out. With no floor at all it passes:
+/// instead, since refusing on them would leave the ref no way out, as does a parcel the bytes name
+/// that the store does not hold. With no floor at all it passes:
 /// what clones fetched is then the operator's to know.
 fn refuse_below_a_floor(damaged: &DamagedRef, head: &str, notes: &mut Vec<String>) -> Result<(), String> {
     let evidence = gather(damaged, &Tainted::read(notes), notes);
@@ -1270,6 +1290,14 @@ fn refuse_below_a_floor(damaged: &DamagedRef, head: &str, notes: &mut Vec<String
                 "any of the parcels the ref's own bytes may name ({})", evidence.salvage_ambiguous.join(", ")
             )));
         }
+    }
+
+    // The bytes stand on a parcel the store does not hold, so no ancestry can be walked from it.
+    if let Some(parcel) = &evidence.salvage_absent {
+        push_note(notes, format!(
+            "This warehouse is served, and the ref of pallet \"{}\" named {}, which is not in the store, so {} could not be checked against it: its clones may rely on that parcel.",
+            damaged.pallet, parcel, head
+        ));
     }
 
     if partial {

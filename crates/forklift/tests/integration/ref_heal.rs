@@ -272,6 +272,66 @@ fn a_prefix_too_short_or_naming_no_parcel_salvages_nothing() {
 
 }
 
+// A damaged ref whose bytes begin with the full hash of a parcel the store decided is gone stands
+// on that parcel, which nothing heal could rebuild at descends from: heal refuses and names it,
+// with nothing else naming a head, and with a bay standing on an older head of the pallet, which
+// it would otherwise be rebuilt at. `--remove-ref` (nothing standing on the pallet) or `--ref`
+// then settles it; served, `--ref` notes that the head could not be checked against the parcel.
+// Mutation: salvage such bytes to nothing → the no-evidence row refuses as "nothing in this
+// warehouse names its head", and the bay row rebuilds at the bay's base, red.
+#[test]
+fn a_ref_whose_bytes_name_a_gone_parcel_is_refused_naming_it() {
+    for row in ["nothing else", "a bay below it"] {
+        let area = Area::new(&format!("salvage-gone-{}", row.replace(' ', "-")));
+        let (root, side) = side_only_its_bytes_name(&area);
+        let candidates = match row {
+            "a bay below it" => {
+                let bay = area.bay(&root, "below");
+                area.run_ok(&bay, &["shift", "side"]);
+                // Its base, and its journal's entry for the shift.
+                2
+            }
+            _ => 0,
+        };
+        let gone = flip_digit(&side, 63);
+        let bytes = format!("{}torn", gone).into_bytes();
+        std::fs::write(ref_path(&root, "side"), &bytes).unwrap();
+
+        let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+        let refs = &refused["error"]["details"]["refs_refused"];
+        assert_eq!(refs[0]["pallet"], "side", "{}: {}", row, refused);
+        assert_eq!(refs[0]["reason"], format!(
+            "its own bytes name {}, which is not in the store (the parcel is gone, or the damage reached the hash itself), so it is not rebuilt at another head in that parcel's place: restore the parcel from a backup of the warehouse, or clone it afresh from a remote that holds it, and run \"forklift heal\" again; or set its head yourself",
+            gone
+        ), "{}: {}", row, refused);
+        assert_eq!(refs[0]["candidates"].as_array().unwrap().len(), candidates, "{}: {}", row, refused);
+        assert_eq!(refused["error"]["next_step"], "forklift heal --ref side=<parcel>", "{}: {}", row, refused);
+        // Under a reason that names a parcel, the empty list says only that no candidate was found.
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert_eq!(message.contains("No candidate head was found for it."), candidates == 0, "{}: {}", row, refused);
+        assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), bytes, "{}: the ref must be left alone", row);
+
+        match row {
+            "nothing else" => {
+                area.run_ok(&root, &["heal", "--remove-ref", "side"]);
+                assert!(!ref_path(&root, "side").exists(), "{}", row);
+            }
+            _ => {
+                {
+                    let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+                    assert!(forklift_core::util::tombstone_utils::mark_served(true).unwrap());
+                }
+                let set = area.run_ok(&root, &["heal", "--ref", &format!("side={}", side)]);
+                assert!(text(&set.stdout).contains(&format!(
+                    "This warehouse is served, and the ref of pallet \"side\" named {}, which is not in the store, so {} could not be checked against it",
+                    gone, side
+                )), "{}", text(&set.stdout));
+                assert_eq!(head(&root, "side"), side, "{}", row);
+            }
+        }
+    }
+}
+
 #[test]
 fn a_second_checkout_ahead_on_the_same_pallet_wins() {
     // Mutation: choose the first verified candidate without the descent checks → the rebuild lands

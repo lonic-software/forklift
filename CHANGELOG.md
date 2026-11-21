@@ -91,6 +91,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **`heal` no longer rebuilds a pallet's ref below the parcel its own damaged bytes name.** A
+  damaged ref whose bytes name in full a parcel the store has decided is gone, with no durability
+  taint accounting for it, is refused with `ref_damaged` (exit 53), naming that parcel and its
+  restore from a backup or a remote, with every head found listed for `--ref`. Before, those bytes
+  counted as naming nothing, so `heal` rebuilt the ref at an older head a checkout, journal or
+  interrupted operation named, with exit 0 and no word of the parcel, or refused saying nothing
+  names its head. `--remove-ref` still removes such a ref where nothing stands on its pallet, and
+  in a served warehouse `--ref` notes that the head it sets could not be checked against the
+  parcel. Under a refusal whose list of heads is empty, the line now reads "No candidate head was
+  found for it." in place of "Nothing names a head for it.", which contradicted a reason naming a
+  parcel.
 - **Each metadata pallet's ref now has a copy.** Every change to a ref under `.forklift/meta/` also
   writes the same bytes to `.forklift/meta-copy/<name>`, under the same lock, in the order that
   leaves the copy at the newer head if the write is interrupted. Beside a ref that reads, garbage

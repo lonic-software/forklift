@@ -102,7 +102,9 @@ forklift heal
 
 `heal` rebuilds the ref at the head the warehouse agrees on: the bases your checkouts stand on, their
 journals, an interrupted operation, and what the damaged file still names. If those disagree or name
-nothing, it changes nothing and lists every head it found. Pick one with
+nothing, it changes nothing and lists every head it found. If the damaged file names a parcel the
+store no longer holds, it changes nothing and names that parcel: restore it from a backup or from a
+remote that holds it and run `heal` again, or pick a head. Pick one with
 `forklift heal --ref <pallet>=<parcel>`. If nothing names a head and no checkout stands on the pallet,
 `forklift heal --remove-ref <pallet>` drops the ref and keeps its bytes under `.forklift/removed-refs`;
 what only that ref reached is then no longer kept by any pallet.

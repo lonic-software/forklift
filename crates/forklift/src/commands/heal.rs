@@ -1549,7 +1549,7 @@ fn refusal_lines(all: &[ref_heal::Refused]) -> Vec<String> {
         lines.push(format!("The ref of pallet \"{}\" was not rebuilt: {}.", refused.pallet, refused.reason));
 
         if refused.candidates.is_empty() {
-            lines.push("  Nothing names a head for it.".to_string());
+            lines.push("  No candidate head was found for it.".to_string());
         }
         for candidate in &refused.candidates {
             lines.push(format!("  {} ({})", candidate.head, candidate.source));
@@ -1572,7 +1572,7 @@ fn refused_too<'a>(error: String, refused: impl IntoIterator<Item = &'a ref_heal
 /// The heads found for a ref heal did not rebuild, in words.
 fn candidates_clause(candidates: &[ref_heal::Candidate]) -> String {
     match candidates.is_empty() {
-        true => "nothing names a head for it".to_string(),
+        true => "no candidate head was found for it".to_string(),
         false => format!("candidates: {}", candidates.iter()
             .map(|candidate| format!("{} ({})", candidate.head, candidate.source)).collect::<Vec<_>>().join(", ")),
     }
@@ -2560,14 +2560,14 @@ mod tests {
         ]);
         let two = deferred_sentences(&[refused("@kv", &[]), refused("@tags", &[("h1", "the ref's copy"), ("h2", "what the ref's own bytes still name")])], None);
         assert_eq!(two, vec![
-            "The ref of pallet \"@kv\" was not rebuilt yet: it waits; nothing names a head for it.".to_string(),
+            "The ref of pallet \"@kv\" was not rebuilt yet: it waits; no candidate head was found for it.".to_string(),
             "The ref of pallet \"@tags\" was not rebuilt yet: it waits; candidates: h1 (the ref's copy), h2 (what the ref's own \
             bytes still name).".to_string(),
             "This run stopped before judging those refs a second time; a later heal judges them again.".to_string(),
         ]);
         // Beside a torn taint only the ref it holds gets the hand step; the other waits as before.
         assert_eq!(deferred_sentences(&[refused("@kv", &[]), refused("@tags", &[("h1", "the ref's copy")])], Some(&held(false))), vec![
-            "The ref of pallet \"@kv\" was not rebuilt yet: it waits; nothing names a head for it.".to_string(),
+            "The ref of pallet \"@kv\" was not rebuilt yet: it waits; no candidate head was found for it.".to_string(),
             "The ref of pallet \"@tags\" was not rebuilt yet: it waits; candidates: h1 (the ref's copy). The durability taint's \
             record is torn, so every object the ref's bytes name counts as possibly lost, and a later heal leaves it again; a head \
             named, once checked to be one this store holds, can be written into its file by hand, which heal does not verify.".to_string(),
@@ -2575,7 +2575,7 @@ mod tests {
         ]);
         // With no head named, there is nothing to write by hand.
         assert_eq!(deferred_sentences(&[refused("@tags", &[])], Some(&held(false))), vec![
-            "The ref of pallet \"@tags\" was not rebuilt yet: it waits; nothing names a head for it. The durability taint's \
+            "The ref of pallet \"@tags\" was not rebuilt yet: it waits; no candidate head was found for it. The durability taint's \
             record is torn, so every object the ref's bytes name counts as possibly lost, and a later heal leaves it again.".to_string(),
         ]);
         assert_eq!(deferred_sentences(&[refused("@tags", &[("h1", "the ref's copy")])], Some(&held(true))), vec![
