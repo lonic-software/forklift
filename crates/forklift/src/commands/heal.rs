@@ -1670,8 +1670,8 @@ fn append_notes(error: String, notes: &[String]) -> String {
 /// names, whose unread head kept the taint standing.
 fn deferred_sentences(deferred: &[ref_heal::Refused], held: Option<&ref_heal::TaintHold>, kept: &[String]) -> Vec<String> {
     let is_held = |refused: &ref_heal::Refused| held.is_some_and(|held| held.refs.contains(&refused.pallet));
-    // The taint recovery could not check what only this ref reaches, so the taint stands on it,
-    // and the pass that would judge it again never runs.
+    // The taint recovery could not check what this ref reaches, so the taint may stand on it
+    // for good, and the pass that would judge it again runs only once the taint is resolved.
     let is_kept = |refused: &ref_heal::Refused| !is_held(refused) && kept.contains(&refused.pallet);
     let mut sentences: Vec<String> = deferred.iter().map(|refused| {
         let line = format!(
@@ -1680,9 +1680,9 @@ fn deferred_sentences(deferred: &[ref_heal::Refused], held: Option<&ref_heal::Ta
         );
         match held.filter(|_| is_held(refused)) {
             None if is_kept(refused) => format!(
-                "{} The durability taint stands while this ref cannot be read, so every later heal stops here the same way: \
-                restore the ref of {} and its copy, with the parcels they name, from a backup of the warehouse, \
-                or clone the warehouse afresh; then run \"forklift heal\" again.", line, refused.pallet
+                "{} While this ref cannot be read, the durability taint's recovery cannot check what it reaches, \
+                and heal judges the ref again only once the taint is resolved; if it is not, restore the warehouse \
+                from a backup, or clone it afresh, then run \"forklift heal\" again.", line
             ),
             None => line,
             Some(held) if held.unread => format!(
@@ -2598,14 +2598,15 @@ mod tests {
             could not be read, so every object the ref's bytes name counted as possibly lost; a later heal that can read the \
             taint judges it again.".to_string(),
         ]);
-        // A ref whose unread head kept the taint standing is never judged again while it stays
-        // unread; the other is, and a ref kept names but no pass deferred is not said.
+        // A ref whose unread head kept the taint standing is judged again only once the taint is
+        // resolved, and gets the way out for when it is not; the other waits as before, and a ref
+        // kept names but no pass deferred is not said.
         let kept = ["@tags".to_string(), "@x".to_string()];
         assert_eq!(deferred_sentences(&[refused("@kv", &[]), refused("@tags", &[("h1", "the ref's copy")])], None, &kept), vec![
             "The ref of pallet \"@kv\" was not rebuilt yet: it waits; no candidate head was found for it.".to_string(),
-            "The ref of pallet \"@tags\" was not rebuilt yet: it waits; candidates: h1 (the ref's copy). The durability taint \
-            stands while this ref cannot be read, so every later heal stops here the same way: restore the ref of @tags and its \
-            copy, with the parcels they name, from a backup of the warehouse, or clone the warehouse afresh; then run \
+            "The ref of pallet \"@tags\" was not rebuilt yet: it waits; candidates: h1 (the ref's copy). While this ref \
+            cannot be read, the durability taint's recovery cannot check what it reaches, and heal judges the ref again only once \
+            the taint is resolved; if it is not, restore the warehouse from a backup, or clone it afresh, then run \
             \"forklift heal\" again.".to_string(),
             "This run stopped before judging the other ref a second time; a later heal judges it again.".to_string(),
         ]);

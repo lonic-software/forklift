@@ -316,10 +316,10 @@ pub struct HealOutcome {
 #[derive(Debug)]
 pub struct RunRefused {
     pub error: CoreError,
-    /// The wire name of every pallet ref whose head this run's walk could not read, when the
-    /// taint stands with an object kept only because the walk was incomplete: it could not prove
-    /// nothing references the object. Empty otherwise. While one of these refs stays unread,
-    /// every run's walk is incomplete again and keeps the object again.
+    /// The wire name of every pallet ref whose head this run's walk could not read, when that left
+    /// the taint standing: a torn taint's rescan refused because the walk was incomplete, or an
+    /// object was kept because the walk could not prove nothing references it. Empty for every
+    /// other refusal. While one of these refs stays unread, no run's walk is complete.
     pub kept_by_unread_refs: Vec<String>,
 }
 
@@ -377,10 +377,12 @@ impl HealOutcome {
 /// * `Ok(HealOutcome)` - Nothing was tainted, or the taint is now **fully** cleared (every
 ///                       recorded path reached restaged, or vanished-and-unreferenced/a resolved
 ///                       shard note). The in-memory gate is cleared too.
-/// * `Err(RunRefused)` - A [`RefusalCode::DurabilityTaint`] refusal: at least one reference remains
-///                       genuinely dangling after the walk (torn or not). The taint is rewritten to
-///                       record exactly the unresolved remainder (never the original full set,
-///                       never nothing) and the gate is left standing.
+/// * `Err(RunRefused)` - The run's refusal, with the refs whose unread head left the taint
+///                       standing ([`RunRefused::kept_by_unread_refs`]). A
+///                       [`RefusalCode::DurabilityTaint`] refusal for a reference still dangling
+///                       after the walk rewrites the taint to record exactly the unresolved
+///                       remainder (never the original full set, never nothing) and leaves the gate
+///                       standing; a torn record the rescan could not finish is left as it was.
 pub async fn run(progress: Option<&dyn Fn(&str)>) -> Result<HealOutcome, RunRefused> {
     let root = forklift_root();
 
@@ -430,7 +432,7 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
     // (`heal_utils::heal_if_tainted`) is completely unaffected by this — it still refuses torn
     // immediately, lock-free; only this locked verb rescans.
     if state.torn {
-        return Ok(rescan_torn_taint(root, &state.files, progress)?);
+        return rescan_torn_taint(root, &state.files, progress);
     }
     if state.recorded.is_empty() {
         // Companion fix (DESIGN.html §3.1.1): "nothing recorded" says nothing about the gate — a
@@ -1074,10 +1076,7 @@ async fn resolve_the_rest(
             index_rebuild_skipped: false,
         })
     } else {
-        let kept_by_unread_refs = match kept_for_an_incomplete_walk {
-            true => walk.unread_refs.clone(),
-            false => Vec::new(),
-        };
+        let kept_by_unread_refs = if kept_for_an_incomplete_walk { walk.unread_refs } else { Vec::new() };
         Err(RunRefused { error: dangling_refusal(root, &dangling_lines, &incomplete_reasons), kept_by_unread_refs })
     }
 }
@@ -1183,7 +1182,7 @@ fn rescan_torn_taint(
     root: &Path,
     old_files: &[PathBuf],
     progress: Option<&dyn Fn(&str)>,
-) -> Result<HealOutcome, CoreError> {
+) -> Result<HealOutcome, RunRefused> {
     let report = |line: String| { if let Some(f) = progress { f(&line); } };
 
     let candidates = enumerate_store_wide_paths(root).map_err(|e| rescan_failure_refusal(root, &e))?;
@@ -1299,7 +1298,11 @@ fn rescan_torn_taint(
             because a source of durable references, or an object they reach, could not be read; \
             the torn record is left standing.".to_string()
         );
-        return Err(torn_rescan_degraded_refusal(root, restaged.len(), &incomplete_reasons));
+        // A ref whose head cannot be read refuses every rescan on its own, whatever else is named.
+        return Err(RunRefused {
+            error: torn_rescan_degraded_refusal(root, restaged.len(), &incomplete_reasons),
+            kept_by_unread_refs: walk.unread_refs,
+        });
     }
 
     // A corrupt object the walk reached is recorded as a boundary; step 1 already listed it.
@@ -1364,7 +1367,7 @@ fn rescan_torn_taint(
             "torn durability taint: rescan complete — {} reference(s) remain dangling.",
             dangling_lines.len()
         ));
-        Err(torn_rescan_dangling_refusal(root, &dangling_lines))
+        Err(torn_rescan_dangling_refusal(root, &dangling_lines).into())
     }
 }
 
@@ -4031,7 +4034,7 @@ fn dangling_refusal(root: &Path, lines: &[String], degraded: &[String]) -> CoreE
     } else {
         format!(
             "At least one of these could not be conclusively checked because a source of durable \
-            references (a bay's saved state, or the office record), or a pack index holding \
+            references (a bay's saved state, the office record, or a pallet ref), or a pack index holding \
             objects they reach, could not be read this run — fix it (for a pack index: restore its pack files from a good \
             copy, move an index that does not parse out of the pack folder only if it holds \
             nothing this warehouse needs, or re-create the \
