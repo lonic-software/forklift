@@ -2886,7 +2886,8 @@ are in `details` under `--json`). Choose one yourself:
   and refuses the option for one before it changes anything. Where `heal` has no head it can
   rebuild a metadata ref at (nothing names one, or what does is several parcels, one possibly lost,
   a copy and bytes that diverge, or a head whose history does not verify), it names restoring the
-  ref and its copy from a backup. Where its refusal is no verdict on the ref, it names the step
+  ref and its copy from a backup; where its damaged bytes name a parcel the store has decided is
+  gone, restoring that parcel, or the ref and its copy. Where its refusal is no verdict on the ref, it names the step
   that lets a later `heal` judge it: for a ref that waits on the office's or `@redactions`' refusal,
   or on an unborn office, that step; for what heal could not read, that read's own step, else
   settling it; for a rebuild heal could not write or read back, the write's own step, else
@@ -2931,15 +2932,19 @@ never followed: the read refuses it as blocked, naming moving it aside, and `hea
 a `Note:` naming the same. A ref whose path cannot be read is refused, never read as a pallet never
 written, naming making the ref's file and the folders on the way to it readable.
 
-A ref that reads but names a head the store has decided it does not hold, beside a copy naming a
-head the store does hold, is rebuilt at the copy's head, even where that is the older of the two,
+A ref whose bytes name in full a head the store has decided it does not hold, whether they read as
+that head or are damaged after it, beside a copy naming another head the store does hold, is rebuilt
+at the copy's head, even where that is the older of the two,
 with a `Note:` naming the head the ref named. `heal` makes that note before it writes, so it is
 reported whatever the write's outcome. A meta ref's rebuild that the pass before the taint recovery
 wrote or tried to write, and left for the pass after it, gets a `Note:` saying so and why; a refusal
 says each note once. The store has not decided while something could yet account for the missing head,
 such as a refill from the origin, a redaction or a withholding, a pack or record it cannot read in
 full, or the durability taint; `heal` then leaves the ref as it is. The office's ref is never
-rebuilt this way: it is left as it is, with its copy. Other commands do not judge such a ref: they
+rebuilt this way: it is left as it is, with its copy. A damaged ref whose bytes name such a head
+and that is not rebuilt at its copy (it has none, its copy names that same head, or it is the
+office's) is refused, naming the head, and the step is to restore that parcel from a backup of the
+warehouse or a fresh clone of a remote that holds it, or the ref and its copy from a backup. Other commands do not judge such a ref: they
 read it like any ref whose head is missing, and refuse on the missing object, not with
 `ref_damaged`.
 
