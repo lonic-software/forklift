@@ -1676,7 +1676,7 @@ fn damaged_user_ref_sentences(damaged: &[ref_heal::DamagedRef], kept: &[String])
     let (stuck, rest): (Vec<_>, Vec<_>) = damaged.iter().partition(|damaged| kept.contains(&wire(damaged)));
     let mut sentences: Vec<String> = stuck.iter().map(|damaged| format!(
         "The ref of pallet \"{}\" is damaged. While it cannot be read, the durability taint's recovery cannot check \
-        what it reaches, and heal rebuilds the ref only once the taint is resolved; if it is not, restore the warehouse \
+        what it reaches, and heal judges the ref again only once the taint is resolved; if it is not, restore the warehouse \
         from a backup, or clone it afresh, then run \"forklift heal\" again.", wire(damaged)
     )).collect();
     if !rest.is_empty() {

@@ -2612,7 +2612,7 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
 
         let promise = "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.";
         let way_out = "The ref of pallet \"side\" is damaged. While it cannot be read, the durability taint's recovery \
-            cannot check what it reaches, and heal rebuilds the ref only once the taint is resolved; if it is not, restore \
+            cannot check what it reaches, and heal judges the ref again only once the taint is resolved; if it is not, restore \
             the warehouse from a backup, or clone it afresh, then run \"forklift heal\" again.";
 
         // A lost ref reads as no head, so nothing is left unread, and the ref is one of the rest.
