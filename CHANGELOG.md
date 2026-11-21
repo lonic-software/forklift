@@ -29,8 +29,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   as `@tags`'s) that is gone or no longer holds a parcel hash is rebuilt from its copy, or from the
   parcel its remaining bytes still name, once the head verifies as that pallet's history against
   the office. A copy that disagrees with those bytes is taken only when it descends from what
-  they name; otherwise `heal` refuses with both heads (`ref_damaged`, exit 53). A ref that reads
-  but names a head the store has decided it does not hold is rebuilt at its copy's head when the
+  they name; otherwise `heal` refuses with both heads (`ref_damaged`, exit 53). A ref whose bytes
+  name in full a head the store has decided it does not hold, whether they read as that head or are
+  damaged after it, is rebuilt at its copy's head when the
   store holds that one (the office's ref excepted), with a note naming the head it named, made before the rebuild
   is written, so it is reported whatever the write's outcome. A rebuild, of a pallet's ref or a
   metadata ref, that the pass before the taint recovery wrote but could not read back is read back
@@ -65,7 +66,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **`heal` names its way out for every damaged metadata ref it does not rebuild, and never
   removes one.** Where `heal` has no head it can rebuild the ref at (nothing names one, or what does
   is several parcels, one possibly lost, a copy and bytes that diverge, or a head whose history does
-  not verify), the step is to restore the ref and its copy from a backup. `heal --remove-ref
+  not verify), the step is to restore the ref and its copy from a backup. Where its damaged bytes
+  name in full a parcel the store has decided is gone and `heal` does not rebuild it at its copy
+  (it has none, the copy names no head or that parcel too, or it is the office's ref, which is never
+  taken back to an older head this way), `heal` names that parcel, and the step is to restore it from a backup
+  or a fresh clone, or the ref and its copy from a backup. `heal --remove-ref
   @<name>` is refused before anything changes. Where the refusal is no verdict on the ref, the step
   is the one `heal` names: for a ref that waits on the office's or `@redactions`' refusal, or on an
   unborn office, that step; where `heal` could not read what it needs (a file it may not read, pack

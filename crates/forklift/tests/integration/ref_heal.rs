@@ -2095,6 +2095,130 @@ fn an_office_ref_naming_a_head_the_store_decided_is_gone_keeps_both_files() {
     )), "{}", value);
 }
 
+// A damaged meta ref whose bytes begin with the full hash of a parcel the store decided is gone
+// is judged as one naming that head: beside a copy naming a head the store holds it is rebuilt
+// there, and the head its bytes named is reported. Mutation: salvage such bytes to nothing (the
+// old outcome) and leave them unjudged as stale → rebuilt with no note, red at the note.
+#[test]
+fn a_damaged_meta_ref_whose_bytes_name_a_gone_head_is_rebuilt_from_its_copy_and_names_it() {
+    // A taint over the copy's head, which the store holds: the pass before the recovery waits on
+    // it, and the pass after reads the ref stale once the recovery cleared it, so one run
+    // converges.
+    for tainted in [false, true] {
+        let area = Area::new(&format!("meta-absent-damaged-{}", tainted));
+        let (root, _, second) = tagged(&area);
+        let copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
+        let gone = flip_digit(&second, 63);
+        std::fs::write(meta_path(&root, "tags"), format!("{}torn", gone)).unwrap();
+        if tainted {
+            plant_taint(&root, &[second.as_str()]);
+        }
+
+        let data = healed(&area, &root);
+        assert_eq!(rebuilt_meta(&data), vec![("@tags".to_string(), second.clone(), "the ref's copy".to_string())], "{}", data);
+        assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), copy, "{}", data);
+        assert!(data["notes"].to_string().contains(&format!(
+            "The ref of pallet \\\"@tags\\\" named {}, which was not in the store, when heal set out to rebuild it at {} from the ref's copy.", gone, second
+        )), "the head its bytes named is reported: {}", data);
+    }
+}
+
+// The office's damaged ref whose bytes begin with the full hash of a parcel the store decided is
+// gone is never rebuilt at its copy, which would roll the trust root back: heal refuses, names
+// both heads, and leaves both files. Mutation: salvage such bytes to nothing → rebuilt at the
+// copy, red.
+#[test]
+fn a_damaged_office_ref_whose_bytes_name_a_gone_head_is_not_rolled_back_to_its_copy() {
+    let area = Area::new("meta-absent-damaged-office");
+    let (root, _, _) = tagged(&area);
+    area.run_ok(&root, &["office", "enroll"]);
+    let office = meta_head(&root, "office").unwrap();
+    let copy = std::fs::read(meta_copy_path(&root, "office")).unwrap();
+    let gone = flip_digit(&office, 63);
+    let bytes = format!("{}torn", gone).into_bytes();
+    std::fs::write(meta_path(&root, "office"), &bytes).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert_eq!(std::fs::read(meta_path(&root, "office")).unwrap(), bytes, "{}", refused);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "office")).unwrap(), copy, "{}", refused);
+    assert!(message.contains(&format!(
+        "The ref of pallet \"@office\" was not rebuilt: its own bytes name {}, which is not in the store, and it is not rebuilt at its copy's head {} in its place", gone, office
+    )), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], lost_step(&gone, "@office").as_str(), "{}", refused);
+}
+
+/// The way out of a meta ref whose own bytes name `parcel`, which the store decided is gone.
+fn lost_step(parcel: &str, pallet: &str) -> String {
+    format!(
+        "Restore parcel {} from a backup of the warehouse, or clone it afresh from a remote that holds it; or restore the ref of {} and its copy from a backup. Then run \"forklift heal\" again.",
+        parcel, pallet
+    )
+}
+
+// A damaged meta ref whose bytes name, in full, a parcel the store decided is gone is not rebuilt
+// where it has no copy, nor where its copy names that same parcel: heal refuses, names the parcel
+// and its restore, and leaves the ref. (Bytes that parse there read as an intact ref, which the
+// lost-objects refusal names.) Mutation: salvage such bytes to nothing → the no-copy row refuses
+// with "neither its copy nor its own bytes name a head" and the backup step, red.
+#[test]
+fn a_meta_ref_naming_a_gone_parcel_with_no_copy_to_go_back_to_names_the_parcel() {
+    // What stands at the copy's path, the reason's close, and whether that blocks the copy.
+    let mut rows = vec![
+        ("none", "it has no copy", false),
+        ("same", "its copy names it too", false),
+        ("not a head", "its copy does not name a head", false),
+    ];
+    if cfg!(unix) {
+        rows.push(("symlink", "what stands at its copy's path is not a file", true));
+    }
+    for (copy, close, blocks) in rows {
+        let area = Area::new(&format!("meta-lost-{}", copy.replace(' ', "-")));
+        let (root, _, second) = tagged(&area);
+        let gone = flip_digit(&second, 63);
+        let bytes = format!("{}torn", gone).into_bytes();
+        std::fs::write(meta_path(&root, "tags"), &bytes).unwrap();
+        let copy_path = meta_copy_path(&root, "tags");
+        forklift_core::util::file_utils::remove_file(&copy_path).unwrap();
+        match copy {
+            "same" => std::fs::write(&copy_path, format!("{}\n", gone)).unwrap(),
+            "not a head" => std::fs::write(&copy_path, b"not a head\n").unwrap(),
+            #[cfg(unix)]
+            "symlink" => std::os::unix::fs::symlink(root.join("nowhere"), &copy_path).unwrap(),
+            _ => {}
+        }
+
+        let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+        let message = refused["error"]["message"].as_str().unwrap();
+        let reason = format!("its own bytes name {}, which is not in the store, and {}", gone, close);
+        assert!(message.contains(&format!("The ref of pallet \"@tags\" was not rebuilt: {}", reason)), "{}: {}", copy, refused);
+        let next_step = refused["error"]["next_step"].as_str().unwrap();
+        match blocks {
+            true => assert!(next_step.starts_with("Replace what stands at the copy's path"), "{}: {}", copy, refused),
+            false => assert_eq!(next_step, lost_step(&gone, "@tags"), "{}: {}", copy, refused),
+        }
+        assert_eq!(std::fs::read(meta_path(&root, "tags")).unwrap(), bytes, "{}", copy);
+    }
+}
+
+// A copy whose own head is gone too: both heads are lost, which has the generic way out, and the
+// ref is judged by its copy's verification, as before. Mutation: refuse every copy that is not
+// stale as the lost parcel → next_step is the parcel's restore, red.
+#[test]
+fn a_meta_ref_naming_a_gone_parcel_beside_a_copy_whose_head_is_gone_too_waits_on_the_copy() {
+    let area = Area::new("meta-lost-both");
+    let (root, _, second) = tagged(&area);
+    let gone = flip_digit(&second, 63);
+    let copy_gone = flip_digit(&second, 62);
+    std::fs::write(meta_path(&root, "tags"), format!("{}torn", gone)).unwrap();
+    std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", copy_gone)).unwrap();
+
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("The ref of pallet \"@tags\" was not rebuilt: parcel {} does not pass verification", copy_gone)), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], backup_step("@tags").as_str(), "{}", refused);
+}
+
 // A folder planted at the copy's path fails the first write's copy, after its ref landed.
 // Mutation: skip the copy mend → the copy stays absent, red.
 #[test]
