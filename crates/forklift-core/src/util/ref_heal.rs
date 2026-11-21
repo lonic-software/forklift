@@ -2881,8 +2881,9 @@ mod tests {
         }
     }
 
-    // Mutation: drop the taint check from the predicate → a covered head reads as decided
-    // absent, red. The clean half shows the fixture reaches the decided answer.
+    // Mutations: drop the taint check from the predicate → a covered head reads as decided
+    // absent, red; salvage an empty answer as gone without asking it → torn bytes beside a torn
+    // taint salvage as gone, red. The clean halves show the fixture reaches the decided answer.
     #[test]
     fn a_head_the_taint_covers_is_never_decided_absent() {
         let (_root, _scope) = scratch("ref-heal-absent-tainted");
@@ -2892,6 +2893,13 @@ mod tests {
 
         assert!(head_decided_absent(&absent, &clean), "the store decided it is absent");
         assert!(!head_decided_absent(&absent, &covering), "the taint may yet restore it");
+
+        // Bytes naming it in full salvage it as gone only where that holds; beside a torn taint,
+        // which may yet restore any head, they salvage to nothing, as before.
+        let torn = Tainted { hashes: BTreeSet::new(), torn: true, unread: false };
+        let bytes = format!("{}torn", absent).into_bytes();
+        assert!(matches!(salvage(&bytes, &clean), Ok(Salvage::Absent(ref gone)) if *gone == absent));
+        assert!(matches!(salvage(&bytes, &torn), Ok(Salvage::Nothing)));
     }
 
     // A meta ref whose head the store cannot tell of, beside a copy naming a held head, is no
