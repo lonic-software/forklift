@@ -252,7 +252,8 @@ history reaches them, and in `pallets_unread` each pallet whose ref could not be
 and a `reason`), whose history may reach them too. `next_step` is to restore from a backup or clone afresh, to re-create the
 warehouse when another build's index is in the pack folder, or `forklift heal` when another process
 held the store and the indexes were not rebuilt. A heal whose reachability walk cannot finish exits
-non-zero without claiming anything lost.
+non-zero without claiming anything lost; when no damaged ref is refused it fails with the generic
+`error` code, whose `message` follows the failure with the lines of what the run repaired.
 
 **Schema 45**: a new refusal code, `withheld_damaged` (exit 56): a served warehouse's
 record of withheld content is lost or damaged, so what its head withholds cannot be told. Nothing

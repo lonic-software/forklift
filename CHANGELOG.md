@@ -774,6 +774,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- Under `--json`, a `heal` that fails with an uncoded error after its repairs, such as a
+  reachability check that cannot finish, now says what it repaired in the error's `message`. Before,
+  the error carried only the failure, so the repairs went unreported though they had happened; the
+  recovery of an interrupted operation was the only one said there.
 - **`heal` restores a damaged record of a merge in progress from a copy kept beside it.** Every
   write of a consolidation's state, its out-of-scope skeleton or a pick's state now leaves a copy
   (`consolidation-copy`, `consolidation-skeleton-copy`, `cherry-pick-copy`), and `forklift heal`
