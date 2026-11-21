@@ -468,8 +468,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     };
     // The trust repair runs in both passes, and may note the same thing in each: a refusal and
-    // the report say each note once. After a first write the two files agree, so a second one means they moved between the passes: the
-    // report names the first, and the second is noted.
+    // the report say each note once.
+    //
+    // After a first write the two files agree, so a second one means they moved between the
+    // passes: the report names the first, and the second is noted.
     let trust_restored_after = meta_second.trust.restored;
     if let (Some(_), Some(after)) = (&trust_repair.restored, &trust_restored_after) {
         ref_notes.push(format!("{} (after the taint recovery).", after.sentence().trim_end_matches('.')));
@@ -2335,7 +2337,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deferred_sentences, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
+    use super::{append_notes, deferred_sentences, ref_heal, unjudged_sentences, unload_step_when, LostObject, ObjectsLost, UnreadPallet};
 
     // A pallet whose ref could not be read may be the one whose history reaches the lost
     // objects, so the report names it and never says no pallet's history reaches them.
@@ -2364,6 +2366,16 @@ mod tests {
 
         // With every ref read, the line stands.
         assert!(report(Vec::new()).contains(&nothing.to_string()));
+    }
+
+    // Both meta passes may make the same note, so a refusal says each note once, in the order
+    // first made. Mutation: append every note → red (the repeated note is said twice).
+    #[test]
+    fn a_refusal_says_each_note_once_in_the_order_first_made() {
+        let notes = ["The first.".to_string(), "The both.".to_string(), "The both.".to_string(), "The second.".to_string()];
+        assert_eq!(append_notes("It was refused.".to_string(), &notes), "It was refused. Note: The first. Note: The both. Note: The second.");
+        // Distinct notes are each said.
+        assert_eq!(append_notes("It was refused.".to_string(), &notes[..2]), "It was refused. Note: The first. Note: The both.");
     }
 
     #[test]
