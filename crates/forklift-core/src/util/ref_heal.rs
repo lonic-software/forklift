@@ -930,7 +930,11 @@ fn sync_again(namespace: PalletNamespace, name: &str) -> Result<Option<String>, 
     if namespace == PalletNamespace::Meta {
         written.push(("copy", pallet_utils::get_meta_copy_path(name)));
     }
+    sync_files_again(&written)
+}
 
+/// [`sync_again`] for the folder of each of `written`, each named by the word its error says.
+fn sync_files_again(written: &[(&str, std::path::PathBuf)]) -> Result<Option<String>, String> {
     let mut tainted = None;
     // A copy the write did not get as far as leaves nothing to sync.
     for (file, path) in written.iter().filter(|(_, path)| path.symlink_metadata().is_ok()) {
@@ -1841,8 +1845,10 @@ impl Drop for RemedyScope {
 const TRUST_REFUSED_STEP: &str = "Take one of the ways out the trust file's refusal names, then run \"forklift heal\" again.";
 
 /// Set an intact meta ref's copy to the ref's bytes, when the copy is lost or differs and the
-/// store gives the ref's head whole.
-fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>) {
+/// store gives the ref's head whole. Its notes go to `report.notes`; a copy write that landed and
+/// is not durable goes to `report.undurable`.
+fn mend_copy(state: &MetaState, head: &str, pass: Pass, report: &mut Repair) {
+    let notes = &mut report.notes;
     let reference = state.reference.as_deref().unwrap_or_default();
 
     if let pallet_utils::MetaCopyState::Other = state.copy {
@@ -1858,9 +1864,9 @@ fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>)
     // The copy is set only toward a head the store gives whole: over any other answer, it may be
     // the one file still naming a head a reader can load. The store's outer error is only a
     // decided answer or an untold one, never bytes of a newer build, which come back inside `Ok`.
-    // Before the taint the refusal is silent, as the error arm below is: the pass after the taint
-    // recovery reads the store again and mends a head the recovery made readable, or says why
-    // not. A run that returns before that pass reports nothing of this copy; the next run does.
+    // Before the taint the refusal is silent, as a write below that did not land is: the pass
+    // after the taint recovery reads the store again and mends a head the recovery made readable,
+    // or says why not. A run that returns before that pass reports nothing of this copy; the next run does.
     let refused = match object_utils::load_parcel_judged(head) {
         Ok(Ok(_)) | Ok(Err(object_utils::NotAParcel::Newer(_))) => None,
         Ok(Err(object_utils::NotAParcel::Other(_))) => Some("is not a parcel".to_string()),
@@ -1899,11 +1905,102 @@ fn mend_copy(state: &MetaState, head: &str, pass: Pass, notes: &mut Vec<String>)
         }),
         // A taint still standing after the recovery is reported by the recovery.
         Ok(pallet_utils::CopyMend::AfterTaint) => {}
-        Err(_) if pass == Pass::BeforeTaint => {}
-        Err(error) => push_note(notes, format!(
-            "The copy of pallet \"{}\"'s ref was not set to the ref's head {}: {}", state.wire(), head, error
+        Err(error) => copy_write_failed(state, head, pass, &error, report),
+    }
+}
+
+/// Judge the failed copy mend of meta ref `state` at `head` that reported `error`, as
+/// [`mend_copy`]'s.
+///
+/// Only a failed write ([`pallet_utils::CopyMendError::WriteFailed`]) can have landed: its rename
+/// done, a folder sync after it failing. So that copy alone is read back, and what it holds is
+/// reported in either pass, since the pass after the taint recovery reads a copy that holds the
+/// ref's head as matching its ref and says nothing of the write. A copy that holds it, or cannot
+/// be read, is synced again here when what the write left unsynced has no taint recording it, as
+/// a ref's is ([`mended`]), since that sync needs only the file, not the answer; a sync that still
+/// does not hold is said in `report.undurable`. A mend that refused before writing, and a copy
+/// that reads and holds something else, are left for the pass after the taint recovery, which
+/// judges them again, or said by that pass.
+fn copy_write_failed(state: &MetaState, head: &str, pass: Pass, error: &pallet_utils::CopyMendError, report: &mut Repair) {
+    use pallet_utils::CopyMendError;
+
+    let wire = state.wire();
+    let (read, unrecorded) = match error {
+        CopyMendError::WriteFailed(why) => (
+            copy_read_back(&state.name, state.reference.as_deref().unwrap_or_default()),
+            file_utils::is_taint_unrecorded(why),
+        ),
+        // Nothing was written, as by a write that did not land.
+        CopyMendError::Moved(_) | CopyMendError::Refused(_) => (ReadBack::Elsewhere, false),
+    };
+    let again = match read {
+        ReadBack::Landed | ReadBack::Unread(_) if unrecorded => {
+            sync_files_again(&[("copy", pallet_utils::get_meta_copy_path(&state.name))])
+        }
+        _ => Ok(None),
+    };
+
+    // Only a failure after the copy's rename leaves what it wrote unsynced with no taint recording
+    // it, so an undurable copy was set by this write. Any other failed write may have failed
+    // before its rename, with the copy set by another mend before the read back, so a copy that
+    // holds the head is said to hold it, not to have been set to it.
+    match (again, read) {
+        (Err(why), ReadBack::Landed) => report.undurable.push(format!(
+            "The copy of pallet \"{}\"'s ref was set to the ref's head {}, but {}. Heal synced its folder again, and \
+            neither that sync nor a taint recording it held, so a crash can still lose the copy's write; a later heal \
+            reads the copy as matching its ref and does not sync it again.",
+            wire, head, why.trim_end_matches('.')
+        )),
+        (Err(why), ReadBack::Unread(_)) => report.undurable.push(format!(
+            "The copy of pallet \"{}\"'s ref may have been set to the ref's head {}, and if it was, {}. Heal synced its \
+            folder again, and neither that sync nor a taint recording it held, so a crash can still lose the copy's \
+            write; a later heal reads the copy as matching its ref and does not sync it again.",
+            wire, head, why.trim_end_matches('.')
+        )),
+        (Ok(again), read @ (ReadBack::Landed | ReadBack::Unread(_))) => {
+            push_note(&mut report.notes, match read {
+                ReadBack::Unread(why) => format!(
+                    "The copy of pallet \"{}\"'s ref may have been set to the ref's head {}: its write reported {}, and \
+                    the copy could not be read back: {}",
+                    wire, head, error, why
+                ),
+                _ => format!(
+                    "The copy of pallet \"{}\"'s ref holds the ref's head {}, though its write reported: {}", wire, head, error
+                ),
+            });
+            if let Some(again) = again {
+                push_note(&mut report.notes, format!(
+                    "Heal synced the folder of the copy of pallet \"{}\"'s ref again, which reported: {}", wire, again
+                ));
+            }
+        }
+        (_, ReadBack::Elsewhere) if pass == Pass::BeforeTaint => {}
+        (_, ReadBack::Elsewhere) => push_note(&mut report.notes, format!(
+            "The copy of pallet \"{}\"'s ref was not set to the ref's head {}: {}", wire, head, error
         )),
     }
+}
+
+/// What the copy of meta pallet `name` reads back as against `reference`, the ref's bytes a copy
+/// write set it to: [`ReadBack::Landed`] when it holds exactly those bytes.
+fn copy_read_back(name: &str, reference: &[u8]) -> ReadBack {
+    #[cfg(test)]
+    if COPY_READ_BACK_UNREAD.with(|unread| unread.replace(false)) {
+        return ReadBack::Unread("the read was refused for the test".to_string());
+    }
+
+    match pallet_utils::read_meta_copy_state(name) {
+        Ok(pallet_utils::MetaCopyState::Bytes(bytes)) if bytes == reference => ReadBack::Landed,
+        Ok(_) => ReadBack::Elsewhere,
+        Err(why) => ReadBack::Unread(why),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next [`copy_read_back`] answer [`ReadBack::Unread`], once, since no fixture
+    /// fails the read of a copy right after its write failed.
+    static COPY_READ_BACK_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What a meta repair pass did: the meta refs' [`Repair`], and the trust file repair run between
@@ -2182,15 +2279,16 @@ fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String,
     }
 }
 
-/// What the ref of a pallet heal wrote at a head reads back as. A write can land and still report
-/// a failure (under a standing taint, its rename goes through and the taint is reported), so the
-/// ref, read as it stands, decides whether it landed.
+/// What the ref of a pallet heal wrote at a head, or a meta ref's copy heal set to its ref's bytes
+/// ([`copy_read_back`]), reads back as. A write can land and still report a failure (under a
+/// standing taint, its rename goes through and the taint is reported), so the file, read as it
+/// stands, decides whether it landed.
 enum ReadBack {
-    /// The ref holds the head heal wrote.
+    /// The ref holds the head heal wrote; a copy, exactly its ref's bytes.
     Landed,
-    /// The ref reads, and holds no such head: missing, damaged, at another head, or not a file.
+    /// The file reads, and holds no such head: missing, damaged, at another head, or not a file.
     Elsewhere,
-    /// The ref could not be read: no answer on whether the write landed.
+    /// The file could not be read: no answer on whether the write landed.
     Unread(String),
 }
 
@@ -2393,7 +2491,7 @@ fn repair_other_meta(pass: Pass, office_judged: bool, judged: Option<RedactionsJ
         if state.damage().is_none() {
             if let Some(head) = state.reference.as_deref().and_then(pallet_utils::parse_ref_bytes) {
                 if state.copy != pallet_utils::MetaCopyState::Bytes(state.reference.clone().unwrap_or_default()) {
-                    mend_copy(state, &head, pass, &mut report.notes);
+                    mend_copy(state, &head, pass, report);
                 }
             }
             continue;
@@ -2727,13 +2825,151 @@ mod tests {
         let state = tags(&mut Vec::new());
         assert_eq!(state.damage(), None);
 
-        let mut notes = Vec::new();
-        mend_copy(&state, &absent, Pass::AfterTaint, &mut notes);
+        let mut report = Repair::default();
+        mend_copy(&state, &absent, Pass::AfterTaint, &mut report);
+        let notes = report.notes;
         assert_eq!(std::fs::read(&copy_path).unwrap(), format!("{}\n", held).into_bytes());
         assert_eq!(std::fs::read(&ref_path).unwrap(), format!("{}\n", absent).into_bytes());
         assert!(notes.iter().any(|note| note.starts_with(&format!(
             "The copy of pallet \"@tags\"'s ref names {}, and was left as it is: the ref's head {} could not be read from the store:", held, absent
         ))), "{:?}", notes);
+    }
+
+    // A copy write that fails after its rename has landed: either pass says what the copy holds,
+    // and when no taint records what the write left unsynced, syncs the copy's folder again,
+    // also for a copy it cannot read back, and says what that sync reported, or that it did not
+    // hold; the pass after the taint recovery reads the copy as matching its ref and says
+    // nothing. Unix only: the folder-sync fault is injected on unix alone. Mutations: drop the
+    // first pass's failed write (`(_, _) if pass == Pass::BeforeTaint => {}` ahead of the notes)
+    // → nothing said in the first pass, red; skip the sync again → one sync, red; say "not set"
+    // for a landed write → the second pass's note, red; no sync for an unread copy → nothing
+    // undurable, red; drop what the sync again reported for an unread copy → one note, red. A
+    // mend that refused before writing says nothing in the first pass and that the copy was not
+    // set in the second; mutations: sort the changed-since-judged refusal as a failed write, or
+    // read a refusal's copy back → "holds the ref's head" said of a write never made, red.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_write_that_landed_despite_its_error_is_reported_and_synced_again() {
+        // Unactivated, a taint that records writes nothing: activated by another test, the cell
+        // whose second sync is recorded leaves a taint standing, and every later mend waits for it.
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::reset_activation_for_test();
+        let (_root, _scope) = scratch("ref-heal-copy-write");
+        let head = stub_parcel("head");
+        let stale = stub_parcel("stale");
+        let ref_path = pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, "tags");
+        let copy_path = pallet_utils::get_meta_copy_path("tags");
+        let folder = copy_path.parent().unwrap().to_path_buf();
+        for path in [&ref_path, &copy_path] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&ref_path, format!("{}\n", head)).unwrap();
+        let written = format!("{}\n", head).into_bytes();
+        let tags = || meta_states(&mut Vec::new()).unwrap().into_iter().find(|state| state.name == "tags").unwrap();
+        let sync_failure = format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy());
+        let unrecorded = format!(
+            "{} (additionally, while recording a durability taint for the affected object(s): injected taint-record failure)",
+            sync_failure
+        );
+        let holds = format!(
+            "The copy of pallet \"@tags\"'s ref holds the ref's head {}, though its write reported: {}", head, unrecorded
+        );
+        let maybe = format!(
+            "The copy of pallet \"@tags\"'s ref may have been set to the ref's head {}: its write reported {}, and the copy \
+            could not be read back: the read was refused for the test",
+            head, unrecorded
+        );
+        let synced = format!(
+            "Heal synced the folder of the copy of pallet \"@tags\"'s ref again, which reported: {}", sync_failure
+        );
+        let undurable_tail = format!(
+            "its copy is not durable: {}. Heal synced its folder again, and neither that sync nor a taint recording it \
+            held, so a crash can still lose the copy's write; a later heal reads the copy as matching its ref and does not \
+            sync it again.",
+            unrecorded
+        );
+
+        // How the folder syncs fail: the write's alone, heal's again too with no taint recording
+        // either, or heal's again too with a taint recording it.
+        #[derive(Clone, Copy, Debug)]
+        enum Syncs { WriteOnly, BothUnrecorded, BothSecondRecorded }
+        for pass in [Pass::BeforeTaint, Pass::AfterTaint] {
+            for unread in [false, true] {
+                for syncs in [Syncs::WriteOnly, Syncs::BothUnrecorded, Syncs::BothSecondRecorded] {
+                    let cell = format!("{:?} unread={} {:?}", pass, unread, syncs);
+                    std::fs::write(&copy_path, format!("{}\n", stale)).unwrap();
+                    let state = tags();
+                    assert_eq!(state.damage(), None, "{}: the ref is intact", cell);
+                    let mut report = Repair::default();
+                    let attempts = {
+                        let _fault = match syncs {
+                            Syncs::WriteOnly => crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder),
+                            _ => crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder),
+                        };
+                        let _taint = match syncs {
+                            Syncs::BothSecondRecorded => crate::util::file_utils::TaintRecordFaultGuard::failing_once(),
+                            _ => crate::util::file_utils::TaintRecordFaultGuard::failing(),
+                        };
+                        COPY_READ_BACK_UNREAD.with(|cell| cell.set(unread));
+                        mend_copy(&state, &head, pass, &mut report);
+                        COPY_READ_BACK_UNREAD.with(|cell| cell.set(false));
+                        crate::util::file_utils::sync_dir_attempts().into_iter().filter(|synced| *synced == folder).count()
+                    };
+                    assert_eq!(std::fs::read(&copy_path).unwrap(), written, "{}: the write landed", cell);
+                    assert_eq!(attempts, 2, "{}: the write's sync, then heal's own", cell);
+                    let said = if unread { &maybe } else { &holds };
+                    match syncs {
+                        Syncs::WriteOnly => {
+                            assert!(report.undurable.is_empty(), "{}: {:?}", cell, report.undurable);
+                            assert_eq!(report.notes, vec![said.clone()], "{}", cell);
+                        }
+                        Syncs::BothSecondRecorded => {
+                            assert!(report.undurable.is_empty(), "{}: {:?}", cell, report.undurable);
+                            assert_eq!(report.notes, vec![said.clone(), synced.clone()], "{}", cell);
+                        }
+                        Syncs::BothUnrecorded => {
+                            let opening = match unread {
+                                false => format!("The copy of pallet \"@tags\"'s ref was set to the ref's head {}, but ", head),
+                                true => format!("The copy of pallet \"@tags\"'s ref may have been set to the ref's head {}, and if it was, ", head),
+                            };
+                            assert_eq!(report.undurable, vec![format!("{}{}", opening, undurable_tail)], "{}", cell);
+                            assert!(report.notes.is_empty(), "{}: {:?}", cell, report.notes);
+                        }
+                    }
+                }
+            }
+        }
+
+        // A mend that refused before writing, its copy changed since it was judged, here to the
+        // ref's own bytes: nothing was written and nothing is synced, so the first pass says
+        // nothing and the second says the copy was not set, with why, never that it holds the head.
+        for pass in [Pass::BeforeTaint, Pass::AfterTaint] {
+            std::fs::write(&copy_path, format!("{}\n", stale)).unwrap();
+            let state = tags();
+            std::fs::write(&copy_path, &written).unwrap();
+            let mut report = Repair::default();
+            let attempts = {
+                let _fault = crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder);
+                mend_copy(&state, &head, pass, &mut report);
+                crate::util::file_utils::sync_dir_attempts().len()
+            };
+            assert_eq!(attempts, 0, "{:?}: a refusal writes and syncs nothing", pass);
+            let refused = format!(
+                "Refusing to mend the copy of pallet \"@tags\" (\"{}\"): it changed since it was judged. Nothing was \
+                written. Run the command again.",
+                copy_path.to_string_lossy()
+            );
+            let said = match pass {
+                Pass::BeforeTaint => vec![],
+                Pass::AfterTaint => vec![format!("The copy of pallet \"@tags\"'s ref was not set to the ref's head {}: {}", head, refused)],
+            };
+            assert_eq!(report.notes, said, "{:?}", pass);
+            assert!(report.undurable.is_empty(), "{:?}: {:?}", pass, report.undurable);
+        }
+
+        // A landed copy the second pass reads as matching its ref: nothing more to say.
+        let state = tags();
+        assert_eq!(state.copy, pallet_utils::MetaCopyState::Bytes(written));
     }
 
     // Mutation: judge two matching parcels as Nothing → the ref's bytes stop being a floor and
