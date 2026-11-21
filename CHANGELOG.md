@@ -95,15 +95,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   A damaged ref whose bytes name in full a parcel the store has decided is gone, with no
   durability taint the pass read covering it, is first looked up one character off: a parcel the
   store holds at one changed character of that hash, or with one inserted character taken out, is
-  what the damage most likely made it from, and the ref is rebuilt there once it verifies. This
-  lookup applies to metadata refs too. Where none matches, a pallet's ref is refused with `ref_damaged`
-  (exit 53), naming the parcel and its restore from a backup or a remote, with every head found
+  what the damage most likely made it from, and is taken as what the bytes name, as before. This
+  lookup applies to metadata refs too. Where none matches, a pallet's ref is refused with
+  `ref_damaged` (exit 53), naming the parcel and its restore from a backup or a remote, with every head found
   listed for `--ref`. Before, those bytes counted as naming nothing, so `heal` rebuilt the ref at
   whatever head a checkout, journal or interrupted operation named, with exit 0 and no word of
   the parcel, or refused saying nothing names its head. `--remove-ref` still removes such a ref
   where nothing stands on its pallet, keeping its bytes; `--ref` notes the parcel, served or not,
-  since a served warehouse cannot check the head against it and an unserved one does not keep the
-  bytes it replaces. Under a refusal whose list of heads is empty, the line now reads "No
+  since setting the ref replaces its bytes without keeping them (and, served, the head cannot be
+  checked against it). Under a refusal whose list of heads is empty, the line now reads "No
   candidate head was found for it." in place of "Nothing names a head for it.", which
   contradicted a reason naming a parcel.
 - **Each metadata pallet's ref now has a copy.** Every change to a ref under `.forklift/meta/` also

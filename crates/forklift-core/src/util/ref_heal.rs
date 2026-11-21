@@ -599,25 +599,35 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
             // character changed, or one hex character inserted ahead of the 65th. Any other empty
             // answer is as before, nothing.
             Ok(matches) if matches.is_empty() && head_decided_absent(&hash, tainted) => {
-                let mut near = Vec::new();
+                let mut nearby: Vec<String> = Vec::new();
                 for at in 0..HASH_LENGTH {
                     for digit in b"0123456789abcdef".iter().filter(|digit| **digit != bytes[at]) {
                         let mut changed = bytes[..HASH_LENGTH].to_vec();
                         changed[at] = *digit;
-                        match matching(&String::from_utf8_lossy(&changed))? {
-                            Ok(found) => near.extend(found),
-                            Err(untold) => return Ok(untold),
-                        }
+                        nearby.push(String::from_utf8_lossy(&changed).into_owned());
                     }
                 }
                 if run > HASH_LENGTH {
                     for at in 0..=HASH_LENGTH {
                         let mut kept = bytes[..=HASH_LENGTH].to_vec();
                         kept.remove(at);
-                        match matching(&String::from_utf8_lossy(&kept))? {
-                            Ok(found) => near.extend(found),
-                            Err(untold) => return Ok(untold),
-                        }
+                        nearby.push(String::from_utf8_lossy(&kept).into_owned());
+                    }
+                }
+                // Each of the ~1000 hashes is judged by its own pack answer, as a lookup would
+                // judge it, then looked up only where a stat of its loose path or a pack index
+                // holds it, or the taint names it, so no fan-out folder is listed per hash.
+                let mut near = Vec::new();
+                for candidate in nearby {
+                    if !tainted.hashes.contains(&candidate)
+                        && unlisted.get().is_some_and(|packs| packs.reason_for(&candidate).is_none())
+                        && !crate::util::file_utils::raw_object_present(&candidate)?
+                    {
+                        continue;
+                    }
+                    match matching(&candidate)? {
+                        Ok(found) => near.extend(found),
+                        Err(untold) => return Ok(untold),
                     }
                 }
                 near.sort();
@@ -1209,7 +1219,9 @@ pub fn check_set_damaged_ref(pallet: &str, parcel: &str, notes: &mut Vec<String>
 }
 
 /// Every refusal of [`set_damaged_ref`], before its write: the damaged ref, the parcel's full
-/// hash, and the preconditions the write holds it to.
+/// hash, and the preconditions the write holds it to. It also backs the dry run and comes before
+/// every refusal, so its `notes` say what was judged, or what the write would do, never what was
+/// done.
 fn admit_set(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<(DamagedRef, String, pallet_utils::RefPreconditions), String> {
     let damaged = damaged_ref(pallet, notes)?;
 
@@ -1229,11 +1241,11 @@ fn admit_set(pallet: &str, parcel: &str, notes: &mut Vec<String>) -> Result<(Dam
     if served {
         refuse_below_a_floor(&damaged, &head, notes)?;
     } else if let RefDamage::Unreadable(bytes) = &damaged.damage {
-        // The write replaces the only record of a parcel the bytes name and the store does not
-        // hold, so the note keeps it. A lookup that fails only leaves the note out.
+        // The write would replace the only record of a parcel the bytes name and the store does
+        // not hold, so the note keeps it. A lookup that fails only leaves the note out.
         if let Ok(Salvage::Absent(parcel)) = salvage(bytes, &Tainted::read(notes)) {
             push_note(notes, format!(
-                "The ref of pallet \"{}\" named {}, which is not in the store; its bytes are replaced and not kept.",
+                "The ref of pallet \"{}\" names {}, which is not in the store; setting the ref replaces those bytes, which are not kept.",
                 damaged.pallet, parcel
             ));
         }
@@ -1336,7 +1348,7 @@ fn refuse_below_a_floor(damaged: &DamagedRef, head: &str, notes: &mut Vec<String
     // The bytes stand on a parcel the store does not hold, so no ancestry can be walked from it.
     if let Some(parcel) = &evidence.salvage_absent {
         push_note(notes, format!(
-            "This warehouse is served, and the ref of pallet \"{}\" named {}, which is not in the store, so {} could not be checked against it: its clones may rely on that parcel.",
+            "This warehouse is served, and the ref of pallet \"{}\" names {}, which is not in the store, so {} could not be checked against it: its clones may rely on that parcel, and setting the ref replaces those bytes, which are not kept.",
             damaged.pallet, parcel, head
         ));
     }
@@ -2795,6 +2807,38 @@ fn rebuild_redactions(state: &MetaState, blocking: &[String], judged: Option<Red
 mod tests {
     use super::*;
     use crate::util::pallet_utils::tests::{scratch, stub_parcel};
+
+    // A --ref the trust check refuses, over a ref whose bytes name a gone parcel, writes nothing,
+    // and its notes say what the write would do, never that it did, served or not. The check runs
+    // after every note, so the refusal shows each beside an unchanged ref.
+    #[test]
+    fn a_refused_set_over_a_gone_parcel_notes_only_what_the_write_would_do() {
+        for served in [false, true] {
+            let (_root, _scope) = scratch(&format!("ref-heal-set-gone-{}", served));
+            let head = stub_parcel("head");
+            if served {
+                assert!(crate::util::tombstone_utils::mark_served(true).unwrap());
+            }
+            let gone = blake3::hash(b"never stored here").to_hex().to_string();
+            let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = format!("{}torn", gone);
+            std::fs::write(&path, &bytes).unwrap();
+
+            TRUSTED_REFUSED.with(|refused| refused.set(true));
+            let mut notes = Vec::new();
+            let set = set_damaged_ref("main", &head, &mut notes);
+            TRUSTED_REFUSED.with(|refused| refused.set(false));
+
+            assert_eq!(set.err().as_deref(), Some("the trust check was refused for the test"), "served {}", served);
+            let note = match served {
+                true => format!("This warehouse is served, and the ref of pallet \"main\" names {}, which is not in the store, so {} could not be checked against it: its clones may rely on that parcel, and setting the ref replaces those bytes, which are not kept.", gone, head),
+                false => format!("The ref of pallet \"main\" names {}, which is not in the store; setting the ref replaces those bytes, which are not kept.", gone),
+            };
+            assert!(notes.contains(&note), "served {}: {:?}", served, notes);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes, "served {}: the ref is left alone", served);
+        }
+    }
 
     // A user rebuild whose head the trust check refuses was never written, whatever its ref
     // reads back as; one whose write landed though it reported an error is rebuilt, with what

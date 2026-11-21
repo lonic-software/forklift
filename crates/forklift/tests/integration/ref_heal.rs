@@ -322,11 +322,11 @@ fn a_ref_whose_bytes_name_a_gone_parcel_is_refused_naming_it() {
                     assert!(forklift_core::util::tombstone_utils::mark_served(true).unwrap());
                 }
                 format!(
-                    "This warehouse is served, and the ref of pallet \"side\" named {}, which is not in the store, so {} could not be checked against it",
+                    "This warehouse is served, and the ref of pallet \"side\" names {}, which is not in the store, so {} could not be checked against it: its clones may rely on that parcel, and setting the ref replaces those bytes, which are not kept.",
                     gone, side
                 )
             }
-            _ => format!("The ref of pallet \"side\" named {}, which is not in the store; its bytes are replaced and not kept.", gone),
+            _ => format!("The ref of pallet \"side\" names {}, which is not in the store; setting the ref replaces those bytes, which are not kept.", gone),
         };
         let set = area.run_ok(&root, &["heal", "--ref", &format!("side={}", side)]);
         assert!(text(&set.stdout).contains(&note), "{}: {}", row, text(&set.stdout));
