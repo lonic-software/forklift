@@ -495,7 +495,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     ref_notes.extend(second.notes);
     let mut refs_refused = second.refused;
     refs_refused.extend(meta_second.refused);
-    refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: second.unjudged, held: None });
+    refs_left.replace(RefsLeft { deferred: Vec::new(), refused: refs_refused.clone(), unjudged: Vec::new(), held: None });
     if let Some(error) = stopped_with(second.stopped, &second.undurable) {
         return Err(changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes));
     }
