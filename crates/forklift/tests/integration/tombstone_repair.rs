@@ -529,13 +529,15 @@ fn heal_over_damaged_tombstones_after_the_taint_recovery_names_every_ref_it_judg
     assert!(message.contains(&said), "{}", message);
     assert!(message.contains("The ref of pallet \"zeta\" was not rebuilt: nothing in this warehouse names its head"), "{}", message);
     assert!(!message.contains("this run stopped before judging it"), "{}", message);
-    // The taint it cleared is said too: its files are gone, so no later run reports it.
-    // Up to the shard's path, whose separators are the platform's.
+    // The taint it cleared is said too, before the notes on the run: its files are gone, so no
+    // later run reports it. The shard's path is read with "/" between its parts on every platform.
+    let message = message.replace('\\', "/");
     let cleared = format!(
-        "Durability taint cleared: restaged objects/{}/{}; resolved (absent and unreferenced) inventory",
-        &main[..2], &main[2..],
+        "Durability taint cleared: restaged objects/{}/{}; resolved (absent and unreferenced) {}.",
+        &main[..2], &main[2..], shard.to_string_lossy().replace('\\', "/"),
     );
-    assert!(message.contains(&cleared), "{}", message);
+    let at = message.find(&cleared).unwrap_or_else(|| panic!("{}", message));
+    assert!(message.find("Note: ").is_some_and(|note| at < note), "{}", message);
     assert!(message.contains("Note: the staged inventory shard"), "{}", message);
 }
 

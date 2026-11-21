@@ -356,7 +356,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // judge only what is left. A refusal says what this run already changed: its own "Nothing was
     // changed" speaks only for the write it refused. Its notes go along: a check they say was
     // skipped would otherwise go unreported.
-    let changed = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
+    let repairs = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed]| {
         let mut error = config_said(error);
         if let Some(record) = &record_rebuilt {
             error = forklift_core::error::append_to_message(error, &record.sentence());
@@ -386,7 +386,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         for removed in removed {
             error = forklift_core::error::append_to_message(error, &removed_sentence(removed));
         }
-        append_notes(error, notes)
+        error
+    };
+    let changed = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
+        append_notes(repairs(error, rebuilt, removed), notes)
     };
 
     for (pallet, parcel) in set_ref {
@@ -411,12 +414,13 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         false => position_heal::repair(position, &mut ref_notes).map_err(|error| changed(error, &refs_rebuilt, &refs_removed, &ref_notes))?,
     };
 
+    // The repairs, then the notes on them.
+    let repairs_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed]| match &late_position {
+        Some(position) => forklift_core::error::append_to_message(repairs(error, rebuilt, removed), &position.sentence()),
+        None => repairs(error, rebuilt, removed),
+    };
     let changed_after = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String]| {
-        let mut error = changed(error, rebuilt, removed, notes);
-        if let Some(position) = &late_position {
-            error = forklift_core::error::append_to_message(error, &position.sentence());
-        }
-        error
+        append_notes(repairs_after(error, rebuilt, removed), notes)
     };
 
     // Before the taint recovery, whose closure walk reads every ref: a ref rebuilt here roots
@@ -424,6 +428,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let first = ref_heal::repair(Pass::BeforeTaint).map_err(|error| changed_after(error, &refs_rebuilt, &refs_removed, &ref_notes))?;
     refs_rebuilt.extend(first.rebuilt);
     ref_notes.extend(first.notes);
+    let rebuilt_before_taint = refs_rebuilt.len();
     // What the first pass refused, the ref whose write met the stop included, is said here: the
     // second pass, which would refuse it again, never runs. So are the damaged refs it stopped
     // before judging, beside the meta refs left.
@@ -456,16 +461,17 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
     };
 
-    // Every failure from here on says the taint this run cleared, and what its recovery noted,
-    // beside the repairs before it: the taint's files are gone, so no later run reports them.
-    // `since_taint` is what the run did after the taint recovery, in the order it did it.
-    let taint_cleared = taint_sentence(&outcome);
-    let taint_notes: Vec<String> = outcome.notes.iter().map(|note| forklift_core::error::rendered_frames(note)).collect();
+    // Every failure from here on says the taint this run cleared, and what its recovery noted:
+    // the taint's files are gone, so no later run reports them. It goes after the repairs before
+    // it, and `since_taint` holds what each step after it repaired, pushed as the step ends; the
+    // notes, the taint recovery's first, follow every repair.
+    let taint_notes = outcome.notes.clone();
+    let mut since_taint: Vec<String> = taint_sentence(&outcome).into_iter().collect();
     let changed_after_taint = |error: String, rebuilt: &[ref_heal::Rebuilt], removed: &[ref_heal::Removed], notes: &[String], since_taint: &[String]| {
+        let error = repairs_after(error, &rebuilt[..rebuilt_before_taint], removed);
+        let error = since_taint.iter().fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence));
         let notes: Vec<String> = taint_notes.iter().chain(notes).cloned().collect();
-        let error = changed_after(error, rebuilt, removed, &notes);
-        taint_cleared.iter().chain(since_taint)
-            .fold(error, |error, sentence| forklift_core::error::append_to_message(error, sentence))
+        append_notes(error, &notes)
     };
 
     // After the taint, which may have refetched what a candidate lacked; before the operation
@@ -478,9 +484,10 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         }
         Err(stopped) => {
             refs_left.replace(RefsLeft::after_second(&meta_deferred, stopped.refused, stopped.unjudged));
+            since_taint.extend(stopped.rebuilt.iter().map(rebuilt_sentence));
             refs_rebuilt.extend(stopped.rebuilt);
             ref_notes.extend(stopped.notes);
-            return Err(changed_after_taint(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes, &[]));
+            return Err(changed_after_taint(stopped.error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint));
         }
     };
     // The trust repair runs in both passes, and may note the same thing in each: a refusal and
@@ -492,11 +499,13 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     if let (Some(_), Some(after)) = (&trust_repair.restored, &trust_restored_after) {
         ref_notes.push(format!("{} (after the taint recovery).", after.sentence().trim_end_matches('.')));
     }
-    let mut since_taint: Vec<String> = trust_after_said(trust_repair.restored.as_ref(), trust_restored_after.as_ref()).into_iter().collect();
     ref_notes.extend(meta_second.trust.notes);
     // So for the meta refs: one still damaged when this pass reads it was judged by the first
-    // too, and may be noted the same way again.
+    // too, and may be noted the same way again. The pass's rebuilt meta refs are said before a
+    // trust file only it restored.
     let meta_second = meta_second.repair;
+    since_taint.extend(meta_second.rebuilt.iter().map(rebuilt_sentence));
+    since_taint.extend(trust_after_said(trust_repair.restored.as_ref(), trust_restored_after.as_ref()));
     refs_rebuilt.extend(meta_second.rebuilt);
     ref_notes.extend(meta_second.notes);
     if let Some(error) = stopped_with(meta_second.stopped, &meta_second.undurable) {
@@ -504,6 +513,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
 
     let second = ref_heal::repair(Pass::AfterTaint).map_err(|error| changed_after_taint(error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint))?;
+    since_taint.extend(second.rebuilt.iter().map(rebuilt_sentence));
     refs_rebuilt.extend(second.rebuilt);
     ref_notes.extend(second.notes);
     let mut refs_refused = second.refused;
@@ -546,10 +556,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
     let unreadable = inventory_error.is_some();
     // A step that fails after a written rebuild says so beside every other repair.
-    let with_rebuilt = |error: String, rebuilt: &Option<InventoryRebuilt>| match rebuilt {
-        Some(rebuilt) => forklift_core::error::append_to_message(error, &rebuilt.sentence()),
-        None => error,
-    };
+    since_taint.extend(inventory_rebuilt.iter().map(InventoryRebuilt::sentence));
     let held_park = partial_park.is_some() && inventory_held.is_some();
     if held_park {
         ref_notes.push(
@@ -571,7 +578,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let recovered = match waits.is_some() || held_park || unreadable {
         true => Ok(None),
         false => operation_utils::recover(),
-    }.map_err(|error| with_rebuilt(changed_after_taint(error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint), &inventory_rebuilt))?;
+    }.map_err(|error| changed_after_taint(error, &refs_rebuilt, &refs_removed, &ref_notes, &since_taint))?;
     let operation = recovered.map(|recovery| OperationRecovery {
         operation: recovery.operation.as_str().to_string(),
         outcome: match recovery.outcome {
@@ -596,7 +603,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
                 // Judged against the position that recovery left, which it may have moved.
                 let settled = merge_state_heal::agreement_in(&forklift_core::globals::bay_root());
                 let later = merge_state_heal::repair(settled.as_ref(), &mut ref_notes)
-                    .map_err(|error| with_rebuilt(changed_after_taint(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes, &since_taint), &inventory_rebuilt))?;
+                    .map_err(|error| changed_after_taint(String::from(error), &refs_rebuilt, &refs_removed, &ref_notes, &since_taint))?;
                 merge_repair = merge_repair.then(later);
                 if merge_note.is_none() {
                     merge_note = merge_note_of(&merge_repair.refusal);
@@ -1633,13 +1640,16 @@ fn scope_sentence(rebuilt: &ScopeRebuilt) -> String {
 /// call already appended: a ref both meta passes judge may be noted the same way by each, and
 /// more than one pass adds to the notes a refusal carries, so a refusal says each note once.
 fn append_notes(error: String, notes: &[String]) -> String {
-    let mut said: Vec<&str> = Vec::new();
+    let mut said: Vec<String> = Vec::new();
     notes.iter().fold(error, |error, note| {
-        if said.contains(&note.as_str()) {
+        // Judged once rendered: a note carrying a refusal's frame says the same as its rendering.
+        let note = forklift_core::error::rendered_frames(note);
+        if said.contains(&note) {
             return error;
         }
+        let error = forklift_core::error::append_to_message(error, &format!("Note: {}", note));
         said.push(note);
-        forklift_core::error::append_to_message(error, &format!("Note: {}", note))
+        error
     })
 }
 
@@ -2342,19 +2352,23 @@ impl CommandOutput for HealReport {
 }
 
 impl OperationRecovery {
-    /// The recovery as report lines: its outcome, then the files it left unheld.
-    fn lines(&self) -> Vec<String> {
+    /// What the recovery did, and where it left the bay.
+    fn outcome_line(&self) -> String {
         let at = match &self.base {
             Some(base) => format!("\"{}\" at {}", self.pallet, base),
             None => format!("\"{}\" (unborn)", self.pallet),
         };
-
-        let mut lines = vec![match self.outcome {
+        match self.outcome {
             OperationOutcome::Finished => format!("The interrupted {} had already finished; the bay stands on {}.", self.operation, at),
             OperationOutcome::RolledForward => format!("Finished the interrupted {}; the bay stands on {}.", self.operation, at),
             OperationOutcome::RolledBack => format!("Undid the interrupted {}; the bay is back on {}.", self.operation, at),
             OperationOutcome::Cleared => format!("The interrupted {} had changed nothing to undo; its record is cleared.", self.operation),
-        }];
+        }
+    }
+
+    /// The recovery as report lines: its outcome, then the files it left unheld.
+    fn lines(&self) -> Vec<String> {
+        let mut lines = vec![self.outcome_line()];
 
         if !self.unheld.is_empty() {
             lines.push(format!("{}:", UNHELD));
@@ -2365,12 +2379,10 @@ impl OperationRecovery {
 
     /// The recovery as one sentence of a failure's message, the files it left unheld listed inline.
     fn sentence(&self) -> String {
-        let mut lines = self.lines();
-        lines.truncate(1);
-        if !self.unheld.is_empty() {
-            lines.push(format!("{}: {}.", UNHELD, self.unheld.join(", ")));
+        match self.unheld.is_empty() {
+            true => self.outcome_line(),
+            false => format!("{} {}: {}.", self.outcome_line(), UNHELD, self.unheld.join(", ")),
         }
-        lines.join(" ")
     }
 }
 
@@ -2520,6 +2532,11 @@ mod tests {
         assert_eq!(append_notes("It was refused.".to_string(), &notes), "It was refused. Note: The first. Note: The both. Note: The second.");
         // Distinct notes are each said.
         assert_eq!(append_notes("It was refused.".to_string(), &notes[..2]), "It was refused. Note: The first. Note: The both.");
+        // A note carrying a refusal's frame is said rendered, and once beside its rendering.
+        use forklift_core::error::{CoreError, RefusalCode};
+        let framed: String = CoreError::refusal(RefusalCode::SealedDamaged, "The record is damaged.", "forklift heal").into();
+        let notes = [framed, "The record is damaged. (Next step: forklift heal)".to_string()];
+        assert_eq!(append_notes("It was refused.".to_string(), &notes), "It was refused. Note: The record is damaged. (Next step: forklift heal)");
     }
 
     #[test]
