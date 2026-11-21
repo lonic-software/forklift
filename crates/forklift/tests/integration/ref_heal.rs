@@ -2141,14 +2141,15 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
 }
 
 /// A meta pallet's first write whose sync failed and whose birth a power loss then undid: the
-/// taint records the vanished file. A copy gone beside a ref that holds a head resolves in the
-/// taint recovery and is set to the ref's bytes after it; a ref gone beside its copy is rebuilt
-/// from the copy before the recovery. Either file gone with the other one gone or damaged too
-/// is more than one fault, and the taint stands.
+/// taint records the vanished file. A copy gone beside a ref that is a file holding a head
+/// resolves in the taint recovery, and the meta pass after it sets the copy to the ref's bytes;
+/// where the store does not give that head, the copy is left and the run refuses the head as
+/// lost, as on a warehouse with no taint. A ref gone beside its copy is rebuilt from the copy before the recovery. A copy
+/// gone beside a ref that is gone, damaged or not a file is more than one fault, and the taint
+/// stands.
 // Mutations: file a vanished copy as unrecognized again → "copy" red (the run refuses, the
 // taint stands); resolve a vanished copy whatever its ref holds → "copy-ref-damaged" red (the
-// taint clears); judge the ref by its bytes alone → "copy-head-absent" red (the taint clears);
-// read the ref through a link → "copy-ref-link" red (the taint clears).
+// taint clears); read the ref through a link → "copy-ref-link" red (the taint clears).
 #[test]
 fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
     for case in ["copy", "ref", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
@@ -2178,9 +2179,15 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
                 std::fs::write(&target, std::fs::read(&reference).unwrap()).unwrap();
                 forklift_core::util::file_utils::remove_file(&reference).unwrap();
                 #[cfg(unix)]
-                std::os::unix::fs::symlink(&target, &reference).unwrap();
+                let linked = std::os::unix::fs::symlink(&target, &reference);
                 #[cfg(windows)]
-                if std::os::windows::fs::symlink_file(&target, &reference).is_err() { continue; }
+                let linked = std::os::windows::fs::symlink_file(&target, &reference);
+                // A Windows runner without the privilege to make a link skips the case, and says so.
+                if let Err(error) = linked {
+                    assert!(cfg!(windows), "{}: {}", case, error);
+                    eprintln!("{}: skipped, no link could be made here: {}", case, error);
+                    continue;
+                }
             }
             _ => {}
         }
@@ -2195,12 +2202,17 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
                 assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "{}: {}", case, said);
                 assert_eq!(std::fs::read(&copy).unwrap(), format!("{}\n", second).into_bytes(), "{}: the copy holds the ref's bytes: {}", case, said);
             }
+            "copy-head-absent" => {
+                assert!(!taint_left, "{}: the taint clears: {}", case, said);
+                assert!(!copy.exists(), "{}: the copy is not set to a head the store does not give: {}", case, said);
+                assert!(!output.status.success(), "{}: {}", case, said);
+                assert!(said.contains("\"code\": \"objects_lost\"") && said.contains(&absent), "{}: the lost head is refused as lost: {}", case, said);
+            }
             _ => {
                 assert!(!output.status.success(), "{}: {}", case, said);
                 assert!(taint_left, "{}: the taint stands: {}", case, said);
                 let why = match case {
                     "copy-ref-damaged" => "does not hold a head either".to_string(),
-                    "copy-head-absent" => format!("names {}, which is not in the store", absent),
                     "copy-ref-link" => "is not a file".to_string(),
                     _ => "is lost too".to_string(),
                 };

@@ -656,29 +656,43 @@ async fn resolve_the_rest(
                     ));
                 }
             },
-            // A copy is a second record of its ref's head, which the meta pass after the recovery
-            // sets it to. So its absence is made durable and resolved, but only beside a ref that
-            // meta pass would set it from: with the ref gone, damaged or naming a head the store
-            // does not give whole, the taint record is the one thing left saying the copy is lost.
-            VanishedClass::MetaCopy(reference) => match meta_ref_gives_its_head(root, &reference) {
-                Ok(()) => match sync_nearest_ancestor(root, relative) {
-                    Ok(()) => refs_resolved.push(relative.to_string_lossy().into_owned()),
-                    Err(error) => {
+            // A copy is a second record of its ref's head. Beside a ref that is a file holding a
+            // head, the meta pass after the recovery reaches the copy on every run, as on a
+            // warehouse with no taint: it sets the copy to the ref's bytes, or says why not. So the
+            // record is resolved there, its absence made durable. Whether the store gives that head
+            // is the mend's question, asked once this recovery has restaged what it can. Beside any
+            // other ref, the record stays: nothing else would say the copy is lost.
+            VanishedClass::MetaCopy(name) => {
+                let reference = format!("{}/{}", pallet_utils::FOLDER_NAME_META_ROOT, name);
+                let why = match pallet_utils::read_file_state(&root.join(pallet_utils::FOLDER_NAME_META_ROOT).join(name)) {
+                    Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => match pallet_utils::parse_ref_bytes(&bytes) {
+                        Some(_) => None,
+                        None => Some("does not hold a head either".to_string()),
+                    },
+                    Ok(pallet_utils::MetaCopyState::Absent) => Some("is lost too".to_string()),
+                    Ok(pallet_utils::MetaCopyState::Other) => Some("is not a file".to_string()),
+                    Err(error) => Some(format!("cannot be read ({})", error)),
+                };
+                match why {
+                    None => match sync_nearest_ancestor(root, relative) {
+                        Ok(()) => refs_resolved.push(relative.to_string_lossy().into_owned()),
+                        Err(error) => {
+                            remainder.insert(relative.clone());
+                            dangling_lines.push(format!(
+                                "a lost meta pallet ref copy whose loss could not be made durable: \"{}\" ({})",
+                                relative.to_string_lossy(), error
+                            ));
+                        }
+                    },
+                    Some(why) => {
                         remainder.insert(relative.clone());
                         dangling_lines.push(format!(
-                            "a lost meta pallet ref copy whose loss could not be made durable: \"{}\" ({})",
-                            relative.to_string_lossy(), error
+                            "a lost meta pallet ref copy whose ref (\"{}\") {}: \"{}\"",
+                            reference, why, relative.to_string_lossy()
                         ));
                     }
-                },
-                Err(why) => {
-                    remainder.insert(relative.clone());
-                    dangling_lines.push(format!(
-                        "a lost meta pallet ref copy whose ref (\"{}\") {}: \"{}\"",
-                        reference, why, relative.to_string_lossy()
-                    ));
                 }
-            },
+            }
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1481,9 +1495,11 @@ enum VanishedClass {
     Ref,
     /// The copy of a meta pallet's ref (`meta-copy/<name>`), gone since the taint was recorded:
     /// the first write of a meta pallet whose copy's directory sync failed, then a power loss that
-    /// undid the copy's birth. The path of the ref it copies, root-relative and `/`-separated
-    /// (`meta/<name>`).
-    MetaCopy(String),
+    /// undid the copy's birth. The meta pallet's name, one of [`META_PALLET_NAMES`]: a path of any
+    /// other shape under `meta-copy/` is unrecognized.
+    ///
+    /// [`META_PALLET_NAMES`]: crate::util::meta_tree::META_PALLET_NAMES
+    MetaCopy(&'static str),
     /// A shape none of the above recognizes.
     Unrecognized,
 }
@@ -1503,9 +1519,11 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
     }
 
     if let Ok(name) = relative.strip_prefix(pallet_utils::FOLDER_NAME_META_COPY_ROOT) {
-        let parts: Vec<String> = name.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
-        if !parts.is_empty() {
-            return VanishedClass::MetaCopy(format!("{}/{}", pallet_utils::FOLDER_NAME_META_ROOT, parts.join("/")));
+        let mut parts = name.components();
+        if let (Some(std::path::Component::Normal(name)), None) = (parts.next(), parts.next()) {
+            if let Some(name) = crate::util::meta_tree::META_PALLET_NAMES.iter().find(|known| std::ffi::OsStr::new(known) == name) {
+                return VanishedClass::MetaCopy(*name);
+            }
         }
     }
 
@@ -1521,28 +1539,6 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_INDEX => VanishedClass::PackIndex(relative.with_extension("")),
         Some(ext) if ext == signature_table::FILE_EXTENSION_SIGNATURE_TABLE => VanishedClass::SignatureTable,
         _ => VanishedClass::Unrecognized,
-    }
-}
-
-/// Whether meta ref `reference` (root-relative, as [`VanishedClass::MetaCopy`] names it) is one
-/// the meta pass after the recovery sets a lost copy from: a file, not a link, that holds a head
-/// the store gives whole, as `ref_heal`'s copy mend asks. `Err` says why not, read errors included.
-fn meta_ref_gives_its_head(root: &Path, reference: &str) -> Result<(), String> {
-    let path = root.join(reference);
-    let bytes = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() => std::fs::read(&path).map_err(|error| format!("cannot be read ({})", error))?,
-        Ok(_) => return Err("is not a file".to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err("is lost too".to_string()),
-        Err(error) => return Err(format!("cannot be read ({})", error)),
-    };
-    let Some(head) = pallet_utils::parse_ref_bytes(&bytes) else {
-        return Err("does not hold a head either".to_string());
-    };
-    match object_utils::load_parcel_judged(&head) {
-        Ok(Ok(_)) | Ok(Err(object_utils::NotAParcel::Newer(_))) => Ok(()),
-        Ok(Err(object_utils::NotAParcel::Other(_))) => Err(format!("names {}, which is not a parcel", head)),
-        Err((_, file_utils::ReadFault::Decided(file_utils::Decided::Absent))) => Err(format!("names {}, which is not in the store", head)),
-        Err((error, _)) => Err(format!("names {}, which cannot be read from the store ({})", head, error)),
     }
 }
 
@@ -6242,9 +6238,11 @@ mod tests {
         assert!(matches!(classify_vanished(Path::new("pallets/team/feature")), VanishedClass::Ref));
         assert!(matches!(
             classify_vanished(Path::new("meta-copy/office")),
-            VanishedClass::MetaCopy(reference) if reference == "meta/office"
+            VanishedClass::MetaCopy("office")
         ));
-        assert!(matches!(classify_vanished(Path::new("meta-copy")), VanishedClass::Unrecognized));
+        for shape in ["meta-copy", "meta-copy/main", "meta-copy/office/office", "meta-copy/../pallets/main"] {
+            assert!(matches!(classify_vanished(Path::new(shape)), VanishedClass::Unrecognized), "{}", shape);
+        }
         // A meta ref gone beside its copy is rebuilt from it before the recovery restages, so
         // one that is still gone has no copy to rebuild from: more than one fault.
         assert!(matches!(classify_vanished(Path::new("meta/office")), VanishedClass::Unrecognized));
