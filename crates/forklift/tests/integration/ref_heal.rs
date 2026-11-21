@@ -1107,6 +1107,36 @@ fn a_reachability_walk_that_cannot_finish_claims_nothing_lost() {
 }
 
 #[test]
+fn a_walk_that_cannot_finish_still_reports_the_repairs_under_json() {
+    // The failure is uncoded, so it has no details to carry the report in: under --json its
+    // message says what the run did, which human mode prints before it.
+    // Mutation: drop the report's lines from the uncoded failure → the rebuild goes unsaid → red.
+    let area = Area::new("walk-error-rebuilt");
+    let root = area.warehouse();
+    let before = head(&root, "main");
+    damage(&root, "main", Damage::Delete);
+    std::fs::write(root.join("c.txt"), "three\n").unwrap();
+    area.run_ok(&root, &["load", "."]);
+    garble_staged_shards(&root);
+    let rebuilt = format!("Rebuilt the ref of pallet \"main\" at {}", before);
+
+    let output = area.run(&root, &["--json", "heal"]);
+    assert_eq!(output.status.code(), Some(1), "{}{}", text(&output.stdout), text(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("heal could not finish its reachability check"), "{}", value);
+    assert!(message.contains(&rebuilt), "{}", value);
+    assert_eq!(head(&root, "main"), before);
+
+    // Human mode printed the report before the failure, and the failure does not say it twice.
+    damage(&root, "main", Damage::Delete);
+    let output = area.run(&root, &["heal"]);
+    assert_eq!(output.status.code(), Some(1), "{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(text(&output.stdout).contains(&rebuilt), "{}", text(&output.stdout));
+    assert!(!text(&output.stderr).contains(&rebuilt), "{}", text(&output.stderr));
+}
+
+#[test]
 fn a_refused_ref_keeps_its_code_when_the_walk_cannot_finish() {
     // The walk's failure is said, but a ref heal refused still answers `ref_damaged` with its own
     // next step.

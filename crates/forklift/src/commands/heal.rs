@@ -1014,12 +1014,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             let also = lines.split_off(1);
             return Err(match CoreError::from(error) {
                 refused @ CoreError::Refusal { .. } => with_report(&report, refused, also),
-                // Under --json the recovery's outcome too, which no report shows there: its marker
-                // is cleared, so no later run reports it.
                 CoreError::Other(message) => CoreError::Other(
-                    std::iter::once(message)
-                        .chain(report.operation.iter().filter(|_| output::is_json()).flat_map(OperationRecovery::lines))
-                        .chain(also).collect::<Vec<_>>().join("\n"),
+                    std::iter::once(message).chain(json_said(&report)).chain(also).collect::<Vec<_>>().join("\n"),
                 ),
             }.into());
         }
@@ -1043,7 +1039,7 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         if !report.refs_refused.is_empty() {
             return Err(ref_refusal(&report, Some(&unfinished)).into());
         }
-        return Err(unfinished);
+        return Err(std::iter::once(unfinished).chain(json_said(&report)).collect::<Vec<_>>().join("\n"));
     }
 
     if report.refs_refused.is_empty() && report.objects_lost.is_none() && origin_refused.is_none() {
@@ -1475,6 +1471,18 @@ fn with_report(report: &HealReport, refused: CoreError, also: Vec<String>) -> Co
     };
 
     CoreError::refusal_with_details(code, lines.join("\n"), next_step, details)
+}
+
+/// What the run did, as the lines of an uncoded failure under `--json`. Such a failure has no
+/// `details` to carry the report in, and no report is emitted beside it, so without these lines
+/// the run's repairs, the recovery's outcome among them (its marker is cleared, so no later run
+/// reports it), would go unreported. Human mode prints the report before the failure, so this is
+/// empty there, and for a run that found and did nothing, where the failure speaks alone.
+fn json_said(report: &HealReport) -> Vec<String> {
+    match output::is_json() && (report.was_tainted || !report.nothing_done()) {
+        true => report.lines(),
+        false => Vec::new(),
+    }
 }
 
 /// The `ref_damaged` refusal of a run that left a damaged ref standing, carrying the whole report.
@@ -2144,160 +2152,171 @@ impl HealReport {
             && self.refs_rebuilt.is_empty() && self.refs_removed.is_empty() && self.refs_refused.is_empty()
             && self.objects_lost.is_none()
     }
-}
 
-impl CommandOutput for HealReport {
-    fn render_human(&self) {
+    /// The report as the lines a person reads, in the order they are printed.
+    fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+
         if let Some(rebuilt) = &self.record_rebuilt {
-            println!("{}", rebuilt.sentence());
+            lines.push(rebuilt.sentence().to_string());
         }
 
         if let Some(rebuilt) = &self.unavailable_rebuilt {
-            println!("{}", rebuilt.sentence());
+            lines.push(rebuilt.sentence().to_string());
         }
 
         if let Some(rebuilt) = &self.redactions_applied_rebuilt {
-            println!("{}", rebuilt.sentence());
+            lines.push(rebuilt.sentence().to_string());
         }
 
         if let Some(restored) = &self.checkout_scope_restored {
-            println!("{}", restored.sentence());
+            lines.push(restored.sentence().to_string());
         }
 
         for sentence in self.merge_state_restored.iter().flat_map(MergeStateRestored::sentences) {
-            println!("{}", sentence);
+            lines.push(sentence.to_string());
         }
 
         if let Some(rebuilt) = &self.fetch_scope_rebuilt {
-            println!("{}", scope_sentence(rebuilt));
+            lines.push(scope_sentence(rebuilt).to_string());
         }
 
         if let Some(rebuilt) = &self.parked_rebuilt {
-            println!("{}", rebuilt.sentence());
+            lines.push(rebuilt.sentence().to_string());
         }
 
         if let Some(rebuilt) = &self.position_rebuilt {
-            println!("{}", rebuilt.sentence());
+            lines.push(rebuilt.sentence().to_string());
         }
 
         if let Some(repaired) = &self.config_repaired {
             for sentence in repaired.sentences() {
-                println!("{}", sentence);
+                lines.push(sentence.to_string());
             }
         }
 
         if let Some(restored) = &self.trust_restored {
-            println!("{}", restored.sentence());
+            lines.push(restored.sentence().to_string());
         }
 
         if let Some(rebuilt) = &self.inventory_rebuilt {
-            println!("{}", rebuilt.sentence());
+            lines.push(rebuilt.sentence().to_string());
         }
 
         for rebuilt in &self.refs_rebuilt {
-            println!("{}", rebuilt_sentence(rebuilt));
+            lines.push(rebuilt_sentence(rebuilt).to_string());
         }
 
         for removed in &self.refs_removed {
-            println!("{}", removed_sentence(removed));
+            lines.push(removed_sentence(removed).to_string());
         }
 
         if let Some(operation) = &self.operation {
-            operation.render_human();
+            lines.extend(operation.lines());
         }
 
         if self.was_tainted {
             if self.restaged.is_empty() && self.resolved.is_empty() {
-                println!("Durability taint cleared.");
+                lines.push("Durability taint cleared.".to_string());
             } else {
-                println!("Durability taint cleared:");
+                lines.push("Durability taint cleared:".to_string());
                 for path in &self.restaged {
-                    println!("  restaged: {}", path);
+                    lines.push(format!("  restaged: {}", path));
                 }
                 for path in &self.resolved {
-                    println!("  resolved (absent and unreferenced): {}", path);
+                    lines.push(format!("  resolved (absent and unreferenced): {}", path));
                 }
             }
         } else if self.nothing_done() {
-            println!("Nothing to heal — no durability taint is standing.");
+            lines.push("Nothing to heal — no durability taint is standing.".to_string());
         }
 
         if !self.unsealed.is_empty() {
-            println!(
+            lines.push(format!(
                 "{} object(s) are on disk again and no longer held by hash alone; their sealed-object \
                 records are removed:",
                 self.unsealed.len()
-            );
+            ));
             for hash in &self.unsealed {
-                println!("  {}", hash);
+                lines.push(format!("  {}", hash));
             }
         }
 
         if !self.newly_held_by_hash.is_empty() {
-            println!(
+            lines.push(format!(
                 "{} absent object(s) beneath recorded objects on disk are now held by hash alone, as \
                 they were beneath their records:",
                 self.newly_held_by_hash.len()
-            );
+            ));
             for hash in &self.newly_held_by_hash {
-                println!("  {}", hash);
+                lines.push(format!("  {}", hash));
             }
         }
 
         if !self.resealed.is_empty() {
-            println!(
+            lines.push(format!(
                 "{} absent object(s) whose sealed-object records were lost are recorded again as held \
                 by the origin, which a read fetches them from:",
                 self.resealed.len()
-            );
+            ));
             for hash in &self.resealed {
-                println!("  {}", hash);
+                lines.push(format!("  {}", hash));
             }
         }
 
         if !self.recorded_unavailable.is_empty() {
-            println!(
+            lines.push(format!(
                 "{} absent object(s) the remote's host withholds are recorded unavailable again, so a \
                 checkout or an export leaves them out:",
                 self.recorded_unavailable.len()
-            );
+            ));
             for hash in &self.recorded_unavailable {
-                println!("  {}", hash);
+                lines.push(format!("  {}", hash));
             }
-            println!("If this warehouse held a copy of one, restoring it from a backup brings the content back.");
+            lines.push("If this warehouse held a copy of one, restoring it from a backup brings the content back.".to_string());
         }
 
         if !self.restored_from_working_tree.is_empty() {
-            println!(
+            lines.push(format!(
                 "{} path(s) whose content the store had lost are stored again from the working tree:",
                 self.restored_from_working_tree.len()
-            );
+            ));
             for path in &self.restored_from_working_tree {
-                println!("  {}", path);
+                lines.push(format!("  {}", path));
             }
         }
 
         if !self.redactions_reapplied.is_empty() {
-            println!(
+            lines.push(format!(
                 "{} absent object(s) a redaction names are applied again, so a read of one is refused \
                 as redacted and an export leaves it out:",
                 self.redactions_reapplied.len()
-            );
+            ));
             for hash in &self.redactions_reapplied {
-                println!("  {}", hash);
+                lines.push(format!("  {}", hash));
             }
         }
 
         if let Some(error) = &self.unseal_failed {
-            println!(
+            lines.push(format!(
                 "The sealed-object records of objects on disk again were not all removed: {}",
                 error
-            );
-            println!("Run \"forklift heal\" again to retry.");
+            ));
+            lines.push("Run \"forklift heal\" again to retry.".to_string());
         }
 
         for note in &self.notes {
-            println!("Note: {}", note);
+            lines.push(format!("Note: {}", note));
+        }
+
+        lines
+    }
+}
+
+impl CommandOutput for HealReport {
+    fn render_human(&self) {
+        for line in self.lines() {
+            println!("{}", line);
         }
     }
 }
@@ -2322,12 +2341,6 @@ impl OperationRecovery {
             lines.extend(self.unheld.iter().map(|path| format!("  {}", path)));
         }
         lines
-    }
-
-    fn render_human(&self) {
-        for line in self.lines() {
-            println!("{}", line);
-        }
     }
 }
 
