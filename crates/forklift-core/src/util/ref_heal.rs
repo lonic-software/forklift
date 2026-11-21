@@ -1725,14 +1725,12 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
                 Some(head) if state.stale => Ok((head, FROM_COPY)),
                 Some(head) if head == parcel => lost("its copy names it too".to_string()),
                 Some(head) if is_office(state) => lost(format!("it is not rebuilt at its copy's head {} in its place", head)),
-                // A copy whose head the store did not give whole when the state was read: one the
-                // taint covers may yet be restored, and one held now was not then, so neither is
-                // gone back to here. Any other is verified as before, and refuses as its read says.
-                Some(head) if tainted.covers(&head) => Err((format!(
-                    "its own bytes name {}, which is not in the store, and its copy's head {} is one the durability taint covers", parcel, head
-                ), candidates, Owner::Unread(None))),
+                // A copy the store holds, beside a ref the state's reading did not find stale (the
+                // taint covered the copy's head then, or one of the two answers moved since), is
+                // not gone back to without the note a stale ref gets: it is judged again. Any other
+                // is verified as before, and refuses as its read says.
                 Some(head) if matches!(object_utils::load_parcel_judged(&head), Ok(Ok(_))) => Err((format!(
-                    "its own bytes name {}, which is not in the store, and its copy's head {} was not in the store when heal read the ref", parcel, head
+                    "its own bytes name {}, which is not in the store, and its copy's head {} is in the store, but heal's first reading of the two did not find the ref stale", parcel, head
                 ), candidates, Owner::Again)),
                 Some(head) => Ok((head, FROM_COPY)),
                 None => lost(match state.copy {
@@ -2929,9 +2927,10 @@ mod tests {
     }
 
     // Beside a copy whose head was not judged held when the state was read, a ref naming a gone
-    // parcel goes back to no copy: one the taint covers is unread, one held now moved, and one
-    // gone too is verified as before. Mutations: take the copy's head for either of the first two →
-    // the rebuild is chosen, red; refuse the third as lost → the owner is the parcel's, red.
+    // parcel goes back to no copy: one the store holds (the taint covering it then, or held since)
+    // is judged again, and one gone too is verified as before. Mutations: take the copy's head for
+    // a held one → the rebuild is chosen, red; refuse a gone one as lost → the owner is the
+    // parcel's, red.
     #[test]
     fn a_gone_parcel_beside_a_copy_not_judged_held_waits_on_the_copy() {
         let (_root, _scope) = scratch("ref-heal-absent-copy-unheld");
@@ -2946,8 +2945,8 @@ mod tests {
             stale: false,
         };
 
-        let covering = Tainted { hashes: BTreeSet::from([copy_gone.clone()]), torn: false, unread: false };
-        assert!(matches!(choose_meta(&state(&copy_gone), &covering), Err((ref why, _, Owner::Unread(None))) if why.contains("the durability taint covers")));
+        let covering = Tainted { hashes: BTreeSet::from([held.clone()]), torn: false, unread: false };
+        assert!(matches!(choose_meta(&state(&held), &covering), Err((_, _, Owner::Again))));
         assert!(matches!(choose_meta(&state(&held), &clean), Err((_, _, Owner::Again))));
         assert!(matches!(choose_meta(&state(&copy_gone), &clean), Ok((ref head, FROM_COPY)) if *head == copy_gone));
     }

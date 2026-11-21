@@ -2945,7 +2945,8 @@ rebuilt this way: it is left as it is, with its copy. A damaged ref whose bytes 
 and that is not rebuilt at its copy (it has none, its copy names no head or that same head, or it
 is the office's) is refused, naming the head, and the step is to restore that parcel from a backup
 of the warehouse or a fresh clone of a remote that holds it, or the ref and its copy from a backup;
-while something that is not a file stands at the copy's path, replacing it comes first. Beside a
+while a link, or anything else that is neither a file nor a folder, stands at the copy's path, replacing
+it comes first. Beside a
 copy whose own head the store does not hold either, the ref waits on that head as any rebuild at
 its copy does. Other commands do not judge such a ref: they
 read it like any ref whose head is missing, and refuse on the missing object, not with
