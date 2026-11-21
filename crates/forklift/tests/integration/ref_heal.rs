@@ -554,7 +554,6 @@ fn an_interrupted_consolidation_is_rebuilt_at_its_parcel_and_rolled_forward() {
         let area = Area::new(&format!("merge-crash-{}", at));
         let root = mergeable(&area);
         let before = head(&root, "main");
-        common::backdate_tree(&root, 3600);
 
         let stopped = forklift_command()
             .args(["consolidate", "side"])
