@@ -2134,8 +2134,59 @@ fn a_damaged_office_ref_whose_bytes_name_a_gone_head_is_not_rolled_back_to_its_c
     let message = refused["error"]["message"].as_str().unwrap();
     assert_eq!(std::fs::read(meta_path(&root, "office")).unwrap(), bytes, "{}", refused);
     assert_eq!(std::fs::read(meta_copy_path(&root, "office")).unwrap(), copy, "{}", refused);
-    assert!(message.contains(&format!("The ref of pallet \"@office\" was not rebuilt: its own bytes name {}, which is not in the store", gone)), "{}", refused);
-    assert!(message.contains(&office), "the copy's head is named: {}", refused);
+    assert!(message.contains(&format!(
+        "The ref of pallet \"@office\" was not rebuilt: its own bytes name {}, which is not in the store, and it is not rebuilt at its copy's head {} in its place", gone, office
+    )), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], lost_step(&gone, "@office").as_str(), "{}", refused);
+
+    // A meta ref waiting on that refusal names the office's way out, not heal again. Mutation:
+    // leave the lost office's owner out of the cascade → "forklift heal", red.
+    let tags_copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
+    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
+    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: it is verified against the office and checked against the redactions, and the ref of pallet \"@office\" is damaged too"), "{}", refused);
+    assert_eq!(refused["error"]["next_step"], lost_step(&gone, "@office").as_str(), "{}", refused);
+    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), tags_copy, "the sound copy stands");
+}
+
+/// The way out of a meta ref whose own bytes name `parcel`, which the store decided is gone.
+fn lost_step(parcel: &str, pallet: &str) -> String {
+    format!(
+        "Restore parcel {} from a backup of the warehouse, or clone it afresh from a remote that holds it; or restore the ref of {} and its copy from a backup. Then run \"forklift heal\" again.",
+        parcel, pallet
+    )
+}
+
+// A damaged meta ref whose bytes name, in full, a parcel the store decided is gone is not rebuilt
+// where it has no copy, nor where its copy names that same parcel: heal refuses, names the parcel
+// and its restore, and leaves the ref. (Bytes that parse there read as an intact ref, which the
+// lost-objects refusal names.) Mutation: salvage such bytes to nothing → the no-copy row refuses
+// with "neither its copy nor its own bytes name a head" and the backup step, red.
+#[test]
+fn a_meta_ref_naming_a_gone_parcel_with_no_copy_to_go_back_to_names_the_parcel() {
+    for copy_names_it in [false, true] {
+        let case = format!("copy names the parcel: {}", copy_names_it);
+        let area = Area::new(&format!("meta-lost-{}", copy_names_it));
+        let (root, _, second) = tagged(&area);
+        let gone = flip_digit(&second, 63);
+        let bytes = format!("{}torn", gone).into_bytes();
+        std::fs::write(meta_path(&root, "tags"), &bytes).unwrap();
+        match copy_names_it {
+            true => std::fs::write(meta_copy_path(&root, "tags"), format!("{}\n", gone)).unwrap(),
+            false => forklift_core::util::file_utils::remove_file(&meta_copy_path(&root, "tags")).unwrap(),
+        }
+
+        let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
+        let message = refused["error"]["message"].as_str().unwrap();
+        let reason = match copy_names_it {
+            true => format!("its own bytes name {}, which is not in the store, and it is not rebuilt at its copy's head {} in its place", gone, gone),
+            false => format!("its own bytes name {}, which is not in the store, and it has no copy", gone),
+        };
+        assert!(message.contains(&format!("The ref of pallet \"@tags\" was not rebuilt: {}", reason)), "{}: {}", case, refused);
+        assert_eq!(refused["error"]["next_step"], lost_step(&gone, "@tags").as_str(), "{}: {}", case, refused);
+        assert_eq!(std::fs::read(meta_path(&root, "tags")).unwrap(), bytes, "{}", case);
+    }
 }
 
 // A folder planted at the copy's path fails the first write's copy, after its ref landed.

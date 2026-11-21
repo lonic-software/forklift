@@ -1643,8 +1643,9 @@ pub enum RefDamage {
     /// The ref file holds these bytes, which are not a head the reader accepts.
     Unreadable(Vec<u8>),
 
-    /// The ref file holds these bytes, which parse as a head the store has decided is absent.
-    /// Only a meta ref is judged so, and only beside a copy naming another head the store holds.
+    /// The ref file holds these bytes, which name in full a head the store has decided is absent:
+    /// they parse as it, or begin with its 64 characters and do not parse. Only a meta ref is
+    /// judged so, and only beside a copy naming another head the store holds.
     AbsentHead(Vec<u8>),
 }
 

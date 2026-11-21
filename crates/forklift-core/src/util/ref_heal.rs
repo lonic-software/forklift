@@ -162,6 +162,12 @@ pub enum Owner {
     /// `None`; [`refuse_in`] lifts the step out of the reason.
     Unwritten(Option<String>),
 
+    /// Its own bytes name this parcel in full, which the store has decided is gone, and heal may
+    /// not rebuild it at its copy: there is none, it names the same parcel, or the ref is the
+    /// office, whose rebuild at an older head would take back what the office has since revoked.
+    /// The way out is the parcel restored, or the ref and its copy ([`lost_step`]).
+    Lost(String),
+
     /// Its files moved while heal ran: a later heal judges it again.
     Again,
 }
@@ -264,6 +270,11 @@ enum Salvage {
 
     /// A match whose kind cannot be read, or that is tainted.
     Unknown(String),
+
+    /// The bytes name this hash in full ([`named_hash`]), the store holds no object by it, and
+    /// the store has decided it is gone with no taint accounting for it. Never a head to rebuild
+    /// at: the ref named it, and rebuilding elsewhere loses the only record of it.
+    Absent(String),
 
     /// A match whose kind cannot be read, where the store's read said nothing of the object (it
     /// could not be consulted, or left the answer undecided), or a pack that may hold a match the
@@ -513,7 +524,8 @@ fn gather(damaged: &DamagedRef, tainted: &Tainted, notes: &mut Vec<String>) -> E
 
     if let RefDamage::Unreadable(bytes) = &damaged.damage {
         match salvage(bytes, tainted) {
-            Ok(Salvage::Nothing) => {}
+            // A user ref's bytes naming a gone parcel give heal no head, as bytes that name none.
+            Ok(Salvage::Nothing | Salvage::Absent(_)) => {}
             Ok(Salvage::Found(head)) => evidence.candidates.push((head, Source::Salvage)),
             Ok(Salvage::Unknown(reason) | Salvage::Untold(reason) | Salvage::Newer(reason)) => evidence.salvage_unknown = Some(reason),
             Ok(Salvage::Ambiguous(parcels, dropped)) => {
@@ -568,8 +580,11 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
         Ok(Ok(matches))
     };
 
-    if run >= HASH_LENGTH {
-        return Ok(match matching(&String::from_utf8_lossy(&bytes[..HASH_LENGTH]))? {
+    if let Some(hash) = named_hash(bytes) {
+        return Ok(match matching(&hash)? {
+            // Only an absence the store decided, with no taint accounting for it, names the hash
+            // as gone; any other empty answer is as before, nothing.
+            Ok(matches) if matches.is_empty() && head_decided_absent(&hash, tainted) => Salvage::Absent(hash),
             Ok(matches) => judge(matches, tainted),
             Err(untold) => untold,
         });
@@ -597,6 +612,14 @@ fn salvage(bytes: &[u8], tainted: &Tainted) -> Result<Salvage, String> {
     }
 
     Ok(judge(matches, tainted))
+}
+
+/// The hash a ref's `bytes` name in full: their 64 leading characters, when every one is hex, as
+/// in bytes that parse as a head and in bytes whose newline alone is damaged. [`salvage`], the
+/// stale judgment of [`meta_states`] and the note of a stale rebuild all read the hash so.
+fn named_hash(bytes: &[u8]) -> Option<String> {
+    (bytes.len() >= HASH_LENGTH && bytes[..HASH_LENGTH].iter().all(|byte| is_hex(*byte)))
+        .then(|| String::from_utf8_lossy(&bytes[..HASH_LENGTH]).into_owned())
 }
 
 /// Whether a damaged ref's `bytes` name a hash, or a prefix of one, that [`salvage`] looks up: 64
@@ -1323,6 +1346,7 @@ pub fn meta_step(refused: &Refused, all: &[Refused]) -> String {
                 true => pallet_utils::blocked_copy_step(&at.pallet[1..], "run \"forklift heal\" again"),
                 false => unrebuildable_step(&at.pallet, "run \"forklift heal\" again"),
             },
+            Some(Owner::Lost(parcel)) => return lost_step(&at.pallet, parcel, "run \"forklift heal\" again"),
             Some(Owner::OfficeUnborn) => return crate::util::office_utils::office_unborn_step(),
             Some(Owner::Newer) => return newer_step(),
             Some(Owner::Trust(step)) => return step.clone(),
@@ -1358,6 +1382,18 @@ pub fn newer_step() -> String {
 /// by `rerun`: heal never removes a meta ref, so the ref and its copy are restored from a backup.
 pub fn unrebuildable_step(wire: &str, rerun: &str) -> String {
     format!("Restore the ref of {} and its copy from a backup, then {}.", wire, rerun)
+}
+
+/// The way out of meta ref `wire`'s refusal over its own bytes naming `parcel`, which the store
+/// decided is gone, closed by `rerun`: the parcel back in the store, from a backup of the
+/// warehouse or a clone of a remote that holds it, or the ref and its copy restored from a backup
+/// instead. The bytes need not name a parcel that ever existed, so the second stands where the
+/// first cannot.
+pub fn lost_step(wire: &str, parcel: &str, rerun: &str) -> String {
+    format!(
+        "Restore parcel {} from a backup of the warehouse, or clone it afresh from a remote that holds it; or restore the ref of {} and its copy from a backup. Then {}.",
+        parcel, wire, rerun
+    )
 }
 
 /// The step a read of meta ref `name` names where neither its copy nor its own bytes
@@ -1439,8 +1475,8 @@ struct MetaState {
 
     copy: pallet_utils::MetaCopyState,
 
-    /// Whether the ref's bytes name a head the store has decided is absent, beside a copy naming
-    /// another head the store holds; never for the office. Judged once, when the state is read, so
+    /// Whether the ref's bytes name a head ([`named_hash`]) the store has decided is absent, beside
+    /// a copy naming another head the store holds; never for the office. Judged once, when the state is read, so
     /// every reader of [`MetaState::damage`] sees the same answer.
     stale: bool,
 }
@@ -1537,7 +1573,7 @@ fn meta_states_skipping(skipped: &mut Vec<(String, String)>) -> Result<Vec<MetaS
         if is_office(state) {
             continue;
         }
-        let (Some(head), Some(copy)) = (state.reference.as_deref().and_then(pallet_utils::parse_ref_bytes), state.copy_head()) else {
+        let (Some(head), Some(copy)) = (state.reference.as_deref().and_then(named_hash), state.copy_head()) else {
             continue;
         };
         if head == copy {
@@ -1641,9 +1677,13 @@ type MetaRefusal = (String, Vec<Candidate>, Owner);
 /// over their command and util modules finds none. A ref ahead of its copy (a write whose copy
 /// was not mended, a copy restored from an older backup) is rebuilt at what its own bytes name,
 /// while the store holds that head. A ref whose head the store decided is gone beside a copy whose
-/// head it holds ([`RefDamage::AbsentHead`]) salvages nothing, so it is rebuilt at the copy's head,
+/// head it holds ([`RefDamage::AbsentHead`]) salvages that head as gone ([`Salvage::Absent`]), never as
+/// a head to rebuild at, so it is rebuilt at the copy's head,
 /// even where the copy is the older of the two: the ref goes back to the last head that can be
-/// read, and the note [`write_meta_rebuild`] leaves names the head it named.
+/// read, and the note [`write_meta_rebuild`] leaves names the head it named. Bytes that do not
+/// parse but name such a head in full ([`named_hash`]) are judged the same way. Otherwise a head
+/// the store decided is gone is never rebuilt over: with no copy, a copy naming the same parcel,
+/// or on the office, heal refuses and names the parcel ([`Owner::Lost`]).
 fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static str), MetaRefusal> {
     let copy = state.copy_head();
     let mut candidates: Vec<Candidate> = copy.iter()
@@ -1667,6 +1707,15 @@ fn choose_meta(state: &MetaState, tainted: &Tainted) -> Result<(String, &'static
         Salvage::Nothing => match copy {
             Some(head) => Ok((head, FROM_COPY)),
             None => Err(("neither its copy nor its own bytes name a head".to_string(), candidates, Owner::Unrebuildable)),
+        },
+        // Never a head to rebuild at. A stale ref goes back to its copy's head, which the store
+        // holds, and its note names the parcel; otherwise the parcel is what it waits on.
+        Salvage::Absent(parcel) => match (state.stale, copy) {
+            (true, Some(head)) => Ok((head, FROM_COPY)),
+            (_, copy) => Err((match copy {
+                Some(copy) => format!("its own bytes name {}, which is not in the store, and it is not rebuilt at its copy's head {} in its place", parcel, copy),
+                None => format!("its own bytes name {}, which is not in the store, and it has no copy", parcel),
+            }, candidates, Owner::Lost(parcel))),
         },
         Salvage::Found(salvaged) => {
             candidates.push(Candidate { head: salvaged.clone(), source: Source::Salvage.describe() });
@@ -2403,7 +2452,7 @@ fn write_meta_rebuild(state: &MetaState,
     // of the write is reported beside it; for a write it could not read back, that is the attempt,
     // not where the ref ended.
     let gone = match &damage {
-        RefDamage::AbsentHead(bytes) => pallet_utils::parse_ref_bytes(bytes),
+        RefDamage::AbsentHead(bytes) => named_hash(bytes),
         _ => None,
     };
     if let Some(gone) = gone {
