@@ -32,7 +32,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   they name; otherwise `heal` refuses with both heads (`ref_damaged`, exit 53). A ref that reads
   but names a head the store has decided it does not hold is rebuilt at its copy's head when the
   store holds that one (the office's ref excepted), with a note naming the head it named, made before the rebuild
-  is written, so it stands whether or not the write goes through. A copy lost or out of step beside
+  is written, so it is reported whatever the write's outcome. A metadata ref's rebuild that the
+  pass before the taint recovery wrote or tried to write, and left for the pass after it, is noted
+  with the reason, and a refusal says each note once. A copy lost or out of step beside
   a ref that reads is set back to the ref only when the store holds the ref's head; otherwise both
   are left, with a note. The office's ref is rebuilt first, at a
   head that verifies against the anchor of the trust file or of its copy, and a trust file lost

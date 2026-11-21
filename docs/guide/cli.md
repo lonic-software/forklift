@@ -2930,8 +2930,10 @@ written, naming making the ref's file and the folders on the way to it readable.
 
 A ref that reads but names a head the store has decided it does not hold, beside a copy naming a
 head the store does hold, is rebuilt at the copy's head, even where that is the older of the two,
-with a `Note:` naming the head the ref named. `heal` makes that note before it writes, so it stands
-whether or not the rebuild is written. The store has not decided while something could yet account for the missing head,
+with a `Note:` naming the head the ref named. `heal` makes that note before it writes, so it is
+reported whatever the write's outcome. A meta ref's rebuild that the pass before the taint recovery
+wrote or tried to write, and left for the pass after it, gets a `Note:` saying so and why; a refusal
+says each note once. The store has not decided while something could yet account for the missing head,
 such as a refill from the origin, a redaction or a withholding, a pack or record it cannot read in
 full, or the durability taint; `heal` then leaves the ref as it is. The office's ref is never
 rebuilt this way: it is left as it is, with its copy. Other commands do not judge such a ref: they
