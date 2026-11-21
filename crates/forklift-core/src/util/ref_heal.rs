@@ -2834,6 +2834,24 @@ mod tests {
         }
     }
 
+    // A meta ref waiting on an office refused over a parcel its bytes name is given the office's
+    // way out: the parcel restored, never heal again. Mutation: leave a lost office out of the
+    // cascade → "forklift heal", red.
+    #[test]
+    fn a_meta_ref_waiting_on_a_lost_office_names_the_office_parcel() {
+        let (_root, _scope) = scratch("ref-heal-lost-cascade");
+        let parcel = "ab".repeat(HASH_LENGTH / 2);
+        let state = |name: &str| MetaState { name: name.to_string(), reference: Some(b"torn".to_vec()), copy: pallet_utils::MetaCopyState::Absent, stale: false };
+        let mut report = Repair::default();
+        refuse_in(&mut report, &state("office"), Pass::AfterTaint, "its own bytes name a parcel".to_string(), Vec::new(), Owner::Lost(parcel.clone()));
+        refuse_in(&mut report, &state("tags"), Pass::AfterTaint, "the office is damaged too".to_string(), Vec::new(), Owner::Cascade("@office".to_string()));
+        let tags = report.refused.iter().find(|refused| refused.pallet == "@tags").unwrap();
+        assert_eq!(meta_step(tags, &report.refused), format!(
+            "Restore parcel {} from a backup of the warehouse, or clone it afresh from a remote that holds it; or restore the ref of @office and its copy from a backup. Then run \"forklift heal\" again.",
+            parcel
+        ));
+    }
+
     // An unread refusal's way out is the step its read named, when that is not heal itself: it
     // reaches meta_step, and leaves the reason, so no message restates
     // its step. Mutations: keep `None` in refuse_in → the step falls back to "Settle what heal could

@@ -2138,16 +2138,6 @@ fn a_damaged_office_ref_whose_bytes_name_a_gone_head_is_not_rolled_back_to_its_c
         "The ref of pallet \"@office\" was not rebuilt: its own bytes name {}, which is not in the store, and it is not rebuilt at its copy's head {} in its place", gone, office
     )), "{}", refused);
     assert_eq!(refused["error"]["next_step"], lost_step(&gone, "@office").as_str(), "{}", refused);
-
-    // A meta ref waiting on that refusal names the office's way out, not heal again. Mutation:
-    // leave the lost office's owner out of the cascade → "forklift heal", red.
-    let tags_copy = std::fs::read(meta_copy_path(&root, "tags")).unwrap();
-    forklift_core::util::file_utils::remove_file(&meta_path(&root, "tags")).unwrap();
-    let refused = ref_damaged(&area.run(&root, &["--json", "heal"]));
-    let message = refused["error"]["message"].as_str().unwrap();
-    assert!(message.contains("The ref of pallet \"@tags\" was not rebuilt: it is verified against the office and checked against the redactions, and the ref of pallet \"@office\" is damaged too"), "{}", refused);
-    assert_eq!(refused["error"]["next_step"], lost_step(&gone, "@office").as_str(), "{}", refused);
-    assert_eq!(std::fs::read(meta_copy_path(&root, "tags")).unwrap(), tags_copy, "the sound copy stands");
 }
 
 /// The way out of a meta ref whose own bytes name `parcel`, which the store decided is gone.
