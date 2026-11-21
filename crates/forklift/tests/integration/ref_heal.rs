@@ -2140,6 +2140,100 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
     std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
 }
 
+/// Make `link` a link to file `target`. A Windows runner without the privilege to make one
+/// answers false; anywhere else a failure is the test's.
+fn link_file(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+}
+
+/// A meta pallet's first write whose sync failed and whose birth a power loss then undid: the
+/// taint records the vanished file. A copy gone beside a ref that is a file holding a head
+/// resolves in the taint recovery, and the meta pass after it sets the copy to the ref's bytes;
+/// where the store does not give that head, the copy is left, the pass says why, and the run
+/// refuses the head as lost, as on a warehouse with no taint. A ref gone beside its copy is
+/// rebuilt from the copy before the recovery. A copy gone beside a ref that is gone, damaged or
+/// not a file is more than one fault, and the taint stands.
+// Mutations: file a vanished copy as unrecognized again → "copy" red (the run refuses, the
+// taint stands); resolve a vanished copy whatever its ref holds → "copy-ref-damaged" red (the
+// taint clears); read the ref through a link → "copy-ref-link" red (the taint clears); judge
+// the ref's head against the store in the recovery → "copy-head-absent" red (the taint stands).
+#[test]
+fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
+    for case in ["copy", "ref", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
+        let area = Area::new(&format!("meta-vanished-{}", case));
+        let (root, _, second) = tagged(&area);
+        let (copy, reference) = (meta_copy_path(&root, "tags"), meta_path(&root, "tags"));
+        let absent = format!("{}{}", if second.starts_with('0') { '1' } else { '0' }, &second[1..]);
+        let recorded: &[&str] = match case {
+            "copy" | "copy-ref-damaged" | "copy-head-absent" | "copy-ref-link" => &["meta-copy/tags"],
+            "ref" => &["meta/tags"],
+            _ => &["meta/tags", "meta-copy/tags"],
+        };
+        let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(recorded.iter().map(|path| path.to_string()))).unwrap();
+        if case != "ref" {
+            forklift_core::util::file_utils::remove_file(&copy).unwrap();
+        }
+        match case {
+            "ref" | "both" => forklift_core::util::file_utils::remove_file(&reference).unwrap(),
+            "copy-ref-damaged" => std::fs::write(&reference, b"not a hash").unwrap(),
+            // A well-formed head the store does not hold: the copy mend would not set the copy to it.
+            "copy-head-absent" => std::fs::write(&reference, format!("{}\n", absent)).unwrap(),
+            // A link to a file holding the ref's own bytes: the copy mend reads a link as no ref.
+            "copy-ref-link" => {
+                let target = root.join("ref-target");
+                std::fs::write(&target, std::fs::read(&reference).unwrap()).unwrap();
+                forklift_core::util::file_utils::remove_file(&reference).unwrap();
+                if !link_file(&target, &reference) {
+                    eprintln!("{}: skipped, no link could be made here", case);
+                    continue;
+                }
+            }
+            _ => {}
+        }
+
+        let output = area.run(&root, &["--json", "heal"]);
+        let said = format!("{}{}", text(&output.stdout), text(&output.stderr));
+        let taint_left = std::fs::read_dir(&dir).map(|mut entries| entries.next().is_some()).unwrap_or(false);
+        match case {
+            "copy" | "ref" => {
+                assert!(output.status.success(), "{}: {}", case, said);
+                assert!(!taint_left, "{}: the taint clears: {}", case, said);
+                assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "{}: {}", case, said);
+                assert_eq!(std::fs::read(&copy).unwrap(), format!("{}\n", second).into_bytes(), "{}: the copy holds the ref's bytes: {}", case, said);
+            }
+            "copy-head-absent" => {
+                assert!(!taint_left, "{}: the taint clears: {}", case, said);
+                assert!(!copy.exists(), "{}: the copy is not set to a head the store does not give: {}", case, said);
+                assert!(!output.status.success(), "{}: {}", case, said);
+                assert!(said.contains("\"code\": \"objects_lost\"") && said.contains(&absent), "{}: the lost head is refused as lost: {}", case, said);
+                let note = format!("the ref's head {} is not in the store, so the copy was not set to it", absent);
+                assert!(said.contains(&note), "{}: the meta pass says why the copy was not set ({}): {}", case, note, said);
+            }
+            _ => {
+                assert!(!output.status.success(), "{}: {}", case, said);
+                assert!(taint_left, "{}: the taint stands: {}", case, said);
+                let why = match case {
+                    "copy-ref-damaged" => "does not hold a head either".to_string(),
+                    "copy-ref-link" => "is not a file".to_string(),
+                    _ => "is lost too".to_string(),
+                };
+                let line = format!("a lost meta pallet ref copy whose ref (\\\"meta/tags\\\") {}: \\\"meta-copy/tags\\\"", why);
+                assert!(said.contains(&line), "{}: the refusal says why the copy is not resolved ({}): {}", case, line, said);
+            }
+        }
+    }
+}
+
 /// A meta ref and a taint. Lost beside a copy that verifies, the ref is rebuilt before the taint
 /// recovery, and a refusal there names the rebuild. One heal cannot settle before the recovery
 /// (its bytes name an object the taint records, or its copy names a parcel the taint took) is
