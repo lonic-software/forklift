@@ -52,7 +52,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   stands, names each ref left that way with the heads found for it, and each damaged metadata
   ref a pass that stopped never judged. Where damaged tombstones refuse a pallet ref's rebuild and
   stop the run, with their repair as the step, the refusal now also names that ref and the head its
-  rebuild was not written at; before, it left the ref unnamed.
+  rebuild was not written at, and every other damaged pallet ref the run stopped before judging;
+  before, it left them unnamed.
 
 - **`heal` names its way out for every damaged metadata ref it does not rebuild, and never
   removes one.** Where `heal` has no head it can rebuild the ref at (nothing names one, or what does
