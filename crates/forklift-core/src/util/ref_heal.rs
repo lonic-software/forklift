@@ -1864,9 +1864,9 @@ fn mend_copy(state: &MetaState, head: &str, pass: Pass, report: &mut Repair) {
     // The copy is set only toward a head the store gives whole: over any other answer, it may be
     // the one file still naming a head a reader can load. The store's outer error is only a
     // decided answer or an untold one, never bytes of a newer build, which come back inside `Ok`.
-    // Before the taint the refusal is silent, as the error arm below is: the pass after the taint
-    // recovery reads the store again and mends a head the recovery made readable, or says why
-    // not. A run that returns before that pass reports nothing of this copy; the next run does.
+    // Before the taint the refusal is silent, as a write below that did not land is: the pass
+    // after the taint recovery reads the store again and mends a head the recovery made readable,
+    // or says why not. A run that returns before that pass reports nothing of this copy; the next run does.
     let refused = match object_utils::load_parcel_judged(head) {
         Ok(Ok(_)) | Ok(Err(object_utils::NotAParcel::Newer(_))) => None,
         Ok(Err(object_utils::NotAParcel::Other(_))) => Some("is not a parcel".to_string()),
