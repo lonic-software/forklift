@@ -50,7 +50,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   that ref's step. A metadata ref that cannot be settled before the taint recovery is judged again after
   it; a refusal that stops the run before then, such as one for a durability taint that still
   stands, names each ref left that way with the heads found for it, and each damaged metadata
-  ref a pass that stopped never judged.
+  ref a pass that stopped never judged. Where damaged tombstones refuse a pallet ref's rebuild and
+  stop the run, with their repair as the step, the refusal now also names that ref and the head its
+  rebuild was not written at; before, it left the ref unnamed.
 
 - **`heal` names its way out for every damaged metadata ref it does not rebuild, and never
   removes one.** Where `heal` has no head it can rebuild the ref at (nothing names one, or what does
