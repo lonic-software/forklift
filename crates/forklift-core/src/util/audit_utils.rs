@@ -3583,7 +3583,7 @@ pub(crate) fn report_missing_chunks(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use crate::util::office_utils::{
@@ -4339,7 +4339,7 @@ mod tests {
 
     /// A real, disk-backed office chain: a genesis admin with a self-endorsed identity
     /// root (exactly what `office enroll` produces), trust established.
-    struct PrivilegeFixture {
+    pub(crate) struct PrivilegeFixture {
         _scope: crate::globals::StorageRootScope,
         // `None` when a caller is holding `PRIVILEGE_KEYS_ENV_LOCK` itself in an outer
         // scope that must outlive this fixture (see `build`'s doc comment) — otherwise
@@ -4347,7 +4347,7 @@ mod tests {
         // order, right after `Drop::drop` restores `FORKLIFT_KEYS_DIR`.
         _keys_lock: Option<std::sync::MutexGuard<'static, ()>>,
         root: std::path::PathBuf,
-        anchor: TrustAnchor,
+        pub(crate) anchor: TrustAnchor,
         admin: crate::model::operator::Operator,
         admin_key_id: String,
         // What `FORKLIFT_KEYS_DIR` held before this fixture pointed it at its own
@@ -4359,7 +4359,7 @@ mod tests {
     }
 
     impl PrivilegeFixture {
-        fn new(name: &str) -> PrivilegeFixture {
+        pub(crate) fn new(name: &str) -> PrivilegeFixture {
             let keys_lock = PRIVILEGE_KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             PrivilegeFixture::build(name, Some(keys_lock))
         }

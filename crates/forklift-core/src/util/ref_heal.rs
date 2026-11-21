@@ -832,26 +832,32 @@ pub fn repair(pass: Pass) -> Result<Repair, String> {
                         report.stopped = Some(error);
                         break;
                     }
-                    Err(error) => match read_back(PalletNamespace::User, &damaged.pallet, &head) {
-                        ReadBack::Landed => match mended(&error, PalletNamespace::User, &damaged.pallet) {
-                            Ok(again) => {
-                                push_note(&mut report.notes, landed_despite(&damaged.pallet, &head, &error));
-                                if let Some(again) = again {
-                                    push_note(&mut report.notes, synced_again(&damaged.pallet, &again));
-                                }
-                                report.rebuilt.push(Rebuilt { pallet: damaged.pallet.clone(), head, source });
-                            }
-                            Err(why) => report.undurable.push(undurable(&damaged.pallet, &head, &why)),
-                        },
-                        // The first pass leaves a failed write to the second, which reports it.
-                        _ if pass == Pass::BeforeTaint => {}
-                        read => report.refused.push(Refused {
-                            pallet: damaged.pallet.clone(),
-                            reason: unwritten_reason(&head, &error, &read),
-                            candidates: listed(&evidence.candidates),
-                            meta: None,
-                        }),
-                    },
+                    Err(error) => {
+                        let mut read = read_back(PalletNamespace::User, &damaged.pallet, &head);
+                        let attempt = WriteAttempt::of_ref(pass, PalletNamespace::User, &damaged.pallet, &head, Some(&error), &read);
+                        let attempted = attempt.is_some();
+                        if let Some((_, settled)) = attempt.and_then(|attempt| settle_attempts(vec![attempt], &mut report).pop()) {
+                            read = settled;
+                        }
+
+                        match read {
+                            ReadBack::Landed => landed(&mut report, PalletNamespace::User, &damaged.pallet, head, source, Some(&error)),
+                            // The pass after the taint recovery may read a write that landed as an
+                            // undamaged ref, and then says nothing of it: the head is named here.
+                            ReadBack::Unread(why) if attempted => push_note(&mut report.notes, format!(
+                                "The ref of pallet \"{}\" may have been rebuilt at {}: the write reported {}, and its ref could not be read back: {}.",
+                                damaged.pallet, head, error, why.trim_end_matches('.')
+                            )),
+                            // The first pass leaves a failed write to the second, which reports it.
+                            _ if pass == Pass::BeforeTaint => {}
+                            read => report.refused.push(Refused {
+                                pallet: damaged.pallet.clone(),
+                                reason: unwritten_reason(&head, &error, &read),
+                                candidates: listed(&evidence.candidates),
+                                meta: None,
+                            }),
+                        }
+                    }
                 }
             }
         }
@@ -927,6 +933,96 @@ fn undurable(pallet: &str, head: &str, why: &str) -> String {
 /// synced, a taint standing) leaves the ref written, and what the write reported stands beside it.
 fn landed_despite(pallet: &str, head: &str, error: &RefUpdateError) -> String {
     format!("The ref of pallet \"{}\" was rebuilt at {}, though its write reported: {}", pallet, head, error)
+}
+
+/// The sentence for a rebuild of the ref of `pallet` (as it is written on the wire) at `head`
+/// whose ref could not be read back, and which is not durable if it landed, `why` naming which
+/// file and the error, though heal synced it again.
+fn undurable_if_landed(pallet: &str, head: &str, why: &str) -> String {
+    format!(
+        "The ref of pallet \"{}\" may have been rebuilt at {}, and if it was, {}. Heal synced its folder again, and \
+        neither that sync nor a taint recording it held, so a crash can still lose the rebuild; a later heal reads \
+        the ref as undamaged and does not sync it again.",
+        pallet, head, why.trim_end_matches('.')
+    )
+}
+
+/// Report the rebuild of the ref of pallet `name` in `namespace` at `head`, found at `source`,
+/// whose ref read back at `head` though its write may have reported `error`: rebuilt, with what
+/// the write reported beside it once what it left unsynced with no taint recording it is synced
+/// again ([`mended`]), or not durable when that sync does not hold either.
+fn landed(report: &mut Repair, namespace: PalletNamespace, name: &str, head: String, source: String, error: Option<&RefUpdateError>) {
+    let wire = pallet_utils::PalletRef { namespace, name: name.to_string() }.to_wire();
+    let Some(error) = error else {
+        report.rebuilt.push(Rebuilt { pallet: wire, head, source });
+        return;
+    };
+    match mended(error, namespace, name) {
+        Ok(again) => {
+            push_note(&mut report.notes, landed_despite(&wire, &head, error));
+            if let Some(again) = again {
+                push_note(&mut report.notes, synced_again(&wire, &again));
+            }
+            report.rebuilt.push(Rebuilt { pallet: wire, head, source });
+        }
+        Err(why) => report.undurable.push(undurable(&wire, &head, &why)),
+    }
+}
+
+/// A ref write [`Pass::BeforeTaint`] made that may have landed, though its ref could not be read
+/// back. The pass after the taint recovery would read a ref it landed in as undamaged and judge
+/// nothing, so the pass that wrote it settles it ([`settle_attempts`]).
+///
+/// Where it is taken apart, an irrefutable `let` does it, so a further variant fails to build
+/// there until that site decides it.
+#[derive(Debug)]
+enum WriteAttempt {
+    /// The write of the ref of pallet `name` in `namespace` at `head`, and what it reported
+    /// (`None`: it returned `Ok`).
+    Ref { namespace: PalletNamespace, name: String, head: String, error: Option<RefUpdateError> },
+}
+
+impl WriteAttempt {
+    /// The attempt a write of the ref of pallet `name` in `namespace` at `head` is in `pass`, its
+    /// write having reported `error` (`None`: `Ok`) and its ref read back as `read`. Only a write
+    /// that returned `Ok` or failed with [`RefUpdateError::Failed`] can have landed, and one that
+    /// stopped on damaged tombstones is the pass's stop instead; only an unread ref leaves it
+    /// unanswered; and [`Pass::AfterTaint`] refuses what it cannot answer, with no pass after it.
+    fn of_ref(pass: Pass, namespace: PalletNamespace, name: &str, head: &str, error: Option<&RefUpdateError>, read: &ReadBack) -> Option<WriteAttempt> {
+        let may_have_landed = match error {
+            None => true,
+            Some(RefUpdateError::Failed(error)) => !crate::util::tombstone_utils::is_damage(error),
+            Some(_) => false,
+        };
+        (pass == Pass::BeforeTaint && matches!(read, ReadBack::Unread(_)) && may_have_landed).then(|| WriteAttempt::Ref {
+            namespace, name: name.to_string(), head: head.to_string(), error: error.cloned(),
+        })
+    }
+}
+
+/// Settle `attempts`, each at its write: read its ref back once more, and for a write that failed,
+/// sync again what it left unsynced with no taint recording that ([`mended`]) while the ref still
+/// cannot be read, since that sync needs only the files the write left, not its landing. A sync
+/// that does not hold is said in `report.undurable`. A read that finds the head leaves that sync to
+/// the write's own judgment ([`landed`]), which reports the rebuild.
+///
+/// # Returns
+/// Each attempt, with what its ref read back as now, which the write is judged on in place of its
+/// first read. Nothing is refused or deferred here.
+fn settle_attempts(attempts: Vec<WriteAttempt>, report: &mut Repair) -> Vec<(WriteAttempt, ReadBack)> {
+    attempts.into_iter().map(|attempt| {
+        let WriteAttempt::Ref { namespace, name, head, error } = &attempt;
+        let read = read_back(*namespace, name, head);
+        if let (ReadBack::Unread(_), Some(error)) = (&read, error) {
+            let wire = pallet_utils::PalletRef { namespace: *namespace, name: name.clone() }.to_wire();
+            match mended(error, *namespace, name) {
+                Ok(None) => {}
+                Ok(Some(again)) => push_note(&mut report.notes, synced_again(&wire, &again)),
+                Err(why) => report.undurable.push(undurable_if_landed(&wire, head, &why)),
+            }
+        }
+        (attempt, read)
+    }).collect()
 }
 
 /// The trust state a ref of `pallet` rebuilt or set at `head` is written under: in a warehouse
@@ -2075,16 +2171,28 @@ impl ReadBack {
 
 #[cfg(test)]
 thread_local! {
-    /// Makes [`read_back`] answer [`ReadBack::Unread`], since no fixture fails the read of a ref
-    /// heal could judge right after its write failed.
-    static READ_BACK_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many of the next [`read_back`] calls answer [`ReadBack::Unread`], since no fixture
+    /// fails the read of a ref heal could judge right after its write failed.
+    static READ_BACK_UNREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Run before the next [`read_back`] that reads the ref, once.
+    static BEFORE_READ_BACK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+
+    /// The wire name of each ref [`read_back`] was asked to read, in order.
+    static READS_BACK: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Read back the ref of pallet `name` after heal wrote it at `head`.
 fn read_back(namespace: PalletNamespace, name: &str, head: &str) -> ReadBack {
     #[cfg(test)]
-    if READ_BACK_UNREAD.with(|unread| unread.get()) {
+    READS_BACK.with(|reads| reads.borrow_mut().push(pallet_utils::PalletRef { namespace, name: name.to_string() }.to_wire()));
+    #[cfg(test)]
+    if READ_BACK_UNREAD.with(|unread| unread.replace(unread.get().saturating_sub(1)) > 0) {
         return ReadBack::Unread("the read was refused for the test".to_string());
+    }
+    #[cfg(test)]
+    if let Some(before) = BEFORE_READ_BACK.with(std::cell::Cell::take) {
+        before();
     }
 
     match pallet_utils::read_file_state(&pallet_utils::get_pallet_ref_path(namespace, name)) {
@@ -2137,7 +2245,11 @@ fn write_meta_rebuild(state: &MetaState,
     }
     let written = pallet_utils::repair_meta_pallet_head(&state.name, &damage, &state.copy, &head, preconditions, judged);
 
-    let read = read_back(PalletNamespace::Meta, &state.name, &head);
+    let mut read = read_back(PalletNamespace::Meta, &state.name, &head);
+    let attempt = WriteAttempt::of_ref(pass, PalletNamespace::Meta, &state.name, &head, written.as_ref().err(), &read);
+    if let Some((_, settled)) = attempt.and_then(|attempt| settle_attempts(vec![attempt], report).pop()) {
+        read = settled;
+    }
 
     let (reason, owner) = match written {
         // As in the user pass: the refusal is the answer, and what this pass rebuilt stays
@@ -2146,23 +2258,9 @@ fn write_meta_rebuild(state: &MetaState,
             report.stopped = Some(error);
             return true;
         }
-        // As in the user pass: what the write reported stands beside the ref it wrote, once what
-        // it left unsynced with no taint recording it is synced again.
+        // As in the user pass.
         _ if matches!(read, ReadBack::Landed) => {
-            let Err(error) = &written else {
-                report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
-                return false;
-            };
-            match mended(error, PalletNamespace::Meta, &state.name) {
-                Ok(again) => {
-                    push_note(&mut report.notes, landed_despite(&state.wire(), &head, error));
-                    if let Some(again) = again {
-                        push_note(&mut report.notes, synced_again(&state.wire(), &again));
-                    }
-                    report.rebuilt.push(Rebuilt { pallet: state.wire(), head, source: source.to_string() });
-                }
-                Err(why) => report.undurable.push(undurable(&state.wire(), &head, &why)),
-            }
+            landed(report, PalletNamespace::Meta, &state.name, head, source.to_string(), written.as_ref().err());
             return false;
         }
         // A precondition that moved is heal's own race: a later heal judges the ref afresh.
@@ -2381,10 +2479,10 @@ mod tests {
         std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
 
         TRUSTED_REFUSED.with(|refused| refused.set(true));
-        READ_BACK_UNREAD.with(|unread| unread.set(true));
+        READ_BACK_UNREAD.with(|unread| unread.set(usize::MAX));
         let before = repair(Pass::BeforeTaint);
         let after = repair(Pass::AfterTaint);
-        READ_BACK_UNREAD.with(|unread| unread.set(false));
+        READ_BACK_UNREAD.with(|unread| unread.set(0));
         TRUSTED_REFUSED.with(|refused| refused.set(false));
         let before = before.unwrap();
         assert!(before.refused.is_empty() && before.rebuilt.is_empty(), "the first pass leaves it: {:?}", before.refused);
@@ -2868,7 +2966,7 @@ mod tests {
                     #[cfg(unix)]
                     let _taint = matches!(row, Row::Undurable).then(crate::util::file_utils::TaintRecordFaultGuard::failing);
                     match row {
-                        Row::Unread => READ_BACK_UNREAD.with(|unread| unread.set(true)),
+                        Row::Unread => READ_BACK_UNREAD.with(|unread| unread.set(usize::MAX)),
                         #[cfg(unix)]
                         Row::ReadOnly => {
                             use std::os::unix::fs::PermissionsExt;
@@ -2881,7 +2979,7 @@ mod tests {
                         _ => {}
                     }
                     let repair = repair_meta(pass);
-                    READ_BACK_UNREAD.with(|unread| unread.set(false));
+                    READ_BACK_UNREAD.with(|unread| unread.set(0));
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
@@ -3061,9 +3159,9 @@ mod tests {
             // unwritten, and its way out stays settling why. Mutation: judge the reason without the
             // read back → "was not written", red.
             std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
-            READ_BACK_UNREAD.with(|unread| unread.set(true));
+            READ_BACK_UNREAD.with(|unread| unread.set(usize::MAX));
             let refused = repair_meta(Pass::AfterTaint).unwrap().repair.refused;
-            READ_BACK_UNREAD.with(|unread| unread.set(false));
+            READ_BACK_UNREAD.with(|unread| unread.set(0));
             std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
             let tags = refused.iter().find(|refused| refused.pallet == "@tags").expect("@tags is refused");
             assert!(tags.reason.contains(&format!("the rebuild at {} may have been written: the write reported", parcel)), "{:?}", tags);
@@ -3115,6 +3213,274 @@ mod tests {
         let rebuilt = repair_meta(Pass::AfterTaint).unwrap().repair;
         assert!(rebuilt.refused.is_empty(), "{:?}", rebuilt.refused);
         assert_eq!(pallet_utils::get_meta_pallet_head(TAGS_PALLET_NAME).unwrap().as_deref(), Some(parcel.as_str()));
+    }
+
+    // A ref write the pass before the taint recovery could not read back is read back once more,
+    // at the write, and judged on that read, since the pass after the recovery would read a ref
+    // it landed in as undamaged and judge nothing. Each row is a write, each column what that
+    // second read finds.
+    // Mutations: drop the settle in repair's arm, or judge there on the first read → a user
+    // Landed cell judges the unread first read, red; the same in write_meta_rebuild, for every
+    // meta ref or for the office or @redactions alone → that row's Landed cell is deferred on
+    // the unread first read, red; drop the user unread note → the user Unread cells lack it,
+    // red; skip the sync again on an unread settle → the kept-fault cells carry no undurable
+    // entry, red.
+    #[test]
+    fn a_first_pass_write_it_could_not_read_back_is_read_again_at_the_write() {
+        use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
+        use crate::util::office_utils::OFFICE_PALLET_NAME;
+        use crate::util::redaction_utils::REDACTIONS_PALLET_NAME;
+        use crate::util::tag_utils::TAGS_PALLET_NAME;
+
+        // The rows that fail a write by an injected folder sync run on unix only: a folder sync
+        // is a no-op elsewhere, so no injected sync failure can fire.
+        #[cfg_attr(not(unix), allow(dead_code))]
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Row {
+            /// A meta write that returned `Ok`.
+            MetaOk,
+            /// A meta write that left its folder unsynced, with no taint recording that, once.
+            MetaUnrecorded,
+            /// A meta write whose folder sync failed, and a taint records it.
+            MetaFailed,
+            /// As `MetaUnrecorded`, the sync failing every time.
+            MetaKept,
+            UserUnrecorded,
+            UserFailed,
+            UserKept,
+            /// The office's write, beside two trust files that both verify it, so the trust
+            /// repair stops the pass right after.
+            Office,
+            /// `@redactions`' write that returned `Ok`, beside a lost `@tags`.
+            Redactions,
+        }
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Read { Landed, Elsewhere, Unread }
+
+        /// What a pass reported, the trust stop's report among them.
+        #[derive(Debug)]
+        struct Seen { rebuilt: Vec<(String, String)>, deferred: Vec<(String, String, Owner)>, refused: usize, notes: Vec<String>, undurable: Vec<String> }
+        let deferred = |deferred: Vec<Refused>| deferred.into_iter()
+            .map(|refused| (refused.pallet, refused.reason, refused.meta.expect("only a meta ref is deferred").owner))
+            .collect::<Vec<_>>();
+        let rebuilt = |rebuilt: Vec<Rebuilt>| rebuilt.into_iter().map(|rebuilt| (rebuilt.pallet, rebuilt.head)).collect::<Vec<_>>();
+
+        let mut cells = Vec::new();
+        for read in [Read::Landed, Read::Elsewhere, Read::Unread] {
+            cells.extend([(Row::MetaOk, read), (Row::Redactions, read)]);
+            #[cfg(unix)]
+            cells.extend([(Row::MetaUnrecorded, read), (Row::MetaFailed, read), (Row::UserUnrecorded, read), (Row::UserFailed, read)]);
+        }
+        cells.extend([(Row::Office, Read::Landed), (Row::Office, Read::Unread)]);
+        #[cfg(unix)]
+        cells.extend([(Row::MetaKept, Read::Unread), (Row::UserKept, Read::Unread)]);
+
+        const REFUSED_READ: &str = "the read was refused for the test";
+        let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+        let meta_parcel = |message: &str| stack_meta_parcel(store_meta_tree(b"forklift-meta 1 tags", None).unwrap(), Vec::new(), &operator, message, None).unwrap();
+        // A meta ref lost beside a copy that names `head`.
+        let lose = |name: &str, head: &str| {
+            let (reference, copy) = (pallet_utils::get_pallet_ref_path(PalletNamespace::Meta, name), pallet_utils::get_meta_copy_path(name));
+            for path in [&reference, &copy] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            }
+            std::fs::write(&copy, format!("{}\n", head)).unwrap();
+            if reference.exists() {
+                crate::util::file_utils::remove_file(&reference).unwrap();
+            }
+        };
+
+        for (row, read) in cells {
+            let cell = format!("{:?} {:?}", row, read);
+            // A root per cell: a taint a cell's fault leaves stands under its root for this
+            // process.
+            let (fixture, _scratch) = match row {
+                Row::Office => (Some(crate::util::audit_utils::tests::PrivilegeFixture::new(&format!("ref-heal-settle-{:?}", read))), None),
+                _ => (None, Some(scratch(&format!("ref-heal-settle-{:?}-{:?}", row, read)))),
+            };
+            let user = matches!(row, Row::UserUnrecorded | Row::UserFailed | Row::UserKept);
+            let failed = !matches!(row, Row::MetaOk | Row::Office | Row::Redactions);
+            let kept = matches!(row, Row::MetaKept | Row::UserKept);
+            let other = "0".repeat(64);
+
+            let (namespace, name, head) = match (row, &fixture) {
+                (Row::Office, Some(fixture)) => {
+                    let head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap().unwrap();
+                    lose(OFFICE_PALLET_NAME, &head);
+                    let resettled = crate::util::office_utils::encode_trust_anchor(&crate::util::office_utils::TrustAnchor {
+                        enabled_at: fixture.anchor.enabled_at + 1, ..fixture.anchor.clone()
+                    });
+                    let copy = crate::globals::forklift_root().join(crate::util::office_utils::FILE_NAME_TRUST_COPY);
+                    crate::util::file_utils::write_file_atomically(&copy, resettled.as_bytes()).unwrap();
+                    (PalletNamespace::Meta, OFFICE_PALLET_NAME, head)
+                }
+                (Row::Redactions, _) => {
+                    let head = redact("one");
+                    lose(REDACTIONS_PALLET_NAME, &head);
+                    lose(TAGS_PALLET_NAME, &meta_parcel("held"));
+                    (PalletNamespace::Meta, REDACTIONS_PALLET_NAME, head)
+                }
+                _ if user => {
+                    let head = stub_parcel("head");
+                    let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main");
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    // Damaged, its bytes still naming the head.
+                    std::fs::write(&path, &head.as_bytes()[..20]).unwrap();
+                    (PalletNamespace::User, "main", head)
+                }
+                _ => {
+                    let head = meta_parcel("held");
+                    lose(TAGS_PALLET_NAME, &head);
+                    (PalletNamespace::Meta, TAGS_PALLET_NAME, head)
+                }
+            };
+            let wire = pallet_utils::PalletRef { namespace, name: name.to_string() }.to_wire();
+            let ref_path = pallet_utils::get_pallet_ref_path(namespace, name);
+            #[cfg(unix)]
+            let folder = ref_path.parent().unwrap().to_path_buf();
+
+            let seen = {
+                #[cfg(unix)]
+                let _sync = match row {
+                    Row::MetaUnrecorded | Row::UserUnrecorded => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly_once(&folder)),
+                    Row::MetaFailed | Row::UserFailed | Row::MetaKept | Row::UserKept => Some(crate::util::file_utils::SyncDirFaultGuard::failing_exactly(&folder)),
+                    Row::MetaOk | Row::Office | Row::Redactions => None,
+                };
+                #[cfg(unix)]
+                let _taint = (failed && row != Row::MetaFailed && row != Row::UserFailed).then(crate::util::file_utils::TaintRecordFaultGuard::failing);
+                // The first read back answers unread; the settle's reads the ref, or is unread too.
+                READ_BACK_UNREAD.with(|unread| unread.set(if read == Read::Unread { 2 } else { 1 }));
+                READS_BACK.with(|reads| reads.borrow_mut().clear());
+                if read == Read::Elsewhere {
+                    let (moved, other) = (ref_path.clone(), other.clone());
+                    BEFORE_READ_BACK.with(|before| before.set(Some(Box::new(move || std::fs::write(&moved, format!("{}\n", other)).unwrap()))));
+                }
+                let seen = match row {
+                    _ if user => {
+                        let repair = repair(Pass::BeforeTaint).unwrap();
+                        Seen { rebuilt: rebuilt(repair.rebuilt), deferred: deferred(repair.deferred), refused: repair.refused.len(), notes: repair.notes, undurable: repair.undurable }
+                    }
+                    Row::Office => {
+                        let stopped = repair_meta(Pass::BeforeTaint).expect_err("the trust repair stops the pass");
+                        Seen { rebuilt: rebuilt(stopped.rebuilt), deferred: deferred(stopped.deferred), refused: stopped.refused.len(), notes: stopped.notes, undurable: Vec::new() }
+                    }
+                    _ => {
+                        let repair = repair_meta(Pass::BeforeTaint).unwrap().repair;
+                        Seen { rebuilt: rebuilt(repair.rebuilt), deferred: deferred(repair.deferred), refused: repair.refused.len(), notes: repair.notes, undurable: repair.undurable }
+                    }
+                };
+                let left = READ_BACK_UNREAD.with(|unread| unread.replace(0));
+                let unrun = BEFORE_READ_BACK.with(std::cell::Cell::take).is_some();
+                assert!(left == 0 && !unrun, "{}: both hooks were consumed: {:?}", cell, seen);
+                let reads = READS_BACK.with(|reads| reads.take());
+                assert_eq!(reads.iter().filter(|read| **read == wire).count(), 2, "{}: the write was read back exactly twice: {:?}", cell, reads);
+                assert_eq!(reads[..2], [wire.clone(), wire.clone()], "{}: the first two reads are of the ref heal wrote: {:?}", cell, reads);
+                seen
+            };
+
+            assert_eq!(seen.refused, 0, "{}: the first pass refuses nothing: {:?}", cell, seen);
+            let ours = seen.deferred.iter().find(|deferred| deferred.0 == wire);
+            let deferral = seen.notes.iter().filter(|note| note.starts_with(&format!("The pass before the taint recovery left the ref of pallet \"{}\"", wire))).collect::<Vec<_>>();
+            let rebuilt_here = seen.rebuilt.contains(&(wire.clone(), head.clone()));
+            let maybe_note = format!("The ref of pallet \"{}\" may have been rebuilt at {}: the write reported ", wire, head);
+            let maybe: Vec<_> = seen.notes.iter().filter(|note| note.starts_with(&maybe_note)).collect();
+            if read != Read::Unread {
+                let first = seen.notes.iter().chain(seen.deferred.iter().map(|deferred| &deferred.1)).find(|said| said.contains(REFUSED_READ));
+                assert!(first.is_none(), "{}: the first read's answer is judged on: {:?}", cell, first);
+            }
+
+            match read {
+                Read::Landed => {
+                    assert!(rebuilt_here && ours.is_none() && deferral.is_empty(), "{}: rebuilt, not deferred: {:?}", cell, seen);
+                    let despite = format!("The ref of pallet \"{}\" was rebuilt at {}, though its write reported: ", wire, head);
+                    assert_eq!(seen.notes.iter().any(|note| note.starts_with(&despite)), failed, "{}: {:?}", cell, seen.notes);
+                    assert!(seen.undurable.is_empty(), "{}: {:?}", cell, seen.undurable);
+                }
+                Read::Elsewhere if user => {
+                    assert!(seen.rebuilt.is_empty() && seen.deferred.is_empty() && maybe.is_empty() && seen.undurable.is_empty(), "{}: nothing landed, so nothing is said: {:?}", cell, seen);
+                }
+                Read::Elsewhere => {
+                    let (reason, owner) = ours.map(|ours| (ours.1.clone(), ours.2.clone())).unwrap_or_else(|| panic!("{}: deferred: {:?}", cell, seen));
+                    match failed {
+                        false => {
+                            assert_eq!((reason.as_str(), &owner), (format!("the rebuild at {} did not read back", head).as_str(), &Owner::Again), "{}", cell);
+                            assert_eq!(deferral, vec![&format!("The pass before the taint recovery left the ref of pallet \"{}\" for the pass after it: the rebuild at {} did not read back.", wire, head)], "{}", cell);
+                        }
+                        true => {
+                            assert!(reason.starts_with(&format!("the rebuild at {} was not written: ", head)), "{}: {}", cell, reason);
+                            assert_eq!(owner, Owner::Unwritten(None), "{}", cell);
+                        }
+                    }
+                    assert!(!rebuilt_here && seen.undurable.is_empty(), "{}: {:?}", cell, seen);
+                }
+                Read::Unread if user => {
+                    assert_eq!(maybe.len(), 1, "{}: the head heal set out to write is named once: {:?}", cell, seen.notes);
+                    assert!(maybe[0].ends_with(&format!(", and its ref could not be read back: {}.", REFUSED_READ)), "{}: {}", cell, maybe[0]);
+                    assert!(seen.rebuilt.is_empty() && seen.deferred.is_empty(), "{}: {:?}", cell, seen);
+                }
+                Read::Unread => {
+                    let (reason, owner) = ours.map(|ours| (ours.1.clone(), ours.2.clone())).unwrap_or_else(|| panic!("{}: deferred: {:?}", cell, seen));
+                    match failed {
+                        false => assert_eq!(reason, format!("the rebuild at {} was written, but its ref could not be read back: {}", head, REFUSED_READ), "{}", cell),
+                        true => assert!(reason.starts_with(&format!("the rebuild at {} may have been written: the write reported ", head))
+                            && reason.ends_with(&format!(", and its ref could not be read back: {}", REFUSED_READ)), "{}: {}", cell, reason),
+                    }
+                    assert_eq!(owner, Owner::Unwritten(None), "{}", cell);
+                    assert_eq!(deferral.len(), 1, "{}: {:?}", cell, seen.notes);
+                    assert!(!rebuilt_here, "{}: {:?}", cell, seen);
+                }
+            }
+
+            // Not durable if it landed: said only where the sync again fails too, and only while
+            // the ref still cannot be read.
+            #[cfg(unix)]
+            match kept {
+                true => {
+                    let said = format!(
+                        "The ref of pallet \"{}\" may have been rebuilt at {}, and if it was, its ref is not durable: injected directory-sync failure for \"{}\"",
+                        wire, head, folder.to_string_lossy()
+                    );
+                    assert!(seen.undurable.len() == 1 && seen.undurable[0].starts_with(&said), "{}: {:?}", cell, seen.undurable);
+                }
+                false => assert!(seen.undurable.is_empty(), "{}: {:?}", cell, seen.undurable),
+            }
+            #[cfg(not(unix))]
+            let _ = kept;
+
+            // A @tags beside @redactions waits for it, as long as heal cannot tell @redactions
+            // stands.
+            if row == Row::Redactions {
+                let tags = seen.deferred.iter().find(|deferred| deferred.0 == "@tags");
+                match read {
+                    Read::Landed => assert!(tags.is_none() && seen.rebuilt.iter().any(|rebuilt| rebuilt.0 == "@tags"), "{}: {:?}", cell, seen),
+                    Read::Elsewhere | Read::Unread => assert_eq!(tags.map(|tags| (tags.1.as_str(), &tags.2)), Some((
+                        "it is verified against the office and checked against the redactions, and the ref of pallet \"@redactions\" is damaged too: set that first",
+                        &Owner::Cascade("@redactions".to_string()),
+                    )), "{}: {:?}", cell, seen),
+                }
+            }
+        }
+
+        // The settle answers each attempt with what its ref reads as now.
+        let (_root, _scope) = scratch("ref-heal-settle-answers");
+        let head = stub_parcel("head");
+        let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{}\n", head)).unwrap();
+        let attempt = |name: &str| WriteAttempt::Ref { namespace: PalletNamespace::User, name: name.to_string(), head: head.clone(), error: None };
+        let mut report = Repair::default();
+        let answers = |settled: Vec<(WriteAttempt, ReadBack)>| settled.into_iter().map(|(WriteAttempt::Ref { name, head, .. }, read)| (name, head, match read {
+            ReadBack::Landed => "landed".to_string(),
+            ReadBack::Elsewhere => "elsewhere".to_string(),
+            ReadBack::Unread(why) => why,
+        })).collect::<Vec<_>>();
+        assert_eq!(answers(settle_attempts(vec![attempt("main"), attempt("absent")], &mut report)), vec![
+            ("main".to_string(), head.clone(), "landed".to_string()),
+            ("absent".to_string(), head.clone(), "elsewhere".to_string()),
+        ]);
+        READ_BACK_UNREAD.with(|unread| unread.set(1));
+        assert_eq!(answers(settle_attempts(vec![attempt("main")], &mut report)), vec![("main".to_string(), head.clone(), REFUSED_READ.to_string())]);
+        assert_eq!(report, Repair::default(), "an attempt that returned Ok needs no sync again");
     }
 
     /// Record an unsigned redaction of a blob of `content`, and return the `@redactions` head.
