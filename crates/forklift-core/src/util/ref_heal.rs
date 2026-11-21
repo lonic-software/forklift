@@ -973,7 +973,8 @@ fn landed(report: &mut Repair, namespace: PalletNamespace, name: &str, head: Str
 /// back. The pass after the taint recovery would read a ref it landed in as undamaged and judge
 /// nothing, so the pass that wrote it settles it ([`settle_attempts`]).
 ///
-/// Every match on it names each variant, with no wildcard arm.
+/// Where it is taken apart, an irrefutable `let` does it, so a further variant fails to build
+/// there until that site decides it.
 #[derive(Debug)]
 enum WriteAttempt {
     /// The write of the ref of pallet `name` in `namespace` at `head`, and what it reported
@@ -3213,12 +3214,12 @@ mod tests {
     // at the write, and judged on that read, since the pass after the recovery would read a ref
     // it landed in as undamaged and judge nothing. Each row is a write, each column what that
     // second read finds.
-    // Mutations: drop the settle in repair's arm → the user Landed cells are not rebuilt, red;
-    // drop it in write_meta_rebuild → the meta Landed cells are deferred, the trust stop carries
-    // no rebuild and @tags waits on @redactions, red; judge on the first read after the settle →
-    // the Elsewhere cells give the first read's reason, red; drop the user unread note → the user
-    // Unread cells lack it, red; skip the sync again on an unread settle → the kept-fault cells
-    // carry no undurable entry, red.
+    // Mutations: drop the settle in repair's arm, or judge there on the first read → a user
+    // Landed cell judges the unread first read, red; the same in write_meta_rebuild, for every
+    // meta ref or for the office or @redactions alone → that row's Landed cell is deferred on
+    // the unread first read, red; drop the user unread note → the user Unread cells lack it,
+    // red; skip the sync again on an unread settle → the kept-fault cells carry no undurable
+    // entry, red.
     #[test]
     fn a_first_pass_write_it_could_not_read_back_is_read_again_at_the_write() {
         use crate::util::meta_tree::{stack_meta_parcel, store_meta_tree};
