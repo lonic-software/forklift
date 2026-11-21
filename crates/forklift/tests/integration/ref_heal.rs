@@ -2147,16 +2147,17 @@ fn plant_taint(root: &Path, hashes: &[&str]) {
 /// is more than one fault, and the taint stands.
 // Mutations: file a vanished copy as unrecognized again → "copy" red (the run refuses, the
 // taint stands); resolve a vanished copy whatever its ref holds → "copy-ref-damaged" red (the
-// taint clears); judge the ref by its bytes alone → "copy-head-absent" red (the taint clears).
+// taint clears); judge the ref by its bytes alone → "copy-head-absent" red (the taint clears);
+// read the ref through a link → "copy-ref-link" red (the taint clears).
 #[test]
 fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
-    for case in ["copy", "ref", "copy-ref-damaged", "copy-head-absent", "both"] {
+    for case in ["copy", "ref", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
         let area = Area::new(&format!("meta-vanished-{}", case));
         let (root, _, second) = tagged(&area);
         let (copy, reference) = (meta_copy_path(&root, "tags"), meta_path(&root, "tags"));
         let absent = format!("{}{}", if second.starts_with('0') { '1' } else { '0' }, &second[1..]);
         let recorded: &[&str] = match case {
-            "copy" | "copy-ref-damaged" | "copy-head-absent" => &["meta-copy/tags"],
+            "copy" | "copy-ref-damaged" | "copy-head-absent" | "copy-ref-link" => &["meta-copy/tags"],
             "ref" => &["meta/tags"],
             _ => &["meta/tags", "meta-copy/tags"],
         };
@@ -2171,6 +2172,16 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
             "copy-ref-damaged" => std::fs::write(&reference, b"not a hash").unwrap(),
             // A well-formed head the store does not hold: the copy mend would not set the copy to it.
             "copy-head-absent" => std::fs::write(&reference, format!("{}\n", absent)).unwrap(),
+            // A link to a file holding the ref's own bytes: the copy mend reads a link as no ref.
+            "copy-ref-link" => {
+                let target = root.join("ref-target");
+                std::fs::write(&target, std::fs::read(&reference).unwrap()).unwrap();
+                forklift_core::util::file_utils::remove_file(&reference).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, &reference).unwrap();
+                #[cfg(windows)]
+                if std::os::windows::fs::symlink_file(&target, &reference).is_err() { continue; }
+            }
             _ => {}
         }
 
@@ -2190,6 +2201,7 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
                 let why = match case {
                     "copy-ref-damaged" => "does not hold a head either".to_string(),
                     "copy-head-absent" => format!("names {}, which is not in the store", absent),
+                    "copy-ref-link" => "is not a file".to_string(),
                     _ => "is lost too".to_string(),
                 };
                 let line = format!("a lost meta pallet ref copy whose ref (\\\"meta/tags\\\") {}: \\\"meta-copy/tags\\\"", why);
