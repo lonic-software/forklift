@@ -840,6 +840,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **An `undo` that stops after putting the pallets back can be retried.** An `undo` of a `stack`,
+  `consolidate` or `pick` puts the bay's position and the pallets back first, then the
+  consolidation or pick that was in progress before. When one of those later writes failed, or the
+  undo stopped before taking the operation off the journal, every retry refused with "has moved
+  since that operation", and the operation could be neither undone nor retried. An undo now marks
+  the journal entry before it changes anything, and a retry of a marked entry resumes from where
+  the last run stopped. An entry no undo has started is now refused when the bay only looks like an
+  interrupted undo's, where before one such bay was accepted. `abort`, with or without
+  `--keep-files`, clears the mark, so an undo after it never writes the aborted merge back.
 - `heal` checks every pallet that `--ref` and `--remove-ref` name before it changes anything.
   Before, an invalid name, or `--ref` naming a metadata pallet (`@<name>`), was refused only after
   the specs before it had already been written.
@@ -872,7 +881,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   Now the current pallet is moved back where the operation left it, and the retry runs once
   `forklift heal` has cleared the taint. The move still runs the redaction check, and in a served
   or sparse warehouse it still reads the pallet's history; a read the taint refuses leaves the
-  undo as before, and the error then says a retried undo will not pass its check. The same holds
+  pallet put back, and the error then says whether a retried undo resumes from there. The same holds
   when the fetch scope changed while the undo ran, or when the record of sealed or unavailable
   content lost an entry, as it does in a cache warehouse when sealed content is read back in
   meanwhile: the pallet is then moved back by an ordinary checked write, which the taint refuses.
