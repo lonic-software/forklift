@@ -4620,7 +4620,10 @@ async fn redaction_round(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>
 fn finish_round(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>, applied: bool, held_back: bool, owed: bool) {
     use std::sync::atomic::Ordering;
 
-    // A rebuild the drain held back (`rebuild_again`) is carried on as one an apply calls for is.
+    // An asked-for rebuild (`rebuild_again`) is carried on as one an apply calls for is: one the
+    // drain held back, or one whose waiter is still queued for a permit. A queued one may build
+    // before the round this leaves it to, which then builds once more; an extra build, never a
+    // lost one.
     let due = applied || held_back || warehouse.rebuild_again.load(Ordering::SeqCst);
 
     // Each leaves a round to follow: the write asks for a run after setting the flag, and a run
@@ -5027,9 +5030,9 @@ fn maybe_rebuild_bundle(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) 
 /// order with the requests waiting for one. It holds no reference to the warehouse while it waits,
 /// so it never holds a drain open ([`drain`]), and it gets its turn under sustained load, as a
 /// rebuild that only took a free permit would not. One asked for by a lift waits for that lift's
-/// own permit to be given back. A build runs for as long as it takes, so in multi mode as many
-/// warehouses as there are permits can rebuild at once, and costly requests are refused for
-/// capacity meanwhile.
+/// own permit to be given back. A build runs for as long as it takes, holding its permit: at a cap
+/// of 1 every costly request is refused for capacity meanwhile, and in multi mode as many
+/// warehouses as there are permits can rebuild at once, with the same effect.
 fn rebuild_bundle(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, again: bool) {
     use std::sync::atomic::Ordering;
 
@@ -5106,6 +5109,7 @@ async fn run_rebuild(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, per
         let worker = Arc::clone(&warehouse);
         let result = permit.spawn_blocking(move || {
             let _scope = StorageRootScope::enter(&worker.root);
+            bundle_build_test_checkpoint(&worker.root);
 
             bundle_utils::build_bundle()
         }).await;
@@ -5549,6 +5553,25 @@ fn bundle_open_test_checkpoint(root: &std::path::Path) {
 
 #[cfg(not(test))]
 fn bundle_open_test_checkpoint(_root: &std::path::Path) {}
+
+/// Test seam: a bundle build of the armed warehouse root runs the armed closure once, on the
+/// build's blocking thread before it builds, so a test can see what the build holds while it runs.
+/// Keyed by root so tests rebuilding concurrently never meet.
+#[cfg(test)]
+static BUNDLE_BUILD_TEST_SEAMS: Mutex<BTreeMap<PathBuf, Box<dyn FnOnce() + Send>>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn bundle_build_test_checkpoint(root: &std::path::Path) {
+    let armed = BUNDLE_BUILD_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).remove(root);
+
+    if let Some(run) = armed {
+        run();
+    }
+}
+
+#[cfg(not(test))]
+fn bundle_build_test_checkpoint(_root: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -12055,10 +12078,12 @@ mod tests {
     }
 
     /// A waiter granted while a build runs leaves its ask to that build, and the build's end
-    /// queues it, so the ask gets a build of its own.
+    /// queues it, so the ask gets a build of its own. That build holds its Heavy permit while it
+    /// runs: nothing else contends for the permit here, so a build that gave it back would see it
+    /// free.
     ///
-    /// Revert: drop the re-check after a rebuild ends → the ask stays with no waiter and no
-    /// build → red.
+    /// Reverts: drop the re-check after a rebuild ends → the ask stays with no waiter and no
+    /// build → red. Give the permit back before the build → red.
     #[tokio::test]
     async fn an_ask_met_by_a_running_build_is_queued_when_that_build_ends() {
         let root = scratch_dir("rebuild-ask-during-build");
@@ -12077,11 +12102,20 @@ mod tests {
         assert!(handle.rebuild_again.load(Ordering::SeqCst), "the ask is left to the running build");
         assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 7, "and no build served it");
 
+        let free_during_build = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (heavy, seen) = (Arc::clone(&heavy), Arc::clone(&free_during_build));
+            BUNDLE_BUILD_TEST_SEAMS.lock().unwrap().insert(root.clone(), Box::new(move || {
+                *seen.lock().unwrap() = Some(heavy.available_permits());
+            }));
+        }
+
         // That build ends.
         finish_rebuild(&state, &handle);
         eventually("the ask got a build of its own", || {
             handle.lifts_since_bundle.load(Ordering::SeqCst) == 0 && rebuilds_settled(&handle)
         }).await;
+        assert_eq!(*free_during_build.lock().unwrap(), Some(0), "the build holds its permit while it runs");
 
         drop((handle, state));
         let _ = forklift_core::util::file_utils::remove_dir_all(&root);

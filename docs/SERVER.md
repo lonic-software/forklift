@@ -506,11 +506,13 @@ host if lifts or fetches queue; each refusal is logged as a warning. The cap cou
 not callers or warehouses, so a burst on one warehouse can refuse requests on another: per-caller
 budgets and a cap on reads are not part of it. Background bundle rebuilds (`rebuild_after_lifts`,
 at most one per warehouse) count against the same cap: a rebuild that finds it full waits its turn
-in arrival order with the requests, without holding the warehouse, so it never holds up a drain.
-Meanwhile clients get the bundle already built, or none if a redaction took it down, and fetch the
-rest object by object. A build holds its slot until it ends, so with several warehouses rebuilding
-at once, costly requests can be refused for capacity for as long as the builds run. Redaction runs
-stay outside the cap.
+in arrival order with the requests. While it waits it holds nothing of the warehouse; once it runs,
+a redaction run that must drain the warehouse waits for it to end. Meanwhile clients get the bundle
+already built, or none if a redaction took it down, and fetch the rest object by object. A build
+holds its slot until it ends, which can take minutes on a large warehouse. At a cap of 1 (the
+default on a one-CPU host), every costly request is refused for capacity while a rebuild runs, and
+with several warehouses rebuilding at once the same holds at any cap they fill. Size the cap above
+1 if pushes must keep landing during a rebuild. Redaction runs stay outside the cap.
 
 **The single-writer rule:** exactly one serving process per warehouse root; a second server
 on the same root is refused at startup, since the serve lock it needs is held. Do not point two
