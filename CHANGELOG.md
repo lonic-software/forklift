@@ -828,9 +828,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
   Before, the taint left by the failure refused each of these put-backs, and the trust anchor or
   the copy was left at the new value beside an unchanged office or ref. The taint still stands
-  afterwards, and `heal` is still needed. A trust install that created the trust file and then
-  fails removes it again; if the folder sync after that removal fails, a taint is now recorded for
-  `heal` as well.
+  afterwards, and `heal` is still needed. When putting the trust anchor back lands but its folder
+  sync fails, the install's error now says the previous anchor was put back, not that the new one
+  stands.
 - `heal` no longer refuses forever over a durability taint that records a lost metadata ref copy
   (`.forklift/meta-copy/<name>`), as a crash can leave one after a metadata pallet's first write.
   When the ref beside it is a file holding a parcel hash, that part of the taint is resolved, and

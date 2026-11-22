@@ -1517,7 +1517,7 @@ fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
 ///
 /// Inside a bulk-store session the write is only staged and returns `Ok`: its rename and its
 /// re-check run in `BulkStoreSession::finish`, which renames every staged file and then re-checks,
-/// so a taint standing there is reported after the files were replaced, compensating or not.
+/// so a taint standing there is reported after the files were replaced.
 pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
     write_file_atomically_as(file_path, content, false)
 }
