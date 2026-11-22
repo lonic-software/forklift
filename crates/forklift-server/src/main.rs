@@ -65,6 +65,17 @@ enum Command {
         #[arg(long)]
         max_heavy_requests: Option<u32>,
 
+        /// Let each caller send at most this many cheap requests a minute (every authenticated
+        /// route but the costly ones); past it a request is refused with a 429 and Retry-After
+        /// (default: no limit; at least 4)
+        #[arg(long)]
+        light_requests_per_minute: Option<u32>,
+
+        /// Let each caller send at most this many costly requests a minute; past it a request is
+        /// refused with a 429 and Retry-After (default: no limit; at least 4)
+        #[arg(long)]
+        heavy_requests_per_minute: Option<u32>,
+
         /// Serve with no authentication at all: the explicit opt-out. Without this (and
         /// without --token/--tokens/a configured authentication hook), the server refuses
         /// to start rather than infer "open" from an empty auth config.
@@ -249,8 +260,13 @@ async fn async_main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Serve { root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, open, config } =>
-            serve(root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, open, config).await,
+        Command::Serve {
+            root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests,
+            light_requests_per_minute, heavy_requests_per_minute, open, config,
+        } => serve(
+            root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests,
+            RequestLimitFlags { light_requests_per_minute, heavy_requests_per_minute }, open, config,
+        ).await,
         Command::Prepare { root } => prepare(&root),
         Command::Upgrade { root } => upgrade(&root),
         Command::Bundle { root } => bundle(&root),
@@ -322,13 +338,23 @@ async fn serve(root: Option<String>,
                max_body_mb: Option<u64>,
                rebuild_after_lifts: Option<u32>,
                max_heavy_requests: Option<u32>,
+               limits: RequestLimitFlags,
                open: bool,
                config: Option<String>) -> Result<(), String> {
     let options = serve_options(
-        root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, open, config,
+        root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, limits, open,
+        config,
     )?;
 
     server::serve(options).await
+}
+
+/// The per-caller request limit flags of `serve` (`--light-requests-per-minute`,
+/// `--heavy-requests-per-minute`).
+#[derive(Default)]
+struct RequestLimitFlags {
+    light_requests_per_minute: Option<u32>,
+    heavy_requests_per_minute: Option<u32>,
 }
 
 /// The flags merged with the config file `config` names, if any: a flag that is given wins.
@@ -341,6 +367,7 @@ fn serve_options(root: Option<String>,
                max_body_mb: Option<u64>,
                rebuild_after_lifts: Option<u32>,
                max_heavy_requests: Option<u32>,
+               limits: RequestLimitFlags,
                open: bool,
                config: Option<String>) -> Result<server::ServeOptions, String> {
     let file = match config {
@@ -364,6 +391,8 @@ fn serve_options(root: Option<String>,
         resolution_hook: file.resolution_hook,
         authentication_cache_secs: file.authentication_cache_secs,
         max_heavy_requests: max_heavy_requests.or(file.max_heavy_requests),
+        light_requests_per_minute: limits.light_requests_per_minute.or(file.light_requests_per_minute),
+        heavy_requests_per_minute: limits.heavy_requests_per_minute.or(file.heavy_requests_per_minute),
         // The flag is the affirmative case: passing `--open` always opts out, regardless of
         // the config file. There is no flag-side way to *cancel* `open = true` in the file
         // (matching every other flag/file pair here, where "flags override" only ever means
@@ -413,6 +442,8 @@ struct ConfigFile {
     max_body_mb: Option<u64>,
     rebuild_after_lifts: Option<u32>,
     max_heavy_requests: Option<u32>,
+    light_requests_per_minute: Option<u32>,
+    heavy_requests_per_minute: Option<u32>,
 
     /// The explicit opt-out of authentication (`server::ServeOptions::open`'s config-file
     /// counterpart). `Option<bool>`, like every other field here, rather than a bare `bool`
@@ -440,6 +471,8 @@ impl std::fmt::Debug for ConfigFile {
             .field("max_body_mb", &self.max_body_mb)
             .field("rebuild_after_lifts", &self.rebuild_after_lifts)
             .field("max_heavy_requests", &self.max_heavy_requests)
+            .field("light_requests_per_minute", &self.light_requests_per_minute)
+            .field("heavy_requests_per_minute", &self.heavy_requests_per_minute)
             .field("open", &self.open)
             .field("authentication_hook", &self.authentication_hook)
             .field("admission_hook", &self.admission_hook)
@@ -591,9 +624,9 @@ fn optional_bool(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Resul
 /// present in the file against this list, so `tokenn = "…"` (a typo `parse_config`'s strict
 /// per-field readers cannot catch on their own, since the misspelled key is simply never looked
 /// up) is a startup error rather than a silently no-op setting.
-const CONFIG_TOP_LEVEL_KEYS: [&str; 10] = [
+const CONFIG_TOP_LEVEL_KEYS: [&str; 12] = [
     "root", "warehouses", "addr", "token", "tokens", "max_body_mb", "rebuild_after_lifts",
-    "max_heavy_requests", "open", "hooks",
+    "max_heavy_requests", "light_requests_per_minute", "heavy_requests_per_minute", "open", "hooks",
 ];
 
 /// The keys `parse_config` understands inside `[hooks]` — four independent `{name}_url` /
@@ -725,6 +758,14 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
             doc.get("rebuild_after_lifts"), path, "rebuild_after_lifts"
         )?,
         max_heavy_requests: positive_u32(doc.get("max_heavy_requests"), path, "max_heavy_requests")?,
+        // The lowest limit is refused in `server::RequestLimits::new`, where this file and the
+        // flags converge.
+        light_requests_per_minute: optional_u32(
+            doc.get("light_requests_per_minute"), path, "light_requests_per_minute"
+        )?,
+        heavy_requests_per_minute: optional_u32(
+            doc.get("heavy_requests_per_minute"), path, "heavy_requests_per_minute"
+        )?,
         open: optional_bool(doc.get("open"), path, "open")?,
         authentication_hook: hook_of("authentication")?,
         admission_hook: hook_of("admission")?,
@@ -973,6 +1014,8 @@ mod tests {
         assert_eq!(file.max_body_mb, None);
         assert_eq!(file.rebuild_after_lifts, None);
         assert_eq!(file.max_heavy_requests, None);
+        assert_eq!(file.light_requests_per_minute, None);
+        assert_eq!(file.heavy_requests_per_minute, None);
         assert_eq!(file.open, None);
         assert!(file.authentication_hook.is_none());
         assert!(file.admission_hook.is_none());
@@ -993,6 +1036,8 @@ mod tests {
             max_body_mb = 4096
             rebuild_after_lifts = 20
             max_heavy_requests = 6
+            light_requests_per_minute = 6000
+            heavy_requests_per_minute = 120
             open = true
 
             [hooks]
@@ -1014,6 +1059,8 @@ mod tests {
         assert_eq!(file.max_body_mb, Some(4096));
         assert_eq!(file.rebuild_after_lifts, Some(20));
         assert_eq!(file.max_heavy_requests, Some(6));
+        assert_eq!(file.light_requests_per_minute, Some(6000));
+        assert_eq!(file.heavy_requests_per_minute, Some(120));
         assert_eq!(file.open, Some(true));
         assert_eq!(file.authentication_hook.as_ref().map(|h| h.url.as_str()),
                    Some("https://provider.example/hooks/auth"));
@@ -1118,13 +1165,46 @@ mod tests {
     fn the_max_heavy_requests_flag_overrides_the_file() {
         let path = scratch_config("max-heavy-requests-flag", "max_heavy_requests = 3\n");
         let options_with = |flag: Option<u32>| serve_options(
-            None, None, None, None, None, None, None, flag, false, Some(path.to_str().unwrap().to_string()),
+            None, None, None, None, None, None, None, flag, RequestLimitFlags::default(), false,
+            Some(path.to_str().unwrap().to_string()),
         ).unwrap().max_heavy_requests;
 
         assert_eq!(options_with(Some(5)), Some(5));
         assert_eq!(options_with(None), Some(3));
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
+    }
+
+    /// Each request limit flag wins over its own file key, and each key is used when its flag is
+    /// not given; neither class reads the other's value. The file's 100 and 10, the flags' 700 and
+    /// 70 and the unset default are all distinct.
+    ///
+    /// Reverts: merge a file key over its flag → red; read the light key for the heavy limit →
+    /// red.
+    #[test]
+    fn the_request_limit_flags_override_the_file() {
+        let path = scratch_config(
+            "request-limit-flags", "light_requests_per_minute = 100\nheavy_requests_per_minute = 10\n"
+        );
+        let options_with = |light: Option<u32>, heavy: Option<u32>| {
+            let options = serve_options(
+                None, None, None, None, None, None, None, None,
+                RequestLimitFlags { light_requests_per_minute: light, heavy_requests_per_minute: heavy }, false,
+                Some(path.to_str().unwrap().to_string()),
+            ).unwrap();
+
+            (options.light_requests_per_minute, options.heavy_requests_per_minute)
+        };
+
+        assert_eq!(options_with(Some(700), Some(70)), (Some(700), Some(70)));
+        assert_eq!(options_with(None, None), (Some(100), Some(10)));
+        assert_eq!(options_with(Some(700), None), (Some(700), Some(10)));
+
+        let _ = forklift_core::util::file_utils::remove_file(&path);
+        let unset = serve_options(
+            None, None, None, None, None, None, None, None, RequestLimitFlags::default(), false, None,
+        ).unwrap();
+        assert_eq!((unset.light_requests_per_minute, unset.heavy_requests_per_minute), (None, None));
     }
 
     #[test]
@@ -1516,6 +1596,7 @@ mod tests {
             None,
             None,
             None,
+            RequestLimitFlags::default(),
             false,
             Some(path.to_str().unwrap().to_string()),
         ).await.unwrap_err();
@@ -1542,6 +1623,7 @@ mod tests {
             None,
             None,
             None,
+            RequestLimitFlags::default(),
             false,
             Some(path.to_str().unwrap().to_string()),
         ).await.unwrap_err();
@@ -1567,6 +1649,7 @@ mod tests {
             None,
             None,
             None,
+            RequestLimitFlags::default(),
             false,
             None,
         ).await.unwrap_err();

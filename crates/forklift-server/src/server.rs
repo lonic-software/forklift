@@ -51,6 +51,10 @@ use forklift_core::util::applied_redactions::AppliedSet;
 use forklift_core::util::withholding::{self, WithheldSet};
 use subtle::ConstantTimeEq;
 
+mod request_limits;
+
+use request_limits::RequestLimits;
+
 /// One served warehouse: its storage root, its bundle-rebuild state and the locks it is served
 /// under.
 struct WarehouseHandle {
@@ -663,6 +667,10 @@ struct AppState {
     /// How long a Heavy request waits for a permit: [`HEAVY_WAIT`] when served, shorter in tests.
     heavy_wait: std::time::Duration,
 
+    /// Each caller's request budget per cost class, charged by the authentication layer
+    /// ([`authenticate`]).
+    limits: RequestLimits,
+
     /// The explicit opt-out of authentication — see [`ServeOptions::open`]. `check_auth` reads
     /// this, and only this, to decide whether an otherwise-empty auth config means `Open`;
     /// `serve` refuses to start rather than ever construct an `AppState` with this `false` and
@@ -774,6 +782,14 @@ pub struct ServeOptions {
     /// run at once; `None` = the host's available parallelism. Zero is refused. See
     /// [`heavy_capacity`].
     pub max_heavy_requests: Option<u32>,
+
+    /// How many cheap requests (every authenticated route but the costly ones above) each caller
+    /// may send a minute; `None` = no limit. See [`RequestLimits`].
+    pub light_requests_per_minute: Option<u32>,
+
+    /// How many costly requests each caller may send a minute; `None` = no limit. See
+    /// [`RequestLimits`].
+    pub heavy_requests_per_minute: Option<u32>,
 
     /// The explicit opt-out of authentication (`--open` / `open = true`). This is the ONLY
     /// way [`check_auth`] ever returns [`Principal::Open`] — an empty auth config (no token, no
@@ -967,6 +983,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // only path into this value — see `authentication_cache_ttl`'s own doc for why.
     let authentication_cache_ttl = authentication_cache_ttl(options.authentication_cache_secs)?;
     let heavy_capacity = heavy_capacity(options.max_heavy_requests)?;
+    let limits = RequestLimits::new(options.light_requests_per_minute, options.heavy_requests_per_minute)?;
 
     // Refuse to start rather than ever construct an `AppState` that would fall through to
     // `Principal::Open` by accident: `check_auth` only returns `Open` when `options.open` is
@@ -1118,6 +1135,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         heavy: Arc::new(tokio::sync::Semaphore::new(heavy_capacity)),
         rebuilds: Arc::new(tokio::sync::Semaphore::new(REBUILD_SLOTS)),
         heavy_wait: HEAVY_WAIT,
+        limits,
         open: options.open,
     });
 
@@ -1218,9 +1236,10 @@ enum Access {
     Public,
 }
 
-/// What a [`RouteEntry`]'s request costs the server, and so whether it is admitted under the cap
-/// of costly requests ([`acquire_heavy`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// What a [`RouteEntry`]'s request costs the server: whether it is admitted under the cap of
+/// costly requests ([`acquire_heavy`]), and which of its caller's buckets it is charged to
+/// ([`RequestLimits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Cost {
     /// Nothing unbounded on the request path: no history walk, no bundle built, or only a walk
     /// bounded otherwise (`post_holds`'s own cap, the chunk gate's one walk per warehouse).
@@ -1238,9 +1257,9 @@ struct RouteEntry {
     mount: Mount,
     modes: Modes,
     access: Access,
-    /// Read by the test that holds it to the handlers calling [`acquire_heavy`]; the handler, not
-    /// this field, admits the request, so the field carries the class for that test and the reader.
-    #[cfg_attr(not(test), expect(dead_code, reason = "read only by the test that holds it to the handlers"))]
+    /// The bucket the authentication layer charges the request to ([`authenticate`]). Admission
+    /// under the Heavy cap is the handler's own call to [`acquire_heavy`], which a test holds to
+    /// this field.
     cost: Cost,
     /// Builds the entry's method router from the entry's own method, so an entry cannot answer a
     /// method it does not name.
@@ -1305,7 +1324,7 @@ fn register(state: &Arc<AppState>, mount: Mount, multi: bool) -> Router<Arc<AppS
         let mut answer = (entry.handler)(entry.verb.filter());
 
         if entry.access == Access::Authenticated {
-            answer = answer.route_layer(middleware::from_fn_with_state(Arc::clone(state), authenticate));
+            answer = answer.route_layer(middleware::from_fn_with_state((Arc::clone(state), entry.cost), authenticate));
         }
 
         // axum merges a second method router on a path it already holds into the first.
@@ -1339,25 +1358,61 @@ fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
 }
 
 /// The authentication layer: refuse the request from its headers alone, or pass it on with its
-/// [`Principal`] in the request extensions. See [`router`].
-async fn authenticate(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Response {
-    match check_auth(&state, request.headers()).await {
-        Ok(principal) => {
-            request.extensions_mut().insert(principal);
-            next.run(request).await
-        }
-        Err(error) => {
-            let body = request.into_body();
+/// [`Principal`] in the request extensions. A caller whose bucket for the route's cost class is
+/// empty ([`RequestLimits`]) is refused here too, with a `429`, before its body is read. A request
+/// admitted is charged whatever its handler then answers. See [`router`].
+async fn authenticate(State((state, cost)): State<(Arc<AppState>, Cost)>,
+                      mut request: Request,
+                      next: Next) -> Response {
+    let principal = match check_auth(&state, request.headers()).await {
+        Ok(principal) => principal,
+        Err(error) => return refuse_unread(request, error_response(error)),
+    };
 
-            if !body.is_end_stream() {
-                tokio::spawn(discard_refused_body(
-                    body, REFUSED_BODY_DISCARD_TIME, REFUSED_BODY_DISCARD_BYTES
-                ));
-            }
-
-            error_response(error)
+    if let Err(throttled) = state.limits.charge(&principal, cost) {
+        if throttled.log {
+            tracing::warn!(
+                caller = ?principal,
+                class = ?cost,
+                retry_after_secs = throttled.retry_after_secs,
+                "a caller was refused for its request limit; further refusals of the same caller and \
+                class this minute are not logged"
+            );
         }
+
+        return refuse_unread(request, throttled_response(throttled.retry_after_secs));
     }
+
+    request.extensions_mut().insert(principal);
+    next.run(request).await
+}
+
+/// Answer `request` with `refusal` without reading its body first: a body still arriving is read
+/// and thrown away in the background ([`discard_refused_body`]), so a client still writing reads
+/// the refusal rather than a broken pipe.
+fn refuse_unread(request: Request, refusal: Response) -> Response {
+    let body = request.into_body();
+
+    if !body.is_end_stream() {
+        tokio::spawn(discard_refused_body(body, REFUSED_BODY_DISCARD_TIME, REFUSED_BODY_DISCARD_BYTES));
+    }
+
+    refusal
+}
+
+/// The `429` of a caller whose request limit is spent: `Retry-After` is the time its next request
+/// takes to refill.
+fn throttled_response(retry_after_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(error_body(
+            "This caller has sent more requests than the server's request limit allows. Try again \
+            after the time Retry-After gives.".to_string()
+        )),
+    ).into_response();
+    response.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+
+    response
 }
 
 /// How long, and how many bytes, one refused request's body is read and thrown away.
@@ -1368,7 +1423,8 @@ const REFUSED_BODY_DISCARD_BYTES: usize = 128 * 1024 * 1024;
 /// writing would break its pipe before it reads the refusal, and it would report a network failure
 /// instead of a bad token. Past either bound the connection closes and that client does see the
 /// failure. The bounds are per request: a body finished inside them leaves the connection open for
-/// the next request, as any refusal does, so limiting a peer's request rate stays the proxy's job.
+/// the next request, as any refusal does, so limiting the request rate of a peer that fails
+/// authentication stays the proxy's job ([`RequestLimits`] charges only authenticated callers).
 async fn discard_refused_body(body: Body, time: std::time::Duration, bytes: usize) {
     use tokio_stream::StreamExt;
 
@@ -5798,6 +5854,7 @@ mod tests {
             heavy: Arc::new(tokio::sync::Semaphore::new(heavy_capacity(None).unwrap())),
             rebuilds: Arc::new(tokio::sync::Semaphore::new(REBUILD_SLOTS)),
             heavy_wait: HEAVY_WAIT,
+            limits: RequestLimits::unlimited(),
             open: true,
         }
     }
@@ -6083,6 +6140,156 @@ mod tests {
             .map(|(is_multi, route)| (is_multi, route.to_string()));
 
         assert_eq!(public, expected, "the public routes, asked in each mode");
+    }
+
+    /// The response's head, its status line and headers, read as [`status_line`] reads the line.
+    async fn response_head(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 1024];
+
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "the connection closed with no response");
+                received.extend_from_slice(&chunk[..count]);
+            }
+        }).await;
+
+        assert!(read.is_ok(), "no response while the body was owed: the server is waiting for it");
+
+        String::from_utf8_lossy(&received).to_lowercase()
+    }
+
+    /// Served, the layer charges each request to its caller's bucket for the route's own cost
+    /// class: a caller whose Heavy bucket is spent is refused on every Heavy route, with a `429`
+    /// whose `Retry-After` is one request's refill and with its body still owed, and on no Light
+    /// route; a caller whose Light bucket is spent is refused on every Light route and on no Heavy
+    /// one; a caller that has spent nothing is refused nowhere. `/healthz` is charged to nobody.
+    /// Each bucket is spent just before the request it must refuse, so no refill while the test
+    /// runs can admit that request. The `Retry-After` value itself is pinned in `request_limits`'
+    /// tests: a spent bucket refills between the spending and the answer, so only its bound is
+    /// asserted here.
+    ///
+    /// Reverts: charge every request as Light (or as Heavy) → red on the other class's routes; key
+    /// the bucket on the class alone → red on the fresh callers; charge after the handler reads its
+    /// body → red, the refusal waits for the body.
+    #[tokio::test]
+    async fn the_layer_charges_each_route_to_its_own_class() {
+        let single = scratch_dir("limits-layer-single");
+        let multi = scratch_dir("limits-layer-multi");
+        let state_for = |mode: ServeMode| {
+            // alice and bob, and one fresh caller for each request that must be admitted, since
+            // every admitted request spends from its caller's bucket.
+            let operator_tokens = [("tok-alice".to_string(), "alice".to_string()), ("tok-bob".to_string(), "bob".to_string())]
+                .into_iter()
+                .chain((0..64).map(|index| (format!("tok-{index}"), format!("fresh-{index}"))))
+                .collect();
+            Arc::new(AppState {
+                operator_tokens,
+                open: false,
+                limits: RequestLimits::new(Some(6), Some(4)).unwrap(),
+                ..base_state(mode)
+            })
+        };
+        let cases = [
+            (state_for(ServeMode::Single(Arc::new(WarehouseHandle::new(single)))), false),
+            (state_for(ServeMode::Multi { base: multi }), true),
+        ];
+        let mut refused = Vec::new();
+
+        for (state, is_multi) in cases {
+            let addr = serve_router(Arc::clone(&state), 1 << 20).await;
+            let mut fresh = (0..64).map(|index| format!("tok-{index}"));
+
+            for (entry, path) in registered_routes(is_multi) {
+                let method = verb_name(entry.verb);
+
+                if entry.access == Access::Public {
+                    for _ in 0..10 {
+                        let mut stream = send_head(addr, method, &path, None, 0).await;
+                        assert!(status_line(&mut stream).await.contains(" 200 "), "{method} {path}");
+                    }
+                    continue;
+                }
+
+                // At most one request's refill: 15 s at 4 a minute, 10 s at 6.
+                let (spent, spender, unspent, most_wait) = match entry.cost {
+                    Cost::Heavy => ("tok-alice", "alice", "tok-bob", 15),
+                    Cost::Light => ("tok-bob", "bob", "tok-alice", 10),
+                };
+                let spender = Principal::Operator(spender.to_string());
+                while state.limits.charge(&spender, entry.cost).is_ok() {}
+
+                let mut stream = send_head(addr, method, &path, Some(spent), 1 << 19).await;
+                let head = response_head(&mut stream).await;
+                assert!(head.starts_with("http/1.1 429 "), "{method} {path} as {spent}: {head}");
+                let wait: u64 = head.lines()
+                    .find_map(|line| line.strip_prefix("retry-after: "))
+                    .unwrap_or_else(|| panic!("{method} {path}: no retry-after in {head}"))
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert!((1..=most_wait).contains(&wait), "{method} {path} as {spent}: {head}");
+                refused.push((is_multi, entry.cost, format!("{method} {path}")));
+
+                // The caller that spent only the other class's bucket, once per mode and class,
+                // and a fresh caller on every route.
+                let unspent_asks = refused.iter()
+                    .filter(|(multi, cost, _)| *multi == is_multi && *cost == entry.cost)
+                    .count() == 1;
+                let tokens = unspent_asks.then(|| unspent.to_string()).into_iter()
+                    .chain(fresh.next());
+
+                for token in tokens {
+                    let mut stream = send_head(addr, method, &path, Some(&token), 0).await;
+                    let status = status_line(&mut stream).await;
+                    assert!(!status.contains(" 429 "), "{method} {path} as {token}: {status}");
+                }
+            }
+        }
+
+        let heavy = refused.iter().filter(|(_, cost, _)| *cost == Cost::Heavy).count();
+        assert_eq!(heavy, 8, "the four Heavy routes, in each mode: {refused:?}");
+        assert!(refused.len() > heavy, "some Light route was asked: {refused:?}");
+    }
+
+    /// A request its handler refuses for now, a `503` with `Retry-After`, is charged like any
+    /// other: a drained warehouse answers every request so, and a caller with a budget of 4 a
+    /// minute in each class is answered `503` four times in each, then `429`.
+    ///
+    /// Revert: give the token back on a `503` with `Retry-After` → every request is a `503` → red.
+    #[tokio::test]
+    async fn a_request_refused_for_now_spends_its_budget() {
+        let handle = Arc::new(WarehouseHandle::new(scratch_dir("limits-refused-for-now")));
+        handle.draining.store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = Arc::new(AppState {
+            operator_tokens: [("tok-alice".to_string(), "alice".to_string())].into_iter().collect(),
+            open: false,
+            limits: RequestLimits::new(Some(4), Some(4)).unwrap(),
+            ..base_state(ServeMode::Single(handle))
+        });
+        let addr = serve_router(state, 1 << 20).await;
+
+        let batch = br#"{"hashes":[]}"#;
+
+        for (method, path, body) in [("POST", "/v1/objects/batch", &batch[..]), ("GET", "/v1/bundles/latest", &[][..])] {
+            for attempt in 1..=5 {
+                use tokio::io::AsyncWriteExt;
+
+                let mut stream = send_head(addr, method, path, Some("tok-alice"), body.len()).await;
+                stream.write_all(body).await.unwrap();
+                let head = response_head(&mut stream).await;
+
+                if attempt <= 4 {
+                    assert!(head.starts_with("http/1.1 503 "), "{method} {path}, request {attempt}: {head}");
+                    assert!(head.contains("\r\nretry-after: "), "{method} {path}, request {attempt}: {head}");
+                } else {
+                    assert!(head.starts_with("http/1.1 429 "), "{method} {path}, request {attempt}: {head}");
+                }
+            }
+        }
     }
 
     const REMOTE_PROTOCOL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/format/REMOTE_PROTOCOL.md");
@@ -11317,6 +11524,8 @@ mod tests {
             resolution_hook: None,
             authentication_cache_secs: None,
             max_heavy_requests: None,
+            light_requests_per_minute: None,
+            heavy_requests_per_minute: None,
             open: false,
         }
     }
@@ -12298,5 +12507,21 @@ mod tests {
         let error = serve(options).await.unwrap_err();
 
         assert!(error.starts_with("--max-heavy-requests (\"max_heavy_requests\" in the config file) is 0"), "{error}");
+    }
+
+    /// Each request limit of a `ServeOptions` reaches the server's limits as its own class: a
+    /// limit under the minimum is refused at startup, naming the flag it came from.
+    ///
+    /// Reverts: build the limits from neither option → both start → red; swap the two → each names
+    /// the other's flag → red.
+    #[tokio::test]
+    async fn serve_builds_its_request_limits_from_its_options() {
+        let light = ServeOptions { light_requests_per_minute: Some(2), open: true, ..bare_serve_options() };
+        let error = serve(light).await.unwrap_err();
+        assert!(error.starts_with("--light-requests-per-minute (\"light_requests_per_minute\" in the config file) is 2"), "{error}");
+
+        let heavy = ServeOptions { heavy_requests_per_minute: Some(3), open: true, ..bare_serve_options() };
+        let error = serve(heavy).await.unwrap_err();
+        assert!(error.starts_with("--heavy-requests-per-minute (\"heavy_requests_per_minute\" in the config file) is 3"), "{error}");
     }
 }
