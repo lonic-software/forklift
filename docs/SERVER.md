@@ -170,6 +170,10 @@ max_body_mb = 4096               # refuse larger request bodies (default: 64 MiB
 rebuild_after_lifts = 20         # rebuild the bundle in the background (default: never)
 max_heavy_requests = 8           # costly requests run at once (default: the host's available
                                   # parallelism; zero is refused) — see "TLS and hardening"
+light_requests_per_minute = 6000 # cheap requests per caller per minute (default: no limit;
+                                  # at least 4) — see "TLS and hardening"
+heavy_requests_per_minute = 120  # costly requests per caller per minute (default: no limit;
+                                  # at least 4)
 open = false                     # explicit opt-out of authentication (default: false — see
                                   # "Authentication" above; a config with none of token, tokens,
                                   # or an authentication hook, and this unset, refuses to start)
@@ -484,15 +488,16 @@ forklift.example.com {
 }
 ```
 
-Request timeouts, connection limits and rate limiting also belong to the proxy layer
-(nginx/caddy/haproxy do this better than any embedded knob). The server enforces two limits
-itself.
+Request timeouts, connection limits and rate limiting by address also belong to the proxy layer
+(nginx/caddy/haproxy do this better than any embedded knob). The server enforces three limits
+itself, the ones a proxy cannot: it does not know what a request costs or who sent it.
 
 `max_body_mb` gates disk-fill abuse behind verification. It applies to callers the server has
 admitted: authentication runs on the request's headers, and a refused caller's body is thrown
 away as it arrives, never held in memory, for at most 5 seconds and 128 MiB per request. A body
 that runs past either bound has its connection closed; one that finishes inside them leaves the
-connection open, so rate limiting stays the proxy's job.
+connection open, so limiting the request rate of callers who fail authentication stays the
+proxy's job.
 
 `max_heavy_requests` caps how many costly requests run at once, across every warehouse the
 process serves: ref updates (`POST /v1/pallets/{name}`), pallet deletions
@@ -503,8 +508,8 @@ refused with a `503` carrying `Retry-After`, before it has changed anything; the
 out and sends it again. The default is the host's available parallelism (4 when the host does not
 report one). It is uncalibrated: no benchmark of these routes exists yet, so size it to your
 host if lifts or fetches queue; each refusal is logged as a warning. The cap counts requests,
-not callers or warehouses, so a burst on one warehouse can refuse requests on another: per-caller
-budgets and a cap on reads are not part of it. Background bundle rebuilds (`rebuild_after_lifts`)
+not callers or warehouses, so a burst on one warehouse can refuse requests on another; the
+per-caller limits below are what keep one caller's burst to its own budget. Background bundle rebuilds (`rebuild_after_lifts`)
 are bounded apart from that cap: a serving process runs one build at a time, across every
 warehouse it serves, so a rebuild never refuses a request, and the most costly requests and builds
 running at once are the cap plus one build. A rebuild that finds a build running for another warehouse waits its
@@ -513,6 +518,31 @@ drain the warehouse waits for it to end. Meanwhile clients get the bundle alread
 a redaction took it down, and fetch the rest object by object. With many warehouses rebuilding,
 each waits for the builds queued before it, a redaction's rebuild included. Redaction runs stay
 outside both bounds.
+
+`light_requests_per_minute` and `heavy_requests_per_minute` limit what each caller may send. A
+caller is the principal its request authenticates as: an operator token or an `authentication`
+hook identity is one caller, everyone holding the static `--token` is one caller, and every
+request to an `--open` server is one caller. Each caller has one budget per class, and the costly
+class is the four routes `max_heavy_requests` caps; every other authenticated route is cheap, and
+`/healthz` is never limited. A caller who has spent its budget is refused with a `429` carrying
+`Retry-After`, the time its next request takes to come back, before anything is read from the
+request or changed; the client waits it out and sends the request again, for up to 30 seconds. A
+budget holds a minute of requests and refills continuously, so a caller may send a minute's worth
+at once. One caller spending its budget never spends another's, and costly requests never spend
+the cheap budget. The budgets are kept per serving process, across every warehouse it serves, and
+start full when the process starts. A limit is at least 4 a minute: below it a caller would be told
+to wait longer than its client waits. Each class is unlimited unless set, and so is a caller that
+fails authentication. The first refusal of a caller and class each minute is logged as a warning.
+
+Size them to the traffic of one busy client, not to a request rate. A lift sends one request per
+new object on this head (up to 24 at once) and a fetch that falls back to loose objects one per
+object, all cheap, so a cheap limit near the number of objects a lift uploads in a minute slows
+lifts, and a much lower one can fail them, since each refused request is given up after 30
+seconds of refusals. A clone sends one batch fetch, a costly
+request, per 512 objects, so a costly limit also bounds how fast a large clone can go. A
+`POST /v1/resolve` refused for its limit shows pseudonyms instead of display names, as any refusal
+of it does. No defaults are set because nothing has measured these routes yet; the serverless head
+has no per-caller limit, only API Gateway's throttle for all callers together.
 
 **The single-writer rule:** exactly one serving process per warehouse root; a second server
 on the same root is refused at startup, since the serve lock it needs is held. Do not point two

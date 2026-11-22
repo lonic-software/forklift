@@ -90,8 +90,8 @@ impl RequestLimits {
                 if limit < MIN_REQUESTS_PER_MINUTE {
                     return Err(format!(
                         "--{} (\"{}\" in the config file) is {}; the lowest limit is {} a minute, \
-                        because a caller told to wait longer than about 15 s gives up on its \
-                        request. Pick a higher limit, or leave it unset for no limit.",
+                        since under it a refused caller is told to wait longer than its client \
+                        waits. Pick a higher limit, or leave it unset for no limit.",
                         name.replace('_', "-"), name, limit, MIN_REQUESTS_PER_MINUTE
                     ));
                 }

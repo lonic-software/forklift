@@ -1423,7 +1423,8 @@ const REFUSED_BODY_DISCARD_BYTES: usize = 128 * 1024 * 1024;
 /// writing would break its pipe before it reads the refusal, and it would report a network failure
 /// instead of a bad token. Past either bound the connection closes and that client does see the
 /// failure. The bounds are per request: a body finished inside them leaves the connection open for
-/// the next request, as any refusal does, so limiting a peer's request rate stays the proxy's job.
+/// the next request, as any refusal does, so limiting the request rate of a peer that fails
+/// authentication stays the proxy's job ([`RequestLimits`] charges only authenticated callers).
 async fn discard_refused_body(body: Body, time: std::time::Duration, bytes: usize) {
     use tokio_stream::StreamExt;
 
