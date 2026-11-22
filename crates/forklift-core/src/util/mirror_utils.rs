@@ -90,7 +90,8 @@ pub enum RootsWrite {
 impl RootsWrite {
     /// The sentence for a run's last write of the record that failed, naming the record; `None`
     /// when it did not fail. It says nothing of what a later run will do: a taint that refused the
-    /// write refuses the next one too, until it is healed.
+    /// write refuses the next one too, until it is healed. [`update_mirror_roots`] never ends as
+    /// `Unread`, so that arm says only why the record could not be read.
     pub fn failure(&self) -> Option<String> {
         match self {
             RootsWrite::AlreadyRead | RootsWrite::Landed => None,

@@ -247,8 +247,8 @@ fn put_back_owed(record: &BTreeMap<String, String>, owed: &[String], last: Optio
     note_put_backs(&settled.put_back(), owed, outcomes);
 }
 
-/// Complete the message of each pallet in `owed` with `said`, what retrying the put-back its
-/// refusal could not make did.
+/// Complete the message of each pallet in `owed` with `said`, what became of the put-back its
+/// refusal could not make.
 fn note_put_backs(said: &str, owed: &[String], outcomes: &mut [PalletMirror]) {
     for outcome in outcomes.iter_mut().filter(|outcome| owed.contains(&outcome.pallet)) {
         let message = outcome.message.get_or_insert_with(String::new);
@@ -1505,8 +1505,9 @@ mod tests {
     /// on disk cannot be read); when it fails, the owed entries alone are tried again and the
     /// message says how that went.
     /// Revert: retry even when the last write landed → the retry's own reading, not the write that
-    /// put the record back, is said → red. Whether each outcome is retried is pinned in
-    /// `mirror_utils`' table test.
+    /// put the record back, is said → red. The table test in `mirror_utils` pins which outcomes
+    /// hold the put-backs; that a not-durable last write is said rather than retried is reached by
+    /// no test, since no test can make a write land and its folder sync fail.
     #[test]
     fn the_last_write_says_an_owed_put_back_landed_and_its_failure_falls_back_to_the_retry() {
         let _warehouse = crate::test_support::Warehouse::storage_only("mirror-finish-owed");
