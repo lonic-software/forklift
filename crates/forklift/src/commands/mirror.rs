@@ -98,10 +98,11 @@ pub async fn handle_command() -> Result<(), String> {
     report.tags = run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &in_step, false).await;
 
     // The record keeps the configured set: a pallet that went through, or was refused or failed
-    // after its export, holds the entry its export wrote; one that failed before it keeps its
-    // prior entry, so a later run resumes from it. A pallet no longer configured drops out.
+    // after its export, holds the entry its export wrote; one that failed before it, or was
+    // refused by the takedown check just before its push, keeps its prior entry, so a later run
+    // resumes from it. A pallet no longer configured drops out.
     record.retain(|pallet, _| pallets.contains(pallet));
-    mirror_utils::write_mirror_roots(&record)?;
+    mirror_utils::update_mirror_roots(&record)?;
 
     let failed: Vec<&PalletMirror> = report.pallets.iter().filter(|outcome| outcome.status.is_failure()).collect();
     if failed.is_empty() && !report.tags.is_failure() {
@@ -665,9 +666,13 @@ impl<'a> Run<'a> {
                     Some(root) => record.insert(pallet.to_string(), root),
                     None => record.remove(pallet),
                 };
-                let rewritten = mirror_utils::write_mirror_roots(record);
-                self.put_back(&exported_ref, previous.as_deref(), &commit)?;
-                rewritten?;
+                // The record in memory stays the one put back: if writing it fails here, the
+                // run's last write of the record tries it again.
+                let refused = mirror_utils::put_back_mirror_roots(refused, record);
+                self.put_back(&exported_ref, previous.as_deref(), &commit).map_err(|problem| match problem {
+                    Problem::Damaged(damage) => Problem::Damaged(format!("{} {}", refused, damage)),
+                    Problem::Failed(failed) => Problem::Failed(format!("{} {}", refused, failed)),
+                })?;
                 return Err(Problem::Failed(refused));
             }
 

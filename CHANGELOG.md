@@ -888,6 +888,18 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   holds what it held before but may not be durable yet, that it could not be put back, or that
   whether it was is not known.
 
+  Two put-backs that follow no failed write of their own now land under a taint recorded since
+  their command wrote, by another process or another write: `git mirror`, refused just before a
+  push for content redacted or withheld during the run, puts its record of mirrored roots back, and
+  a `load` refused for redacted content withdraws its incomplete-load marker. Before, the taint
+  refused both, leaving the record naming the refused head and the marker naming the load. The
+  mirror's refusal now says the record was put back, or what reading it back shows; before, a
+  failed put-back replaced the refusal with the write's error. The run's last write of that record
+  is made only when it changes what the record holds, so a run that leaves the record as it
+  already reads still reports each pallet under such a taint, rather than only the taint; and when
+  putting the exported ref back fails too, the message keeps the refusal and what became of the
+  record.
+
   An `undo` of a `stack`, `consolidate` or `pick` whose put-back of a pallet failed in this way
   could not be retried, even after `forklift heal`: the current pallet and the bay's position were
   both left put back while the journal still held the undone operation, so every retry refused
