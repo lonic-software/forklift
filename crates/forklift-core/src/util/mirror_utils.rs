@@ -104,6 +104,31 @@ pub fn put_back_mirror_roots(error: String, before: &BTreeMap<String, String>) -
     })
 }
 
+/// Put back the entries of the pallets in `owed`, whose takedown refusal could not put the record
+/// back, to what `record` holds for each (or to no entry), and return the sentence saying what
+/// happened to the record ([`file_utils::put_back_as_read`]). It writes the record as it reads now
+/// with only those entries changed, through the compensating write of [`put_back_mirror_roots`]:
+/// each entry it changes is put back to what stood before its pallet's step, so a taint standing
+/// for the storage root, which refuses the run's ordinary last write, does not refuse this one.
+pub fn put_back_owed_roots(record: &BTreeMap<String, String>, owed: &[String]) -> String {
+    let mut wanted = match read_mirror_roots() {
+        Ok(now) => now,
+        Err(unread) => return format!("The mirror record could not be put back: {}", unread),
+    };
+    for pallet in owed {
+        match record.get(pallet) {
+            Some(root) => wanted.insert(pallet.clone(), root.clone()),
+            None => wanted.remove(pallet),
+        };
+    }
+
+    // A record that already reads as put back goes unmentioned by the put-back: say it is back.
+    match put_back_mirror_roots(String::new(), &wanted).trim_start() {
+        "" => "The mirror record was put back.".to_string(),
+        said => said.to_string(),
+    }
+}
+
 fn roots_bytes(roots: &BTreeMap<String, String>) -> Vec<u8> {
     let lines = roots.iter().map(|(pallet, parcel)| format!("{} {}", pallet, parcel));
 
@@ -226,6 +251,52 @@ mod tests {
         assert!(changed.starts_with("The mirror record could not be written: "), "got: {}", changed);
         assert!(changed.contains(crate::util::taint_utils::GATE_TAINT_MARKER), "got: {}", changed);
         assert_eq!(read_mirror_roots().unwrap(), before);
+    }
+
+    /// An owed put-back lands under a standing taint that refuses the run's ordinary last write,
+    /// and changes only the owed entries: one owed pallet is put back to its prior root, another
+    /// with no prior root loses its entry, and an entry only the run's memory holds stays out.
+    /// Revert: write the owed entries through the ordinary write → refused under the taint, the
+    /// record keeps the stepped heads → red. Revert: write the whole record in memory → the entry
+    /// only memory holds lands → red.
+    #[test]
+    fn an_owed_put_back_lands_under_a_taint_and_changes_only_the_owed_entries() {
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::activate();
+        let _scratch = Scratch::new("owed-put-back");
+
+        let on_disk = BTreeMap::from([
+            ("main".to_string(), "b2".repeat(32)),
+            ("feat".to_string(), "c3".repeat(32)),
+            ("new".to_string(), "d4".repeat(32)),
+        ]);
+        write_mirror_roots(&on_disk).unwrap();
+        // In memory: main put back to its prior root, new (no prior root) dropped, and an entry the
+        // record on disk does not hold.
+        let record = BTreeMap::from([
+            ("main".to_string(), "a1".repeat(32)),
+            ("feat".to_string(), "c3".repeat(32)),
+            ("memory".to_string(), "e5".repeat(32)),
+        ]);
+        let owed = ["main".to_string(), "new".to_string()];
+
+        let taint_dir = crate::globals::forklift_root().join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(
+            taint_dir.join("taint-99999-0"),
+            crate::util::taint_utils::taint_file_bytes(["objects/zz/recorded-during-the-run"]),
+        ).unwrap();
+
+        assert_eq!(put_back_owed_roots(&record, &owed), "The mirror record was put back.");
+        assert_eq!(read_mirror_roots().unwrap(), BTreeMap::from([
+            ("main".to_string(), "a1".repeat(32)),
+            ("feat".to_string(), "c3".repeat(32)),
+        ]));
+
+        // Already put back: said as back, nothing rewritten.
+        assert_eq!(put_back_owed_roots(&record, &owed), "The mirror record was put back.");
+        // The run's ordinary last write is still refused.
+        assert!(update_mirror_roots(&record).is_err());
     }
 
     /// Each read-back is said as it is, and nothing is promised of a later run.
