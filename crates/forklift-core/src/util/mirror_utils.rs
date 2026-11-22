@@ -108,8 +108,10 @@ pub fn put_back_mirror_roots(error: String, before: &BTreeMap<String, String>) -
 /// back, to what `record` holds for each (or to no entry), and return the sentence saying what
 /// happened to the record ([`file_utils::put_back_as_read`]). It writes the record as it reads now
 /// with only those entries changed, through the compensating write of [`put_back_mirror_roots`]:
-/// each entry it changes is put back to what stood before its pallet's step, so a taint standing
-/// for the storage root, which refuses the run's ordinary last write, does not refuse this one.
+/// each entry it changes is put back to what stood before its pallet's step, and every other
+/// entry is written as it already reads, so nothing becomes visible that was not. A taint
+/// standing for the storage root, which refuses the run's ordinary last write, does not refuse
+/// this one.
 pub fn put_back_owed_roots(record: &BTreeMap<String, String>, owed: &[String]) -> String {
     let mut wanted = match read_mirror_roots() {
         Ok(now) => now,

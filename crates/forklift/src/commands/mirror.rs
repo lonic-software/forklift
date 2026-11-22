@@ -98,10 +98,11 @@ pub async fn handle_command() -> Result<(), String> {
     report.tags = run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &in_step, false).await;
 
     // The record keeps the configured set: a pallet that went through, or was refused or failed
-    // after its export, holds the entry its export wrote; one that failed before it keeps its
-    // prior entry, and so does one refused by the takedown check just before its push once that
-    // refusal's put-back, or the owed put-back retried here, lands. A pallet no longer configured
-    // drops out.
+    // after its export, holds the entry its export wrote; one that failed before it, or was
+    // refused by the takedown check just before its push, keeps its prior entry, so a later run
+    // resumes from it. A pallet no longer configured drops out. That is the record once this
+    // write lands; when it fails, the record keeps what it read before it, except that a
+    // put-back the takedown refusal could not make is tried again on its own.
     record.retain(|pallet, _| pallets.contains(pallet));
     // A failure of this write joins the report: what the run did stays reported either way.
     let record_failure = finish_record(&record, &run.record_owed, &mut report.pallets);
@@ -213,12 +214,19 @@ pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) 
 }
 
 /// A run's last write of the record, made only when it changes what the record holds
-/// ([`mirror_utils::update_mirror_roots`]), after the put-backs owed by takedown refusals
-/// ([`put_back_owed`]). Returns the write's failure, for the caller to add to what it reports.
+/// ([`mirror_utils::update_mirror_roots`]). The record in memory holds each put-back a takedown
+/// refusal could not make (`owed`), so when the write lands each such pallet's message says the
+/// record was put back; when it fails, those put-backs alone are tried again ([`put_back_owed`]),
+/// and the message says how that went. Returns the write's failure, for the caller to add to what
+/// it reports.
 fn finish_record(record: &BTreeMap<String, String>, owed: &[String], outcomes: &mut [PalletMirror]) -> Option<String> {
-    put_back_owed(record, owed, outcomes);
+    let written = mirror_utils::update_mirror_roots(record);
+    match written {
+        Ok(()) => note_put_backs("The mirror record was put back.", owed, outcomes),
+        Err(_) => put_back_owed(record, owed, outcomes),
+    }
 
-    mirror_utils::update_mirror_roots(record).err()
+    written.err()
 }
 
 /// Try again each put-back a takedown refusal could not make (`owed`), with the compensating
@@ -1483,6 +1491,34 @@ mod tests {
         assert_eq!((refused.as_str(), owed), ("Refused. The mirror record was put back.", false));
         assert!(record.is_empty());
         assert!(mirror_utils::read_mirror_roots().unwrap().is_empty());
+    }
+
+    /// The run's last write decides what an owed pallet's message says: when it lands, the record
+    /// was put back, even where retrying the owed entries alone would have failed (here the record
+    /// on disk cannot be read); when it fails, the owed entries alone are tried again and the
+    /// message says how that went.
+    /// Revert: retry before the last write → "could not be put back" though it was → red; skip
+    /// the retry when the write fails → the message says nothing of the record → red.
+    #[test]
+    fn the_last_write_says_an_owed_put_back_landed_and_its_failure_falls_back_to_the_retry() {
+        let _warehouse = crate::test_support::Warehouse::storage_only("mirror-finish-owed");
+        let path = mirror_utils::mirror_roots_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a record").unwrap();
+        let record = BTreeMap::from([("main".to_string(), "a1".repeat(32))]);
+        let mut outcomes = vec![PalletMirror::new("main", MirrorStatus::Failed, "Refused.".to_string())];
+
+        assert_eq!(finish_record(&record, &["main".to_string()], &mut outcomes), None);
+        assert_eq!(outcomes[0].message.as_deref(), Some("Refused. The mirror record was put back."));
+        assert_eq!(mirror_utils::read_mirror_roots().unwrap(), record);
+
+        // A folder where the record belongs fails the last write, and the retry too.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut outcomes = vec![PalletMirror::new("main", MirrorStatus::Failed, "Refused.".to_string())];
+        assert!(finish_record(&record, &["main".to_string()], &mut outcomes).is_some());
+        let said = outcomes[0].message.clone().unwrap();
+        assert!(said.starts_with("Refused. The mirror record could not be put back"), "{}", said);
     }
 
     /// The retry writes only when a put-back is owed, and then changes only the owed entries (a
