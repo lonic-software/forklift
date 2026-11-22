@@ -430,6 +430,10 @@ struct Tainted {
     torn: bool,
     /// Whether the taint could not be read, which [`Tainted::read`] takes as torn.
     unread: bool,
+    /// Whether the taint stands ([`taint_utils::TaintState::standing`]), so a write's sync is
+    /// refused until it is resolved; true where it could not be read, as that sync's re-check
+    /// refuses then too.
+    standing: bool,
 }
 
 impl Tainted {
@@ -439,10 +443,11 @@ impl Tainted {
                 hashes: state.recorded.iter().filter_map(|path| file_utils::hash_from_object_path(path)).collect(),
                 torn: state.torn,
                 unread: false,
+                standing: state.standing(),
             },
             Err(error) => {
                 push_note(notes, format!("The durability taint could not be read, so every object salvaged from a damaged ref counts as possibly lost: {}", error));
-                Tainted { hashes: BTreeSet::new(), torn: true, unread: true }
+                Tainted { hashes: BTreeSet::new(), torn: true, unread: true, standing: true }
             }
         }
     }
@@ -1542,11 +1547,21 @@ fn admit_remove(pallet: &str, notes: &mut Vec<String>) -> Result<DamagedRef, Str
             .map(|candidate| format!("{} ({})", candidate.head, candidate.source))
             .collect();
 
+        // A standing taint refuses the write of --ref, so its step is the heal that resolves the
+        // taint first; once it is resolved, the removal is refused with --ref again.
+        let step = match tainted.standing {
+            true => format!(
+                ". A durability taint stands, which refuses the write of \"forklift heal --ref {}=<parcel>\" until it is resolved: \
+                run \"forklift heal\" first, which resolves it or says what keeps it standing",
+                pallet
+            ),
+            false => format!(": set it with \"forklift heal --ref {}=<parcel>\"", pallet),
+        };
         return Err(format!(
-            "Something still names a head for pallet \"{}\"{}, so its ref is not removed: set it with \"forklift heal --ref {}=<parcel>\". Nothing was changed.",
+            "Something still names a head for pallet \"{}\"{}, so its ref is not removed{}. Nothing was changed.",
             pallet,
             if named.is_empty() { String::new() } else { format!(": {}", named.join(", ")) },
-            pallet,
+            step,
         ));
     }
 
@@ -3026,15 +3041,15 @@ mod tests {
     fn a_head_the_taint_covers_is_never_decided_absent() {
         let (_root, _scope) = scratch("ref-heal-absent-tainted");
         let absent = blake3::hash(b"never stored here").to_hex().to_string();
-        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
-        let covering = Tainted { hashes: BTreeSet::from([absent.clone()]), torn: false, unread: false };
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false, standing: false };
+        let covering = Tainted { hashes: BTreeSet::from([absent.clone()]), torn: false, unread: false, standing: true };
 
         assert!(head_decided_absent(&absent, &clean), "the store decided it is absent");
         assert!(!head_decided_absent(&absent, &covering), "the taint may yet restore it");
 
         // Bytes naming it in full salvage it as gone only where that holds; beside a torn taint,
         // which may yet restore any head, they salvage to nothing, as before.
-        let torn = Tainted { hashes: BTreeSet::new(), torn: true, unread: false };
+        let torn = Tainted { hashes: BTreeSet::new(), torn: true, unread: false, standing: true };
         let bytes = format!("{}torn", absent).into_bytes();
         assert!(matches!(salvage(&bytes, &clean), Ok(Salvage::Absent(ref gone)) if *gone == absent));
         assert!(matches!(salvage(&bytes, &torn), Ok(Salvage::Nothing)));
@@ -3051,7 +3066,7 @@ mod tests {
         let gone = blake3::hash(b"never stored here").to_hex().to_string();
         let copy_gone = blake3::hash(b"nor this").to_hex().to_string();
         let held = stub_parcel("held");
-        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false, standing: false };
         let state = |copy: &str| MetaState {
             name: "tags".to_string(),
             reference: Some(format!("{}torn", gone).into_bytes()),
@@ -3059,7 +3074,7 @@ mod tests {
             stale: false,
         };
 
-        let covering = Tainted { hashes: BTreeSet::from([held.clone()]), torn: false, unread: false };
+        let covering = Tainted { hashes: BTreeSet::from([held.clone()]), torn: false, unread: false, standing: true };
         assert!(matches!(choose_meta(&state(&held), &covering), Err((_, _, Owner::Again))));
         assert!(matches!(choose_meta(&state(&held), &clean), Err((_, _, Owner::Again))));
         assert!(matches!(choose_meta(&state(&copy_gone), &clean), Ok((ref head, FROM_COPY)) if *head == copy_gone));
@@ -3087,7 +3102,7 @@ mod tests {
         assert_eq!(tags(&mut Vec::new()).damage(), Some(RefDamage::AbsentHead(format!("{}\n", absent).into_bytes())));
 
         let _failing = crate::util::pack_utils::fail_unindexed_holders("the pack registry could not be read");
-        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false, standing: false };
         assert!(head_held(&held, &clean), "the copy's head still reads whole");
         let state = tags(&mut Vec::new());
         assert_eq!(state.damage(), None);
@@ -3245,7 +3260,7 @@ mod tests {
     fn bytes_matching_more_than_one_parcel_are_unknown_not_nothing() {
         let (_root, _scope) = scratch("ref-heal-judge");
         let (one, two) = (stub_parcel("1"), stub_parcel("2"));
-        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false, standing: false };
 
         assert_eq!(judge(vec![one.clone()], &clean), Salvage::Found(one.clone()));
         // A whole object of another kind drops out, told from its one parse.
@@ -3253,7 +3268,7 @@ mod tests {
         assert_eq!(judge(vec![one.clone(), blob], &clean), Salvage::Found(one.clone()));
         assert_eq!(judge(vec![one.clone(), two.clone()], &clean), Salvage::Ambiguous(vec![one.clone(), two.clone()], false));
 
-        let tainted = Tainted { hashes: BTreeSet::from(["f".repeat(HASH_LENGTH)]), torn: false, unread: false };
+        let tainted = Tainted { hashes: BTreeSet::from(["f".repeat(HASH_LENGTH)]), torn: false, unread: false, standing: true };
         assert_eq!(judge(vec![one.clone(), two.clone(), "f".repeat(HASH_LENGTH)], &tainted), Salvage::Ambiguous(vec![one, two], true));
     }
 
@@ -3285,7 +3300,7 @@ mod tests {
         use crate::util::pack_utils::{pack_folder, TransportPackBuilder};
 
         let (_root, _scope) = scratch("ref-heal-salvage-unlisted");
-        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false, standing: false };
         let one = stub_parcel("1");
         assert_eq!(salvage(&one.as_bytes()[..12], &clean), Ok(Salvage::Found(one.clone())));
 
@@ -4157,7 +4172,7 @@ mod tests {
         // Between step 1 and step 3, the copy moves back to the older head.
         std::fs::write(pallet_utils::get_meta_copy_path(REDACTIONS_PALLET_NAME), format!("{}\n", older)).unwrap();
         let state = state_named(&mut notes);
-        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false };
+        let clean = Tainted { hashes: BTreeSet::new(), torn: false, unread: false, standing: false };
         let mut report = Repair::default();
 
         let rebuilt = rebuild_redactions(&state, &[], Some(RedactionsJudged::Verified(judged, FROM_COPY)), &clean, Pass::AfterTaint, &mut report);

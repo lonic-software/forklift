@@ -588,6 +588,15 @@ pub struct TaintState {
     pub files: Vec<PathBuf>,
 }
 
+impl TaintState {
+    /// Whether this state stands: something is recorded, or a file is torn. The durable re-check
+    /// on a write's sync refuses while it does ([`gate_standing_message`]), so a step that names
+    /// a write asks this before it offers one.
+    pub fn standing(&self) -> bool {
+        !self.recorded.is_empty() || self.torn
+    }
+}
+
 /// Read and union every taint file under `root`'s taint directory. A no-op — always the empty,
 /// non-torn state — unless [`activate`] has been called in this process (see the module doc
 /// comment): an unactivated process has no heal wired, so it must not act on taint state even to

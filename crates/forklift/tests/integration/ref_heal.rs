@@ -2663,3 +2663,67 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
         }
     }
 }
+
+/// A damaged user ref that something still names a head for is not removed, and the refusal
+/// names the write that sets it. A standing taint refuses that write until it is resolved, so
+/// there the refusal names the heal that resolves the taint first; once it has, the removal is
+/// refused with the write again, and the write it names is taken.
+// The step rests on one choice, the taint standing or not, read as the write's re-check reads it:
+// something recorded, or a file torn. The cases are the three cells of that read, so each mutant
+// of the choice goes red in one: the write named under a taint (recorded, torn); the heal named
+// with none (clean); only a recorded object counted (torn).
+#[test]
+fn remove_ref_under_a_standing_taint_names_the_heal_that_resolves_it() {
+    for case in ["clean", "recorded", "torn"] {
+        let area = Area::new(&format!("remove-taint-{}", case));
+        let root = area.warehouse();
+        area.run_ok(&root, &["pallet", "create", "side"]);
+        area.run_ok(&root, &["shift", "side"]);
+        area.stack(&root, "s.txt", "side");
+        area.run_ok(&root, &["shift", "main"]);
+        let side = head(&root, "side");
+        // The journal still names side's head, so the removal is refused.
+        damage(&root, "side", Damage::Zero);
+        let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
+        match case {
+            // A vanished object nothing reaches: the recovery resolves it.
+            "recorded" => plant_taint(&root, &[&"0".repeat(side.len())]),
+            "torn" => {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("taint-1-0"), b"torn").unwrap();
+            }
+            _ => {}
+        }
+
+        let write = "\"forklift heal --ref side=<parcel>\"";
+        let named = format!("Something still names a head for pallet \"side\": {} (", side);
+        let set = format!("so its ref is not removed: set it with {}. Nothing was changed.", write);
+        let first = format!("so its ref is not removed. A durability taint stands, which refuses the write of {} until it is \
+            resolved: run \"forklift heal\" first, which resolves it or says what keeps it standing. Nothing was changed.", write);
+        let refused = area.run(&root, &["heal", "--remove-ref", "side"]);
+        assert!(!refused.status.success(), "{}: {}", case, text(&refused.stdout));
+        let said = text(&refused.stderr);
+        assert!(said.contains(&named), "{}: {}", case, said);
+        assert_eq!(said.contains(&set), case == "clean", "{}: {}", case, said);
+        assert_eq!(said.contains(&first), case != "clean", "{}: {}", case, said);
+        assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), vec![0u8; side.len() + 1], "{}: the ref is left as it was", case);
+
+        if case != "clean" {
+            // The write the old step named is what the taint refuses.
+            let write = area.run(&root, &["heal", "--ref", &format!("side={}", side)]);
+            assert!(!write.status.success(), "{}: {}", case, text(&write.stdout));
+            assert!(text(&write.stderr).contains("existence cannot be trusted here until it is healed"), "{}: {}", case, text(&write.stderr));
+
+            // The heal it names resolves the taint, and the removal then names the write.
+            let _ = area.run(&root, &["heal"]);
+            assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none(), "{}: the taint is resolved", case);
+            if std::fs::read_to_string(ref_path(&root, "side")).is_ok_and(|bytes| bytes.trim_end() == side) {
+                continue;
+            }
+            let again = area.run(&root, &["heal", "--remove-ref", "side"]);
+            assert!(text(&again.stderr).contains(&set), "{}: {}", case, text(&again.stderr));
+        }
+        area.run_ok(&root, &["heal", "--ref", &format!("side={}", side)]);
+        assert_eq!(head(&root, "side"), side, "{}", case);
+    }
+}
