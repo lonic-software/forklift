@@ -17,8 +17,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   cap per serving process, set with `--max-heavy-requests` or `max_heavy_requests` (default: the
   host's available parallelism; zero is refused). A request that finds the cap full waits up to 5
   seconds and is then refused with a `503` and `Retry-After`, before it changes anything, and the
-  client sends it again after the wait. A burst of pushes no longer fills the server's blocking
-  threads with history walks.
+  client sends it again after the wait. Background bundle rebuilds now run one at a time per serving
+  process, across every warehouse it serves, apart from that cap, so a rebuild never refuses a
+  request. A burst of pushes no longer fills the server's blocking
+  threads with history walks or bundle builds.
 - **`park` can park part of the work in progress.** `park <paths>…` parks and resets only the
   changes at or under the paths; every other file keeps its working content and its staging. An
   interrupted partial park is finished over its paths only. A path that names nothing refuses, so
