@@ -666,12 +666,9 @@ impl<'a> Run<'a> {
                     Some(root) => record.insert(pallet.to_string(), root),
                     None => record.remove(pallet),
                 };
+                // The record in memory stays the one put back: if writing it fails here, the
+                // run's last write of the record tries it again.
                 let refused = mirror_utils::put_back_mirror_roots(refused, record);
-                // The record in memory follows what the put-back left on disk, so the run's last
-                // write neither redoes nor undoes what the refusal reports.
-                if let Ok(now) = mirror_utils::read_mirror_roots() {
-                    *record = now;
-                }
                 self.put_back(&exported_ref, previous.as_deref(), &commit).map_err(|problem| match problem {
                     Problem::Damaged(damage) => Problem::Damaged(format!("{} {}", refused, damage)),
                     Problem::Failed(failed) => Problem::Failed(format!("{} {}", refused, failed)),
