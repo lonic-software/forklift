@@ -2090,7 +2090,7 @@ pub(crate) fn dir_sync_attempts() -> Vec<PathBuf> {
 /// `pub(crate)` so [`heal_utils`](crate::util::heal_utils)'s entry-heal can fsync a batch of
 /// restaged objects' distinct parent directories directly — the same raw primitive
 /// [`sync_touched_directories`] uses, never the taint-aware [`sync_dir_or_taint`] wrapper (whose
-/// own success re-check would refuse while the very taint the heal is resolving still stands).
+/// own re-check would refuse while the very taint the heal is resolving still stands).
 #[cfg(unix)]
 pub(crate) fn fsync_dir_data(dir: &Path) -> Result<(), String> {
     #[cfg(test)]

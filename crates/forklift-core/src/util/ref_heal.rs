@@ -2488,9 +2488,9 @@ fn refuse_in(report: &mut Repair, state: &MetaState, pass: Pass, reason: String,
 }
 
 /// What the ref of a pallet heal wrote at a head, or a meta ref's copy heal set to its ref's bytes
-/// ([`copy_read_back`]), reads back as. A write can land and still report a failure (under a
-/// standing taint, its rename goes through and the taint is reported), so the file, read as it
-/// stands, decides whether it landed.
+/// ([`copy_read_back`]), reads back as. A write can land and still report a failure (its folder
+/// not synced, or a taint recorded while it was in flight), so the file, read as it stands,
+/// decides whether it landed.
 enum ReadBack {
     /// The ref holds the head heal wrote; a copy, exactly its ref's bytes.
     Landed,
@@ -2872,9 +2872,14 @@ mod tests {
     // red; let a landed read-back drop the write's error → no note, red; let a landed read-back
     // win over an unrecorded taint → main is rebuilt, red.
     // Unix only: a folder sync is a no-op elsewhere, so no injected sync failure can fire.
+    // Unactivated, and held so: an activated process records a real taint for the failed sync
+    // below, and the next rebuild is then refused before its rename, which the cases after it do
+    // not mean.
     #[cfg(unix)]
     #[test]
     fn a_user_rebuild_says_what_its_write_did() {
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::reset_activation_for_test();
         let (_root, _scope) = scratch("ref-heal-user-write");
         let head = stub_parcel("head");
         let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main");

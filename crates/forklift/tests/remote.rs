@@ -10647,13 +10647,13 @@ fn heal_driven_refetch_clears_only_the_hash_the_remote_actually_has() {
 }
 
 // Heal's own refetch stores go through the ordinary write path, which self-trips
-// `taint_recheck`'s standing-taint success re-check, because the taint being healed stands for
-// the entire run. With exactly one missing object the first (and only) store's `Err` is masked
+// `taint_recheck`'s standing-taint re-check, because the taint being healed stands for the
+// entire run. With exactly one missing object the first (and only) store's `Err` is masked
 // by `resolve_the_rest`'s unconditional `raw_object_present` recheck (D3), so
 // `heal_driven_refetch_clears_only_the_hash_the_remote_actually_has` above never exercises the
 // N≥2 path. This test does — it pins `SelfTripExemptionGuard` (a process-global RAII counter
-// consulted only in `taint_recheck`'s success arm), armed for the whole of
-// `attempt_heal_driven_refetch`.
+// consulted only in `taint_recheck`), armed for the whole heal run and again, nested, for the whole
+// of `attempt_heal_driven_refetch`.
 #[test]
 fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
     // The batch path's bundle import stores its records one at a time, each with its own
@@ -10664,9 +10664,9 @@ fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
     // still correctly reported recovered — the bug is invisible with only one missing object,
     // which is exactly the shape of the test above. With two, only one lands.
     //
-    // Mutation: revert `SelfTripExemptionGuard` (or arm it somewhere that does not span both
+    // Mutation: revert `SelfTripExemptionGuard` (or arm it nowhere that spans both
     // `attempt_heal_driven_refetch` passes and every store inside them) → one of the two objects
-    // self-trips its own success re-check and is reported still dangling → red.
+    // self-trips its own re-check and is reported still dangling → red.
     let area = TestArea::new("heal-refetch-multi");
     let server = Server::start(&area, None);
 
