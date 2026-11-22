@@ -3184,7 +3184,10 @@ fn warehouse_creation_is_gated_and_validated() {
 
     // An open (token-less) multi-warehouse server refuses creation outright.
     let open = Server::start_multi(&area, None);
-    assert_eq!(http_status(&open.url, "PUT", "/warehouses/alpha", None), "HTTP/1.1 403 Forbidden");
+    let (status, body) = http_send_json(&open.url, "PUT", "/warehouses/alpha", "");
+    assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    assert!(body.contains("start the server with --token-sha256, or token_sha256 in the config file"),
+            "the refusal names the flag that sets the static token: {}", body);
     drop(open);
 
     let area = TestArea::new("create-gate2");
