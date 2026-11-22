@@ -322,10 +322,25 @@ pub fn tombstone_heads() -> Result<Vec<String>, String> {
 
 /// Replace the tombstone list, durably. Only under the ref lock.
 pub(crate) fn write_tombstones(_lock: &RefLock, tombstones: &Tombstones) -> Result<(), String> {
+    file_utils::write_file_atomically(&tombstones_path(), &tombstone_bytes(tombstones))
+}
+
+/// Put the tombstone list back to `before`, read before a step of a ref removal that failed with
+/// `error`, and return `error` with what happened appended ([`file_utils::put_back_as_read`]). The
+/// write is a compensating one: a taint the failed step left standing does not stop it. Only under
+/// the ref lock.
+pub(crate) fn put_back_tombstones(_lock: &RefLock, before: &Tombstones, error: String) -> String {
+    file_utils::put_back_as_read(error, "tombstone list", before, read_tombstones, |tombstones| {
+        file_utils::write_file_compensating(&tombstones_path(), &tombstone_bytes(tombstones))
+    })
+}
+
+/// The record bytes of `tombstones`.
+fn tombstone_bytes(tombstones: &Tombstones) -> Vec<u8> {
     let named = tombstones.named.iter().map(|(pallet, head)| format!("{} {}", head, pallet));
     let lines: Vec<String> = named.chain(tombstones.kept.iter().cloned()).collect();
 
-    file_utils::write_file_atomically(&tombstones_path(), &record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, lines))
+    record_utils::to_bytes(TOMBSTONES_RECORD, TOMBSTONES_VERSION, lines)
 }
 
 /// Take the serve lock, then the ref lock, for a rewrite of the list at the served root's own disk.

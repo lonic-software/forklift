@@ -1281,6 +1281,40 @@ pub(crate) fn write_file_compensating(file_path: &Path, content: &[u8]) -> Resul
     write_file_atomically_as(file_path, content, true)
 }
 
+/// Put a record back to `before`, as read before a command step that failed with `error`, and
+/// return `error` with what happened appended. `read` reads the record as it stands; `write` is
+/// its compensating write ([`write_file_compensating`]). A record that still reads as `before` is
+/// left alone and goes unmentioned, since the failed step did not change it; one that cannot be
+/// read is written back, as it may have changed. A write can land and still return an error, when
+/// its folder sync fails, so a failed put-back is read back, and the message says only what that
+/// read shows: the record holds what it held before but may not be durable yet, it could not be
+/// put back, or whether it was is not known. `what` names the record in those sentences ("undo
+/// journal").
+pub(crate) fn put_back_as_read<T: ?Sized, R: PartialEq<T>>(
+    error: String,
+    what: &str,
+    before: &T,
+    read: impl Fn() -> Result<R, String>,
+    write: impl FnOnce(&T) -> Result<(), String>,
+) -> String {
+    if read().is_ok_and(|now| now == *before) {
+        return error;
+    }
+
+    match write(before) {
+        Ok(()) => format!("{} The {} was put back.", error, what),
+        Err(failed) => match read() {
+            Ok(now) if now == *before => format!(
+                "{} The {} holds what it held before, but it may not be on disk durably yet ({}).", error, what, failed
+            ),
+            Ok(_) => format!("{} The {} could not be put back either: {}", error, what, failed),
+            Err(unread) => format!(
+                "{} Whether the {} was put back is not known: {} It could not be read back: {}", error, what, failed, unread
+            ),
+        },
+    }
+}
+
 /// The durable-taint re-check: refuse if a taint is standing for the storage root that owns
 /// `final_paths`. It reads the durable taint files rather than only the in-memory gate
 /// [`taint_utils::gate_check`] covers, so it sees this process's own earlier failure and a
@@ -5419,6 +5453,48 @@ pub(crate) fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf
 
 #[cfg(test)]
 mod tests {
+    /// A put-back says what holds by reading the record back: unchanged, the record is not
+    /// written and the error is as given; a write that lands and still fails is put back but may
+    /// not be durable; one that does not land could not be put back; one that goes says nothing.
+    /// Revert: write without first reading whether the record changed → the unchanged record is
+    /// written → red; word a failed put-back without reading back → red.
+    #[test]
+    fn a_put_back_reads_the_record_back_to_say_what_holds() {
+        use std::cell::Cell;
+
+        // `unreadable` reads: the first read and the read-back each fail when their flag is set.
+        let put_back = |now: u8, lands: bool, fails: bool, unreadable: (bool, bool)| {
+            let record = Cell::new(now);
+            let written = Cell::new(false);
+            let reads = Cell::new(0);
+            let read = || {
+                reads.set(reads.get() + 1);
+                let fails = if reads.get() == 1 { unreadable.0 } else { unreadable.1 };
+                if fails { Err("unreadable".to_string()) } else { Ok(record.get()) }
+            };
+            let message = super::put_back_as_read("Failed.".to_string(), "test record", &1u8, read, |before| {
+                written.set(true);
+                if lands { record.set(*before); }
+                if fails { Err("sync failed.".to_string()) } else { Ok(()) }
+            });
+
+            (message, written.get(), record.get())
+        };
+
+        assert_eq!(put_back(1, true, false, (false, false)), ("Failed.".to_string(), false, 1), "an unchanged record is not written");
+        assert_eq!(put_back(2, true, false, (false, false)), ("Failed. The test record was put back.".to_string(), true, 1));
+        assert_eq!(put_back(1, true, false, (true, false)), ("Failed. The test record was put back.".to_string(), true, 1), "an unreadable record is written back");
+        assert_eq!(put_back(2, true, true, (false, false)), (
+            "Failed. The test record holds what it held before, but it may not be on disk durably yet (sync failed.).".to_string(), true, 1,
+        ));
+        assert_eq!(put_back(2, false, true, (false, false)), (
+            "Failed. The test record could not be put back either: sync failed.".to_string(), true, 2,
+        ));
+        assert_eq!(put_back(2, true, true, (false, true)), (
+            "Failed. Whether the test record was put back is not known: sync failed. It could not be read back: unreadable".to_string(), true, 1,
+        ));
+    }
+
     /// A loose object whose frame declares a window above the bounded decoder's cap, which the
     /// ordinary read decodes unbounded, still reads its kind: a header peek that fails falls back
     /// to the ordinary read, never refuses.

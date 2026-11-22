@@ -365,26 +365,32 @@ fn push_capped(entries: &mut Vec<JournalEntry>, entry: JournalEntry) {
 /// this returns (the caller refuses inside a bulk store session).
 ///
 /// # Returns
-/// * `Ok(Vec<JournalEntry>)` - The entries as read before the append, for
-///                             [`write_back_in_hold`] if the removal does not land.
-/// * `Err(String)`           - The journal could not be read or written; nothing was appended.
-pub(crate) fn append_in_hold(_lock: &crate::util::lock_utils::RefLock,
+/// * `Ok(Vec<JournalEntry>)` - The entries as read before the append, for [`put_back_in_hold`] if
+///                             the removal does not land.
+/// * `Err(String)`           - The journal could not be read or written. A write that failed is
+///                             put back ([`put_back_in_hold`]), since it can land and still fail;
+///                             the message says so when the put-back did not hold.
+pub(crate) fn append_in_hold(lock: &crate::util::lock_utils::RefLock,
                              entry: &JournalEntry) -> Result<Vec<JournalEntry>, String> {
     validate_entry(entry)?;
 
     let read = read()?;
     let mut entries = read.clone();
     push_capped(&mut entries, entry.clone());
-    write(&entries)?;
+    write(&entries).map_err(|error| put_back_in_hold(lock, &read, error))?;
 
     Ok(read)
 }
 
-/// Write the bay's journal back to `entries`, as read by [`append_in_hold`] before a removal that
-/// did not land.
-pub(crate) fn write_back_in_hold(_lock: &crate::util::lock_utils::RefLock,
-                                 entries: &[JournalEntry]) -> Result<(), String> {
-    write(entries)
+/// Put the bay's journal back to `before`, as read by [`append_in_hold`], after a step of a
+/// removal that failed with `error`, and return `error` with what happened appended
+/// ([`file_utils::put_back_as_read`]). The write is a compensating one: a taint the failed step
+/// left standing does not stop it.
+pub(crate) fn put_back_in_hold(_lock: &crate::util::lock_utils::RefLock,
+                               before: &[JournalEntry], error: String) -> String {
+    file_utils::put_back_as_read(error, "undo journal", before, read, |entries| {
+        write_as(entries, file_utils::write_file_compensating)
+    })
 }
 
 /// The removed heads of every delete entry in every bay's journal, the main tree's included: the
@@ -1324,10 +1330,22 @@ fn read_from(path: &Path) -> Result<Vec<JournalEntry>, String> {
 
 /// Write the journal atomically.
 fn write(entries: &[JournalEntry]) -> Result<(), String> {
+    write_as(entries, file_utils::write_file_atomically)
+}
+
+/// [`write`] through `writer`: [`file_utils::write_file_atomically`], or for a put-back
+/// [`file_utils::write_file_compensating`].
+fn write_as(entries: &[JournalEntry], writer: fn(&Path, &[u8]) -> Result<(), String>) -> Result<(), String> {
     let json = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries })
         .map_err(|e| format!("Error while serializing the undo journal: {}", e))?;
 
-    file_utils::write_file_atomically(&path(), json.as_bytes())
+    writer(&path(), json.as_bytes())
+}
+
+/// The journal file path of the bay in scope, for a test.
+#[cfg(test)]
+pub(crate) fn path_for_test() -> PathBuf {
+    path()
 }
 
 #[cfg(test)]

@@ -2752,21 +2752,21 @@ pub fn remove_pallet_head_in(
             let read = crate::util::tombstone_utils::read_tombstones()?;
             let mut tombstones = read.clone();
             tombstones.named.insert(wire.clone(), expected.to_string());
-            crate::util::tombstone_utils::write_tombstones(&lock, &tombstones)?;
+            // A write can land and still fail: the list goes back to what was read.
+            crate::util::tombstone_utils::write_tombstones(&lock, &tombstones)
+                .map_err(|e| crate::util::tombstone_utils::put_back_tombstones(&lock, &read, e))?;
 
             Some(read)
         }
         false => None,
     };
 
+    // The journal puts its own failed append back; the tombstones go back here.
     let journal_before = match journal {
         Some(journal) => match crate::util::journal_utils::append_in_hold(&lock, journal) {
             Ok(read) => Some(read),
             Err(e) => return Err(RefUpdateError::Failed(match &tombstones_before {
-                Some(read) => match crate::util::tombstone_utils::write_tombstones(&lock, read) {
-                    Ok(()) => e,
-                    Err(put_back) => format!("{} The tombstones could not be put back either: {}", e, put_back),
-                },
+                Some(read) => crate::util::tombstone_utils::put_back_tombstones(&lock, read, e),
                 None => e,
             })),
         },
@@ -2788,19 +2788,17 @@ pub fn remove_pallet_head_in(
 
             // Not removed: both records go back to what they held before.
             if let Some(read) = &journal_before {
-                if let Err(e) = crate::util::journal_utils::write_back_in_hold(&lock, read) {
-                    error = format!("{} The undo journal could not be put back either: {}", error, e);
-                }
+                error = crate::util::journal_utils::put_back_in_hold(&lock, read, error);
             }
 
             if let Some(read) = &tombstones_before {
-                if let Err(e) = crate::util::tombstone_utils::write_tombstones(&lock, read) {
-                    error = format!("{} The tombstones could not be put back either: {}", error, e);
-                }
+                error = crate::util::tombstone_utils::put_back_tombstones(&lock, read, error);
             }
 
             Err(RefUpdateError::Failed(error))
         }
+        // Not known to stand: a failed unlink can still have removed the file, so both records
+        // stay, and putting them back over a removed ref would leave its head rooted by nothing.
         Err(read) => Err(RefUpdateError::Failed(match unlinked {
             Ok(()) => format!("The ref of pallet \"{}\" could not be read back after it was removed: {}", name, read),
             Err(e) => format!("{} The ref could not be read back either: {}", e, read),
@@ -3237,7 +3235,7 @@ pub(crate) mod tests {
         /// a taint standing, as a failed folder sync does: every write after it runs under that
         /// taint, until the guard drops. The seam comes first in the pair, so a pair dropped whole
         /// clears the taint before it releases the activation lock.
-        fn land_next_write_leaving_a_taint(path: &Path) -> (file_utils::PostRenameTaintSeam, std::sync::MutexGuard<'static, ()>) {
+        pub(super) fn land_next_write_leaving_a_taint(path: &Path) -> (file_utils::PostRenameTaintSeam, std::sync::MutexGuard<'static, ()>) {
             let serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             taint_utils::activate();
             (file_utils::PostRenameTaintSeam::arm_standing_at(path), serial)
@@ -5712,6 +5710,89 @@ pub(crate) mod tests {
             let refused = refused.to_string();
             assert!(crate::error::deframe(&refused).is_some_and(|(code, _, _)| code == "tombstones_damaged"), "{}", refused);
             assert_eq!(get_pallet_head("other").unwrap(), Some(hash('b')), "nothing was removed");
+            let _ = file_utils::remove_dir_all(&root);
+        }
+
+        /// A served root holding pallet "gone" at `hash('b')`, after "first" (at `hash('a')`) was
+        /// removed with its undo entry: the journal and the tombstone list both hold an entry, so
+        /// a put-back that wrote them empty is told apart from one that wrote them back.
+        fn one_removal_recorded(name: &str) -> (PathBuf, StorageRootScope, Option<crate::util::journal_utils::JournalEntry>, tombstone_utils::Tombstones) {
+            let (root, scope) = scratch(name);
+            update_pallet_head("first", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+            update_pallet_head("gone", None, &hash('b'), &RefPreconditions::NONE).unwrap();
+            assert!(tombstone_utils::mark_served(false).unwrap());
+            remove_pallet_head_in(PalletNamespace::User, "first", &hash('a'), &RefPreconditions::NONE, Some(&deleting("first", &hash('a')))).unwrap();
+
+            let journal = crate::util::journal_utils::peek().unwrap();
+            let tombstones = tombstone_utils::read_tombstones().unwrap();
+            assert_eq!(journal, Some(deleting("first", &hash('a'))));
+            assert_eq!(tombstones.named, BTreeMap::from([("first".to_string(), hash('a'))]));
+
+            (root, scope, journal, tombstones)
+        }
+
+        /// A removal whose journal append lands with an error, leaving a taint standing, puts the
+        /// journal and the tombstone list back as they were read, under that taint, and leaves
+        /// the ref standing.
+        /// Revert: either put-back an ordinary write (refused by the standing taint), or the
+        /// append not putting back its own write → the delete entry or the tombstone stays → red.
+        #[test]
+        fn a_journal_append_that_lands_with_an_error_puts_both_records_back_under_its_taint() {
+            let (root, _scope, journal, tombstones) = one_removal_recorded("tombstone-journal-landed");
+            let seam = super::meta_copy::land_next_write_leaving_a_taint(&crate::util::journal_utils::path_for_test());
+
+            let failed = remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, Some(&deleting("gone", &hash('b'))));
+
+            assert!(matches!(failed, Err(RefUpdateError::Failed(_))), "{:?}", failed);
+            assert!(crate::util::taint_utils::read_taints(&forklift_root()).unwrap().standing(), "the failed append's taint stands");
+            assert_eq!(crate::util::journal_utils::peek().unwrap(), journal, "the delete entry is put back out");
+            assert_eq!(tombstone_utils::read_tombstones().unwrap(), tombstones, "the tombstone is put back out");
+            drop(seam);
+            assert_eq!(get_pallet_head("gone").unwrap(), Some(hash('b')), "nothing was removed");
+            let _ = file_utils::remove_dir_all(&root);
+        }
+
+        /// A removal whose tombstone write lands with an error, leaving a taint standing, puts the
+        /// list back as it was read and appends nothing to the journal.
+        /// Revert: return the write's error with no put-back → the tombstone stays → red.
+        #[test]
+        fn a_tombstone_write_that_lands_with_an_error_puts_the_list_back_under_its_taint() {
+            let (root, _scope, journal, tombstones) = one_removal_recorded("tombstone-write-landed");
+            let seam = super::meta_copy::land_next_write_leaving_a_taint(&tombstone_utils::tombstones_path());
+
+            let failed = remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, Some(&deleting("gone", &hash('b'))));
+
+            assert!(matches!(failed, Err(RefUpdateError::Failed(_))), "{:?}", failed);
+            assert!(crate::util::taint_utils::read_taints(&forklift_root()).unwrap().standing(), "the failed write's taint stands");
+            assert_eq!(tombstone_utils::read_tombstones().unwrap(), tombstones, "the tombstone is put back out");
+            assert_eq!(crate::util::journal_utils::peek().unwrap(), journal, "nothing was appended");
+            drop(seam);
+            assert_eq!(get_pallet_head("gone").unwrap(), Some(hash('b')), "nothing was removed");
+            let _ = file_utils::remove_dir_all(&root);
+        }
+
+        /// A ref that cannot be unlinked puts the journal and the tombstone list back as they were
+        /// read; skipped as root, which unlinks anyway.
+        /// Revert: drop either put-back after the unlink → its record keeps the removal → red.
+        #[cfg(unix)]
+        #[test]
+        fn a_ref_that_cannot_be_unlinked_puts_both_records_back() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let (root, _scope, journal, tombstones) = one_removal_recorded("tombstone-unlink-refused");
+            let folder = get_namespace_folder(PalletNamespace::User);
+
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let failed = remove_pallet_head_in(PalletNamespace::User, "gone", &hash('b'), &RefPreconditions::NONE, Some(&deleting("gone", &hash('b'))));
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            if unsafe { libc::geteuid() } != 0 {
+                assert!(matches!(failed, Err(RefUpdateError::Failed(_))), "{:?}", failed);
+                assert_eq!(crate::util::journal_utils::peek().unwrap(), journal, "the delete entry is put back out");
+                assert_eq!(tombstone_utils::read_tombstones().unwrap(), tombstones, "the tombstone is put back out");
+                assert_eq!(get_pallet_head("gone").unwrap(), Some(hash('b')), "nothing was removed");
+            }
+
             let _ = file_utils::remove_dir_all(&root);
         }
 
