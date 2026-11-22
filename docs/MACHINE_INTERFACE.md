@@ -819,8 +819,9 @@ shape, `what_changed: "first_contact"` and no `previous`.
 
 `forklift git mirror` goes through every mirrored pallet even when one fails. When any was refused
 (diverged, layout skew, a mirror repository it did not write), its push failed or raced, or
-another run held the mirror, the command fails with `mirror_incomplete` (exit 33) after the rest
-went through. `error.details` is the run's report, the same `{url, pallets}` shape a successful
+another run held the mirror, or the run's last write of its roots record failed (one more line of
+`error.message`), the command fails with `mirror_incomplete` (exit 33) after the rest went
+through. `error.details` is the run's report, the same `{url, pallets}` shape a successful
 run returns as `data`: each entry's `status` says what happened to that pallet and its
 `message` names the step. A failure before any pallet is tried (no `mirror.url`, a busy or
 damaged mirror) is not this code.

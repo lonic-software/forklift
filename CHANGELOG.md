@@ -900,6 +900,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   putting the exported ref back fails too, the message keeps the refusal and what became of the
   record.
 
+  When that last write of the record does fail, for example under a taint recorded during the
+  run, `git mirror` still reports every pallet: it fails with `mirror_incomplete`, the write's
+  failure one more line of the message and the run's report in its details. Before, the write's
+  error replaced the report. A refusal whose put-back of the record did not land no longer says it
+  could not be put back while that last write may still land it; it says what the write did.
+
   An `undo` of a `stack`, `consolidate` or `pick` whose put-back of a pallet failed in this way
   could not be retried, even after `forklift heal`: the current pallet and the bay's position were
   both left put back while the journal still held the undone operation, so every retry refused
