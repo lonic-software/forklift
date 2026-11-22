@@ -1485,8 +1485,8 @@ async fn admit_in_layer(state: &AppState,
         return Ok(());
     }
 
-    // A path that does not decode is the caller's: answered with the rejection's own status and
-    // text, as the handler's extractor would answer it when no hook is configured.
+    // A path that does not decode is the caller's: answered with the rejection's own status, the
+    // one the handler's extractor answers when no hook is configured, and its text.
     let Path(params) = request.extract_parts::<Path<PathParams>>().await
         .map_err(|rejection| (rejection.status(), rejection.body_text()))?;
 
