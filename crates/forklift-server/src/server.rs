@@ -7668,7 +7668,7 @@ mod tests {
                     .body("{}")
                     .send().await.unwrap();
                 let status = response.status();
-                let body = response.text().await.unwrap();
+                let body = String::from_utf8(body_utils::read_body_capped(response, 1 << 16).await.unwrap()).unwrap();
 
                 assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
                 assert!(body.contains("reads are suspended"), "{path}: {body}");
