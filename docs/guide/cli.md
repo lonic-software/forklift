@@ -2895,8 +2895,9 @@ choose a head yourself:
   be read and no durability taint stands (while one does, it is refused naming `forklift heal`
   first). Its bytes are kept under `.forklift/removed-refs`, and whatever only that ref reached is
   no longer kept by any pallet. Repeatable.
-- `--remove-ref` takes a user pallet only: `heal` never removes a metadata pallet's ref (`@<name>`),
-  and refuses the option for one before it changes anything. Where `heal` has no head it can
+- `--ref` and `--remove-ref` take a user pallet only: `heal` never sets or removes a metadata
+  pallet's ref (`@<name>`) by hand, and refuses either option for one, or for an invalid pallet name,
+  before it changes anything. Where `heal` has no head it can
   rebuild a metadata ref at (nothing names one, or what does is several parcels, one possibly lost,
   a copy and bytes that diverge, or a head whose history does not verify), it names restoring the
   ref and its copy from a backup; where its damaged bytes name a parcel the store has decided is
