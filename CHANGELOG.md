@@ -844,8 +844,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   whether it was is not known.
 
   An `undo` of a `stack`, `consolidate` or `pick` whose put-back of a pallet failed in this way
-  could not be retried, even after `forklift heal`: the current pallet and the bay were both left
-  put back while the journal still held the undone operation, so every retry refused with "has
+  could not be retried, even after `forklift heal`: the current pallet and the bay's position were
+  both left put back while the journal still held the undone operation, so every retry refused with "has
   moved since that operation".
   Now the current pallet is moved back where the operation left it, and the retry runs once
   `forklift heal` has cleared the taint. The move still runs the redaction check, and in a served

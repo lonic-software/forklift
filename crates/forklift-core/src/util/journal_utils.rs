@@ -1108,9 +1108,11 @@ fn put_back_refs(entry: &JournalEntry, store_access: &StoreAccessLock) -> Result
     // moved back there. Read before the first put-back, while the ref still holds that head, and
     // only when the operation moved it, since otherwise no un-restore follows; one that fails
     // refuses nothing, and leaves an un-restore to the ordinary checked write.
-    let basis = match (entry.before.head(current), entry.after.head(current)) {
-        (Some(pre_head), Some(post_head)) if pre_head != post_head => pallet_utils::PutBackBasis::read(current, store_access),
-        _ => Err(format!("the operation did not move \"{}\", so nothing un-restores it.", current)),
+    let un_restore = match (entry.before.head(current), entry.after.head(current)) {
+        (Some(pre_head), Some(post_head)) if pre_head != post_head => {
+            Some(UnRestore { pre_head, post_head, basis: pallet_utils::PutBackBasis::read(current, store_access) })
+        },
+        _ => None,
     };
 
     for wire in put_back_order(entry) {
@@ -1146,11 +1148,19 @@ fn put_back_refs(entry: &JournalEntry, store_access: &StoreAccessLock) -> Result
             // complete (no precondition is consumed, so nothing else refuses it): put the current
             // pallet back where the operation left it, so the bay still matches the entry and a
             // retried undo passes the gate again.
-            Err(e) => return Err(un_restore_current(entry, &basis, e.into())),
+            Err(e) => return Err(un_restore_current(current, un_restore.as_ref(), e.into())),
         }
     }
 
     Ok(())
+}
+
+/// The current pallet's move an undo would reverse, when the operation moved it: the head it put
+/// back to, the head the operation left, and the basis read before the put-back.
+struct UnRestore<'a> {
+    pre_head: &'a String,
+    post_head: &'a String,
+    basis: Result<pallet_utils::PutBackBasis<'a>, String>,
 }
 
 /// The wires of `entry`'s refs in the order an undo puts them back: the current pallet first.
@@ -1171,15 +1181,10 @@ fn put_back_order(entry: &JournalEntry) -> impl Iterator<Item = &String> {
 /// head it puts back: a taint the failed write left standing does not refuse it, so the bay is
 /// left where a retried undo passes its check once `forklift heal` has cleared that taint. Once
 /// `basis` no longer does, it is the ordinary checked write.
-fn un_restore_current(entry: &JournalEntry, basis: &Result<pallet_utils::PutBackBasis<'_>, String>, error: String) -> String {
-    let current = &entry.after.current_pallet;
-    let (Some(pre_head), Some(post_head)) = (entry.before.head(current), entry.after.head(current)) else {
+fn un_restore_current(current: &str, un_restore: Option<&UnRestore<'_>>, error: String) -> String {
+    let Some(UnRestore { pre_head, post_head, basis }) = un_restore else {
         return error;
     };
-
-    if pre_head == post_head {
-        return error;
-    }
 
     let e = match pallet_utils::compensating_head_write(current, pre_head, post_head, basis) {
         Ok(()) | Err(RefUpdateError::Moved(_)) => return error,
