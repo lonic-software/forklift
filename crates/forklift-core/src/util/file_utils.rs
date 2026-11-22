@@ -8306,8 +8306,8 @@ mod tests {
         // Revert: run the check before the rename inside the scope → the put-back is refused and
         // the old bytes stay → red. Revert: run the re-check after the sync inside the scope →
         // the put-back lands and reports Err → red. Revert: never step the depth back down →
-        // the write after the scope lands → red. Revert: count the scope process-wide → the
-        // other thread's write lands → red.
+        // the write after the scope lands → red. Revert: exempt every write on every thread →
+        // the other thread's write lands → red.
         let _serial = lock_taint_activation();
         taint_utils::activate();
 
