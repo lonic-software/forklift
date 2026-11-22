@@ -11587,6 +11587,107 @@ fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
     assert_eq!(history["data"]["entries"][0]["description"], "resolved pick again", "{}", history);
 }
 
+/// A warehouse with a pick of "feature" onto "main" stopped at a conflict on f.txt, and the pick
+/// source's hash. "main" holds f.txt as "alpha\nbeta-MAIN\ngamma\n".
+fn warehouse_with_a_conflicted_pick(name: &str) -> (TestWarehouse, String) {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("f.txt", "alpha\nbeta\ngamma\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
+    warehouse.write_file("f.txt", "alpha\nbeta-FEATURE\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "feature edits beta"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits beta"]));
+
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
+    assert_eq!(picked["data"]["outcome"], "conflicts");
+    (warehouse, source)
+}
+
+/// Stack the head's own f.txt while the pick is in progress: the pick is empty, and is cleared.
+fn stack_an_empty_pick(warehouse: &TestWarehouse) {
+    warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let empty = warehouse.run(&["stack", "-m", "empty"]);
+    assert!(!empty.status.success() && stderr(&empty).contains("The pick is empty"), "{}", stderr(&empty));
+    assert!(!warehouse.root.join(".forklift/cherry-pick").exists(), "the empty pick is cleared");
+}
+
+// An empty pick abandons the pick as an abort does. The conflicted pick's entry comes off, so
+// undo reaches the stack before it.
+//
+// Revert: drop the journal pop from the empty-pick branch → undo refuses the pick's entry, since
+// the bay no longer holds the pick that entry left.
+#[test]
+fn an_empty_pick_lets_undo_reach_past_the_pick() {
+    let (warehouse, _) = warehouse_with_a_conflicted_pick("empty-pick-undo-past");
+    let main_path = warehouse.root.join(".forklift/pallets/main");
+    let main_head = std::fs::read_to_string(&main_path).unwrap();
+    let journal_path = warehouse.root.join(".forklift/journal.json");
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    assert!(journal.contains("\"op\":\"pick\""), "the conflicted pick is journaled: {}", journal);
+
+    stack_an_empty_pick(&warehouse);
+
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    assert!(!journal.contains("\"op\":\"pick\""), "the pick's entry is off the journal: {}", journal);
+
+    let undone = json(&warehouse.run(&["--json", "undo"]));
+    assert_eq!(undone["data"]["op"], "stack", "{}", undone);
+    assert_ne!(std::fs::read_to_string(&main_path).unwrap(), main_head, "the undo takes \"main edits beta\" off");
+}
+
+// An undo of the stack that completed a pick, interrupted after it put the pick back (its pop
+// lost, so the entry still carries its mark), and then an empty pick: the pick is cleared, and
+// so is the mark, so the next undo is refused rather than resumed. A resume would write back the
+// pick the user just cleared.
+//
+// Revert: drop the journal pop from the empty-pick branch → the undo passes as a resume and the
+// pick is in progress again.
+#[test]
+fn an_empty_pick_clears_an_interrupted_undos_mark() {
+    let (warehouse, _) = warehouse_with_a_conflicted_pick("empty-pick-clears-undo-mark");
+    let pick_state = warehouse.root.join(".forklift/cherry-pick");
+    let journal = warehouse.root.join(".forklift/journal.json");
+
+    warehouse.write_file("f.txt", "alpha\nbeta-RESOLVED\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved pick"]));
+    let main_head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+    let completed = std::fs::read_to_string(&journal).unwrap();
+
+    // The undo lands and pops its entry; putting the journal back, with the entry marked, is the
+    // state a lost pop leaves.
+    let undone = json(&warehouse.run(&["--json", "undo"]));
+    assert_eq!(undone["data"]["op"], "stack");
+    assert!(pick_state.exists(), "the undo put the pick back");
+    let mut marked: serde_json::Value = serde_json::from_str(&completed).unwrap();
+    let latest = marked["entries"].as_array_mut().and_then(|entries| entries.last_mut())
+        .unwrap_or_else(|| panic!("no entry to mark: {}", completed));
+    assert_eq!(latest["op"], "stack", "the latest entry is the completing stack: {}", completed);
+    latest["undo_started"] = serde_json::Value::Bool(true);
+    std::fs::write(&journal, serde_json::to_string(&marked).unwrap()).unwrap();
+
+    stack_an_empty_pick(&warehouse);
+    let main_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+
+    let refused = warehouse.run(&["undo"]);
+    assert!(!refused.status.success(), "the undo must not resume: {}", stdout(&refused));
+    assert!(!pick_state.exists(), "the cleared pick must not be written back");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap(), main_after);
+    assert_ne!(main_after, main_head, "the fixture's undo took the completing stack off");
+    let text = std::fs::read_to_string(&journal).unwrap();
+    assert!(!text.contains("\"undo_started\":true"), "the mark is cleared: {}", text);
+}
+
 // A parcel with no description (a git commit imported with an empty message) is picked only with
 // -m: without one the pick refuses before it applies anything, since the parcel would record none.
 #[test]

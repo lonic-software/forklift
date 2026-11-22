@@ -638,7 +638,10 @@ consolidation is in progress, `stack` completes it, and without `-m` the parcel 
 description a clean consolidation would have recorded (`Consolidated "feature" into "main".`). A
 pick in progress is completed the same way, with the description it carried over from the picked
 parcel, or the one given to `pick -m`. A parcel with no description to carry over (a git commit
-imported with an empty message, say) is picked only with `-m`. On a warehouse
+imported with an empty message, say) is picked only with `-m`. A pick whose changes the head
+already has is empty: `stack` records nothing, clears the pick and says so. As after `abort`, when
+nothing but pallet deletes was journaled after the pick, `undo` then reaches the operation before
+it. On a warehouse
 where trust is established, `stack` also signs the parcel (see
 [Identity, signing, and agents](#7-identity-signing-and-agents)).
 
