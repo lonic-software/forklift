@@ -177,7 +177,9 @@ pub fn recorded() -> Option<BTreeSet<String>> {
 /// Withdraw the start a load staged, for a load refused before it published any shard: put the
 /// marker back to `before`, what [`recorded`] read then. Recording the start may have absorbed
 /// narrower roots into the load's own, so this restores the set rather than removing one key.
-/// Best-effort; a `before` that could not be read leaves the marker as it is.
+/// Best-effort; a `before` that could not be read leaves the marker as it is. The put-back is a
+/// compensating write ([`marker_utils::restore`]), so a taint recorded elsewhere since the load
+/// began does not leave the start standing.
 pub fn withdraw_start(before: Option<&BTreeSet<String>>) {
     if let Some(before) = before {
         marker_utils::restore(&marker_path(), before);
@@ -453,6 +455,40 @@ mod tests {
         // Healing "src/b" too clears the guard entirely.
         mark_load_completed("src/b");
         assert!(check_no_incomplete_load().is_ok());
+
+        file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// A load refused before it published any shard withdraws its start even when a taint was
+    /// recorded elsewhere after the start was written: the put-back stood before the load, so the
+    /// taint does not refuse it. An ordinary write of the marker beside it is still refused.
+    /// Revert: restore the marker through the ordinary write → the put-back is refused and the
+    /// load's own root stays recorded → red.
+    #[test]
+    fn a_withdrawn_start_is_put_back_under_a_taint_recorded_since_it_was_written() {
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::activate();
+        let temp = temp_warehouse("withdraw-under-taint");
+        let _scope = StorageRootScope::enter(&temp);
+
+        start_load("src/api");
+        let before = recorded().expect("the marker reads");
+        start_load("src");
+
+        let taint_dir = crate::globals::forklift_root().join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(
+            taint_dir.join("taint-99999-0"),
+            crate::util::taint_utils::taint_file_bytes(["objects/zz/recorded-elsewhere"]),
+        ).unwrap();
+
+        let ordinary = file_utils::write_file_atomically(&marker_path(), b"an ordinary write")
+            .expect_err("an ordinary write of the marker is refused under the taint");
+        assert!(ordinary.contains(crate::util::taint_utils::GATE_TAINT_MARKER), "got: {}", ordinary);
+
+        withdraw_start(Some(&before));
+
+        assert_eq!(recorded(), Some(BTreeSet::from(["src/api".to_string()])), "the start is withdrawn");
 
         file_utils::remove_dir_all(&temp).ok();
     }

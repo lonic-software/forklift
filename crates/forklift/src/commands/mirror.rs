@@ -665,9 +665,8 @@ impl<'a> Run<'a> {
                     Some(root) => record.insert(pallet.to_string(), root),
                     None => record.remove(pallet),
                 };
-                let rewritten = mirror_utils::write_mirror_roots(record);
+                let refused = mirror_utils::put_back_mirror_roots(refused, record);
                 self.put_back(&exported_ref, previous.as_deref(), &commit)?;
-                rewritten?;
                 return Err(Problem::Failed(refused));
             }
 

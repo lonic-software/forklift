@@ -180,7 +180,7 @@ pub fn remove_covered_by(path: &Path, by: &str) -> BTreeSet<String> {
         .partition(|recorded| path_utils::covers(by, recorded));
 
     if !removed.is_empty() {
-        let _ = write_bytes_or_clear(path, &kept);
+        let _ = write_set_or_clear(path, &kept, false);
     }
 
     removed
@@ -189,8 +189,13 @@ pub fn remove_covered_by(path: &Path, by: &str) -> BTreeSet<String> {
 /// Put the set recorded at `path` back to `set`, read from it earlier, best-effort as
 /// [`remove_covered_by`] is: for a caller that recorded a key and then established that nothing
 /// it covers was touched.
+///
+/// A non-empty `set` is written back as a compensating write
+/// ([`file_utils::write_file_compensating`]): it puts back what stood before the caller's
+/// command, so a taint standing for the storage root does not refuse it, whoever recorded that
+/// taint. An empty one removes the file, as [`clear`] does.
 pub fn restore(path: &Path, set: &BTreeSet<String>) {
-    let _ = write_bytes_or_clear(path, set);
+    let _ = write_set_or_clear(path, set, true);
 }
 
 /// Unconditionally clear the marker, best-effort — see [`remove_covered_by`]'s doc comment on
@@ -203,13 +208,21 @@ pub fn clear(path: &Path) {
 /// marker with nothing recorded is represented by a missing file, never an empty one (see the
 /// module doc comment's format section), so [`read`] only ever has to distinguish "missing" from
 /// "malformed", never a third "present but empty" case.
-fn write_bytes_or_clear(path: &Path, set: &BTreeSet<String>) -> Result<(), String> {
+///
+/// With `compensating`, the write is [`file_utils::write_file_compensating`]; a forward write
+/// ([`remove_covered_by`]) passes `false` and keeps the standing-taint re-checks.
+fn write_set_or_clear(path: &Path, set: &BTreeSet<String>, compensating: bool) -> Result<(), String> {
     if set.is_empty() {
         clear(path);
         return Ok(());
     }
 
-    write_bytes(path, &serialize(set))
+    ensure_parent_folder(path)?;
+    if compensating {
+        file_utils::write_file_compensating(path, &serialize(set))
+    } else {
+        file_utils::write_file_atomically(path, &serialize(set))
+    }
 }
 
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
