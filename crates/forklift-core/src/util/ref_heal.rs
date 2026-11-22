@@ -1542,27 +1542,32 @@ fn admit_remove(pallet: &str, notes: &mut Vec<String>) -> Result<DamagedRef, Str
         ));
     }
 
+    // A standing taint refuses the removal's own write as it refuses --ref's, so either way the
+    // step is the heal that resolves it first; once it has, the removal is judged again.
+    let taint = tainted.standing.then_some(
+        "A durability taint stands, which refuses every write heal makes for this ref until it is resolved: \
+        run \"forklift heal\" first, which resolves it or says what keeps it standing."
+    );
+
     if !evidence.candidates.is_empty() || evidence.salvage_unknown.is_some() || !evidence.deleted_in.is_empty() {
         let named: Vec<String> = listed(&evidence.candidates).into_iter()
             .map(|candidate| format!("{} ({})", candidate.head, candidate.source))
             .collect();
-
-        // A standing taint refuses the write of --ref, so its step is the heal that resolves the
-        // taint first; once it is resolved, the removal is refused with --ref again.
-        let step = match tainted.standing {
-            true => format!(
-                ". A durability taint stands, which refuses the write of \"forklift heal --ref {}=<parcel>\" until it is resolved: \
-                run \"forklift heal\" first, which resolves it or says what keeps it standing",
-                pallet
-            ),
-            false => format!(": set it with \"forklift heal --ref {}=<parcel>\"", pallet),
+        let step = match taint {
+            Some(taint) => format!(". {}", taint.trim_end_matches('.')),
+            None => format!(": set it with \"forklift heal --ref {}=<parcel>\"", pallet),
         };
+
         return Err(format!(
             "Something still names a head for pallet \"{}\"{}, so its ref is not removed{}. Nothing was changed.",
             pallet,
             if named.is_empty() { String::new() } else { format!(": {}", named.join(", ")) },
             step,
         ));
+    }
+
+    if let Some(taint) = taint {
+        return Err(format!("The ref of pallet \"{}\" is not removed. {} Nothing was changed.", pallet, taint));
     }
 
     Ok(damaged)

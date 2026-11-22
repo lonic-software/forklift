@@ -63,8 +63,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   clone as the way out for when it is not. A damaged user pallet ref whose unread head keeps the
   taint standing now gets that way out too, where the refusal said `heal` rebuilds it once the
   taint is resolved. `heal --remove-ref <pallet>`, refused because something still names a head for
-  the ref, names `heal --ref` only where no durability taint stands; while one does, which refuses
-  that write, it names `heal` first, to resolve the taint.
+  the ref, names `heal --ref` only where no durability taint stands. While one does, it refuses
+  both that write and the removal's own, so the removal is refused naming `heal` first, to resolve
+  the taint, whether or not something names a head.
   Where damaged tombstones would refuse a pallet ref's rebuild,
   `heal` now writes no user pallet ref and stops the run, with their repair as the step; the refusal
   names each ref it would have rebuilt and the head, each other it refused, and each damaged pallet
