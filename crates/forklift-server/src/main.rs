@@ -60,8 +60,9 @@ enum Command {
         rebuild_after_lifts: Option<u32>,
 
         /// Run at most this many costly requests at once (ref updates, pallet deletions, trust
-        /// installs, batch fetches); past it a request waits briefly, then is refused with a 503
-        /// and Retry-After (default: the host's available parallelism)
+        /// installs, batch fetches, background bundle rebuilds); past it a request waits briefly,
+        /// then is refused with a 503 and Retry-After, and a rebuild is put off (default: the
+        /// host's available parallelism)
         #[arg(long)]
         max_heavy_requests: Option<u32>,
 

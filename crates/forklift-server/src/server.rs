@@ -646,8 +646,9 @@ struct AppState {
     authentication_cache: Mutex<HashMap<String, (String, std::time::Instant)>>,
     authentication_cache_ttl: std::time::Duration,
 
-    /// The permits of Heavy requests in flight ([`acquire_heavy`]): one cap per serving process,
-    /// shared by every warehouse it serves. Sized by [`heavy_capacity`].
+    /// The permits of Heavy requests in flight ([`acquire_heavy`]) and of background bundle
+    /// rebuilds ([`rebuild_bundle`]): one cap per serving process, shared by every warehouse it
+    /// serves. Sized by [`heavy_capacity`].
     heavy: Arc<tokio::sync::Semaphore>,
 
     /// How long a Heavy request waits for a permit: [`HEAVY_WAIT`] when served, shorter in tests.
@@ -4234,17 +4235,40 @@ fn heavy_capacity_when(max_heavy_requests: Option<u32>,
     }
 }
 
-/// One of the server's Heavy permits ([`acquire_heavy`]). Its only use is [`HeavyPermit::spawn`],
-/// which moves it into the task that runs the work, so the slot is freed when the work ends. A
-/// permit held by the request's own future would be freed when a client hangs up, while the work
-/// it started kept running on the blocking pool.
-#[must_use = "a Heavy permit admits work only through HeavyPermit::spawn"]
+/// One of the server's Heavy permits ([`acquire_heavy`], [`HeavyPermit::try_take`]). Its only uses
+/// are [`HeavyPermit::spawn`] and [`HeavyPermit::spawn_blocking`], which move it into the task that
+/// runs the work, so the slot is freed when the work ends. A permit held by the request's own
+/// future would be freed when a client hangs up, while the work it started kept running on the
+/// blocking pool.
+#[must_use = "a Heavy permit admits work only through HeavyPermit::spawn or HeavyPermit::spawn_blocking"]
 struct HeavyPermit {
     /// Held, never read: dropping it is what frees the slot.
     _held: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl HeavyPermit {
+    /// One of `heavy`'s permits if one is free now, without waiting: for background work that is
+    /// put off when the server is at capacity ([`rebuild_bundle`]) rather than queued behind
+    /// requests. A permit queued for a waiting request is not free.
+    fn try_take(heavy: &Arc<tokio::sync::Semaphore>) -> Option<Self> {
+        Arc::clone(heavy).try_acquire_owned().ok().map(|held| HeavyPermit { _held: held })
+    }
+
+    /// Run `work` on the blocking pool, holding this permit until the work ends. The permit moves
+    /// into the closure, so it stays taken while the work runs even when the returned handle is
+    /// dropped.
+    fn spawn_blocking<F, R>(self, work: F) -> tokio::task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let _permit = self;
+
+            work()
+        })
+    }
+
     /// Run `work` as its own task, holding this permit until the work ends. Dropping the returned
     /// handle detaches the task, which keeps running and keeps the permit.
     fn spawn<F>(self, work: F) -> tokio::task::JoinHandle<F::Output>
@@ -4997,6 +5021,14 @@ fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
 /// warehouse already. With `again` (a redaction was just applied, and the bundle withdrawn), a
 /// rebuild already running is followed by another once it ends: it began before the redaction, so
 /// it publishes nothing (see `bundle_utils::build_bundle`).
+///
+/// Each build takes one of the server's Heavy permits ([`AppState::heavy`]), which it holds until
+/// it ends, so rebuilds across warehouses count against the same cap as costly requests. A build
+/// with no permit free does not start, and never waits for one: a rebuild waiting with the
+/// warehouse in hand would hold a drain open ([`drain`]). The ask stays armed instead
+/// (`rebuild_again`, and the lift count is not reset), so the next lift past the threshold or the
+/// next redaction round ([`finish_round`]) asks again. Meanwhile clients fetch the objects the
+/// bundle would have carried one by one.
 fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool) {
     use std::sync::atomic::Ordering;
 
@@ -5019,15 +5051,24 @@ fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool
         return;
     }
 
+    let Some(first) = HeavyPermit::try_take(&state.heavy) else {
+        put_off_rebuild(&warehouse);
+        return;
+    };
+
     // This rebuild starts after whatever asked for another, so it serves that ask.
     warehouse.rebuild_again.store(false, Ordering::SeqCst);
     warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
 
+    let heavy = Arc::clone(&state.heavy);
+
     tokio::spawn(async move {
+        let mut permit = first;
+
         loop {
             let worker = Arc::clone(&warehouse);
 
-            let result = tokio::task::spawn_blocking(move || {
+            let result = permit.spawn_blocking(move || {
                 let _scope = StorageRootScope::enter(&worker.root);
 
                 bundle_utils::build_bundle()
@@ -5056,9 +5097,31 @@ fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool
                 break;
             }
 
+            permit = match HeavyPermit::try_take(&heavy) {
+                Some(next) => next,
+                None => {
+                    put_off_rebuild(&warehouse);
+                    break;
+                }
+            };
+
             warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
         }
     });
+}
+
+/// Leave a rebuild that found no Heavy permit free asked for, and none running: the ask is set
+/// before `bundling` is cleared, so a rebuild started in between finds it and serves it.
+fn put_off_rebuild(warehouse: &WarehouseHandle) {
+    use std::sync::atomic::Ordering;
+
+    warehouse.rebuild_again.store(true, Ordering::SeqCst);
+    warehouse.bundling.store(false, Ordering::SeqCst);
+
+    tracing::debug!(
+        root = %warehouse.root.display(),
+        "a bundle rebuild was put off: every max_heavy_requests permit is taken"
+    );
 }
 
 /// `POST /v1/resolve` — operator identifiers → display names (DESIGN.html §8.12).
@@ -11829,6 +11892,111 @@ mod tests {
         let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
     }
 
+    /// A single-mode state on `root` that rebuilds its bundle after `lifts` lifts, whose Heavy cap
+    /// is `heavy`.
+    fn rebuilding_state(root: PathBuf, heavy: &Arc<tokio::sync::Semaphore>, lifts: u32) -> Arc<AppState> {
+        Arc::new(AppState {
+            heavy: Arc::clone(heavy),
+            heavy_wait: HEAVY_TEST_WAIT,
+            rebuild_after_lifts: Some(lifts),
+            ..single_mode_state(root)
+        })
+    }
+
+    /// Wait, bounded, until no rebuild runs for `handle`.
+    async fn rebuild_settled(handle: &WarehouseHandle) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while handle.bundling.load(Ordering::SeqCst) {
+            assert!(tokio::time::Instant::now() < deadline, "the rebuild did not end in time");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// At capacity, a lift past `rebuild_after_lifts` starts no build. The trigger stays armed:
+    /// the lift count is kept and the rebuild stays asked for. Nothing holds the warehouse for the
+    /// put-off rebuild, so a drain completes. The next lift with a permit free starts the build,
+    /// which holds the permit until it ends.
+    ///
+    /// Reverts: take the first build's permit from a cap of its own → the build starts at
+    /// capacity → red. Reset the lift count when putting a rebuild off → red. Ask for no rebuild
+    /// when putting it off → red.
+    #[tokio::test]
+    async fn a_rebuild_at_capacity_is_put_off_with_its_trigger_armed() {
+        let root = scratch_dir("rebuild-at-capacity");
+        mark_warehouse(&root);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = rebuilding_state(root.clone(), &heavy, 2);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let held = Arc::clone(&heavy).try_acquire_owned().unwrap();
+
+        maybe_rebuild_bundle(&state, Arc::clone(&handle));
+        maybe_rebuild_bundle(&state, Arc::clone(&handle));
+
+        assert!(!handle.bundling.load(Ordering::SeqCst), "no build started at capacity");
+        assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 2, "the lift count is kept");
+        assert!(handle.rebuild_again.load(Ordering::SeqCst), "the rebuild stays asked for");
+        assert!(drain(&state, &handle, std::time::Duration::from_secs(2)).await, "a drain completes");
+        undrain(&state, &handle);
+
+        drop(held);
+        maybe_rebuild_bundle(&state, Arc::clone(&handle));
+
+        assert!(handle.bundling.load(Ordering::SeqCst), "the next lift with a permit free starts the build");
+        assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 0, "and resets the lift count");
+        assert!(!handle.rebuild_again.load(Ordering::SeqCst), "and serves the ask");
+        assert_eq!(heavy.available_permits(), 0, "the build holds the permit");
+        rebuild_settled(&handle).await;
+        assert_eq!(heavy.available_permits(), 1, "the ended build gave the permit back");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// A rebuild asked again while it runs, whose permit a waiting request takes as it ends, does
+    /// not run again: the ask stays armed for the next trigger, and the rebuild lets the warehouse
+    /// go rather than wait for a permit, so a drain completes while the request still holds it.
+    ///
+    /// Reverts: wait for the next build's permit → the rebuild holds the warehouse → the drain
+    /// times out → red. Take the next build's permit from a cap of its own → it runs again, and
+    /// the ask is served → red.
+    #[tokio::test]
+    async fn a_rebuild_asked_again_at_capacity_lets_its_warehouse_go() {
+        let root = scratch_dir("rebuild-again-at-capacity");
+        mark_warehouse(&root);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = rebuilding_state(root.clone(), &heavy, 1000);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+
+        rebuild_bundle(&state, Arc::clone(&handle), false);
+        assert_eq!(heavy.available_permits(), 0, "the first build took the permit");
+        rebuild_bundle(&state, Arc::clone(&handle), true);
+        assert!(handle.rebuild_again.load(Ordering::SeqCst), "asked again while it runs");
+
+        // Queued before the build has started (its task has not run yet on this one-thread
+        // runtime), so the permit the build gives back goes to this waiter.
+        let waiting = Arc::clone(&heavy).acquire_owned();
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut waiting).await.is_err(), "the request waits");
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(30), &mut waiting).await
+            .expect("the build ended and gave its permit to the waiting request").unwrap();
+
+        // Before the drain is marked: a rebuild that sees the drain leaves without asking for a
+        // permit at all, which would pass this test whatever it does at capacity.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while Arc::strong_count(&handle) > 2 {
+            assert!(tokio::time::Instant::now() < deadline, "the rebuild let the warehouse go");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(drain(&state, &handle, std::time::Duration::from_secs(2)).await,
+            "a drain completes while the request holds the permit");
+        undrain(&state, &handle);
+        assert!(!handle.bundling.load(Ordering::SeqCst), "no second build runs");
+        assert!(handle.rebuild_again.load(Ordering::SeqCst), "the rebuild stays asked for");
+
+        drop((granted, handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
     /// Every function in non-test source that names `acquire_heavy`, by the function it is in.
     /// With them, every such function that calls `.spawn` on a binding named `permit`.
     #[derive(Default)]
@@ -11932,8 +12100,8 @@ mod tests {
 
     /// The cost class each route declares matches its handler: a route is `Heavy` exactly when its
     /// handler calls `acquire_heavy`, and nothing but a Heavy route's handler calls it. Each of them
-    /// also hands a binding named `permit` to `.spawn`, the one use [`HeavyPermit`] has, so its
-    /// work runs with the permit inside. The scan reads server.rs alone: `acquire_heavy` is private
+    /// also hands a binding named `permit` to `.spawn`, the use [`HeavyPermit`] has for a request's
+    /// work, so that work runs with the permit inside. The scan reads server.rs alone: `acquire_heavy` is private
     /// to it, so no other file can call it. It checks that the calls are there, not where they sit
     /// or that the spawned permit is the one acquired; the capacity, drain and hang-up tests do.
     ///
