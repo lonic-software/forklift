@@ -166,70 +166,103 @@ pub(crate) fn get_meta_copy_path(name: &str) -> PathBuf {
     path
 }
 
-/// Sync every folder that holds a pallet ref or a meta ref's copy: the user and meta ref trees and
-/// the copies' tree, each tree's root with the folders above it, and every folder inside it. A ref
-/// write whose folder sync failed, with no taint recording that, is visible and not durable, and
-/// nothing on disk says which ref it was; heal runs this first, so a later heal syncs it.
+/// Sync every folder that can hold a pallet ref or a meta ref's copy, so a ref write whose folder
+/// sync failed, with no taint recording that, is synced again: nothing on disk says which ref it
+/// was, and heal runs this first. That is every folder of the user ref tree, and the folders of
+/// each meta ref and each copy (their names are fixed, see [`META_PALLET_NAMES`]), each with the
+/// folders above it.
 ///
-/// No link is followed: a tree whose root is a link, and a link inside one, are left alone. A tree
-/// that is not there has nothing to sync.
+/// The ref tree is walked as [`list_pallets_in`] lists it: a link at its root is followed, and no
+/// link inside it is. A folder that is not there, or is gone by the time it is synced, has nothing
+/// to sync. Each folder gets a plain sync, and each tree's root a full one last, which flushes the
+/// device for all of them.
+///
+/// [`META_PALLET_NAMES`]: crate::util::meta_tree::META_PALLET_NAMES
 ///
 /// # Returns
-/// * `Ok(())`     - Every folder synced (or syncs are off, see [`file_utils::fsync_enabled`]).
+/// * `Ok(())`     - Every folder synced, or syncs are off ([`file_utils::fsync_enabled`], and on
+///   every target but Unix, where a folder sync is a no-op), when nothing is read at all.
 /// * `Err(error)` - The first folder that could not be synced or listed, with the error. Every
 ///   folder is attempted all the same.
 pub fn sync_ref_folders() -> Result<(), String> {
-    let trees = [
-        get_namespace_folder(PalletNamespace::User),
-        get_namespace_folder(PalletNamespace::Meta),
-        forklift_root().join(FOLDER_NAME_META_COPY_ROOT),
-    ];
-    let mut first: Option<String> = None;
-    let listing = |folder: &Path, error: std::io::Error| format!("Error while listing directory \"{}\": {}", folder.to_string_lossy(), error);
+    #[cfg(unix)]
+    {
+        if !file_utils::fsync_enabled() {
+            return Ok(());
+        }
 
-    for tree in trees {
-        match tree.symlink_metadata() {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                first.get_or_insert(format!("Error while reading \"{}\": {}", tree.to_string_lossy(), error));
+        let mut first: Option<String> = None;
+        // A folder another process removed after it was listed (an emptied ref folder is pruned).
+        let gone = |folder: &Path| matches!(std::fs::symlink_metadata(folder), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+
+        // The user ref tree, every folder inside it.
+        let tree = get_namespace_folder(PalletNamespace::User);
+        if tree.is_dir() {
+            let mut pending = vec![tree.clone()];
+            while let Some(folder) = pending.pop() {
+                let entries = match std::fs::read_dir(&folder) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        first.get_or_insert(format!("Error while listing directory \"{}\": {}", folder.to_string_lossy(), error));
+                        continue;
+                    }
+                };
+                for entry in entries {
+                    // A directory entry's type is the entry's own, never a link's target.
+                    match entry.and_then(|entry| entry.file_type().map(|kind| (kind.is_dir(), entry.path()))) {
+                        Ok((true, inner)) => {
+                            if let Err(error) = file_utils::fsync_dir_data(&inner) {
+                                if !gone(&inner) {
+                                    first.get_or_insert(error);
+                                }
+                            }
+                            pending.push(inner);
+                        }
+                        Ok((false, _)) => {}
+                        Err(error) => {
+                            first.get_or_insert(format!("Error while listing directory \"{}\": {}", folder.to_string_lossy(), error));
+                        }
+                    }
+                }
+            }
+        }
+
+        // The folders of the meta refs and of their copies, at fixed names, then each tree's root
+        // and the folders above it, flushing the device.
+        let mut folders = std::collections::BTreeSet::new();
+        for name in crate::util::meta_tree::META_PALLET_NAMES {
+            for path in [get_pallet_ref_path(PalletNamespace::Meta, name), get_meta_copy_path(name)] {
+                if let Some(parent) = path.parent() {
+                    folders.insert(parent.to_path_buf());
+                }
+            }
+        }
+        let roots = [tree, get_namespace_folder(PalletNamespace::Meta), forklift_root().join(FOLDER_NAME_META_COPY_ROOT)];
+        for folder in folders.iter().filter(|folder| !roots.contains(folder)) {
+            if let Err(error) = file_utils::fsync_dir_data(folder) {
+                if !gone(folder) {
+                    first.get_or_insert(error);
+                }
+            }
+        }
+        for root in &roots {
+            if !root.is_dir() {
                 continue;
             }
-        }
-        if let Err(error) = file_utils::sync_dir(&tree) {
-            first.get_or_insert(error);
-        }
-
-        let mut pending = vec![tree];
-        while let Some(folder) = pending.pop() {
-            let entries = match std::fs::read_dir(&folder) {
-                Ok(entries) => entries,
-                Err(error) => {
-                    first.get_or_insert(listing(&folder, error));
-                    continue;
-                }
-            };
-            for entry in entries {
-                // A directory entry's type is the entry's own, never a link's target.
-                let folder_in = entry.and_then(|entry| entry.file_type().map(|kind| (kind.is_dir(), entry.path())));
-                match folder_in {
-                    Ok((true, inner)) => {
-                        if let Err(error) = file_utils::sync_dir_alone(&inner) {
-                            first.get_or_insert(error);
-                        }
-                        pending.push(inner);
-                    }
-                    Ok((false, _)) => {}
-                    Err(error) => {
-                        first.get_or_insert(listing(&folder, error));
-                    }
+            if let Err(error) = file_utils::sync_dir(root) {
+                if !gone(root) {
+                    first.get_or_insert(error);
                 }
             }
         }
-    }
 
-    first.map_or(Ok(()), Err)
+        first.map_or(Ok(()), Err)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
 }
 
 /// What stands at a meta ref's copy path.
@@ -2987,21 +3020,26 @@ pub(crate) mod tests {
         }
     }
 
-    // Every folder of a ref or of a meta ref's copy is synced: each tree's root and the folders
-    // nested in it, and nothing a link points to. A folder that fails is named, and the folders
-    // after it are synced all the same. Mutations: skip the nested folders → "a/b" unsynced, red;
-    // skip the copies' tree → red; follow a link to a folder → the linked folder synced, red;
-    // stop at the first failure → the copies' folders unsynced, red.
+    // Every folder that can hold a ref is synced: each folder of the user ref tree, the meta refs'
+    // and copies' folders, and each tree's root with the folders above it; nothing a link inside
+    // the tree points to, and no folder of the copies' tree that holds no copy. A folder that
+    // fails is named, and the folders after it are synced all the same. Mutations: skip the
+    // nested folders → "a/b" unsynced, red; drop the copies' tree → red; sync a root alone →
+    // ".forklift" unsynced, red; follow a link inside the tree → the linked folder synced, red;
+    // walk the copies' tree → "junk" synced, red; stop at the first failure → the copies' root
+    // unsynced, red.
     // Unix only: a folder sync is a no-op elsewhere, so nothing is recorded.
     #[cfg(unix)]
     #[test]
     fn every_folder_of_a_ref_is_synced() {
-        use crate::util::file_utils::{sync_dir_attempts, SyncDirFaultGuard};
+        use crate::util::file_utils::{dir_sync_attempts, sync_dir_attempts, DirSyncFaultGuard, SyncDirFaultGuard};
 
+        // A root and its ancestors take the full sync, every other folder the plain one.
+        let attempts = || [sync_dir_attempts(), dir_sync_attempts()].concat();
         let (root, _scope) = scratch("sync-ref-folders");
         let user = get_pallet_ref_path(PalletNamespace::User, "a/b/c");
-        let meta = get_pallet_ref_path(PalletNamespace::Meta, "tags");
-        let copy = get_meta_copy_path("x/tags");
+        let meta = get_pallet_ref_path(PalletNamespace::Meta, crate::util::tag_utils::TAGS_PALLET_NAME);
+        let copy = get_meta_copy_path(crate::util::tag_utils::TAGS_PALLET_NAME);
         for path in [&user, &meta, &copy] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"ref").unwrap();
@@ -3010,28 +3048,32 @@ pub(crate) mod tests {
         std::fs::create_dir_all(outside.join("inner")).unwrap();
         let link = user.parent().unwrap().join("linked");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let copies = forklift_root().join(FOLDER_NAME_META_COPY_ROOT);
+        std::fs::create_dir_all(copies.join("junk")).unwrap();
 
         let pallets = get_namespace_folder(PalletNamespace::User);
-        let copies = forklift_root().join(FOLDER_NAME_META_COPY_ROOT);
         let folders = [
-            pallets.clone(), pallets.join("a"), pallets.join("a").join("b"),
-            get_namespace_folder(PalletNamespace::Meta), copies.clone(), copies.join("x"),
+            forklift_root(), pallets.clone(), pallets.join("a"), pallets.join("a").join("b"),
+            get_namespace_folder(PalletNamespace::Meta), copies.clone(),
         ];
         {
-            let _syncs = SyncDirFaultGuard::recording();
+            let _full = SyncDirFaultGuard::recording();
+            let _plain = DirSyncFaultGuard::recording();
             assert_eq!(sync_ref_folders(), Ok(()));
-            let attempted = sync_dir_attempts();
+            let attempted = attempts();
             for folder in &folders {
                 assert!(attempted.contains(folder), "{:?} unsynced: {:?}", folder, attempted);
             }
-            assert!(!attempted.iter().any(|folder| folder.starts_with(&outside) || folder.starts_with(&link)), "{:?}", attempted);
+            assert!(!attempted.iter().any(|folder| folder.starts_with(&outside) || folder.starts_with(&link)), "a link is followed: {:?}", attempted);
+            assert!(!attempted.contains(&copies.join("junk")), "a folder holding no copy is synced: {:?}", attempted);
         }
 
         let failing = pallets.join("a");
-        let _fault = SyncDirFaultGuard::failing_exactly(&failing);
+        let _full = SyncDirFaultGuard::recording();
+        let _fault = DirSyncFaultGuard::failing_exactly(&failing);
         assert_eq!(sync_ref_folders(), Err(format!("injected directory-sync failure for \"{}\"", failing.to_string_lossy())));
-        let attempted = sync_dir_attempts();
-        assert!(attempted.contains(&copies.join("x")), "the folders after the failure are synced: {:?}", attempted);
+        let attempted = attempts();
+        assert!(attempted.contains(&copies), "the folders after the failure are synced: {:?}", attempted);
     }
 
     /// A copy that can be neither written nor removed fails the write loudly, after the primary

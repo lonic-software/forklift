@@ -834,9 +834,8 @@ pub(crate) fn sync_ancestors_within(dir: &Path, root: &Path) -> Result<(), Strin
     }
 }
 
-/// [`sync_dir`] for `dir` alone, without the folders above it. For the taint folder, whose record
-/// must survive the very ancestor failure it is recording, and for a walk that syncs every folder
-/// above `dir` itself ([`crate::util::pallet_utils::sync_ref_folders`]).
+/// [`sync_dir`] for `dir` alone, without the folders above it. Only for the taint folder, whose
+/// record must survive the very ancestor failure it is recording.
 pub(crate) fn sync_dir_alone(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {

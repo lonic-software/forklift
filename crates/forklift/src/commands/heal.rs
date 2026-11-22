@@ -138,8 +138,8 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     // recording that, reads as undamaged, and nothing on disk says which it was. So every run
     // syncs the folder of every ref and copy before it reads or writes anything else.
     pallet_utils::sync_ref_folders().map_err(|error| format!(
-        "The folders of the pallet refs could not all be synced, so a ref an earlier heal rebuilt may not be durable: {}. \
-        Heal went no further: once that is fixed, run \"forklift heal\" again. Nothing was changed.",
+        "Heal syncs the folders of the pallet refs first, and one could not be synced: {}. Heal went no further, and \
+        nothing was changed: once that folder can be opened and synced, run \"forklift heal\" again.",
         error.trim_end_matches('.')
     ))?;
 

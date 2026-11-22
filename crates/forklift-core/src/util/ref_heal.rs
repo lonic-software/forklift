@@ -1067,7 +1067,7 @@ fn undurable(pallet: &str, head: &str, why: &str) -> String {
     format!(
         "The ref of pallet \"{}\" was rebuilt at {}, but {}. Heal synced its folder again, and neither \
         that sync nor a taint recording it held, so a crash can still lose the rebuild. Every heal syncs the \
-        folder of every ref first: once what stopped the sync is fixed, run \"forklift heal\" again.",
+        folder of every ref first, so once what stopped the sync is fixed, running \"forklift heal\" again syncs it again.",
         pallet, head, why.trim_end_matches('.')
     )
 }
@@ -1086,7 +1086,7 @@ fn undurable_if_landed(pallet: &str, head: &str, why: &str) -> String {
     format!(
         "The ref of pallet \"{}\" may have been rebuilt at {}, and if it was, {}. Heal synced its folder again, and \
         neither that sync nor a taint recording it held, so a crash can still lose the rebuild. Every heal syncs the \
-        folder of every ref first: once what stopped the sync is fixed, run \"forklift heal\" again.",
+        folder of every ref first, so once what stopped the sync is fixed, running \"forklift heal\" again syncs it again.",
         pallet, head, why.trim_end_matches('.')
     )
 }
@@ -2155,15 +2155,14 @@ fn copy_write_failed(state: &MetaState, head: &str, pass: Pass, error: &pallet_u
         (Err(why), ReadBack::Landed) => report.undurable.push(format!(
             "The copy of pallet \"{}\"'s ref was set to the ref's head {}, but {}. Heal synced its folder again, and \
             neither that sync nor a taint recording it held, so a crash can still lose the copy's write. Every heal \
-            syncs the folder of every ref and copy first: once what stopped the sync is fixed, run \"forklift heal\" \
-            again.",
+            syncs the folder of every ref and copy first, so once what stopped the sync is fixed, running \"forklift heal\" again \
+            syncs it again.",
             wire, head, why.trim_end_matches('.')
         )),
         (Err(why), ReadBack::Unread(_)) => report.undurable.push(format!(
             "The copy of pallet \"{}\"'s ref may have been set to the ref's head {}, and if it was, {}. Heal synced its \
             folder again, and neither that sync nor a taint recording it held, so a crash can still lose the copy's \
-            write. Every heal syncs the folder of every ref and copy first: once what stopped the sync is fixed, run \
-            \"forklift heal\" again.",
+            write. Every heal syncs the folder of every ref and copy first, so once what stopped the sync is fixed, running \"forklift heal\" again syncs it again.",
             wire, head, why.trim_end_matches('.')
         )),
         (Ok(again), read @ (ReadBack::Landed | ReadBack::Unread(_))) => {
@@ -2936,7 +2935,7 @@ mod tests {
             "The ref of pallet \"main\" was rebuilt at {}, but its ref is not durable: injected directory-sync failure for \"{}\" \
             (additionally, while recording a durability taint for the affected object(s): injected taint-record failure). Heal synced \
             its folder again, and neither that sync nor a taint recording it held, so a crash can still lose the rebuild. Every \
-            heal syncs the folder of every ref first: once what stopped the sync is fixed, run \"forklift heal\" again.",
+            heal syncs the folder of every ref first, so once what stopped the sync is fixed, running \"forklift heal\" again syncs it again.",
             head, folder.to_string_lossy()
         )]);
         assert!(after.rebuilt.is_empty() && after.refused.is_empty() && after.undurable.is_empty(), "{:?}", after);
@@ -3176,8 +3175,8 @@ mod tests {
         );
         let undurable_tail = format!(
             "its copy is not durable: {}. Heal synced its folder again, and neither that sync nor a taint recording it \
-            held, so a crash can still lose the copy's write. Every heal syncs the folder of every ref and copy first: once \
-            what stopped the sync is fixed, run \"forklift heal\" again.",
+            held, so a crash can still lose the copy's write. Every heal syncs the folder of every ref and copy first, so once what stopped the sync is fixed, \
+            running \"forklift heal\" again syncs it again.",
             unrecorded
         );
 

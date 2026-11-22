@@ -2760,7 +2760,9 @@ fn remove_ref_under_a_standing_taint_names_heal_first() {
 /// Heal syncs the folder of every ref before anything else, since a ref an earlier heal rebuilt
 /// with its folder left unsynced, and no taint recording that, reads as undamaged. A folder that
 /// cannot be synced (here, one that cannot be opened) stops the run with nothing changed: the
-/// damaged ref beside it is not rebuilt yet. Once the folder opens, the same heal goes on.
+/// damaged ref beside it is not rebuilt yet. Once the folder opens, the same heal goes on. With
+/// fsync off, the sweep syncs and reads nothing. Mutation: no fsync gate → the sweep refuses with
+/// fsync off, red.
 /// Mutation: drop the sync from heal → the run is refused later, by a pass that cannot list the
 /// folder, with no word of the sync, red.
 #[cfg(unix)]
@@ -2779,27 +2781,34 @@ fn heal_stops_on_a_ref_folder_it_cannot_sync() {
     damage(&root, "main", Damage::Truncate);
     let damaged = std::fs::read(ref_path(&root, "main")).unwrap();
     let folder = ref_path(&root, "feature");
-    let synced = |args: &[&str]| forklift_command()
-        .args(args)
+    let heal = |fsync: &str| forklift_command()
+        .arg("heal")
         .current_dir(&root)
         .env("FORKLIFT_GLOBAL_CONFIG", area.home.join("global-config.toml"))
         .env("FORKLIFT_KEYS_DIR", area.home.join("keys"))
-        .env("FORKLIFT_FSYNC", "1")
+        .env("FORKLIFT_FSYNC", fsync)
         .output()
         .unwrap();
 
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let refused = synced(&["heal"]);
+    let unsynced = heal("0");
+    let refused = heal("1");
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // With fsync off nothing is synced, so the sweep refuses nothing: what refuses is the pass
+    // that lists the folder.
+    let sweep = "Heal syncs the folders of the pallet refs first, and one could not be synced: ";
+    assert!(!text(&unsynced.stderr).contains(sweep), "{}", text(&unsynced.stderr));
+    assert!(text(&unsynced.stderr).contains("feature"), "the run met the folder: {}", text(&unsynced.stderr));
 
     let stderr = text(&refused.stderr);
     assert!(!refused.status.success(), "{}", stderr);
-    assert!(stderr.contains("The folders of the pallet refs could not all be synced, so a ref an earlier heal rebuilt may not be durable: "), "{}", stderr);
+    assert!(stderr.contains(sweep), "{}", stderr);
     assert!(stderr.contains("\".forklift/pallets/feature\""), "the folder is named: {}", stderr);
-    assert!(stderr.contains("Heal went no further: once that is fixed, run \"forklift heal\" again. Nothing was changed."), "{}", stderr);
+    assert!(stderr.contains("Heal went no further, and nothing was changed: once that folder can be opened and synced, run \"forklift heal\" again."), "{}", stderr);
     assert_eq!(std::fs::read(ref_path(&root, "main")).unwrap(), damaged, "nothing was changed");
 
-    let healed = synced(&["heal"]);
+    let healed = heal("1");
     assert!(healed.status.success(), "{}", text(&healed.stderr));
     assert_eq!(head(&root, "main"), main, "once the folder opens, heal goes on");
 }
