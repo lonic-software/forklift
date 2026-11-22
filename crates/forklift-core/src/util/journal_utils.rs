@@ -1177,10 +1177,11 @@ fn put_back_order(entry: &JournalEntry) -> impl Iterator<Item = &String> {
 /// error to report. Other refs restored before the failure stay restored: a retried undo finds
 /// them moved off the operation's heads and leaves them alone.
 ///
-/// A compensating write ([`pallet_utils::compensating_head_write`]) while `basis` still judges the
-/// head it puts back: a taint the failed write left standing does not refuse it, so the bay is
-/// left where a retried undo passes its check once `forklift heal` has cleared that taint. Once
-/// `basis` no longer does, it is the ordinary checked write.
+/// `un_restore` is `None` when the operation did not move the current pallet: nothing is written.
+/// Otherwise the move back is a compensating write ([`pallet_utils::compensating_head_write`])
+/// while its `basis` still judges the head it puts back: a taint the failed write left standing
+/// does not refuse it, so the bay is left where a retried undo passes its check once `forklift
+/// heal` has cleared that taint. Once the basis no longer does, it is the ordinary checked write.
 fn un_restore_current(current: &str, un_restore: Option<&UnRestore<'_>>, error: String) -> String {
     let Some(UnRestore { pre_head, post_head, basis }) = un_restore else {
         return error;
