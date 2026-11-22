@@ -12475,4 +12475,20 @@ mod tests {
 
         assert!(error.starts_with("--max-heavy-requests (\"max_heavy_requests\" in the config file) is 0"), "{error}");
     }
+
+    /// Each request limit of a `ServeOptions` reaches the server's limits as its own class: a
+    /// limit under the minimum is refused at startup, naming the flag it came from.
+    ///
+    /// Reverts: build the limits from neither option → both start → red; swap the two → each names
+    /// the other's flag → red.
+    #[tokio::test]
+    async fn serve_builds_its_request_limits_from_its_options() {
+        let light = ServeOptions { light_requests_per_minute: Some(2), open: true, ..bare_serve_options() };
+        let error = serve(light).await.unwrap_err();
+        assert!(error.starts_with("--light-requests-per-minute (\"light_requests_per_minute\" in the config file) is 2"), "{error}");
+
+        let heavy = ServeOptions { heavy_requests_per_minute: Some(3), open: true, ..bare_serve_options() };
+        let error = serve(heavy).await.unwrap_err();
+        assert!(error.starts_with("--heavy-requests-per-minute (\"heavy_requests_per_minute\" in the config file) is 3"), "{error}");
+    }
 }
