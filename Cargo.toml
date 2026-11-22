@@ -79,9 +79,13 @@ rpassword = "7"
 # `history`'s `DateTime<Utc>` field. Pulls in no TLS/crypto crate (no aws-lc risk).
 schemars = { version = "1.2", features = ["chrono04"] }
 # Constant-time secret comparison (bearer tokens): already in the tree transitively via
-# ed25519-dalek, promoted to a direct dependency for the two server heads' auth checks so a
-# byte-wise `==` never regresses back in. Zero dependencies of its own — pins no new crate.
+# ed25519-dalek, promoted to a direct dependency for the bearer-token check
+# (`forklift_core::util::token_utils`) so a byte-wise `==` never regresses back in. Zero dependencies of its own — pins no new crate.
 subtle = "2.6"
+# SHA-256 for bearer tokens: both server heads hold only token digests
+# (`forklift_core::util::token_utils`), the format `shasum -a 256` and terraform's `sha256()`
+# produce. Already in the tree through ed25519-dalek at this version, so it pins no new crate.
+sha2 = "0.10.9"
 # Test-only (a forklift-core dev-dependency): already in the tree through reqwest's gzip decoder.
 flate2 = "1"
 # Test-only (a forklift-core dev-dependency): already in the tree through reqwest, which builds a

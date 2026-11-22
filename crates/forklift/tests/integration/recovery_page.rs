@@ -123,9 +123,13 @@ impl Server {
         Server::serve(root)
     }
 
+    /// The SHA-256 of `secret`, the token every client in this file presents
+    /// (`printf secret | shasum -a 256`).
+    const SECRET_SHA256: &str = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b";
+
     fn serve(root: &str) -> Server {
         let mut child = Command::new(server_binary())
-            .args(["serve", "--token", "secret", "--root", root, "--addr", "127.0.0.1:0"])
+            .args(["serve", "--token-sha256", Self::SECRET_SHA256, "--root", root, "--addr", "127.0.0.1:0"])
             .env("FORKLIFT_FSYNC", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

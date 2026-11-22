@@ -57,9 +57,9 @@ pub mod withheld;
 pub use aws::{AwsConfig, DynamoRefStore, S3ObjectStore};
 pub use blocking::AsyncBridge;
 pub use entrypoint::{
-    auth_from_env, check_auth_fits_routing, config_from_env, handle, AuthConfig, Credentials, Routing,
-    TokenDigest,
+    auth_from_env, check_auth_fits_routing, config_from_env, handle, AuthConfig, Routing,
 };
+pub use forklift_core::util::token_utils::{Credentials, TokenDigest};
 pub use error::{HeadError, HeadResult, Status};
 pub use head::{BatchCut, BatchDelivery, BatchResult, Head, BATCH_ANSWER_RESERVE, BATCH_BYTE_BUDGET};
 pub use store::{

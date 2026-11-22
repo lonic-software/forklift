@@ -17,6 +17,21 @@ fn server_command() -> Command {
     command
 }
 
+/// A bearer token's SHA-256 digest, the only form `forklift-server` is configured with.
+fn token_digest(token: &str) -> String {
+    <sha2::Sha256 as sha2::Digest>::digest(token.as_bytes()).iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+/// A `forklift-server` tokens file binding each `(token, operator id)` pair, by the token's
+/// digest.
+fn operators_file(operators: &[(&str, &str)]) -> String {
+    let mut file = "[operators_sha256]\n".to_string();
+    for (token, identifier) in operators {
+        file.push_str(&format!("\"{}\" = \"{}\"\n", token_digest(token), identifier));
+    }
+    file
+}
+
 /// A scratch area for one test: warehouses, the server root, the shared key directory
 /// and the per-"machine" global configurations all live under it, and it is deleted
 /// when the test ends.
@@ -179,12 +194,12 @@ impl Server {
     fn spawn(mut args: Vec<String>, token: Option<&str>) -> Server {
         match token {
             Some(token) => {
-                args.push("--token".to_string());
-                args.push(token.to_string());
+                args.push("--token-sha256".to_string());
+                args.push(token_digest(token));
             }
             // No token on the command line: every caller here that passes `None` is either
             // testing genuinely open (`Principal::Open`) server behavior, or already configures
-            // auth another way via `--config` (a file `token`, `[hooks]` authentication, or
+            // auth another way via `--config` (a file `token_sha256`, `[hooks]` authentication, or
             // `--tokens`) — forklift-server no longer infers "open" from an empty auth config
             // (it refuses to start instead), so this harness must say so explicitly. When auth
             // *is* configured some other way, a configured token/tokens/authentication hook
@@ -2089,7 +2104,7 @@ fn manifest_syncs_across_remotes_and_replays_when_diverged() {
 #[test]
 fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     let area = TestArea::new("tags-remote");
-    area.write_file("tokens.toml", "[operators]\n\"w-token\" = \"worker@forklift\"\n");
+    area.write_file("tokens.toml", &operators_file(&[("w-token", "worker@forklift")]));
     let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
 
     prepare_warehouse(&area, "a", &server.url);
@@ -3169,7 +3184,10 @@ fn warehouse_creation_is_gated_and_validated() {
 
     // An open (token-less) multi-warehouse server refuses creation outright.
     let open = Server::start_multi(&area, None);
-    assert_eq!(http_status(&open.url, "PUT", "/warehouses/alpha", None), "HTTP/1.1 403 Forbidden");
+    let (status, body) = http_send_json(&open.url, "PUT", "/warehouses/alpha", "");
+    assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    assert!(body.contains("start the server with --token-sha256, or token_sha256 in the config file"),
+            "the refusal names the flag that sets the static token: {}", body);
     drop(open);
 
     let area = TestArea::new("create-gate2");
@@ -3197,11 +3215,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
 
     // Server tokens map to operator ids (opaque strings; these tests pick readable
     // ones — unset identities would mint pseudonymous UUIDs instead).
-    area.write_file("tokens.toml", concat!(
-        "[operators]\n",
-        "\"w-token\" = \"worker@forklift\"\n",
-        "\"r-token\" = \"reader@forklift\"\n",
-    ));
+    area.write_file("tokens.toml", &operators_file(&[("w-token", "worker@forklift"), ("r-token", "reader@forklift")]));
 
     let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
 
@@ -3302,10 +3316,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
 fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
     let area = TestArea::new("regenesis");
 
-    area.write_file("tokens.toml", concat!(
-        "[operators]\n",
-        "\"w-token\" = \"worker@forklift\"\n",
-    ));
+    area.write_file("tokens.toml", &operators_file(&[("w-token", "worker@forklift")]));
 
     let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
 
@@ -3403,10 +3414,7 @@ fn plant_torn_taint(area: &TestArea, warehouse: &str) {
 /// Set up warehouse A on a server with static token "root", enrolled and lifted, then re-genesis
 /// it and lift the reset. Returns the server; `before_reset` runs after A's first lift.
 fn regenesis_on_remote(area: &TestArea, before_reset: impl FnOnce(&Server)) -> Server {
-    area.write_file("tokens.toml", concat!(
-        "[operators]\n",
-        "\"w-token\" = \"worker@forklift\"\n",
-    ));
+    area.write_file("tokens.toml", &operators_file(&[("w-token", "worker@forklift")]));
     let server = Server::start_with_tokens(area, Some("root"), "tokens.toml");
 
     prepare_warehouse(area, "a", &server.url);
@@ -4442,10 +4450,7 @@ fn a_remote_whose_anchor_was_stripped_is_refused_before_anything_is_fetched() {
 fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     let area = TestArea::new("compromise");
 
-    area.write_file("tokens.toml", concat!(
-        "[operators]\n",
-        "\"w-token\" = \"worker@forklift\"\n",
-    ));
+    area.write_file("tokens.toml", &operators_file(&[("w-token", "worker@forklift")]));
 
     let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
 
@@ -4511,10 +4516,7 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
 fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
     let area = TestArea::new("revoke-tombstone");
 
-    area.write_file("tokens.toml", concat!(
-        "[operators]\n",
-        "\"w-token\" = \"worker@forklift\"\n",
-    ));
+    area.write_file("tokens.toml", &operators_file(&[("w-token", "worker@forklift")]));
 
     let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
 
@@ -4596,8 +4598,8 @@ fn healthz_is_open_and_the_config_file_configures_the_server() {
     assert!(prepared.status.success());
 
     area.write_file("server.toml", &format!(
-        "root = '{}'\naddr = \"127.0.0.1:0\"\ntoken = \"sesame\"\n",
-        root.to_str().unwrap()
+        "root = '{}'\naddr = \"127.0.0.1:0\"\ntoken_sha256 = \"{}\"\n",
+        root.to_str().unwrap(), token_digest("sesame")
     ));
 
     let server = Server::spawn(vec![
@@ -13354,10 +13356,7 @@ fn heal_finishes_an_interrupted_lower_only_under_the_office_it_was_verified_agai
 /// "a", an admin, holding a worker's lifted `feat` and the worker's open haul of it, with main
 /// diverged so merging `feat` conflicts. Returns the server, the haul id and the worker's head.
 fn worker_feat(area: &TestArea) -> (Server, String, String) {
-    area.write_file("tokens.toml", concat!(
-        "[operators]\n",
-        "\"w-token\" = \"worker@forklift\"\n",
-    ));
+    area.write_file("tokens.toml", &operators_file(&[("w-token", "worker@forklift")]));
     let server = Server::start_with_tokens(area, Some("root"), "tokens.toml");
 
     prepare_warehouse(area, "a", &server.url);
