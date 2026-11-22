@@ -17,13 +17,14 @@ use crate::util::lock_utils::StoreAccessLock;
 /// concern, not the journal's.
 const FILE_NAME_JOURNAL: &str = "journal.json";
 
-/// The journal file's format version. The file is `{"version":4,"entries":[...]}`; any other
+/// The journal file's format version. The file is `{"version":5,"entries":[...]}`; any other
 /// version, or anything that does not parse as this shape, is refused by name — never read as
 /// an empty journal, which would make `undo` report "nothing to undo" over a history it lost.
 ///
 /// Version 4 embeds the digested out-of-scope skeleton record, so an older journal's in-progress
-/// consolidation would not read: it is refused as another version, never as damage.
-const JOURNAL_VERSION: u64 = 4;
+/// consolidation would not read: it is refused as another version, never as damage. Version 5 adds
+/// each entry's `undo_started` mark, which an older journal's entries lack.
+const JOURNAL_VERSION: u64 = 5;
 
 /// The op name a pallet delete is journaled under. Its entry records the removed ref with its head
 /// before and none after; the removal writes it itself (see
@@ -198,6 +199,12 @@ pub struct JournalEntry {
     /// The state right after the operation. `undo` refuses unless the bay still matches it (see
     /// [`check_undoable`]), and `restore_refs` rolls back only the refs still sitting here.
     pub after: Snapshot,
+
+    /// Whether an undo of this entry has started: the mark that tells a bay an interrupted undo
+    /// left apart from one that only looks like it. False when the entry is pushed. The pop that
+    /// finishes the undo removes it with the entry, and a merge abort or abandon clears it before
+    /// it changes anything (see [`pop_latest_left_in_progress_if`]).
+    pub undo_started: bool,
 }
 
 /// The journal file, as written.
@@ -341,7 +348,7 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
         return Ok(());
     }
 
-    let entry = JournalEntry { op: op.to_string(), before, after };
+    let entry = JournalEntry { op: op.to_string(), before, after, undo_started: false };
     validate_entry(&entry)?;
 
     let mut entries = read()?;
@@ -440,6 +447,7 @@ pub(crate) fn delete_entry_for_test(victim: &str, head: &str) -> JournalEntry {
         op: DELETE_OP.to_string(),
         before: Snapshot { current_pallet: "current".to_string(), heads: before, consolidation: None, cherry_pick: None },
         after: Snapshot { current_pallet: "current".to_string(), heads: after, consolidation: None, cherry_pick: None },
+        undo_started: false,
     }
 }
 
@@ -467,7 +475,7 @@ pub fn delete_entry(wire: &str, head: &str) -> Result<JournalEntry, String> {
     before.heads.insert(wire.to_string(), Some(head.to_string()));
     after.heads.insert(wire.to_string(), None);
 
-    Ok(JournalEntry { op: DELETE_OP.to_string(), before, after })
+    Ok(JournalEntry { op: DELETE_OP.to_string(), before, after, undo_started: false })
 }
 
 /// How [`restore_deleted`] brought a deleted pallet back.
@@ -759,8 +767,9 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// the bay is still exactly where it left it — for an abort, which abandons that operation outside
 /// `undo`. Kept, the entry would refuse every later undo: the bay no longer holds the consolidation
 /// its after records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
-/// and its undo depends on no bay state. Any other entry is left alone, so a rerun of an
-/// interrupted abort, whose entry is already gone, removes nothing more.
+/// and its undo depends on no bay state. Any other entry is kept, so a rerun of an interrupted
+/// abort, whose entry is already gone, removes nothing more; it only loses an undo's mark (see
+/// [`pop_latest_left_in_progress_if`]).
 ///
 /// # Returns
 /// * `Ok(true)`    - The entry was removed.
@@ -783,7 +792,8 @@ pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
 /// since the record may be damaged: the latest entry other than a pallet delete is removed when it
 /// left a consolidation or pick in progress and the bay still stands where it left it, on the same
 /// pallet and base. Whichever merge that entry recorded, none is in progress once the abort is
-/// through, so kept, it would refuse every later undo. Any other entry is left alone.
+/// through, so kept, it would refuse every later undo. Any other entry is kept, losing only an
+/// undo's mark (see [`pop_latest_left_in_progress_if`]).
 ///
 /// # Returns
 /// * `Ok(true)`    - The entry was removed.
@@ -798,11 +808,22 @@ pub fn pop_if_it_left_in_progress_unread() -> Result<bool, String> {
 
 /// Remove the latest entry other than a pallet delete when it [left a merge in
 /// progress](left_in_progress) and `still_there` holds for it.
+///
+/// First, when that entry carries an undo's [`undo_started`](JournalEntry::undo_started) mark,
+/// rewrite it unmarked. Merge abort and abandon call this before they change anything, so an abort
+/// of the merge an interrupted undo wrote back leaves no mark that a later undo could take for its
+/// own unfinished run and resume, writing the aborted merge back. A failed rewrite fails the
+/// command with nothing changed.
 fn pop_latest_left_in_progress_if(still_there: impl FnOnce(&JournalEntry) -> Result<bool, String>) -> Result<bool, String> {
     let mut entries = read()?;
     let Some(index) = entries.iter().rposition(|entry| entry.op != DELETE_OP) else {
         return Ok(false);
     };
+
+    if entries[index].undo_started {
+        entries[index].undo_started = false;
+        write(&entries)?;
+    }
 
     if !left_in_progress(&entries[index]) || !still_there(&entries[index])? {
         return Ok(false);
@@ -1452,7 +1473,7 @@ mod tests {
 
     /// An entry recording `op` moving `pallet` from `before` to `after`.
     fn entry(op: &str, pallet: &str, before: &str, after: &str) -> JournalEntry {
-        JournalEntry { op: op.to_string(), before: snapshot(pallet, before), after: snapshot(pallet, after) }
+        JournalEntry { op: op.to_string(), before: snapshot(pallet, before), after: snapshot(pallet, after), undo_started: false }
     }
 
     fn plant_journal(content: &str) {
@@ -1775,6 +1796,35 @@ mod tests {
         }
     }
 
+    /// Both pops a merge abort or abandon runs clear an undo's mark from the latest entry other
+    /// than a delete, and keep that entry when they do not remove it. The deletes above it and the
+    /// older entries are left as they were, the older one still marked.
+    #[test]
+    fn the_pops_an_abort_runs_clear_the_latest_entrys_undo_mark() {
+        let _scratch = Scratch::new("pop-clears-mark");
+
+        let mut older = entry("stack", "main", &hash('0'), &hash('1'));
+        older.undo_started = true;
+        let mut latest = entry("stack", "main", &hash('1'), &hash('a'));
+        latest.undo_started = true;
+        let deleted = delete_entry_for_test("gone", &hash('9'));
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('a')))).unwrap();
+
+        let pops: [(&str, fn() -> Result<bool, String>); 2] =
+            [("abort", pop_if_it_left_in_progress), ("abandon", pop_if_it_left_in_progress_unread)];
+        for (what, pop) in pops {
+            write(&[older.clone(), latest.clone(), deleted.clone()]).unwrap();
+
+            assert!(!pop().unwrap(), "{}: an entry that left no merge is kept", what);
+            let marks: Vec<(String, bool)> = read().unwrap().into_iter().map(|entry| (entry.op, entry.undo_started)).collect();
+            assert_eq!(
+                marks,
+                [("stack".to_string(), true), ("stack".to_string(), false), (DELETE_OP.to_string(), false)],
+                "{}", what
+            );
+        }
+    }
+
     #[test]
     fn push_if_changed_records_a_switch_of_the_current_pallet() {
         let _scratch = Scratch::new("push-switch");
@@ -1912,7 +1962,9 @@ mod tests {
         // Version 1 is the format before consolidations and picks recorded their base.
         assert_refused_everywhere(r#"{"version":1,"entries":[]}"#, "has format version 1");
         assert_refused_everywhere(r#"{"version":3,"entries":[]}"#, "has format version 3");
-        assert_refused_everywhere(r#"{"version":5,"entries":[]}"#, "has format version 5");
+        // Version 4 is the format before entries carried an undo's mark.
+        assert_refused_everywhere(r#"{"version":4,"entries":[]}"#, "has format version 4");
+        assert_refused_everywhere(r#"{"version":6,"entries":[]}"#, "has format version 6");
         assert_refused_everywhere(r#"{"version":"1","entries":[]}"#, "has an unreadable format version (\"1\")");
     }
 
@@ -1930,11 +1982,25 @@ mod tests {
         let _scratch = Scratch::new("no-after-journal");
 
         let content = format!(
-            r#"{{"version":4,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}}}}]}}"#,
+            r#"{{"version":5,"entries":[{{"op":"stack","before":{{"current_pallet":"main","heads":{{"main":"{}"}},"consolidation":null}},"undo_started":false}}]}}"#,
             hash('1')
         );
 
         assert_refused_everywhere(&content, "is malformed");
+    }
+
+    /// A version-5 entry without its undo mark is refused, never read as unmarked: the mark is
+    /// what lets a retried undo resume, so a default would be a guess.
+    #[test]
+    fn an_entry_missing_its_undo_mark_is_refused() {
+        let _scratch = Scratch::new("no-mark-journal");
+
+        write(&[entry("stack", "main", &hash('1'), &hash('2'))]).unwrap();
+        let full = std::fs::read_to_string(path()).unwrap();
+        assert_eq!(read().unwrap().len(), 1, "the entry as written must read");
+        assert_eq!(full.matches(r#","undo_started":false"#).count(), 1, "{}", full);
+
+        assert_refused_everywhere(&full.replace(r#","undo_started":false"#, ""), "is malformed");
     }
 
     #[test]
