@@ -101,25 +101,16 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             "--ref takes PALLET=PARCEL, not \"{}\". Nothing was changed.", spec
         )))
         .collect::<Result<Vec<_>, _>>()?;
-    // Heal never removes a meta pallet's ref: it rebuilds one where it has a head to rebuild it at,
-    // and otherwise names the way out.
-    // Each meta name once, in the order given, so naming one twice still reads as one flag to drop.
-    let mut meta: Vec<&String> = Vec::new();
-    for pallet in remove_ref.iter().filter(|pallet| pallet.starts_with('@')) {
-        if !meta.contains(&pallet) {
-            meta.push(pallet);
-        }
-    }
-    if let Some(first) = meta.first() {
-        let flags: Vec<String> = meta.iter().map(|pallet| format!("\"--remove-ref {}\"", pallet)).collect();
-        return Err(format!(
-            "--remove-ref removes only a user pallet's ref, and \"{}\" is not one: heal never removes the ref of a metadata pallet. \
-            Run the command again without {}: heal rebuilds a damaged metadata ref where it can and otherwise names the way out. \
-            Nothing was changed.",
-            first, flags.join(" and ")
-        ));
-    }
+    // Heal never sets or removes a meta pallet's ref by hand: it rebuilds one where it has a head to
+    // rebuild it at, and otherwise names the way out.
+    refuse_meta("--remove-ref removes", "removes", remove_ref.iter().map(|pallet| (pallet.as_str(), format!("--remove-ref {}", pallet))))?;
+    refuse_meta("--ref sets", "sets", set_ref.iter().map(|(pallet, parcel)| (*pallet, format!("--ref {}={}", pallet, parcel))))?;
     let named = set_ref.iter().map(|(pallet, _)| *pallet).chain(remove_ref.iter().map(String::as_str));
+    // Every name is judged before anything is written, so `--ref main=<p> --ref 'bad name'=<q>`
+    // leaves main as it was.
+    for pallet in named.clone() {
+        pallet_utils::validate_pallet_name(pallet).map_err(|error| format!("{}. Nothing was changed.", error))?;
+    }
     if let Some(twice) = named.clone().enumerate().find(|(at, pallet)| named.clone().skip(at + 1).any(|other| other == *pallet)) {
         return Err(format!(
             "Pallet \"{}\" is named more than once by --ref and --remove-ref: name each pallet once. Nothing was changed.",
@@ -1120,6 +1111,32 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     }
 
     Err(ref_refusal(&report, None).into())
+}
+
+/// Refuse the specs of one flag that name a meta pallet, each named once in the order given (by
+/// the first spec naming it), so naming one twice still reads as one flag to drop.
+///
+/// # Arguments
+/// * `flag_does` - The flag and its verb, opening the message ("--ref sets").
+/// * `verb`      - The verb heal never does to a metadata ref ("sets").
+/// * `specs`     - Each spec's pallet and the flag as given.
+fn refuse_meta<'a>(flag_does: &str, verb: &str, specs: impl Iterator<Item = (&'a str, String)>) -> Result<(), String> {
+    let mut meta: Vec<(&str, String)> = Vec::new();
+    for (pallet, flag) in specs.filter(|(pallet, _)| pallet.starts_with(pallet_utils::META_QUALIFIER)) {
+        if !meta.iter().any(|(named, _)| *named == pallet) {
+            meta.push((pallet, flag));
+        }
+    }
+    let Some((first, _)) = meta.first() else {
+        return Ok(());
+    };
+    let flags: Vec<String> = meta.iter().map(|(_, flag)| format!("\"{}\"", flag)).collect();
+    Err(format!(
+        "{} only a user pallet's ref, and \"{}\" is not one: heal never {} the ref of a metadata pallet. \
+        Run the command again without {}: heal rebuilds a damaged metadata ref where it can and otherwise names the way out. \
+        Nothing was changed.",
+        flag_does, first, verb, flags.join(" and ")
+    ))
 }
 
 /// Plan the inventory's rebuild for `marker`, and write it when it is complete or `accept_loss`.

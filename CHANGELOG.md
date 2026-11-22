@@ -830,6 +830,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- `heal` checks every pallet that `--ref` and `--remove-ref` name before it changes anything.
+  Before, an invalid name, or `--ref` naming a metadata pallet (`@<name>`), was refused only after
+  the specs before it had already been written.
 - When a write fails in a way that records a durability taint, the command now still puts back
   what it had already changed. This covers four cases:
   - a trust install whose office write failed puts back the previous trust anchor;
