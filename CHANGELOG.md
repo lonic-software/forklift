@@ -836,9 +836,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
   A pallet removal whose own journal or tombstone write failed after landing now puts that record
   back too. Before, the undo journal kept an entry deleting the pallet although the pallet was
-  still there, and the tombstone list kept the pallet's tombstone. When a put-back itself fails,
-  the error now says whether the record was put back but may not be durable yet, or could not be
-  put back.
+  still there, and the tombstone list kept the pallet's tombstone. This also holds when the ref
+  could not be removed and then could not be read back either. The error now says which record was
+  put back. When a put-back itself fails, it says what reading the record back shows: that it
+  holds what it held before but may not be durable yet, that it could not be put back, or that
+  whether it was is not known.
 - `heal` no longer refuses forever over a durability taint that records a lost metadata ref copy
   (`.forklift/meta-copy/<name>`), as a crash can leave one after a metadata pallet's first write.
   When the ref beside it is a file holding a parcel hash, that part of the taint is resolved, and
