@@ -588,7 +588,7 @@ struct LocalRoots {
 fn root_sources() -> Result<recovery_utils::GcRootSources, String> {
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     recovery_utils::gc_root_sources(
-        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed, recovery_utils::NotedIn::Other,
     )
 }
 

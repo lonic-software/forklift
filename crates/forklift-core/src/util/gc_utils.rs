@@ -274,6 +274,7 @@ fn walk_live_set(excluded: &HashSet<String>) -> Result<LiveWalk, String> {
         &bay_dirs,
         bay_utils::BayReadPolicy::FailClosed,
         crate::util::office_utils::TrustPinReadPolicy::FailClosed,
+        crate::util::recovery_utils::NotedIn::Other,
     )?;
 
     // The parcel walk `collect_reachable_for_sweep` runs, keeping its gaps.

@@ -4476,9 +4476,9 @@ mod tests {
 
         // gc and prune refuse on it; heal reads past it and says so.
         use crate::util::{bay_utils::BayReadPolicy, office_utils::TrustPinReadPolicy, recovery_utils};
-        let refused = recovery_utils::gc_root_sources(&[], BayReadPolicy::FailClosed, TrustPinReadPolicy::FailClosed);
+        let refused = recovery_utils::gc_root_sources(&[], BayReadPolicy::FailClosed, TrustPinReadPolicy::FailClosed, recovery_utils::NotedIn::Other);
         assert!(refused.err().unwrap_or_default().contains("haul.state 2"));
-        let tolerated = recovery_utils::gc_root_sources(&[], BayReadPolicy::Tolerate, TrustPinReadPolicy::Tolerate).unwrap();
+        let tolerated = recovery_utils::gc_root_sources(&[], BayReadPolicy::Tolerate, TrustPinReadPolicy::Tolerate, recovery_utils::NotedIn::Heal).unwrap();
         assert!(tolerated.degraded.iter().any(|note| note.contains("haul.state 2")), "{:?}", tolerated.degraded);
     }
 

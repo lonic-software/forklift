@@ -1674,9 +1674,18 @@ struct WalkRoots {
     unread_refs: Vec<String>,
 }
 
+/// The command a note about a ref that does not read is shown in: inside heal, a read's way out
+/// that is to run heal is left out of the note, since heal is the command already running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NotedIn {
+    Heal,
+    Other,
+}
+
 /// Every user and every meta pallet head, for [`gc_root_sources`] and [`durable_root_sources`]. A
 /// ref that cannot be read is an error under `FailClosed`, and a note in `degraded` under
-/// `Tolerate`.
+/// `Tolerate`, which quotes the read's refusal with its way out unless `noted_in` is heal and the
+/// way out is to run heal.
 ///
 /// A meta ref that reads also yields its copy's head, in every mode, when the copy parses and
 /// names another head: a crash or a failed restore can leave the copy ahead of its ref, and its
@@ -1684,7 +1693,7 @@ struct WalkRoots {
 /// nothing and fails nothing; one that cannot be read is an error under `FailClosed` and a note
 /// under `Tolerate`, as a ref is. The copy of a ref that does not read is not consulted here.
 fn pallet_ref_heads(
-    bay_policy: &bay_utils::BayReadPolicy, degraded: &mut Vec<String>, unread: &mut Vec<String>,
+    bay_policy: &bay_utils::BayReadPolicy, noted_in: NotedIn, degraded: &mut Vec<String>, unread: &mut Vec<String>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut parcels: Vec<String> = Vec::new();
     let mut meta_heads: Vec<String> = Vec::new();
@@ -1699,10 +1708,15 @@ fn pallet_ref_heads(
                     bay_utils::BayReadPolicy::FailClosed => return Err(e),
                     bay_utils::BayReadPolicy::Tolerate => {
                         let wire = pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire();
+                        let said = match crate::error::CoreError::from(e) {
+                            crate::error::CoreError::Refusal { message, next_step, .. }
+                                if noted_in == NotedIn::Heal && next_step == pallet_utils::HEAL_STEP => message,
+                            error => error.to_string(),
+                        };
                         degraded.push(format!(
                             "the ref of pallet \"{}\" could not be read this run ({}); what only it \
                             reaches was treated as held by nothing rather than blocking this command.",
-                            wire, crate::error::CoreError::from(e)
+                            wire, said
                         ));
                         unread.push(wire);
                         None
@@ -1750,7 +1764,7 @@ fn pallet_ref_heads(
 pub(crate) fn durable_root_sources(tombstone_heads: Vec<String>) -> Result<GcRootSources, String> {
     let mut degraded: Vec<String> = Vec::new();
     let mut unread_refs: Vec<String> = Vec::new();
-    let (parcels, meta_heads) = pallet_ref_heads(&bay_utils::BayReadPolicy::Tolerate, &mut degraded, &mut unread_refs)?;
+    let (parcels, meta_heads) = pallet_ref_heads(&bay_utils::BayReadPolicy::Tolerate, NotedIn::Other, &mut degraded, &mut unread_refs)?;
     let trust_pins = office_utils::collect_trust_pin_roots(office_utils::TrustPinReadPolicy::FailClosed)?;
 
     Ok(GcRootSources {
@@ -1870,6 +1884,7 @@ impl GcRootSources {
 /// * `bay_policy` - What to do with a bay whose state cannot be read.
 /// * `pin_policy` - What to do with an unreadable office record backing the revoked-key
 ///                  `distrust_boundary` pins.
+/// * `noted_in`   - The command a note about a ref that does not read is shown in.
 ///
 /// # Returns
 /// * `Ok(GcRootSources)` - Every pallet head, every haul's proposed head not yet merged, the git
@@ -1884,10 +1899,11 @@ pub(crate) fn gc_root_sources(
     bay_dirs: &[PathBuf],
     bay_policy: bay_utils::BayReadPolicy,
     pin_policy: office_utils::TrustPinReadPolicy,
+    noted_in: NotedIn,
 ) -> Result<GcRootSources, String> {
     let mut degraded: Vec<String> = Vec::new();
     let mut unread_refs: Vec<String> = Vec::new();
-    let (mut parcels, meta_heads) = pallet_ref_heads(&bay_policy, &mut degraded, &mut unread_refs)?;
+    let (mut parcels, meta_heads) = pallet_ref_heads(&bay_policy, noted_in, &mut degraded, &mut unread_refs)?;
 
     // A haul's proposed head is merged from the recorded hash, whatever its source pallet holds
     // now. Read under `bay_policy`: like a bay's state, it is a record outside the pallet refs
@@ -2038,7 +2054,7 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
     // not brick on a single unreadable bay or office record.
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = gc_root_sources(
-        &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::Tolerate,
+        &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::Tolerate, NotedIn::Heal,
     )?;
 
     // Tags are read for notes only, never walked — see `WalkRoots::tag_subjects`.
@@ -6413,7 +6429,7 @@ mod tests {
 
         let bay_dirs = bay_utils::all_bay_state_dirs().unwrap();
         let sources = gc_root_sources(
-            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed, NotedIn::Other,
         ).unwrap();
 
         assert!(sources.meta_heads.contains(&h1), "{:?}", sources.meta_heads);
@@ -6422,7 +6438,7 @@ mod tests {
         // A copy that does not parse adds nothing and fails nothing.
         std::fs::write(pallet_utils::get_meta_copy_path("tags"), "not a hash\n").unwrap();
         let sources = gc_root_sources(
-            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed, NotedIn::Other,
         ).unwrap();
         assert_eq!(sources.meta_heads, vec![h1.clone()]);
 
@@ -6438,16 +6454,47 @@ mod tests {
         std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&copy).is_err() {
             let closed = gc_root_sources(
-                &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+                &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed, NotedIn::Other,
             );
             assert!(closed.is_err(), "an unreadable copy must fail GC closed: {:?}", closed.map(|s| s.meta_heads));
             let tolerated = gc_root_sources(
-                &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::FailClosed,
+                &bay_dirs, bay_utils::BayReadPolicy::Tolerate, office_utils::TrustPinReadPolicy::FailClosed, NotedIn::Heal,
             ).unwrap();
             assert_eq!(tolerated.meta_heads, vec![h1.clone()]);
             assert!(tolerated.degraded.iter().any(|note| note.contains("the copy of pallet \"@tags\"")), "{:?}", tolerated.degraded);
         }
         std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    /// A ref that does not read is noted with its read's way out, except that inside heal a way
+    /// out that is to run heal is left out, since heal is the command running. Any other way out
+    /// stays, inside heal too.
+    // Each mutant goes red in one cell: the heal step left in inside heal (side, heal); left out
+    // in every command (side, other); every way out left out inside heal (tags, heal).
+    #[test]
+    fn a_note_about_an_unread_ref_names_heal_only_outside_heal() {
+        use crate::util::pallet_utils::{self, tests::scratch, PalletNamespace};
+
+        let (_root, _scope) = scratch("recovery-unread-ref-step");
+        for (namespace, name) in [(PalletNamespace::User, "side"), (PalletNamespace::Meta, "tags")] {
+            let path = pallet_utils::get_pallet_ref_path(namespace, name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "not a hash\n").unwrap();
+        }
+
+        let heal_step = "does not hold a parcel hash. Nothing was changed. (Next step: forklift heal))";
+        let backup_step = "does not hold a parcel hash. Nothing was changed. (Next step: Restore the ref of @tags and \
+            its copy from a backup, then run the command again.))";
+        for (noted_in, heal_named) in [(NotedIn::Heal, false), (NotedIn::Other, true)] {
+            let (mut degraded, mut unread) = (Vec::new(), Vec::new());
+            pallet_ref_heads(&bay_utils::BayReadPolicy::Tolerate, noted_in, &mut degraded, &mut unread).unwrap();
+            assert_eq!(unread, vec!["side".to_string(), "@tags".to_string()], "{:?}", degraded);
+            let side = degraded.iter().find(|note| note.contains("the ref of pallet \"side\"")).expect("side is noted");
+            assert!(side.contains("does not hold a parcel hash. Nothing was changed."), "{:?}: {}", noted_in, side);
+            assert_eq!(side.contains(heal_step), heal_named, "{:?}: {}", noted_in, side);
+            let tags = degraded.iter().find(|note| note.contains("the ref of pallet \"@tags\"")).expect("@tags is noted");
+            assert!(tags.contains(backup_step), "{:?}: {}", noted_in, tags);
         }
     }
 
@@ -8512,7 +8559,7 @@ mod tests {
         // Prune reads its roots through the same call under the same policy.
         let bay_dirs = bay_utils::all_bay_state_dirs().unwrap();
         let prune_error = gc_root_sources(
-            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+            &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed, NotedIn::Other,
         ).err().expect("prune's root read must fail closed on an unreadable mirror roots record");
         assert!(prune_error.contains(&record_name) && prune_error.contains("delete it"), "{}", prune_error);
 

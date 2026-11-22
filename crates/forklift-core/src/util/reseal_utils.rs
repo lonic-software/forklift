@@ -187,7 +187,7 @@ fn met_under(heads: &[String], targets: &BTreeSet<String>, withheld: &HashSet<St
 fn meta_reach() -> Result<HashSet<String>, String> {
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = recovery_utils::gc_root_sources(
-        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed, recovery_utils::NotedIn::Other,
     )?;
 
     let mut heads = sources.meta_heads.clone();

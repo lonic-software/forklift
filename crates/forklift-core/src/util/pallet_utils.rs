@@ -910,7 +910,8 @@ pub fn get_pallet_head_in(namespace: PalletNamespace, name: &str) -> Result<Opti
     ).into())
 }
 
-const HEAL_STEP: &str = "forklift heal";
+/// The way out of a ref read that heal settles.
+pub(crate) const HEAL_STEP: &str = "forklift heal";
 
 /// How a read's way out that is done by hand closes.
 const RERUN: &str = "run the command again";
