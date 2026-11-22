@@ -885,7 +885,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   a `load` refused for redacted content withdraws its incomplete-load marker. Before, the taint
   refused both, leaving the record naming the refused head and the marker naming the load. The
   mirror's refusal now says the record was put back, or what reading it back shows; before, a
-  failed put-back replaced the refusal with the write's error.
+  failed put-back replaced the refusal with the write's error. The run's last write of that record
+  is made only when it changes what the record holds, so under such a taint the run still reports
+  each pallet rather than only the taint; and when putting the exported ref back fails too, the
+  message keeps the refusal and what became of the record.
 
   An `undo` of a `stack`, `consolidate` or `pick` whose put-back of a pallet failed in this way
   could not be retried, even after `forklift heal`: the current pallet and the bay's position were
