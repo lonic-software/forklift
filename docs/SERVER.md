@@ -21,13 +21,13 @@ serves every prepared warehouse under `/data`:
 ```sh
 docker build -t forklift-server .
 docker run -d -p 9418:9418 -v forklift-data:/data forklift-server \
-    serve --warehouses /data --addr 0.0.0.0:9418 --token <admin-secret>
+    serve --warehouses /data --addr 0.0.0.0:9418 --token-sha256 <SHA-256 of the admin secret>
 ```
 
 The image's baked-in default command is `serve --warehouses /data --addr 0.0.0.0:9418` — with
 no token, that command **refuses to start** (see "Authentication" below), so you always
 override it: as above to set a token, with `--open` for a throwaway/local container, or to
-serve a single warehouse (`serve --root /data/wh --token <secret>`). Create warehouses against
+serve a single warehouse (`serve --root /data/wh --token-sha256 <digest>`). Create warehouses against
 the running container with the admin token:
 
 ```sh
@@ -43,7 +43,7 @@ self-mutate" rule as a bare install.
 
 ```sh
 forklift-server prepare --root /srv/forklift/wh
-forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --token <secret>
+forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --token-sha256 <SHA-256 of the secret>
 ```
 
 Clients configure `forklift config set remote.url http://…` (plus `remote.token`), or just
@@ -91,7 +91,7 @@ again.
 ## Serving many warehouses
 
 ```sh
-forklift-server serve --warehouses /srv/forklift --token <admin-secret>
+forklift-server serve --warehouses /srv/forklift --token-sha256 <SHA-256 of the admin secret>
 ```
 
 Every prepared subdirectory is served at `/warehouses/<id>/v1/…`; the id simply travels
@@ -141,7 +141,8 @@ is fixed in the anchor, so the refusal names the pallet and its head.
 ## Authentication
 
 **Some authentication is required to start the server at all.** Configure at least one of a
-static `--token`/`token`, a `--tokens`/`tokens` operator-token file, or an `authentication` hook
+static `--token-sha256`/`token_sha256`, a `--tokens`/`tokens` operator-token file, or an
+`authentication` hook
 (below) — or the server refuses to start, naming the missing piece. This is not "auth defaults
 to a static token"; there is no default at all, on purpose.
 
@@ -163,7 +164,7 @@ Flags, or a TOML file (`--config server.toml`; flags override the file):
 ```toml
 root = "/srv/forklift/wh"        # or: warehouses = "/srv/forklift"
 addr = "127.0.0.1:9418"
-token = "<secret>"               # static token: full access, gates creation
+token_sha256 = "<64 hex>"        # the static token's SHA-256: full access, gates creation
 tokens = "/etc/forklift/tokens.toml"  # per-operator tokens (below)
 max_body_mb = 4096               # refuse larger request bodies (default: 64 MiB, the largest
                                   # legitimate object after chunking — never unlimited)
@@ -180,18 +181,41 @@ open = false                     # explicit opt-out of authentication (default: 
 ```
 
 Every key here is validated strictly: a key set to a value of the wrong type (e.g. an
-unquoted `token = 12345`) is a startup error naming the file and the key, never silently
+unquoted `token_sha256 = 12345`) is a startup error naming the file and the key, never silently
 treated as unset — and an unrecognized key name (a typo) is refused the same way.
+
+## Tokens are configured as digests
+
+The server never holds a bearer token itself, only its SHA-256 digest: 64 lowercase hex
+characters, such as `printf '%s' "$TOKEN" | shasum -a 256` prints. It hashes the token a request
+presents and compares digests, so a reader of the config file, the tokens file or the command
+line learns no credential. Tokens are high-entropy secrets, so an unsalted digest gives nothing
+away. Generate them as `openssl rand -base64 32`, not as hex: a hex token is spelled like a
+digest, so one put where its digest belongs would be taken as the digest without complaint. A value that is not a digest is refused at startup without
+being echoed, and so is the digest of the empty string. A config file still setting `token`, or a
+tokens file with an `[operators]` table of plaintext tokens, is refused by name, never read as no
+token.
+
+A refusal of the tokens file, of `FORKLIFT_OPERATOR_TOKENS`, or of the config file's syntax, keys
+or value types and ranges names the file (or the variable) and, where it can, the key from the
+server's own vocabulary or the line of the fault. It never quotes a key, table name, value or
+parser message found there, since any of them may be a token or a hook secret put in the wrong
+place: an unrecognized key is named by its table and line only. Not yet covered: a refusal at
+startup of a value that names a place, such as `root`, `addr`, `tokens` or a hook's URL, quotes
+that value, and a hook request's failure quotes the hook's URL.
 
 ## Per-operator tokens (FORK-10)
 
-The token file maps transport secrets to office identifiers — tokens are server-side
-only and never enter the tracked metadata:
+The token file maps transport secrets, by their digests, to office identifiers. Tokens never
+enter the tracked metadata:
 
 ```toml
-[operators]
-"<token>" = "mate@lonic.net"
+[operators_sha256]
+"<SHA-256 of the token>" = "mate@lonic.net"
 ```
+
+A digest bound twice, a blank identifier, and an operator token that is also the static token
+are refused at startup.
 
 A token authorizes transport, not authorship. It decides whose role the server applies to a
 request; it never decides who a parcel is attributed to, which is the parcel's signer in the office.
@@ -207,13 +231,13 @@ What an operator may do derives from their **role** in the target warehouse's of
 
 **Per-pallet grants apply only to a request that resolves to an office operator identity** —
 one authenticated via this token file or an `authentication` hook, never to the shared static
-`--token` or an `--open` server. Every row below is a distinct check `post_ref_update`
+token (`--token-sha256`) or an `--open` server. Every row below is a distinct check `post_ref_update`
 (`crates/forklift-server/src/server.rs`) runs against a ref-update request, in the order it
 runs:
 
 | # | Check | Function | Runs when | What it verifies | What it does *not* cover |
 |---|-------|----------------------|-----------|-------------------|---------------------------|
-| 1 | Authentication | `check_auth` | every request | resolves the request to a `Principal`: `Operator(id)` (a per-operator token or `authentication` hook), `Static` (the shared `--token`), or `Open` (no auth configured, `--open`) | nothing about what that principal may do |
+| 1 | Authentication | `check_auth` | every request | resolves the request to a `Principal`: `Operator(id)` (a per-operator token or `authentication` hook), `Static` (the shared static token, `--token-sha256`), or `Open` (no auth configured, `--open`) | nothing about what that principal may do |
 | 2 | Admission hook | `check_admission`, called for a ref update from `post_ref_update`; the same hook also gates uploads, ref deletes and warehouse creation from their handlers, and every read and fetch from the authentication layer (`docs/format/HOOK_PROTOCOL.md`) | every principal, every authenticated request but `PUT /v1/trust` (a ref update among them), only when `[hooks] admission_url` is configured (below) | a deployer-supplied soft-policy decision (quotas, plan limits, suspensions), given the pallet name — regardless of how the caller authenticated | not an office role/grant check; a no-op when unconfigured |
 | 3 | Transport authorization | `authority_utils::may_move` (`crates/forklift-core/src/util/authority_utils.rs`), called from `post_ref_update`; `user.may_write_pallet` is its working-pallet arm | **only** for `Principal::Operator` that `authority_utils::office_user_of` resolves to a user — trust established (the anchor is set) and the office roster non-empty; an authenticated operator pushing to an untrusted warehouse, or during the bootstrap window before the office is lifted, clears this check with no test run at all (`office_user_of`'s two `None` arms) | for a **working** pallet: the operator's `role`/`pallets` grant permits moving *this* pallet ref (`may_write_pallet`); for a **meta** pallet — one of the fixed set `@office`, `@manifest`, `@haul`, `@tags`, `@kv`; an `@name` outside it is refused (422) before this check, by `meta_tree::check_meta_pallet_name` — `may_write_pallet` is never consulted — only `role != Reader` is required, so a `writer` granted only some other pallet may still transport any meta pallet's ref | never runs for `Principal::Static` (the shared token) or an unauthenticated `--open` caller — they clear this check by never being subject to it; and for a meta pallet, never checks the `pallets` grant list at all, regardless of principal |
 | 4 | Office chain authenticity | `verify_office_chain_memoized`, in `post_ref_update` (for an office update, the new chain; for any other pallet, to obtain the office state) | only once the warehouse is trusted | every office parcel is signed by a key active in the office at the point it signed, chain reaches genesis | a non-office parcel's own signer's role — nothing below checks it: check 6 explicitly finds no role check in any of its three arms |
@@ -523,7 +547,7 @@ outside both bounds.
 
 `light_requests_per_minute` and `heavy_requests_per_minute` limit what each caller may send. A
 caller is the principal its request authenticates as: an operator token or an `authentication`
-hook identity is one caller, everyone holding the static `--token` is one caller, and every
+hook identity is one caller, everyone holding the static token is one caller, and every
 request to an `--open` server is one caller. Each caller has one budget per class, and the costly
 class is the four routes `max_heavy_requests` caps; every other authenticated route is cheap, and
 `/healthz` is never limited. A caller who has spent its budget is refused with a `429` carrying

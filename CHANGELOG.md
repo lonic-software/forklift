@@ -134,6 +134,19 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
+  as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
+  tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
+  file or the command line learns no credential. Clients still present the token itself.
+  **Breaking:** `--token` is gone, a config file setting `token` and a tokens file with an
+  `[operators]` table are refused at startup, and so is a value that is not a 64-character
+  lowercase hex digest; compute one with `printf '%s' "$TOKEN" | shasum -a 256`. An operator token
+  bound twice, or also set as the static token, is refused at startup too. A refusal of a malformed
+  tokens file, `FORKLIFT_OPERATOR_TOKENS`, or the config file's syntax, keys and value types no
+  longer quotes the key, value or parser message found there, so a token or hook secret written in
+  the wrong place there does not reach the log. An unrecognized config key is named by its table
+  and line.
+
 - **While a durability taint stands, a refused write leaves the file as it was.** A write of a
   single file on its own, such as a pallet's ref, that a standing taint refuses is now refused before it
   replaces anything, where before it was written and then reported as refused. `heal`'s own

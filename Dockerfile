@@ -4,7 +4,7 @@
 #
 #   docker build -t forklift-server .
 #   docker run -p 9418:9418 -v forklift-data:/data forklift-server \
-#       serve --warehouses /data --addr 0.0.0.0:9418 --token <admin-secret>
+#       serve --warehouses /data --addr 0.0.0.0:9418 --token-sha256 <SHA-256 of the admin secret>
 #
 # Serves every prepared warehouse under /data (multi-warehouse mode). Create warehouses via
 # the admin API and set a token — see docs/SERVER.md. There is deliberately no server
@@ -14,7 +14,7 @@
 # "Authentication"): forklift-server requires an explicit token/tokens/authentication-hook
 # config, or an explicit --open opt-out, and never infers "open" from an absent one. This is
 # deliberate — a plain `docker run` with no override must fail loud, not silently serve the
-# world from 0.0.0.0. Override the full command (as above) with --token, or with --open for a
+# world from 0.0.0.0. Override the full command (as above) with --token-sha256, or with --open for a
 # throwaway/local container, to actually start it.
 
 # ── build ─────────────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ EXPOSE 9418
 
 # Multi-warehouse mode by default, with no auth setting (see the note above — this refuses to
 # start on its own). Override the full command to serve a single-warehouse root instead
-# (`serve --root /data/wh --token <secret>`), to change the token/tokens/hook, or to point at a
+# (`serve --root /data/wh --token-sha256 <digest>`), to change the token/tokens/hook, or to point at a
 # config file — every override still needs its own auth setting or --open, the root/warehouses
 # choice does not carry one.
 ENTRYPOINT ["forklift-server"]
