@@ -3024,10 +3024,9 @@ pub(crate) mod tests {
     // and copies' folders, and each tree's root with the folders above it; nothing a link inside
     // the tree points to, and no folder of the copies' tree that holds no copy. A folder that
     // fails is named, and the folders after it are synced all the same. Mutations: skip the
-    // nested folders → "a/b" unsynced, red; drop the copies' tree → red; sync a root alone →
-    // ".forklift" unsynced, red; follow a link inside the tree → the linked folder synced, red;
-    // walk the copies' tree → "junk" synced, red; stop at the first failure → the copies' root
-    // unsynced, red.
+    // nested folders → "a" unsynced, red; sync a root alone → ".forklift" unsynced, red; follow a
+    // link inside the tree → the linked folder synced, red; walk all of ".forklift" → "junk"
+    // synced, red; stop at the first failure → the copies' root unsynced, red.
     // Unix only: a folder sync is a no-op elsewhere, so nothing is recorded.
     #[cfg(unix)]
     #[test]
