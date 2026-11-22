@@ -59,6 +59,12 @@ enum Command {
         #[arg(long)]
         rebuild_after_lifts: Option<u32>,
 
+        /// Run at most this many costly requests at once (ref updates, pallet deletions, trust
+        /// installs, batch fetches); past it a request waits briefly, then is refused with a 503
+        /// and Retry-After (default: the host's available parallelism)
+        #[arg(long)]
+        max_heavy_requests: Option<u32>,
+
         /// Serve with no authentication at all: the explicit opt-out. Without this (and
         /// without --token/--tokens/a configured authentication hook), the server refuses
         /// to start rather than infer "open" from an empty auth config.
@@ -243,8 +249,8 @@ async fn async_main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Serve { root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, open, config } =>
-            serve(root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, open, config).await,
+        Command::Serve { root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, open, config } =>
+            serve(root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, open, config).await,
         Command::Prepare { root } => prepare(&root),
         Command::Upgrade { root } => upgrade(&root),
         Command::Bundle { root } => bundle(&root),
@@ -315,6 +321,7 @@ async fn serve(root: Option<String>,
                tokens: Option<String>,
                max_body_mb: Option<u64>,
                rebuild_after_lifts: Option<u32>,
+               max_heavy_requests: Option<u32>,
                open: bool,
                config: Option<String>) -> Result<(), String> {
     let file = match config {
@@ -337,6 +344,7 @@ async fn serve(root: Option<String>,
         events_hook: file.events_hook,
         resolution_hook: file.resolution_hook,
         authentication_cache_secs: file.authentication_cache_secs,
+        max_heavy_requests: max_heavy_requests.or(file.max_heavy_requests),
         // The flag is the affirmative case: passing `--open` always opts out, regardless of
         // the config file. There is no flag-side way to *cancel* `open = true` in the file
         // (matching every other flag/file pair here, where "flags override" only ever means
@@ -385,6 +393,7 @@ struct ConfigFile {
     tokens: Option<String>,
     max_body_mb: Option<u64>,
     rebuild_after_lifts: Option<u32>,
+    max_heavy_requests: Option<u32>,
 
     /// The explicit opt-out of authentication (`server::ServeOptions::open`'s config-file
     /// counterpart). `Option<bool>`, like every other field here, rather than a bare `bool`
@@ -411,6 +420,7 @@ impl std::fmt::Debug for ConfigFile {
             .field("tokens", &self.tokens)
             .field("max_body_mb", &self.max_body_mb)
             .field("rebuild_after_lifts", &self.rebuild_after_lifts)
+            .field("max_heavy_requests", &self.max_heavy_requests)
             .field("open", &self.open)
             .field("authentication_hook", &self.authentication_hook)
             .field("admission_hook", &self.admission_hook)
@@ -525,6 +535,25 @@ fn optional_u32(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result
     }
 }
 
+/// [`optional_u32`]'s counterpart for a count that must be positive, `max_heavy_requests`: zero
+/// would refuse every costly request, and a negative value is no count. `server::heavy_capacity`
+/// refuses zero again where the flag and this file converge, because `server::ServeOptions` is
+/// `pub`.
+fn positive_u32(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<u32>, String> {
+    match optional_integer(item, path, key)? {
+        Some(v) if v < 1 => Err(format!(
+            "The config file \"{}\" has a \"{}\" entry of {}; it must be positive (zero would \
+            refuse every costly request), or left unset.",
+            path, key, v
+        )),
+        Some(v) => u32::try_from(v).map(Some).map_err(|_| format!(
+            "The config file \"{}\" has a \"{}\" entry of {}, which is over u32::MAX ({}).",
+            path, key, v, u32::MAX
+        )),
+        None => Ok(None),
+    }
+}
+
 /// [`optional_string`]'s boolean counterpart, for `open`.
 fn optional_bool(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<bool>, String> {
     let Some(item) = item else { return Ok(None); };
@@ -543,9 +572,9 @@ fn optional_bool(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Resul
 /// present in the file against this list, so `tokenn = "…"` (a typo `parse_config`'s strict
 /// per-field readers cannot catch on their own, since the misspelled key is simply never looked
 /// up) is a startup error rather than a silently no-op setting.
-const CONFIG_TOP_LEVEL_KEYS: [&str; 9] = [
+const CONFIG_TOP_LEVEL_KEYS: [&str; 10] = [
     "root", "warehouses", "addr", "token", "tokens", "max_body_mb", "rebuild_after_lifts",
-    "open", "hooks",
+    "max_heavy_requests", "open", "hooks",
 ];
 
 /// The keys `parse_config` understands inside `[hooks]` — four independent `{name}_url` /
@@ -676,6 +705,7 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         rebuild_after_lifts: optional_u32(
             doc.get("rebuild_after_lifts"), path, "rebuild_after_lifts"
         )?,
+        max_heavy_requests: positive_u32(doc.get("max_heavy_requests"), path, "max_heavy_requests")?,
         open: optional_bool(doc.get("open"), path, "open")?,
         authentication_hook: hook_of("authentication")?,
         admission_hook: hook_of("admission")?,
@@ -923,6 +953,7 @@ mod tests {
         assert_eq!(file.tokens, None);
         assert_eq!(file.max_body_mb, None);
         assert_eq!(file.rebuild_after_lifts, None);
+        assert_eq!(file.max_heavy_requests, None);
         assert_eq!(file.open, None);
         assert!(file.authentication_hook.is_none());
         assert!(file.admission_hook.is_none());
@@ -942,6 +973,7 @@ mod tests {
             tokens = "/etc/forklift/tokens.toml"
             max_body_mb = 4096
             rebuild_after_lifts = 20
+            max_heavy_requests = 6
             open = true
 
             [hooks]
@@ -962,6 +994,7 @@ mod tests {
         assert_eq!(file.token.as_deref(), Some("secret"));
         assert_eq!(file.max_body_mb, Some(4096));
         assert_eq!(file.rebuild_after_lifts, Some(20));
+        assert_eq!(file.max_heavy_requests, Some(6));
         assert_eq!(file.open, Some(true));
         assert_eq!(file.authentication_hook.as_ref().map(|h| h.url.as_str()),
                    Some("https://provider.example/hooks/auth"));
@@ -1028,6 +1061,61 @@ mod tests {
 
         assert!(error.contains("\"token\""), "{}", error);
         assert!(error.contains("not a string"), "{}", error);
+
+        let _ = forklift_core::util::file_utils::remove_file(&path);
+    }
+
+    /// Zero and negative counts are refused naming the key; one is the smallest accepted.
+    ///
+    /// Reverts: read the key with `optional_u32` → zero parses → red; drop the key from
+    /// `CONFIG_TOP_LEVEL_KEYS` → every value is an unrecognized key → red.
+    #[test]
+    fn max_heavy_requests_must_be_a_positive_count() {
+        for (value, expected) in [
+            ("0", "has a \"max_heavy_requests\" entry of 0; it must be positive"),
+            ("-2", "has a \"max_heavy_requests\" entry of -2; it must be positive"),
+            ("4294967296", "has a \"max_heavy_requests\" entry of 4294967296, which is over u32::MAX"),
+            ("\"4\"", "has a \"max_heavy_requests\" entry that is present but is not an integer"),
+        ] {
+            let path = scratch_config("max-heavy-requests-refused", &format!("max_heavy_requests = {value}\n"));
+            let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+            assert!(error.contains(expected), "{value}: {error}");
+            let _ = forklift_core::util::file_utils::remove_file(&path);
+        }
+
+        let path = scratch_config("max-heavy-requests-one", "max_heavy_requests = 1\n");
+        assert_eq!(parse_config(path.to_str().unwrap()).unwrap().max_heavy_requests, Some(1));
+        let _ = forklift_core::util::file_utils::remove_file(&path);
+    }
+
+    /// The `--max-heavy-requests` flag wins over the file's key. A flag of zero over a file of
+    /// three is refused by `server::serve`'s check, which only the flag's value can reach; with no
+    /// flag, the file's three passes that check and `serve` fails later, resolving the root.
+    ///
+    /// Revert: merge `file.max_heavy_requests.or(max_heavy_requests)` → the zero flag loses to the
+    /// file's three → red.
+    #[tokio::test]
+    async fn the_max_heavy_requests_flag_overrides_the_file() {
+        let path = scratch_config("max-heavy-requests-flag", "token = \"admin-secret\"\nmax_heavy_requests = 3\n");
+        let serve_with = |flag: Option<u32>| serve(
+            Some("/does/not/exist/and/does/not/matter".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            flag,
+            false,
+            Some(path.to_str().unwrap().to_string()),
+        );
+
+        let error = serve_with(Some(0)).await.unwrap_err();
+        assert!(error.starts_with("\"max_heavy_requests\" is 0"), "{error}");
+
+        let error = serve_with(None).await.unwrap_err();
+        assert!(error.contains("Error while resolving"), "{error}");
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }
@@ -1420,6 +1508,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             Some(path.to_str().unwrap().to_string()),
         ).await.unwrap_err();
@@ -1445,6 +1534,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             Some(path.to_str().unwrap().to_string()),
         ).await.unwrap_err();
@@ -1466,6 +1556,7 @@ mod tests {
             None,
             None,
             Some(String::new()),
+            None,
             None,
             None,
             None,
