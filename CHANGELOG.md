@@ -12,6 +12,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **`forklift-server`'s admission hook is asked about reads too.** A deployment's admission policy
+  can now refuse fetches as well as writes: object and signature downloads, batch fetches and the
+  bundle are asked as `fetch`, and the handshake, missing-object and upload-target questions,
+  holds and name resolution as `read` (holds names its pallet). Every authenticated request but
+  `PUT /v1/trust` is now asked. An allow for a read is cached for `admission_cache_secs` in
+  `[hooks]` (default 60, `0` turns it off, at most 86400), so a newly suspended caller can keep
+  starting reads for up to that long; denials and writes are never cached. **Breaking:** the hook
+  protocol version is now `2026-11-22`, and its signatures are keyed under the new version, so a
+  hook endpoint built for `2026-07-05` must be updated: until it is, it refuses every request.
 - **`forklift-server` can limit how many requests each caller sends a minute.**
   `--light-requests-per-minute` and `--heavy-requests-per-minute` (or `light_requests_per_minute` and
   `heavy_requests_per_minute` in the config file) give each caller a budget per minute: an operator

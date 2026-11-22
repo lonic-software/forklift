@@ -1,4 +1,4 @@
-# Hook protocol — version `2026-07-05`
+# Hook protocol — version `2026-11-22`
 
 The typed seam between a Forklift server head and a hosting provider (DESIGN.html
 §8.13). Forklift owns these schemas; a provider (or any integration — a corporate
@@ -53,14 +53,16 @@ Request headers:
 | Header                      | Value                                             |
 |-----------------------------|---------------------------------------------------|
 | `x-forklift-hook`           | the hook name (`authentication`, `admission`, `event`, `resolution`) |
-| `x-forklift-hook-version`   | this protocol version (`2026-07-05`)              |
+| `x-forklift-hook-version`   | this protocol version (`2026-11-22`)              |
 | `x-forklift-hook-timestamp` | Unix seconds, decimal                             |
 | `x-forklift-hook-signature` | the request MAC, lowercase hex                    |
 
 The MAC is a Blake3 keyed hash over `"<timestamp>" + "\n" + body`, keyed by
-`blake3::derive_key("forklift hook protocol 2026-07-05 request mac", secret)`. The
+`blake3::derive_key("forklift hook protocol 2026-11-22 request mac", secret)`. The
 key-derivation context is versioned with the protocol, so mixed versions can never
-half-verify. Receivers refuse requests whose timestamp lies more than **300 seconds**
+half-verify: every hook kind shares the one version, so a receiver written for an earlier
+one fails to verify every request it is sent and refuses it. Receivers refuse requests whose
+timestamp lies more than **300 seconds**
 from their clock (replay window), then recompute and compare the MAC
 (`hook_utils::verify_hook_request` is the reference implementation).
 
@@ -105,18 +107,39 @@ Semantics:
 
 ## `admission` — soft policy gate (hot, fail closed)
 
-Called before a mutating operation is admitted: quotas, plan limits, suspended
-accounts, maintenance freezes. A denial is an access decision — it can never make
-invalid content valid, and an approval can never make an unverifiable lift verify.
+Called before every authenticated request but `PUT /v1/trust` is admitted, reads included:
+quotas, plan limits, suspended accounts, maintenance freezes. A denial is an access decision —
+it can never make invalid content valid, and an approval can never make an unverifiable lift
+verify.
+
+The actions:
+
+| Action             | Asked for                                                              |
+|--------------------|------------------------------------------------------------------------|
+| `upload`           | `PUT` of an object, a withheld object's recipe, or a signature         |
+| `ref_update`       | `POST /v1/pallets/{name}`                                              |
+| `ref_delete`       | `DELETE /v1/pallets/{name}`                                            |
+| `warehouse_create` | `PUT /warehouses/{id}` (multi mode)                                    |
+| `fetch`            | stored content: `POST /v1/objects/batch`, `GET /v1/objects/{hash}`, `GET /v1/signatures/{hash}`, `GET /v1/bundles/latest` |
+| `read`             | a question that hands out no stored content: `GET /v1/warehouse`, `POST /v1/objects/missing`, `POST /v1/objects/upload-targets`, `POST /v1/holds/{name}`, `POST /v1/resolve` |
+
+A policy can cut bulk transfer (`fetch`) while still answering the handshake (`read`), so the
+refused client reads the hook's reason; a policy that wants both gone denies both.
+
+The warehouse id and the pallet name are checked before the hook is asked, so the hook only
+ever sees a valid id and a valid reference; a request naming neither validly is answered `422`
+without asking. A read or fetch is asked before the warehouse is looked up, so the hook can be
+asked about a well-formed id that names no warehouse, and a denied caller reads `403` where an
+admitted one would read `404`.
 
 Request:
 
 ```json
 {
-  "action": "upload" | "ref_update" | "ref_delete" | "warehouse_create",
+  "action": "upload" | "ref_update" | "ref_delete" | "warehouse_create" | "fetch" | "read",
   "warehouse": "<warehouse id — multi-warehouse servers only>",
   "operator": "<office identifier of the acting principal, when it has one>",
-  "pallet": "<the pallet a ref_update or ref_delete targets>"
+  "pallet": "<the pallet a ref_update or ref_delete targets, or a holds read asks about>"
 }
 ```
 
@@ -130,6 +153,14 @@ Response — `200` either way; a non-`200` or transport failure counts as a deni
 { "allow": true }
 { "allow": false, "reason": "<shown to the refused client>" }
 ```
+
+* The server caches an allow for a `read` or a `fetch`, keyed by the whole request (default 60
+  seconds, `admission_cache_secs`; `0` turns the cache off). A newly suspended caller can keep
+  being admitted new reads for at most the TTL; a transfer already admitted runs to its end. A
+  denial or a failure is never cached, so lifting a suspension takes effect on the next request,
+  and no write is ever answered from the cache. The cache is bounded in memory, so when it is
+  full a read is asked each time rather than stored. As for authentication, the server refuses
+  to start with a TTL over 24 hours (86400 seconds).
 
 ## `event` — webhooks (cold, queue + retry)
 
@@ -216,6 +247,7 @@ events_secret = "…"
 resolution_url = "https://provider.example/hooks/resolve"
 resolution_secret = "…"
 authentication_cache_secs = 60   # optional, 0-86400 (24h max)
+admission_cache_secs = 60        # optional, 0-86400 (24h max); reads and fetches only
 ```
 
 All four hooks are configured the same way, on the server. Each is independent;

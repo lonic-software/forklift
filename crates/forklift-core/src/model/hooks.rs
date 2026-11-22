@@ -6,8 +6,8 @@
 //! Forklift-owned, deterministic and offline.
 //!
 //! How many hooks a given request runs, and which ones, is a property of the *head* serving it,
-//! not of this protocol: a mutating request may run authentication alone (`put_trust`) or
-//! authentication and admission (`put_signature`, `put_object`), and a head is free to bound each
+//! not of this protocol: a request may run authentication alone (`put_trust`) or authentication
+//! and admission (`put_signature`, `put_object`, a fetch), and a head is free to bound each
 //! one it calls out to individually rather than collectively — a request running two hooks may
 //! legitimately wait twice as long as one running a single hook. A client budget must not assume
 //! a fixed hook count, and must not price a specific head's own per-hook timeout at all: that
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// The hook protocol version. Carried on every request in the
 /// `x-forklift-hook-version` header; a receiver refuses versions it does not know.
 /// It only changes when the wire format changes.
-pub const HOOK_PROTOCOL_VERSION: &str = "2026-07-05";
+pub const HOOK_PROTOCOL_VERSION: &str = "2026-11-22";
 
 /// The header naming which hook a request speaks (`authentication`, `admission`,
 /// `event`, `resolution`).
@@ -63,9 +63,15 @@ pub struct AuthenticationHookResponse {
 /// `admission` (hot path, fail closed): may this request proceed, as a matter of
 /// *soft* policy (quota, plan limits, suspended accounts)? A denial here is an
 /// access decision; it can never make invalid content valid or forge anything.
-#[derive(Serialize, Deserialize)]
+///
+/// A head may cache an allow for a `read` or a `fetch`, keyed by the whole request: the hook is
+/// told nothing else, so two equal requests differ to it only in when they arrive.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AdmissionHookRequest {
-    /// What is being attempted: `upload`, `ref_update`, `ref_delete` or `warehouse_create`.
+    /// What is being attempted. Writes: `upload`, `ref_update`, `ref_delete` or
+    /// `warehouse_create`. Reads: `fetch`, a request for stored content (objects, signatures, a
+    /// bundle), or `read`, a question about the warehouse that hands out no stored content (the
+    /// handshake, which objects are missing, upload targets, holds, name resolution).
     pub action: String,
 
     /// The warehouse id (multi-warehouse servers; absent in single mode).
@@ -77,7 +83,7 @@ pub struct AdmissionHookRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
 
-    /// The pallet a `ref_update` or `ref_delete` targets.
+    /// The pallet a `ref_update` or `ref_delete` targets, or the one a `read` asks holds of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pallet: Option<String>,
 }
