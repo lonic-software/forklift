@@ -196,6 +196,13 @@ being echoed, and so is the digest of the empty string. A config file still sett
 tokens file with an `[operators]` table of plaintext tokens, is refused by name, never read as no
 token.
 
+No refusal about a credential quotes where it came from. A malformed tokens file, config file or
+`FORKLIFT_OPERATOR_TOKENS` is refused with the file's path (or the variable's name) and the line
+of the fault, never with the key, table name, value or parser message found there, since any of
+them may be a token or a hook secret put in the wrong place. Two things are quoted on purpose: the
+path of a file the server could not read, and the name of an unrecognized config-file key, since
+the config's keys are a fixed vocabulary that nothing names after a secret.
+
 ## Per-operator tokens (FORK-10)
 
 The token file maps transport secrets, by their digests, to office identifiers. Tokens never

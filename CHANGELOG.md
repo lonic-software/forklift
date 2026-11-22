@@ -141,7 +141,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   **Breaking:** `--token` is gone, a config file setting `token` and a tokens file with an
   `[operators]` table are refused at startup, and so is a value that is not a 64-character
   lowercase hex digest; compute one with `printf '%s' "$TOKEN" | shasum -a 256`. An operator token
-  bound twice, or also set as the static token, is refused at startup too.
+  bound twice, or also set as the static token, is refused at startup too. A refusal of a malformed
+  tokens file, config file or `FORKLIFT_OPERATOR_TOKENS` now names the line of the fault and no
+  longer quotes it, so a token or hook secret written in the wrong place never reaches the log.
 
 - **While a durability taint stands, a refused write leaves the file as it was.** A write of a
   single file on its own, such as a pallet's ref, that a standing taint refuses is now refused before it
