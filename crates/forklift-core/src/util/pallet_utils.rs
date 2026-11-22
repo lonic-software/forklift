@@ -3345,13 +3345,17 @@ pub(crate) mod tests {
     // source → "dropped, reached elsewhere, tainted" lands, red; the basis.head guard dropped →
     // "basis at another head, tainted" lands, red; the basis.pallet guard dropped → "basis for
     // another pallet, tainted" lands, red; the hold's unreadable record read as unmoved → "hold
-    // read fails" lands, red.
+    // read fails" lands, red; a cache basis read without the sealed record → "sealed dropped,
+    // Cache, tainted" lands, red.
     #[test]
     fn a_compensating_head_write_lands_under_a_taint_only_on_a_basis_that_still_judges_its_head() {
         use crate::util::sealed_utils::{append, SealOp};
-        use crate::util::warehouse_utils::WarehouseMode::{self, Full, Sparse};
+        use crate::util::warehouse_utils::WarehouseMode::{self, Cache, Full, Sparse};
 
-        const BOTH: &[WarehouseMode] = &[Full, Sparse];
+        // A cache warehouse reads the sealed record into its basis as a sparse one does, and its
+        // reads refill sealed content routinely.
+        const BOTH: &[WarehouseMode] = &[Full, Sparse, Cache];
+        const PARTIAL: &[WarehouseMode] = &[Sparse, Cache];
         const SPARSE: &[WarehouseMode] = &[Sparse];
         // A label, the warehouses, what happens around the basis, and the outcome with no taint
         // standing and with one.
@@ -3360,7 +3364,7 @@ pub(crate) mod tests {
             ("2 unavailable added", BOTH, Around::UnavailableAdded, Then::Lands, Then::Lands),
             ("3 scope widened", SPARSE, Around::ScopeWidened, Then::Lands, Then::Incomplete),
             ("3 unavailable dropped", BOTH, Around::UnavailableDropped, Then::Lands, Then::Incomplete),
-            ("3 sealed dropped", SPARSE, Around::SealedDropped, Then::Lands, Then::Incomplete),
+            ("3 sealed dropped", PARTIAL, Around::SealedDropped, Then::Lands, Then::Incomplete),
             ("3 dropped, reached elsewhere", BOTH, Around::DroppedReachedElsewhere, Then::Lands, Then::Failed),
             ("4 basis at another head", BOTH, Around::BasisAtOtherHead, Then::Lands, Then::Incomplete),
             ("4 basis unread", BOTH, Around::BasisUnread, Then::Lands, Then::Incomplete),
@@ -3383,6 +3387,8 @@ pub(crate) mod tests {
                     let store_access = crate::util::lock_utils::StoreAccessLock::shared(|| {}).unwrap();
                     if mode == Sparse {
                         crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
+                    }
+                    if mode != Full {
                         // Only a partial warehouse holds anything by hash alone.
                         append(&[(SealOp::Record, hash('s').as_str())]).unwrap();
                     }
