@@ -202,8 +202,9 @@ pub struct JournalEntry {
 
     /// Whether an undo of this entry has started, kept so that a retried undo can tell a bay its
     /// interrupted run left from one that only looks like it. False when the entry is pushed.
-    /// The pop that finishes an undo removes it with the entry, and a merge abort or abandon
-    /// clears it before it changes anything (see [`pop_latest_left_in_progress_if`]).
+    /// The pop that finishes an undo removes it with the entry, and a merge abort or abandon, or a
+    /// stack that clears an empty pick, clears it before it changes anything (see
+    /// [`pop_latest_left_in_progress_if`]).
     pub undo_started: bool,
 }
 
@@ -765,8 +766,9 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// Remove the most recent entry other than a pallet delete when it is the operation that left the
 /// bay's consolidation or pick in progress (a consolidate or pick that stopped at conflicts), and
 /// the bay is still exactly where it left it — for an abort, which abandons that operation outside
-/// `undo`. Kept, the entry would refuse every later undo: the bay no longer holds the consolidation
-/// its after records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
+/// `undo`, and for a stack that clears an empty pick, which abandons it the same way. Kept, the
+/// entry would refuse every later undo: the bay no longer holds the consolidation its after
+/// records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
 /// and its undo depends on no bay state. Any other entry is kept, so a rerun of an interrupted
 /// abort, whose entry is already gone, removes nothing more. A kept entry loses an undo's mark,
 /// which on such a rerun leaves an older interrupted undo refused, not resumed (see
@@ -813,9 +815,10 @@ pub fn pop_if_it_left_in_progress_unread() -> Result<bool, String> {
 /// progress](left_in_progress) and `still_there` holds for it.
 ///
 /// An entry it keeps loses an undo's [`undo_started`](JournalEntry::undo_started) mark, in the
-/// same single journal write. Merge abort and abandon call this before they change anything, so an
-/// abort of the merge an interrupted undo wrote back leaves no mark that a later undo could take
-/// for its own unfinished run and resume, writing the aborted merge back. A failed read or check
+/// same single journal write. Merge abort and abandon, and a stack that clears an empty pick, call
+/// this before they change anything, so an abort of the merge an interrupted undo wrote back leaves
+/// no mark that a later undo could take for its own unfinished run and resume, writing the aborted
+/// merge back. A failed read or check
 /// fails the command with the journal as it was.
 ///
 /// The mark is cleared on whichever entry is latest. A rerun of an abort interrupted after its pop
