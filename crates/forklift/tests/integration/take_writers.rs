@@ -33,13 +33,13 @@ const PRIMITIVES: &[&str] = &[
     "adopt_pallet_head",
     "update_pallet_head_in",
     "put_back_pallet_head_in",
+    "compensating_head_write",
     "update_pallet_head_verified",
     "update_pallet_head_locked",
     "write_head_or_roll_back",
     "recreate_pallet_head",
     "write_head_locked",
     "repair_pallet_head",
-    "compensating_head_write",
 ];
 
 /// Every production writer: the file, the function holding the call, and why it is sound. A
@@ -58,8 +58,6 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift-core/src/util/operation_utils.rs", "recover_operation", Class::Verifies),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_pallet_head", Class::Primitive),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_meta_pallet_head", Class::Meta),
-    // An un-restore whose basis no longer judges its head falls back to the checked write.
-    ("crates/forklift-core/src/util/pallet_utils.rs", "compensating_head_write", Class::Primitive),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_pallet_head_checked", Class::Primitive),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_pallet_head_locked", Class::Primitive),
     // A rebuilt or chosen head of a damaged ref is verified as the anchor and office stand now, as
