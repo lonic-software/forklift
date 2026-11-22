@@ -501,9 +501,10 @@ answers. A request that finds the cap full waits up to 5 seconds, in arrival ord
 refused with a `503` carrying `Retry-After`, before it has changed anything; the client waits it
 out and sends it again. The default is the host's available parallelism (4 when the host does not
 report one). It is uncalibrated: no benchmark of these routes exists yet, so size it to your
-host if lifts or fetches queue. The cap counts requests, not callers: per-caller budgets and a
-cap on reads are not part of it, and background work (bundle rebuilds and redaction runs, at
-most one of each per warehouse) runs outside it.
+host if lifts or fetches queue; each refusal is logged as a warning. The cap counts requests,
+not callers or warehouses, so a burst on one warehouse can refuse requests on another: per-caller
+budgets and a cap on reads are not part of it, and background work (bundle rebuilds and redaction
+runs, at most one of each per warehouse) runs outside it.
 
 **The single-writer rule:** exactly one serving process per warehouse root; a second server
 on the same root is refused at startup, since the serve lock it needs is held. Do not point two

@@ -324,6 +324,25 @@ async fn serve(root: Option<String>,
                max_heavy_requests: Option<u32>,
                open: bool,
                config: Option<String>) -> Result<(), String> {
+    let options = serve_options(
+        root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, open, config,
+    )?;
+
+    server::serve(options).await
+}
+
+/// The flags merged with the config file `config` names, if any: a flag that is given wins.
+#[allow(clippy::too_many_arguments)]
+fn serve_options(root: Option<String>,
+               warehouses: Option<String>,
+               addr: Option<String>,
+               token: Option<String>,
+               tokens: Option<String>,
+               max_body_mb: Option<u64>,
+               rebuild_after_lifts: Option<u32>,
+               max_heavy_requests: Option<u32>,
+               open: bool,
+               config: Option<String>) -> Result<server::ServeOptions, String> {
     let file = match config {
         Some(path) => parse_config(&path)?,
         None => ConfigFile::default(),
@@ -354,7 +373,7 @@ async fn serve(root: Option<String>,
         blank_token_supplied,
     };
 
-    server::serve(options).await
+    Ok(options)
 }
 
 /// The serve keys of the TOML config file (same names as the flags). The hooks
@@ -1089,33 +1108,21 @@ mod tests {
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
-    /// The `--max-heavy-requests` flag wins over the file's key. A flag of zero over a file of
-    /// three is refused by `server::serve`'s check, which only the flag's value can reach; with no
-    /// flag, the file's three passes that check and `serve` fails later, resolving the root.
+    /// The `--max-heavy-requests` flag wins over the file's key, and the key is used when no flag
+    /// is given. The file's 3, the flag's 5 and every default (unset; the host's parallelism is
+    /// not read here) are all distinct.
     ///
-    /// Revert: merge `file.max_heavy_requests.or(max_heavy_requests)` → the zero flag loses to the
-    /// file's three → red.
-    #[tokio::test]
-    async fn the_max_heavy_requests_flag_overrides_the_file() {
-        let path = scratch_config("max-heavy-requests-flag", "token = \"admin-secret\"\nmax_heavy_requests = 3\n");
-        let serve_with = |flag: Option<u32>| serve(
-            Some("/does/not/exist/and/does/not/matter".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            flag,
-            false,
-            Some(path.to_str().unwrap().to_string()),
-        );
+    /// Reverts: merge `file.max_heavy_requests.or(max_heavy_requests)` → `Some(3)` with the flag
+    /// → red; take the flag alone → `None` with no flag → red.
+    #[test]
+    fn the_max_heavy_requests_flag_overrides_the_file() {
+        let path = scratch_config("max-heavy-requests-flag", "max_heavy_requests = 3\n");
+        let options_with = |flag: Option<u32>| serve_options(
+            None, None, None, None, None, None, None, flag, false, Some(path.to_str().unwrap().to_string()),
+        ).unwrap().max_heavy_requests;
 
-        let error = serve_with(Some(0)).await.unwrap_err();
-        assert!(error.starts_with("\"max_heavy_requests\" is 0"), "{error}");
-
-        let error = serve_with(None).await.unwrap_err();
-        assert!(error.contains("Error while resolving"), "{error}");
+        assert_eq!(options_with(Some(5)), Some(5));
+        assert_eq!(options_with(None), Some(3));
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }

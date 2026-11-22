@@ -3125,6 +3125,14 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    // A ref write may have owed an apply while this request waited for its permit. The request
+    // does not wait for it again holding the permit: it is refused for now.
+    match applies_settled(&warehouse) {
+        Ok(true) => {}
+        Ok(false) => return error_response(applying_refusal()),
+        Err(error) => return error_response(error),
+    }
+
     let gate = Arc::clone(&warehouse);
     let result = permit.spawn(blocking(warehouse, move || {
         let removed = withholding::removed().map_err(internal)?;
@@ -4171,7 +4179,10 @@ const _: () = assert!(APPLY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
 /// private there, so this is stated, not asserted. The tightest case is a pallet deletion: up to
 /// 10 s on the admission hook and 5 s here leave about 15 s for the removal and the redaction apply
 /// it answers after. An overrun is an uncertain outcome at the client, whose retry is safe: a
-/// retried removal that finds its first try landed is answered as done ([`already_deleted`]).
+/// retried removal that finds its first try landed is answered as done ([`already_deleted`]). A
+/// batch fetch may wait [`APPLY_WAIT`] and this wait before its build starts; one whose answer
+/// comes past its budget is abandoned, and the client fetches the rest of that command with loose
+/// object requests, while the build it left finishes here on its permit.
 const HEAVY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const _: () = assert!(APPLY_WAIT.as_secs() + HEAVY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
 const _: () = assert!(HOOK_CLIENT_TIMEOUT.as_secs() + HEAVY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
@@ -4188,20 +4199,38 @@ fn at_capacity_refusal() -> HandlerError {
     )
 }
 
-/// The cap of Heavy requests in flight: how many permits [`serve`] gives [`AppState::heavy`].
-/// `max_heavy_requests` when set, else the host's available parallelism, else
-/// [`FALLBACK_HEAVY_REQUESTS`]. Zero is refused, here as well as in `main.rs`'s config reader,
-/// because [`ServeOptions`] is `pub`: a cap of zero would refuse every Heavy request.
+/// The cap of Heavy requests in flight: how many permits [`serve`] gives [`AppState::heavy`], on
+/// this host ([`heavy_capacity_when`]).
 fn heavy_capacity(max_heavy_requests: Option<u32>) -> Result<usize, String> {
+    let parallelism = std::thread::available_parallelism().ok().map(usize::from);
+
+    heavy_capacity_when(max_heavy_requests, parallelism, tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+/// [`heavy_capacity`] on a host reporting `parallelism`, whose semaphore holds at most
+/// `max_permits`: `max_heavy_requests` when set, else `parallelism`, else
+/// [`FALLBACK_HEAVY_REQUESTS`]. Zero is refused, here as well as in `main.rs`'s config reader,
+/// because [`ServeOptions`] is `pub`: a cap of zero would refuse every Heavy request. A cap the
+/// semaphore cannot hold is refused rather than left to panic it.
+fn heavy_capacity_when(max_heavy_requests: Option<u32>,
+                       parallelism: Option<usize>,
+                       max_permits: usize) -> Result<usize, String> {
     match max_heavy_requests {
         Some(0) => Err(
-            "\"max_heavy_requests\" is 0, which would refuse every ref update, pallet deletion, \
-            trust install and batch fetch; pick a real limit, or leave it unset to use the host's \
-            available parallelism."
+            "--max-heavy-requests (\"max_heavy_requests\" in the config file) is 0, which would \
+            refuse every ref update, pallet deletion, trust install and batch fetch; pick a real \
+            limit, or leave it unset to use the host's available parallelism."
                 .to_string()
         ),
-        Some(cap) => Ok(cap as usize),
-        None => Ok(std::thread::available_parallelism().map_or(FALLBACK_HEAVY_REQUESTS, usize::from)),
+        Some(cap) => match usize::try_from(cap) {
+            Ok(cap) if cap <= max_permits => Ok(cap),
+            _ => Err(format!(
+                "--max-heavy-requests (\"max_heavy_requests\" in the config file) is {}, more than \
+                this server can count; the most it accepts is {}.",
+                cap, max_permits
+            )),
+        },
+        None => Ok(parallelism.unwrap_or(FALLBACK_HEAVY_REQUESTS)),
     }
 }
 
@@ -4239,17 +4268,47 @@ impl HeavyPermit {
 /// idle while a request is not yet working. A warehouse that started draining while the request
 /// waited is answered as drained.
 async fn acquire_heavy(state: &AppState, warehouse: &WarehouseHandle) -> Result<HeavyPermit, HandlerError> {
-    let permit = match tokio::time::timeout(state.heavy_wait, Arc::clone(&state.heavy).acquire_owned()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(closed)) => return Err(internal(format!("The Heavy request cap was closed: {}", closed))),
-        Err(_) => return Err(at_capacity_refusal()),
-    };
+    use std::sync::atomic::Ordering;
 
-    if warehouse.draining.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(draining_refusal());
+    let deadline = tokio::time::Instant::now() + state.heavy_wait;
+    // One acquire for the whole wait, so the request keeps its place in the queue across wakes.
+    let acquire = Arc::clone(&state.heavy).acquire_owned();
+    tokio::pin!(acquire);
+
+    loop {
+        // Listening before the flag is looked at, so a drain marked after the look wakes it: a
+        // drain wakes this warehouse's waiters ([`drain`]), and a waiter would hold it open.
+        let woken = warehouse.applies_wake.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+
+        if warehouse.draining.load(Ordering::SeqCst) {
+            return Err(draining_refusal());
+        }
+
+        tokio::select! {
+            biased;
+            granted = &mut acquire => {
+                let permit = granted.map_err(|closed| internal(format!("The Heavy request cap was closed: {}", closed)))?;
+
+                // A drain marked as the permit was granted.
+                if warehouse.draining.load(Ordering::SeqCst) {
+                    return Err(draining_refusal());
+                }
+
+                return Ok(HeavyPermit { _held: permit });
+            }
+            () = woken => {}
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!(
+                    wait_secs = state.heavy_wait.as_secs(),
+                    "a costly request was refused: every max_heavy_requests permit stayed taken for the whole wait"
+                );
+
+                return Err(at_capacity_refusal());
+            }
+        }
     }
-
-    Ok(HeavyPermit { _held: permit })
 }
 
 /// Start a redaction run for `warehouse`, or, when one runs already, have it go round again.
@@ -4873,16 +4932,8 @@ async fn await_applies(warehouse: &WarehouseHandle) -> Result<(), HandlerError> 
         tokio::pin!(woken);
         woken.as_mut().enable();
 
-        if warehouse.draining.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(draining_refusal());
-        }
-
-        if !warehouse.applies_closed() {
+        if applies_settled(warehouse)? {
             return Ok(());
-        }
-
-        if let Some(damage) = warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
-            return Err(damage_refusal(damage));
         }
 
         tokio::select! {
@@ -4890,6 +4941,28 @@ async fn await_applies(warehouse: &WarehouseHandle) -> Result<(), HandlerError> 
             () = woken => {}
         }
     }
+}
+
+/// Whether content may be answered from `warehouse` now, without waiting.
+///
+/// # Returns
+/// * `Ok(true)`          - No apply is owed.
+/// * `Ok(false)`         - One is owed, which a discharge may end.
+/// * `Err(HandlerError)` - A `503`: the warehouse is drained, or the last apply stopped on damage.
+fn applies_settled(warehouse: &WarehouseHandle) -> Result<bool, HandlerError> {
+    if warehouse.draining.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(draining_refusal());
+    }
+
+    if !warehouse.applies_closed() {
+        return Ok(true);
+    }
+
+    if let Some(damage) = warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
+        return Err(damage_refusal(damage));
+    }
+
+    Ok(false)
 }
 
 /// The `503` of a content request while an apply is owed ([`await_applies`]).
@@ -11664,11 +11737,105 @@ mod tests {
         let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
     }
 
+    /// A request waiting for a permit on a warehouse that starts draining is refused at once, with
+    /// the permit still taken, so it does not hold the drain open for the rest of its wait.
+    ///
+    /// Revert: wait for the permit without listening for the drain's wake → the request waits
+    /// until a permit is free → the bounded join times out → red.
+    #[tokio::test]
+    async fn a_heavy_request_waiting_when_its_warehouse_drains_is_refused_at_once() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let held = Arc::clone(&heavy).try_acquire_owned().unwrap();
+
+        let push = tokio::spawn({
+            let state = Arc::clone(&state);
+            let pushed = fixture.pushed.clone();
+            async move {
+                post_ref_update(
+                    State(state), Extension(Principal::Open), Path(ref_update_params("pushed")),
+                    Json(RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None }),
+                ).await.into_response()
+            }
+        });
+
+        while Arc::strong_count(&handle) < 3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        // What `drain` does to the warehouse's waiters.
+        handle.draining.store(true, Ordering::SeqCst);
+        handle.applies_wake.notify_waiters();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), push).await
+            .expect("the waiting request is refused without waiting for a permit").unwrap();
+        handle.draining.store(false, Ordering::SeqCst);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_text(response).await;
+        assert!(body.contains("briefly unavailable while content redacted or withheld from it is deleted"), "{body}");
+        assert!(!fixture.changed(HeavyRoute::RefUpdate), "the push did not land");
+        assert_eq!(heavy.available_permits(), 0, "the permit is still the holder's");
+
+        drop((held, handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// A batch fetch that waited for its permit while a ref write came to owe an apply is refused
+    /// for now once it is granted one: it answers no content while an apply is owed, though it
+    /// found none owed before it waited.
+    ///
+    /// Revert: drop the batch's check after its permit → it answers `200` → red.
+    #[tokio::test]
+    async fn a_batch_granted_while_an_apply_is_owed_is_refused_for_now() {
+        let fixture = HeavyFixture::new(HeavyRoute::Batch);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        assert!(!handle.applies_closed(), "no apply is owed before the batch waits");
+        let held = Arc::clone(&heavy).try_acquire_owned().unwrap();
+
+        let batch = tokio::spawn({
+            let state = Arc::clone(&state);
+            let pushed = fixture.pushed.clone();
+            async move {
+                post_objects_batch(State(state), Path(PathParams::new()), Json(MissingObjectsRequest { hashes: vec![pushed] })).await
+            }
+        });
+
+        while Arc::strong_count(&handle) < 3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        // A ref write's apply owed, as `owe_apply` counts it.
+        handle.applies_owed.fetch_add(1, Ordering::SeqCst);
+        drop(held);
+        let response = batch.await.unwrap();
+        handle.applies_discharged.fetch_max(handle.applies_owed.load(Ordering::SeqCst), Ordering::SeqCst);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_text(response).await;
+        assert!(body.contains("unavailable while it settles which content redacted from it is no longer served"), "{body}");
+        assert_eq!(heavy.available_permits(), 1, "the refused batch gave its permit back");
+
+        // The same batch with nothing owed answers.
+        let answered = fixture.send(HeavyRoute::Batch, &state).await;
+        assert_eq!(answered.status(), StatusCode::OK);
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
     /// Every function in non-test source that names `acquire_heavy`, by the function it is in.
+    /// With them, every such function that calls `.spawn` on a binding named `permit`.
     #[derive(Default)]
     struct HeavyCallers {
         within: Vec<String>,
         found: BTreeSet<String>,
+        spawning: BTreeSet<String>,
     }
 
     impl HeavyCallers {
@@ -11713,6 +11880,15 @@ mod tests {
             syn::visit::visit_expr_path(self, path);
         }
 
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "spawn"
+                && matches!(&*call.receiver, syn::Expr::Path(path) if path.path.is_ident("permit"))
+            {
+                self.spawning.insert(self.within.last().cloned().unwrap_or_else(|| "<item>".to_string()));
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
             if identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone())).iter().any(|word| word == "acquire_heavy") {
                 self.record();
@@ -11755,13 +11931,15 @@ mod tests {
     }
 
     /// The cost class each route declares matches its handler: a route is `Heavy` exactly when its
-    /// handler calls `acquire_heavy`, and nothing but a Heavy route's handler calls it. The scan
-    /// reads server.rs alone: `acquire_heavy` is private to it, so no other file can call it.
-    /// It checks that the call is there, not where it sits or how long the permit lives; the
-    /// capacity and hang-up tests do.
+    /// handler calls `acquire_heavy`, and nothing but a Heavy route's handler calls it. Each of them
+    /// also hands a binding named `permit` to `.spawn`, the one use [`HeavyPermit`] has, so its
+    /// work runs with the permit inside. The scan reads server.rs alone: `acquire_heavy` is private
+    /// to it, so no other file can call it. It checks that the calls are there, not where they sit
+    /// or that the spawned permit is the one acquired; the capacity, drain and hang-up tests do.
     ///
     /// Reverts: mark `delete_ref` Light → red; drop `acquire_heavy` from a Heavy handler → red;
-    /// call it from a Light one → red.
+    /// call it from a Light one → red; run a Heavy handler's work with `tokio::spawn`, keeping the
+    /// permit in the request → red.
     #[test]
     fn a_route_is_heavy_exactly_when_its_handler_calls_acquire_heavy() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
@@ -11778,6 +11956,7 @@ mod tests {
             .collect();
 
         assert_eq!(heavy, callers.found, "Heavy routes' handlers (left), functions calling acquire_heavy (right)");
+        assert_eq!(callers.found, callers.spawning, "functions calling acquire_heavy (left), functions spawning on `permit` (right)");
 
         // A literal, not read from ROUTES: making a route Heavy or Light is an edit here too.
         let expected: BTreeSet<String> = ["delete_ref", "post_objects_batch", "post_ref_update", "put_trust"]
@@ -11785,21 +11964,32 @@ mod tests {
         assert_eq!(heavy, expected, "the Heavy routes");
     }
 
-    /// `serve`'s capacity: a set value is used as given, zero is refused naming the key, and
-    /// unset is the host's available parallelism.
+    /// `serve`'s capacity: a set value is used as given; zero, and more than the semaphore can
+    /// hold, are refused naming the flag and the key; unset is the host's parallelism, or 4 on a
+    /// host that reports none. The host's 7 and the limit's 9 separate from the fallback 4 and from
+    /// every set value here, so no arm passes on another's value.
     ///
-    /// Reverts: accept zero → no error → red; default to a constant → differs from the host's
-    /// parallelism on any host that reports one other than it → red.
+    /// Reverts: accept zero → no error → red; default to a constant → `Ok(4)` for the host's 7 →
+    /// red; drop the semaphore bound → `Ok(10)` → red; read the host in place of the given
+    /// parallelism → `heavy_capacity`'s wiring is the last assertion.
     #[test]
     fn the_heavy_capacity_is_the_setting_or_the_hosts_parallelism() {
-        assert_eq!(heavy_capacity(Some(3)), Ok(3));
-        assert_eq!(heavy_capacity(Some(1)), Ok(1));
+        assert_eq!(heavy_capacity_when(Some(3), Some(7), 9), Ok(3));
+        assert_eq!(heavy_capacity_when(Some(9), Some(7), 9), Ok(9));
+        assert_eq!(heavy_capacity_when(None, Some(7), 9), Ok(7));
+        assert_eq!(heavy_capacity_when(None, None, 9), Ok(4));
 
-        let error = heavy_capacity(Some(0)).unwrap_err();
-        assert!(error.starts_with("\"max_heavy_requests\" is 0, which would refuse every ref update"), "{error}");
+        let error = heavy_capacity_when(Some(0), Some(7), 9).unwrap_err();
+        assert!(error.starts_with("--max-heavy-requests (\"max_heavy_requests\" in the config file) is 0, \
+            which would refuse every ref update"), "{error}");
 
-        let parallelism = std::thread::available_parallelism().map(usize::from).unwrap_or(FALLBACK_HEAVY_REQUESTS);
-        assert_eq!(heavy_capacity(None), Ok(parallelism));
+        let error = heavy_capacity_when(Some(10), Some(7), 9).unwrap_err();
+        assert_eq!(error, "--max-heavy-requests (\"max_heavy_requests\" in the config file) is 10, more than \
+            this server can count; the most it accepts is 9.");
+
+        // On this host: its own parallelism, read where `serve` reads it.
+        let parallelism = std::thread::available_parallelism().map(usize::from).ok();
+        assert_eq!(heavy_capacity(None), Ok(parallelism.unwrap_or(4)));
     }
 
     /// Reached through a `ServeOptions` built directly, not only through `main.rs`'s readers.
@@ -11811,6 +12001,6 @@ mod tests {
         let options = ServeOptions { max_heavy_requests: Some(0), open: true, ..bare_serve_options() };
         let error = serve(options).await.unwrap_err();
 
-        assert!(error.starts_with("\"max_heavy_requests\" is 0"), "{error}");
+        assert!(error.starts_with("--max-heavy-requests (\"max_heavy_requests\" in the config file) is 0"), "{error}");
     }
 }
