@@ -12008,8 +12008,8 @@ mod tests {
     /// waits for its permit behind a request queued before it, holding no reference to the
     /// warehouse, so a drain completes meanwhile.
     ///
-    /// Reverts: hold the warehouse while waiting → the drain times out → red. Drop an ask made
-    /// while a build runs → no second build → red.
+    /// Reverts: hold the warehouse while waiting → the waiter keeps the warehouse → red. Take a
+    /// permit only when one is free → no build starts → red.
     #[tokio::test]
     async fn a_rebuild_asked_again_waits_its_turn_without_holding_the_warehouse() {
         let root = scratch_dir("rebuild-again-at-capacity");
