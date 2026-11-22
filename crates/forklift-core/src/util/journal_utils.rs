@@ -2975,7 +2975,7 @@ mod tests {
         advance("main", None, &hash('3')).unwrap();
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('3')))).unwrap();
 
-        // Revert: let a marked entry skip the latest check → refused only later, at the put-back.
+        // Revert: let a marked entry skip the latest check → "main" is moved off hash('3').
         let refused = restore_refs(&stale, &held()).unwrap_err();
         assert!(refused.contains("no longer the last journaled operation"), "{}", refused);
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('3')), "nothing is restored");
