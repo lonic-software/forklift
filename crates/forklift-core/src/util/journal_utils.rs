@@ -388,7 +388,7 @@ pub(crate) fn append_in_hold(lock: &crate::util::lock_utils::RefLock,
 /// left standing does not stop it.
 pub(crate) fn put_back_in_hold(_lock: &crate::util::lock_utils::RefLock,
                                before: &[JournalEntry], error: String) -> String {
-    file_utils::put_back_as_read(error, "undo journal", &before.to_vec(), read, |entries| {
+    file_utils::put_back_as_read(error, "undo journal", before, read, |entries| {
         write_as(entries, file_utils::write_file_compensating)
     })
 }

@@ -1820,7 +1820,7 @@ pub fn remove_damaged_ref(name: &str, bytes: &[u8], kept: &Path) -> Result<(), R
     keep_removed(kept, bytes, name)?;
 
     unlink_ref(PalletNamespace::User, &get_pallet_ref_path(PalletNamespace::User, name))
-        .map_err(RefUpdateError::Failed)
+        .map_err(|e| RefUpdateError::Failed(e.into_message()))
 }
 
 /// Whether what stands at meta pallet `name`'s copy path, read as `copy`, blocks it: something
@@ -2776,16 +2776,12 @@ pub fn remove_pallet_head_in(
     let path = get_pallet_ref_path(namespace, name);
     let unlinked = unlink_ref(namespace, &path);
 
-    match get_pallet_head_in(namespace, name) {
-        Ok(None) => {
+    match settle_unlink(name, unlinked, get_pallet_head_in(namespace, name)) {
+        Unlinked::Removed(result) => {
             log_write(wire, Some(expected.to_string()), None);
-            unlinked.map_err(RefUpdateError::Failed)
+            result.map_err(RefUpdateError::Failed)
         }
-        Ok(Some(_)) => {
-            let mut error = unlinked.err().unwrap_or_else(|| format!(
-                "The ref of pallet \"{}\" was still there after it was removed.", name
-            ));
-
+        Unlinked::NotRemoved(mut error) => {
             // Not removed: both records go back to what they held before.
             if let Some(read) = &journal_before {
                 error = crate::util::journal_utils::put_back_in_hold(&lock, read, error);
@@ -2797,26 +2793,75 @@ pub fn remove_pallet_head_in(
 
             Err(RefUpdateError::Failed(error))
         }
-        Err(read) => Err(RefUpdateError::Failed(match unlinked {
-            Ok(()) => format!("The ref of pallet \"{}\" could not be read back after it was removed: {}", name, read),
-            Err(e) => format!("{} The ref could not be read back either: {}", e, read),
-        })),
+        Unlinked::Unknown(error) => Err(RefUpdateError::Failed(error)),
+    }
+}
+
+/// What a removal's unlink left, as [`settle_unlink`] judges it.
+#[derive(Debug, PartialEq)]
+enum Unlinked {
+    /// The ref is gone; the unlink's own result, which fails when a folder sync after it did.
+    Removed(Result<(), String>),
+
+    /// The ref still stands, so the removal's records go back; the error to report.
+    NotRemoved(String),
+
+    /// Whether the ref still stands is not known; the error to report.
+    Unknown(String),
+}
+
+/// Judge what the unlink of pallet `name`'s ref left, from its result and the ref read back
+/// after it. A ref whose file removal itself failed still stands even when it cannot be read back.
+fn settle_unlink(name: &str, unlinked: Result<(), UnlinkError>, read_back: Result<Option<String>, String>) -> Unlinked {
+    match (read_back, unlinked) {
+        (Ok(None), unlinked) => Unlinked::Removed(unlinked.map_err(UnlinkError::into_message)),
+        (Ok(Some(_)), Ok(())) => Unlinked::NotRemoved(format!(
+            "The ref of pallet \"{}\" was still there after it was removed.", name
+        )),
+        (Ok(Some(_)), Err(e)) => Unlinked::NotRemoved(e.into_message()),
+        (Err(read), Ok(())) => Unlinked::Unknown(format!(
+            "The ref of pallet \"{}\" could not be read back after it was removed: {}", name, read
+        )),
+        (Err(read), Err(UnlinkError::NotRemoved(e))) => Unlinked::NotRemoved(format!(
+            "{} The ref could not be read back either: {}", e, read
+        )),
+        (Err(read), Err(UnlinkError::Removed(e))) => Unlinked::Unknown(format!(
+            "{} The ref could not be read back either: {}", e, read
+        )),
+    }
+}
+
+/// Why [`unlink_ref`] failed: before its ref file was removed, or after.
+#[derive(Debug)]
+enum UnlinkError {
+    /// The ref file could not be removed.
+    NotRemoved(String),
+
+    /// The ref file was removed, and a folder sync after it failed.
+    Removed(String),
+}
+
+impl UnlinkError {
+    fn into_message(self) -> String {
+        match self {
+            UnlinkError::NotRemoved(message) | UnlinkError::Removed(message) => message,
+        }
     }
 }
 
 /// Unlink the ref file at `path` and every folder of a nested name it leaves empty, up to the
 /// namespace folder, syncing each removal's parent through the durability taint. Folder removal
 /// stops at the first that does not go (it holds another ref, or anything else).
-fn unlink_ref(namespace: PalletNamespace, path: &Path) -> Result<(), String> {
-    file_utils::remove_file(path).map_err(|e| format!(
+fn unlink_ref(namespace: PalletNamespace, path: &Path) -> Result<(), UnlinkError> {
+    file_utils::remove_file(path).map_err(|e| UnlinkError::NotRemoved(format!(
         "Error while removing the ref file \"{}\": {}", path.to_string_lossy(), e
-    ))?;
+    )))?;
 
     let top = get_namespace_folder(namespace);
     let mut removed: &Path = path;
 
     while let Some(parent) = removed.parent() {
-        file_utils::sync_dir_or_taint(parent, &[path])?;
+        file_utils::sync_dir_or_taint(parent, &[path]).map_err(UnlinkError::Removed)?;
 
         if parent == top || !parent.starts_with(&top) || file_utils::remove_dir(parent).is_err() {
             break;
@@ -5792,6 +5837,32 @@ pub(crate) mod tests {
             }
 
             let _ = file_utils::remove_dir_all(&root);
+        }
+
+        /// What an unlink left is judged from its result and the ref read back: a ref whose file
+        /// removal failed stands, so its records go back, even when it cannot be read back; one
+        /// removed before a failed sync, or one whose unlink went but cannot be read back, is
+        /// not known to stand, so nothing goes back.
+        /// Revert: judge a failed file removal that cannot be read back as not known → red.
+        #[test]
+        fn an_unlink_is_judged_from_its_result_and_the_ref_read_back() {
+            let refused = || Err(UnlinkError::NotRemoved("Not removed.".to_string()));
+            let unsynced = || Err(UnlinkError::Removed("Not synced.".to_string()));
+            let unread = || Err("unreadable".to_string());
+            let cases: [(Result<(), UnlinkError>, Result<Option<String>, String>, Unlinked); 7] = [
+                (Ok(()), Ok(None), Unlinked::Removed(Ok(()))),
+                (unsynced(), Ok(None), Unlinked::Removed(Err("Not synced.".to_string()))),
+                (Ok(()), Ok(Some(hash('a'))), Unlinked::NotRemoved("The ref of pallet \"gone\" was still there after it was removed.".to_string())),
+                (refused(), Ok(Some(hash('a'))), Unlinked::NotRemoved("Not removed.".to_string())),
+                (refused(), unread(), Unlinked::NotRemoved("Not removed. The ref could not be read back either: unreadable".to_string())),
+                (unsynced(), unread(), Unlinked::Unknown("Not synced. The ref could not be read back either: unreadable".to_string())),
+                (Ok(()), unread(), Unlinked::Unknown("The ref of pallet \"gone\" could not be read back after it was removed: unreadable".to_string())),
+            ];
+
+            for (unlinked, read_back, expected) in cases {
+                let case = format!("{:?} / {:?}", unlinked, read_back);
+                assert_eq!(settle_unlink("gone", unlinked, read_back), expected, "{}", case);
+            }
         }
 
         /// A served root with pallet "gone" deleted at `hash('a')`.
