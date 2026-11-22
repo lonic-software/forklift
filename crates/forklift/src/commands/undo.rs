@@ -29,8 +29,10 @@ use crate::output::{self, CommandOutput};
 /// delete changed no bay state, so nothing the bay did since stops its undo.
 ///
 /// The journal entry is only ever consumed (`journal_utils::pop`) once its undo has fully
-/// succeeded — `peek` looks at it first. A refused or failed undo must leave the journal exactly
-/// as it found it, so a retried `undo` sees the same entry rather than skipping straight past it.
+/// succeeded — `peek` looks at it first. A refused or failed undo keeps the entry, so a retried
+/// `undo` sees the same entry rather than skipping straight past it. A soft reset marks it as
+/// started before it changes the bay (`journal_utils::restore_refs`), and a retry of a marked
+/// entry resumes where the failed run stopped.
 ///
 /// # Arguments
 /// * `as_name`      - For `undo --as`: the name to bring a deleted pallet back under. Refused
@@ -306,6 +308,7 @@ mod tests {
         pallet_utils::write_position(&pallet_utils::BayPosition::new("zeta", Some(two.clone()))).unwrap();
         pallet_utils::update_pallet_head("alpha", Some(&alpha_a), &alpha_b, &pallet_utils::RefPreconditions::NONE).unwrap();
         journal_utils::push_if_changed("stack", before).unwrap();
+        let journaled = journal_utils::peek().unwrap();
 
         // Another bay stacks on "zeta" between the gate and the restore.
         let (on, moved_to) = (two.clone(), three.clone());
@@ -320,7 +323,9 @@ mod tests {
         assert_eq!(pallet_utils::get_pallet_head("alpha").unwrap(), Some(alpha_b), "no other ref may be restored");
         assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("zeta", Some(two)),
             "the bay still stands where the operation left it");
-        assert!(journal_utils::peek().unwrap().is_some(), "a refused undo must keep its entry");
+        // Revert: judge the withdrawal by entry.after's heads → the entry stays marked, since
+        // "zeta" was moved before the attempt rather than by it.
+        assert_eq!(journal_utils::peek().unwrap(), journaled, "a refused undo must keep its entry, unmarked");
     }
     #[test]
     fn undo_of_a_delete_whose_history_is_gone_refuses_and_keeps_its_entry() {
