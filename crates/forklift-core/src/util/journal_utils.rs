@@ -1049,8 +1049,9 @@ fn refuse_a_pick_without_its_source(entry: &JournalEntry, resumed: bool) -> Resu
         longer holds that parcel, so the pick could never be completed again. {}",
         entry.op, pick.source,
         match resumed {
-            true => "The undo of it that stopped earlier is not resumed, and the bay stays where \
-                it stopped.",
+            true => "The undo of it that stopped earlier is not resumed: the pallet and the bay's \
+                position are already back where they were before it, and only the pick cannot be \
+                put back. To go on from there, stack.",
             false => "Nothing was undone. The parcel that completed the pick stays; to change it, \
                 stack another on top.",
         }
@@ -1083,7 +1084,7 @@ fn current_pallet_moved(pallet: &str, op: &str) -> String {
 /// mark already set writes none. A failure there refuses with nothing changed. Every bay a stopped
 /// undo leaves from then on is one [`check_undoable`] passes for the marked entry, and a retry
 /// resumes it. A failed run that wrote the mark withdraws it when the bay and every journaled ref
-/// still read as the operation left them, so a refused undo leaves the journal as it was.
+/// still read as they did before it, so a refused undo leaves the journal as it was.
 ///
 /// The bay's position goes back first, to the base `entry.before` records — the tree the bay held
 /// before the operation, never a fresh read of the ref. Then the current pallet's ref: if it moved
@@ -1107,15 +1108,38 @@ fn current_pallet_moved(pallet: &str, op: &str) -> String {
 /// * `store_access` - The command's shared store-access hold, which an un-restore of the current
 ///                    pallet is judged under (see [`un_restore_current`]).
 pub fn restore_refs(entry: &JournalEntry, store_access: &StoreAccessLock) -> Result<(), String> {
+    // Read before the mark, so a failed attempt can tell whether it changed anything.
+    let unmarked = (!entry.undo_started).then(|| Untouched::read(entry));
+
     mark_undo_started(entry)?;
 
     let restored = restore_marked(entry, store_access);
 
-    if restored.is_err() && !entry.undo_started {
-        withdraw_mark_if_unchanged(entry);
+    if let (Err(_), Some(Ok(untouched))) = (&restored, unmarked) {
+        withdraw_mark_if_unchanged(entry, &untouched);
     }
 
     restored
+}
+
+/// The bay and every ref `entry` journals, as read before an attempt to undo it.
+#[derive(PartialEq)]
+struct Untouched {
+    bay: BayState,
+    heads: Vec<Option<String>>,
+}
+
+impl Untouched {
+    fn read(entry: &JournalEntry) -> Result<Untouched, String> {
+        let heads = entry.after.heads.keys()
+            .map(|wire| {
+                let reference = PalletRef::parse(wire)?;
+                pallet_utils::get_pallet_head_in(reference.namespace, &reference.name)
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok(Untouched { bay: BayState::read()?, heads })
+    }
 }
 
 /// The writes of [`restore_refs`] once its entry is marked.
@@ -1184,15 +1208,12 @@ fn restore_marked(entry: &JournalEntry, store_access: &StoreAccessLock) -> Resul
 }
 
 /// Mark the journal's latest entry, which must be `entry`, as an undo of it started, in one journal
-/// write. An entry already marked writes nothing.
+/// write. An entry already marked writes nothing, but must still be the latest.
 fn mark_undo_started(entry: &JournalEntry) -> Result<(), String> {
-    if entry.undo_started {
-        return Ok(());
-    }
-
     let mut entries = read()?;
 
     match entries.last_mut() {
+        Some(latest) if latest == entry && entry.undo_started => return Ok(()),
         Some(latest) if latest == entry => latest.undo_started = true,
         _ => return Err(format!(
             "The undo journal changed while \"{}\" was being undone: it is no longer the last \
@@ -1205,25 +1226,12 @@ fn mark_undo_started(entry: &JournalEntry) -> Result<(), String> {
 }
 
 /// After a failed [`restore_refs`] that marked `entry`, unmark it again when the attempt is seen
-/// to have changed nothing: the bay reads as `entry.after`'s and every ref the entry journals
-/// still holds the head the operation left. A refused undo, such as one a pending move of the
-/// origin stops at its first put-back, then leaves the warehouse as it was. Otherwise, or when a
-/// read or the journal write fails, the mark stays, which only lets a retry resume.
-fn withdraw_mark_if_unchanged(entry: &JournalEntry) {
-    let unchanged = || -> Result<bool, String> {
-        if BayState::read()? != entry.after.bay_state() {
-            return Ok(false);
-        }
-        for (wire, head) in &entry.after.heads {
-            let reference = PalletRef::parse(wire)?;
-            if pallet_utils::get_pallet_head_in(reference.namespace, &reference.name)? != *head {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    };
-
-    if !matches!(unchanged(), Ok(true)) {
+/// to have changed nothing: the bay and every ref the entry journals read as they did before it
+/// (`untouched`). A refused undo, such as one a pending move of the origin stops at its first
+/// put-back, then leaves the warehouse as it was. Otherwise, or when a read or the journal write
+/// fails, the mark stays, which only lets a retry resume.
+fn withdraw_mark_if_unchanged(entry: &JournalEntry, untouched: &Untouched) {
+    if !matches!(Untouched::read(entry), Ok(now) if now == *untouched) {
         return;
     }
 
@@ -2759,7 +2767,8 @@ mod tests {
         let restored = restore_refs(&entry, &held());
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(restored.is_err(), "the \"@kv\" write must fail");
+        let refused = restored.unwrap_err();
+        assert!(!refused.contains("The undo journal changed"), "the mark was written: {}", refused);
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('2')),
             "the current pallet must be back where the operation left it");
         // Everything reads as the operation left it, so the mark the attempt wrote is withdrawn.
@@ -2950,9 +2959,27 @@ mod tests {
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('1')))).unwrap();
 
         let refused = check_undoable(&completed).unwrap_err();
-        assert!(refused.contains("no longer holds that parcel") && refused.contains("is not resumed, and the bay stays where it stopped"),
+        assert!(refused.contains("no longer holds that parcel") && refused.contains("is not resumed") && refused.contains("To go on from there, stack."),
             "{}", refused);
         assert!(!refused.contains("Nothing was undone"), "{}", refused);
+    }
+
+    #[test]
+    fn a_marked_entry_that_is_no_longer_latest_is_not_restored() {
+        let _scratch = Scratch::new("restore-marked-not-latest");
+
+        let mut stale = entry("stack", "main", &hash('1'), &hash('2'));
+        stale.undo_started = true;
+        let later = entry("stack", "main", &hash('2'), &hash('3'));
+        write(&[stale.clone(), later.clone()]).unwrap();
+        advance("main", None, &hash('3')).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('3')))).unwrap();
+
+        // Revert: let a marked entry skip the latest check → "main" goes back to hash('1').
+        let refused = restore_refs(&stale, &held()).unwrap_err();
+        assert!(refused.contains("no longer the last journaled operation"), "{}", refused);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('3')), "nothing is restored");
+        assert_eq!(read().unwrap(), vec![stale, later], "the journal is left as it was");
     }
 
     #[test]

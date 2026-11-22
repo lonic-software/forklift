@@ -308,6 +308,7 @@ mod tests {
         pallet_utils::write_position(&pallet_utils::BayPosition::new("zeta", Some(two.clone()))).unwrap();
         pallet_utils::update_pallet_head("alpha", Some(&alpha_a), &alpha_b, &pallet_utils::RefPreconditions::NONE).unwrap();
         journal_utils::push_if_changed("stack", before).unwrap();
+        let journaled = journal_utils::peek().unwrap();
 
         // Another bay stacks on "zeta" between the gate and the restore.
         let (on, moved_to) = (two.clone(), three.clone());
@@ -322,7 +323,9 @@ mod tests {
         assert_eq!(pallet_utils::get_pallet_head("alpha").unwrap(), Some(alpha_b), "no other ref may be restored");
         assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("zeta", Some(two)),
             "the bay still stands where the operation left it");
-        assert!(journal_utils::peek().unwrap().is_some(), "a refused undo must keep its entry");
+        // Revert: judge the withdrawal by entry.after's heads → the entry stays marked, since
+        // "zeta" was moved before the attempt rather than by it.
+        assert_eq!(journal_utils::peek().unwrap(), journaled, "a refused undo must keep its entry, unmarked");
     }
     #[test]
     fn undo_of_a_delete_whose_history_is_gone_refuses_and_keeps_its_entry() {
