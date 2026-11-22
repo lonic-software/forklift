@@ -1563,7 +1563,7 @@ mod tests {
             (format!("[hooks]\nadmission_secret = {MARK}\n"), "is not valid TOML (line 2)."),
             (format!("[hooks]\nadmission_secret = \"{MARK}\n"), "is not valid TOML (line 2)."),
             (format!("token_sha256 = \"{MARK}\"\ntoken_sha256 = \"{MARK}\"\n"), "is not valid TOML (line 2)."),
-            (format!("[hooks]\nadmission_secret = [\"{MARK}\"]\n"), "\"admission_secret\""),
+            (format!("[hooks]\nadmission_secret = [\"{MARK}\"]\n"), "has a \"hooks.admission_secret\" entry that is present but is not a string"),
             (format!("token_sha256 = \"{MARK}\"\n"), "has an invalid \"token_sha256\""),
         ] {
             let path = scratch_config("canary", &contents);
