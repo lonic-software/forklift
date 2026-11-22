@@ -1810,8 +1810,8 @@ mod tests {
         let deleted = delete_entry_for_test("gone", &hash('9'));
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('a')))).unwrap();
 
-        let pops: [(&str, fn() -> Result<bool, String>); 2] =
-            [("abort", pop_if_it_left_in_progress), ("abandon", pop_if_it_left_in_progress_unread)];
+        type Pop = fn() -> Result<bool, String>;
+        let pops: [(&str, Pop); 2] = [("abort", pop_if_it_left_in_progress), ("abandon", pop_if_it_left_in_progress_unread)];
         for (what, pop) in pops {
             write(&[older.clone(), latest.clone(), deleted.clone()]).unwrap();
 
