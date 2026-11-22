@@ -1001,6 +1001,15 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(),
     sync_result_or_taint(sync_dir(dir), final_paths)
 }
 
+/// Sync `dir` again for `final_paths` that an earlier write already landed and reported unsynced,
+/// recording a taint when this sync fails too, exactly as [`sync_dir_or_taint`] does. Unlike it,
+/// a sync that holds returns `Ok` whatever taint stands: the re-check guards a write about to be
+/// referenced, and a sync of what already landed references nothing new, so a refusal there
+/// would only misreport a sync that held.
+pub(crate) fn sync_dir_again_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(), String> {
+    sync_dir(dir).map_err(|sync_error| taint_after_sync_failure(sync_error, final_paths))
+}
+
 /// Record a taint for `final_paths` after a directory sync just failed, folding the taint
 /// write's own failure (if any) into the returned message — appended after the original sync
 /// error, never in its place, so a caller always sees the failure that actually blocked its

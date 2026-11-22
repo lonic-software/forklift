@@ -1045,7 +1045,9 @@ fn sync_files_again(written: &[(&str, std::path::PathBuf)]) -> Result<Option<Str
     // A copy the write did not get as far as leaves nothing to sync.
     for (file, path) in written.iter().filter(|(_, path)| path.symlink_metadata().is_ok()) {
         let Some(folder) = path.parent() else { continue };
-        match file_utils::sync_dir_or_taint(folder, &[path]) {
+        // Not sync_dir_or_taint: its standing-taint re-check would file a sync that held as
+        // failed, and heal runs this while the taint it resolves still stands.
+        match file_utils::sync_dir_again_or_taint(folder, &[path]) {
             Ok(()) => {}
             Err(error) if file_utils::is_taint_unrecorded(&error) => return Err(format!("its {} is not durable: {}", file, error)),
             Err(error) => { tainted.get_or_insert(error); }
@@ -3266,6 +3268,47 @@ mod tests {
         // A landed copy the second pass reads as matching its ref: nothing more to say.
         let state = tags();
         assert_eq!(state.copy, pallet_utils::MetaCopyState::Bytes(written));
+    }
+
+    // With a taint standing and no exemption armed, heal's re-sync of what a write already landed
+    // says only what the sync did: one that held is not filed as failed, and one that failed is
+    // said by its own error and recorded.
+    // Mutation: sync through sync_dir_or_taint → the held sync returns the standing-taint refusal,
+    // red.
+    #[test]
+    fn a_re_sync_under_a_standing_taint_says_only_what_the_sync_did() {
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::activate();
+        let (_root, _scope) = scratch("ref-heal-re-sync-taint");
+        // Stored before the taint stands, which would refuse it.
+        let head = stub_parcel("head");
+        let taint_dir = crate::globals::forklift_root().join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
+        let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main");
+        let folder = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&path, format!("{}\n", head)).unwrap();
+        let taints = || std::fs::read_dir(&taint_dir).unwrap().count();
+
+        // The fixture's taint stands: a write the re-check guards is refused.
+        let refused = file_utils::sync_dir_or_taint(&folder, &[&path]).unwrap_err();
+        assert!(refused.contains(crate::util::taint_utils::GATE_TAINT_MARKER), "{}", refused);
+
+        assert_eq!(sync_files_again(&[("ref", path.clone())]), Ok(None), "a sync that held");
+        assert_eq!(taints(), 1, "a sync that held records nothing");
+
+        let again = {
+            let _fault = file_utils::SyncDirFaultGuard::failing_exactly(&folder);
+            sync_files_again(&[("ref", path.clone())])
+        };
+        assert_eq!(
+            again,
+            Ok(Some(format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy()))),
+            "a sync that failed, and a taint records it"
+        );
+        assert_eq!(taints(), 2, "the failed sync is recorded");
+        crate::util::taint_utils::reset_activation_for_test();
     }
 
     // Mutation: judge two matching parcels as Nothing → the ref's bytes stop being a floor and
