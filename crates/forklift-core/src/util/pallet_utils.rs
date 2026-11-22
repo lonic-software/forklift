@@ -3254,7 +3254,9 @@ pub(crate) mod tests {
     /// recorded or applied, or the fetch scope changed.
     #[test]
     fn a_compensating_head_write_lands_only_on_the_basis_its_put_back_read() {
-        let cases: [(&str, fn(), Option<&str>); 5] = [
+        // A label, the change made between the read and the write, and what refuses the write.
+        type Case = (&'static str, fn(), Option<&'static str>);
+        let cases: [Case; 5] = [
             ("nothing changed", || {}, None),
             ("the ref moved", || {
                 update_pallet_head("main", Some(&hash('1')), &hash('3'), &RefPreconditions::NONE).unwrap();
