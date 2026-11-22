@@ -1055,6 +1055,57 @@ fn an_unreadable_roots_record_is_rebuilt_from_the_exported_refs() {
     assert_eq!(pallets(record_entries(&fixture.roots_record("a"))), ["feat", "main"]);
 }
 
+/// A run whose last write of the roots record is refused by a durability taint recorded during
+/// the run still reports every pallet: the write's failure is one more line of
+/// `mirror_incomplete`, whose details carry the run's report. Git's pre-receive hook records the
+/// taint while main is pushed, and feat, no longer in the mirrored set, makes that last write
+/// change the record.
+///
+/// Revert: fail the run on the last write's error (`?`) → the error is the write's alone, with no
+/// `mirror_incomplete` and no report → red.
+#[cfg(unix)]
+#[test]
+fn a_taint_recorded_during_the_run_joins_the_report_instead_of_replacing_it() {
+    let fixture = Fixture::new("record-taint");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["pallet", "create", "feat"]);
+    area.stack("a", "code.txt", "feat\n", "on feat");
+    area.lift("a");
+    area.forklift_ok("a", &["shift", "main"]);
+    area.forklift_ok("a", &["git", "mirror"]);
+    let before = record_entries(&fixture.roots_record("a"));
+    assert_eq!(before.iter().map(|(pallet, _)| pallet.as_str()).collect::<Vec<_>>(), ["feat", "main"]);
+
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "main"]);
+    area.stack("a", "code.txt", "v2\n", "second");
+    area.lift("a");
+
+    let staged = area.path("taint-staged");
+    std::fs::write(&staged, forklift_core::util::taint_utils::taint_file_bytes(["objects/zz/recorded-during-the-run"])).unwrap();
+    let taint_dir = area.path("a/.forklift/taint");
+    install_hook(&fixture.git, "pre-receive", &format!(
+        "mkdir -p '{}' && cp '{}' '{}/taint-99999-0'\n",
+        taint_dir.display(), staged.display(), taint_dir.display()
+    ));
+
+    let run = area.forklift("a", &["--json", "git", "mirror"]);
+    assert_eq!(run.status.code(), Some(33), "{}{}", stdout(&run), stderr(&run));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+    assert_eq!(document["error"]["code"], "mirror_incomplete", "{}", document);
+    assert_eq!(outcome(&document["error"]["details"], "main")["status"], "pushed", "{}", document);
+    let message = document["error"]["message"].as_str().unwrap();
+    assert!(message.contains("The mirror record could not be written: "), "{}", message);
+    assert!(message.contains(forklift_core::util::taint_utils::GATE_TAINT_MARKER), "{}", message);
+    assert!(taint_dir.join("taint-99999-0").is_file(), "the hook recorded the taint");
+
+    // main's entry went in before its push; the last write, which would drop feat, did not land.
+    let after = record_entries(&fixture.roots_record("a"));
+    assert_eq!(after.iter().map(|(pallet, _)| pallet.as_str()).collect::<Vec<_>>(), ["feat", "main"]);
+    assert_ne!(after, before);
+}
+
 /// A relative `mirror.url` is read from the warehouse's root, from the main tree and from a bay
 /// alike, never from the mirror's own repository.
 ///
