@@ -3322,18 +3322,19 @@ mod tests {
             assert_eq!(sync_files_again(&[("ref", path.clone())]), Ok(None), "{:?}: a sync that held", taint);
             assert_eq!(taints(), 1, "{:?}: a sync that held records nothing", taint);
 
-            let again = {
-                let _fault = file_utils::SyncDirFaultGuard::failing_exactly(&folder);
-                sync_files_again(&[("ref", path.clone())])
-            };
-            assert_eq!(
-                again,
-                Ok(Some(format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy()))),
-                "{:?}: a sync that failed, and a taint records it", taint
-            );
-            assert_eq!(taints(), 2, "{:?}: the failed sync is recorded", taint);
+            // A folder sync is a no-op off unix, so only there can one fail.
             #[cfg(unix)]
             {
+                let again = {
+                    let _fault = file_utils::SyncDirFaultGuard::failing_exactly(&folder);
+                    sync_files_again(&[("ref", path.clone())])
+                };
+                assert_eq!(
+                    again,
+                    Ok(Some(format!("injected directory-sync failure for \"{}\"", folder.to_string_lossy()))),
+                    "{:?}: a sync that failed, and a taint records it", taint
+                );
+                assert_eq!(taints(), 2, "{:?}: the failed sync is recorded", taint);
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&standing, std::fs::Permissions::from_mode(0o644)).unwrap();
             }
