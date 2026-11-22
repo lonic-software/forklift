@@ -113,6 +113,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **The undo journal moves to version 5.** Each entry now records whether an undo of it has
+  started, and `abort` (with or without `--keep-files`) clears that record. **Breaking:** a journal written
+  before this change is refused as an older version's. Remove it to start a fresh journal, which
+  loses the undo history from before the upgrade.
 - **While a durability taint stands, a refused write leaves the file as it was.** A write of a
   single file on its own, such as a pallet's ref, that a standing taint refuses is now refused before it
   replaces anything, where before it was written and then reported as refused. `heal`'s own
