@@ -1209,13 +1209,20 @@ fn parse_head(bytes: Option<Vec<u8>>) -> Option<String> {
 /// Run `args` in a fresh warehouse stopped before its first rename, then its second, and so on,
 /// handing each stopped warehouse to `check` with the head `@tags` held before the run, until a run
 /// completes.
+///
+/// Each crash point gets its own warehouse, so the stops line up across runs only while every run
+/// makes the same renames. The run's tag cell is a blob of its subject, message and `tagged_at` in
+/// whole seconds, without the tag's name, so without a message of its own `v2` written in the
+/// second `v1` was would be `v1`'s blob, already stored and not renamed. That run would make one
+/// rename fewer, and the stop between the copy and the ref could fall between two runs.
 fn stop_tag_create_at_every_rename(name: &str, tagged: bool, mut check: impl FnMut(&Area, usize, Option<String>)) {
     for at in 1..=MAX_CRASH_POINTS {
         let area = Area::new(&format!("{name}-{at}"));
         tagged_warehouse(&area, tagged);
         let old = parse_head(meta_file(&area, "meta"));
 
-        let args = ["tag", "create", if tagged { "v2" } else { "v1" }, "main"];
+        let tag = if tagged { "v2" } else { "v1" };
+        let args = ["tag", "create", tag, "main", "-m", tag];
         let output = area.command(&args).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string()).output().unwrap();
         if output.status.code() != Some(CRASH_POINT_EXIT_CODE) {
             assert!(output.status.success(), "{args:?} stopped before rename {at} must stop or complete: {}", String::from_utf8_lossy(&output.stderr));
