@@ -3211,8 +3211,8 @@ pub(crate) mod tests {
         }
 
         /// The taint machinery activated (serialized with every test that observes activation),
-        /// with a taint record standing for `paths` in this warehouse: every write then renames
-        /// into place and returns an error.
+        /// with a taint record standing for `paths` in this warehouse: every write is then refused
+        /// before its rename.
         fn plant_taint(paths: &[&str]) -> std::sync::MutexGuard<'static, ()> {
             let serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let folder = forklift_root().join("taint");
@@ -3220,6 +3220,15 @@ pub(crate) mod tests {
             std::fs::write(folder.join("taint-99999-0"), taint_utils::taint_file_bytes(paths.iter().copied())).unwrap();
             taint_utils::activate();
             serial
+        }
+
+        /// The taint machinery activated, and the next write landing with an error: a taint is
+        /// recorded while it is in flight, and cleared before it returns, so the writes after it
+        /// run with no taint standing.
+        fn land_next_write_with_an_error() -> (std::sync::MutexGuard<'static, ()>, file_utils::PostRenameTaintSeam) {
+            let serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            taint_utils::activate();
+            (serial, file_utils::PostRenameTaintSeam::arm())
         }
 
         /// A forward write over a standing ref writes the copy first, and a copy that cannot be
@@ -3258,7 +3267,7 @@ pub(crate) mod tests {
                     _ => {}
                 }
                 let before = copy_state("tags");
-                let _taint = plant_taint(&["objects/zz/planted"]);
+                let _landed = land_next_write_with_an_error();
 
                 let written = write("tags", Some(&h1), &h2);
 
@@ -3269,7 +3278,7 @@ pub(crate) mod tests {
         }
 
         /// A copy already holding the new bytes is not written again.
-        /// Revert: drop the skip → under the standing taint the copy write fails first, and the
+        /// Revert: drop the skip → the copy write is the one that lands with the error, and the
         /// ref stays at H1 → red.
         #[test]
         fn a_copy_already_at_the_new_head_is_not_written_again() {
@@ -3277,12 +3286,12 @@ pub(crate) mod tests {
             let (h1, h2) = (stub_parcel("h1"), stub_parcel("h2"));
             write("tags", None, &h1).unwrap();
             set_copy("tags", &h2);
-            let _taint = plant_taint(&["objects/zz/planted"]);
+            let _landed = land_next_write_with_an_error();
 
             let written = write("tags", Some(&h1), &h2);
 
             assert!(written.is_err(), "the ref write returns the taint's error");
-            assert_eq!(head("tags").as_deref(), Some(h2.as_str()), "the ref write must go ahead and land");
+            assert_eq!(head("tags").as_deref(), Some(h2.as_str()), "the ref write is the first write, and it lands");
             assert_eq!(copy_state("tags"), ref_bytes(&h2));
         }
 
@@ -3559,7 +3568,7 @@ pub(crate) mod tests {
             let (h1, h2) = (stub_parcel("h1"), stub_parcel("h2"));
             write("office", None, &h1).unwrap();
             write("office", Some(&h1), &h2).unwrap();
-            let _taint = plant_taint(&["objects/zz/planted"]);
+            let _landed = land_next_write_with_an_error();
 
             let written = put_back_pallet_head_in(PalletNamespace::Meta, "office", &h2, &h1);
 
