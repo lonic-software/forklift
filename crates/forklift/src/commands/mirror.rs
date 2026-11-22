@@ -552,8 +552,8 @@ struct Run<'a> {
     /// Why an exported ref could not become a boundary, by pallet: reported for that pallet
     /// alone, whichever pallet's fetch brought its parcel in.
     refused: BTreeMap<String, Problem>,
-    /// The pallets whose takedown refusal could not put the record back: the run's last write of
-    /// the record tries it again, and says how that went ([`put_back_owed`]).
+    /// The pallets whose takedown refusal could not put the record back: the run tries again at
+    /// its end, and says how that went ([`put_back_owed`]).
     record_owed: Vec<String>,
     progress: Progress,
 }

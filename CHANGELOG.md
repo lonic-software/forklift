@@ -905,6 +905,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   failure one more line of the message and the run's report in its details. Before, the write's
   error replaced the report. A refusal whose put-back of the record did not land no longer says it
   could not be put back while that last write may still land it; it says what the write did.
+  That retry, in `git mirror` and in a lift's mirror alike, now lands under the taint as the first
+  put-back does, and changes only the refused pallets' entries. Before, it was an ordinary write
+  that a taint standing at the run's end refused, so the record kept naming the refused head as
+  the pallet's root and gc kept the redacted or withheld history it reaches.
 
   An `undo` of a `stack`, `consolidate` or `pick` whose put-back of a pallet failed in this way
   could not be retried, even after `forklift heal`: the current pallet and the bay's position were
