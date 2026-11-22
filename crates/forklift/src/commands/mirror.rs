@@ -1504,8 +1504,9 @@ mod tests {
     /// was put back, even where retrying the owed entries alone would have failed (here the record
     /// on disk cannot be read); when it fails, the owed entries alone are tried again and the
     /// message says how that went.
-    /// Revert: retry before the last write → "could not be put back" though it was → red; skip
-    /// the retry when the write fails → the message says nothing of the record → red.
+    /// Revert: retry even when the last write landed → the retry's own reading, not the write that
+    /// put the record back, is said → red. Whether each outcome is retried is pinned in
+    /// `mirror_utils`' table test.
     #[test]
     fn the_last_write_says_an_owed_put_back_landed_and_its_failure_falls_back_to_the_retry() {
         let _warehouse = crate::test_support::Warehouse::storage_only("mirror-finish-owed");
