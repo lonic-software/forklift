@@ -1186,6 +1186,7 @@ fn building_the_commit_graph_pays_no_durability_barrier() {
 }
 
 /// A warehouse in `area` with one parcel stacked on `main`, and the tag `v1` on it when `tagged`.
+/// `v1` has no message, which [`stop_tag_create_at_every_rename`]'s `v2` relies on to differ.
 fn tagged_warehouse(area: &Area, tagged: bool) {
     for args in [&["prepare"][..], &["config", "set", "operator.identifier", "crash@forklift"]] {
         assert!(area.run(args).status.success(), "{args:?} must succeed");
@@ -1211,18 +1212,18 @@ fn parse_head(bytes: Option<Vec<u8>>) -> Option<String> {
 /// completes.
 ///
 /// Each crash point gets its own warehouse, so the stops line up across runs only while every run
-/// makes the same renames. The run's tag cell is a blob of its subject, message and `tagged_at` in
-/// whole seconds, without the tag's name, so without a message of its own `v2` written in the
-/// second `v1` was would be `v1`'s blob, already stored and not renamed. That run would make one
-/// rename fewer, and the stop between the copy and the ref could fall between two runs.
+/// makes the same renames. A tag cell is a blob of its operator, schema, subject, message and
+/// `tagged_at` in whole seconds, but not the tag's name. So a `v2` on the same parcel, written in
+/// the same second as [`tagged_warehouse`]'s message-less `v1`, would be `v1`'s blob, already
+/// stored and not renamed. That run would make one rename fewer, and the stop between the copy and
+/// the ref could fall between two runs. `v2` gets a message of its own so its cell is always new.
 fn stop_tag_create_at_every_rename(name: &str, tagged: bool, mut check: impl FnMut(&Area, usize, Option<String>)) {
     for at in 1..=MAX_CRASH_POINTS {
         let area = Area::new(&format!("{name}-{at}"));
         tagged_warehouse(&area, tagged);
         let old = parse_head(meta_file(&area, "meta"));
 
-        let tag = if tagged { "v2" } else { "v1" };
-        let args = ["tag", "create", tag, "main", "-m", tag];
+        let args: &[&str] = if tagged { &["tag", "create", "v2", "main", "-m", "v2"] } else { &["tag", "create", "v1", "main"] };
         let output = area.command(&args).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string()).output().unwrap();
         if output.status.code() != Some(CRASH_POINT_EXIT_CODE) {
             assert!(output.status.success(), "{args:?} stopped before rename {at} must stop or complete: {}", String::from_utf8_lossy(&output.stderr));
@@ -1260,7 +1261,8 @@ fn a_meta_ref_lost_after_a_stopped_forward_write_is_never_rebuilt_behind_where_i
             "stopped at rename {at}: @tags stood at {before}, its copy at {copy}, and heal rebuilt it at {after}");
     });
 
-    assert!(copy_led > 0, "no stop left the copy ahead of its ref, so nothing here tested the order");
+    assert!(copy_led > 0, "no stop left the copy ahead of its ref, so nothing here tested the order \
+        (if this is intermittent, the runs do not all make the same renames: see stop_tag_create_at_every_rename)");
 }
 
 // A first meta write writes its ref, then its copy, so after any stop a plain heal leaves the two
