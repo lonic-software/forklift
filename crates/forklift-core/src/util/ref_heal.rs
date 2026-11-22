@@ -1542,11 +1542,12 @@ fn admit_remove(pallet: &str, notes: &mut Vec<String>) -> Result<DamagedRef, Str
         ));
     }
 
-    // A standing taint refuses the removal's own write as it refuses --ref's, so either way the
-    // step is the heal that resolves it first; once it has, the removal is judged again.
+    // While a taint stands, the re-check on a write's sync refuses the removal's own write as it
+    // refuses --ref's, so neither completes, and either way the step is the heal that resolves
+    // the taint first; once it has, the removal is judged again.
     let taint = tainted.standing.then_some(
-        "A durability taint stands, which refuses every write heal makes for this ref until it is resolved: \
-        run \"forklift heal\" first, which resolves it or says what keeps it standing."
+        "A durability taint stands, so neither this removal nor \"forklift heal --ref\" can complete until it is \
+        resolved: run \"forklift heal\" first, which resolves it or says what keeps it standing."
     );
 
     if !evidence.candidates.is_empty() || evidence.salvage_unknown.is_some() || !evidence.deleted_in.is_empty() {
