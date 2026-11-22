@@ -955,7 +955,8 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
 /// Whether `entry` is marked as an undo started, and the bay stands where [`restore_refs`] leaves
 /// it at one of its steps: the earlier position written, with
 /// - (a) the consolidation and cherry-pick still `entry.after`'s, and the current pallet's ref
-///   anywhere: not put back yet, put back, or moved on by another bay since;
+///   anywhere: not put back yet, put back, or moved on by another bay since (which the restore
+///   then refuses as moved);
 /// - (b) the ref at `entry.before`'s head, the consolidation `entry.before`'s and the pick still
 ///   `entry.after`'s;
 /// - (c) the ref at `entry.before`'s head and both records `entry.before`'s: every write done, the
@@ -1049,9 +1050,8 @@ fn refuse_a_pick_without_its_source(entry: &JournalEntry, resumed: bool) -> Resu
         longer holds that parcel, so the pick could never be completed again. {}",
         entry.op, pick.source,
         match resumed {
-            true => "The undo of it that stopped earlier is not resumed: the pallet and the bay's \
-                position are already back where they were before it, and only the pick cannot be \
-                put back. To go on from there, stack.",
+            true => "The undo of it that stopped earlier is not resumed: the bay's position is \
+                already back where it was before that operation, but the pick cannot be put back.",
             false => "Nothing was undone. The parcel that completed the pick stays; to change it, \
                 stack another on top.",
         }
@@ -2954,14 +2954,17 @@ mod tests {
         completed.undo_started = true;
         let completed = in_journal(&completed);
 
-        // Where the undo stopped: the position and the pallet back, the pick not yet.
-        advance("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &hash('1')).unwrap();
+        // Where the undo stopped: the position back, and the pallet either not yet put back or put
+        // back; the pick not yet. The refusal claims only what holds in both.
         pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('1')))).unwrap();
+        for (state, head) in [("ref not yet put back", hash('2')), ("ref put back", hash('1'))] {
+            advance("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &head).unwrap();
 
-        let refused = check_undoable(&completed).unwrap_err();
-        assert!(refused.contains("no longer holds that parcel") && refused.contains("is not resumed") && refused.contains("To go on from there, stack."),
-            "{}", refused);
-        assert!(!refused.contains("Nothing was undone"), "{}", refused);
+            let refused = check_undoable(&completed).unwrap_err();
+            assert!(refused.contains("no longer holds that parcel") && refused.contains("is not resumed")
+                && refused.contains("the bay's position is already back"), "{}: {}", state, refused);
+            assert!(!refused.contains("Nothing was undone") && !refused.contains("pallet"), "{}: {}", state, refused);
+        }
     }
 
     #[test]
