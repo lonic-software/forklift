@@ -432,8 +432,8 @@ struct Tainted {
     /// Whether the taint could not be read, which [`Tainted::read`] takes as torn.
     unread: bool,
     /// Whether the taint stands ([`taint_utils::TaintState::standing`]), so a write outside heal
-    /// is refused until it is resolved; true where it could not be read, as the re-check refuses
-    /// then too.
+    /// is refused until it is resolved (a single ref write before its rename); true where it could
+    /// not be read, as the re-check refuses then too.
     standing: bool,
 }
 

@@ -1193,6 +1193,7 @@ pub struct SelfTripExemptionGuard;
 impl SelfTripExemptionGuard {
     /// Arm the exemption, nesting inside any guard already held: the exemption lasts until the
     /// last guard drops.
+    #[must_use = "the exemption ends when the guard drops: bind it to a named variable for the scope it covers"]
     pub fn new() -> Self {
         SELF_TRIP_EXEMPTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         SelfTripExemptionGuard
@@ -1428,13 +1429,18 @@ fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
 ///                   `taint_utils::activate` has been called in this process (see
 ///                   `sync_dir_or_taint`); an unactivated process sees no change here.
 /// * `Err(String)` - Either nothing landed: the temp write failed, the rename failed, or (once
-///                   activated) a taint was already standing for this root when the write began,
-///                   which refuses it before the rename, leaving `file_path` exactly as it was.
+///                   activated) a taint stood for this root when it was re-checked, after the
+///                   temp's bytes were synced and before the rename, which refuses the write and
+///                   leaves `file_path` exactly as it was.
 ///                   Or the write landed and is not proven durable: the rename succeeded but the
 ///                   following directory sync failed (recorded as a taint, once activated), or the
 ///                   sync held and the re-check after it found a taint recorded while the write
 ///                   was in flight, or could not read the taint state. A caller that must know
 ///                   which reads `file_path` back.
+///
+/// Inside a bulk-store session the write is only staged and returns `Ok`: its rename and its
+/// re-check run in `BulkStoreSession::finish`, which renames every staged file and then re-checks,
+/// so a taint standing there is reported after the files were replaced.
 pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
     let temporary_file_path = temp_path_for(file_path)?;
 

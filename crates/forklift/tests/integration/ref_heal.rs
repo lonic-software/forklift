@@ -2659,7 +2659,7 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
         // Heal's own writes are not refused by the taint, but setting the ref at the head whose
         // parcel is the lost one is: the parcel is not there to set it at. Nothing is written, and
         // the taint stands.
-        if !lost {
+        if kept {
             let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
             let write = area.run(&root, &["heal", "--ref", &format!("side={}", side)]);
             assert_eq!(write.status.code(), Some(1), "{}: {}{}", case, text(&write.stdout), text(&write.stderr));

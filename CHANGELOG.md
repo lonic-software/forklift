@@ -107,7 +107,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 ### Changed
 
 - **While a durability taint stands, a refused write leaves the file as it was.** A write of a
-  single file, such as a pallet's ref, that a standing taint refuses is now refused before it
+  single file on its own, such as a pallet's ref, that a standing taint refuses is now refused before it
   replaces anything, where before it was written and then reported as refused. `heal`'s own
   writes are not refused by the taint it is resolving, so `heal --ref <pallet>=<parcel>` now sets
   the ref and goes on to resolve the taint, where before it was refused until a plain `heal` had
