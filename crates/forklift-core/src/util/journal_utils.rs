@@ -1932,8 +1932,9 @@ mod tests {
         write(&[entry("stack", "main", &hash('1'), &hash('2'))]).unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
-        assert_eq!(value["version"], 4);
+        assert_eq!(value["version"], 5);
         assert_eq!(value["entries"][0]["op"], "stack");
+        assert_eq!(value["entries"][0]["undo_started"], false);
         assert_eq!(value["entries"][0]["before"]["heads"]["main"], hash('1'));
         assert_eq!(value["entries"][0]["after"]["heads"]["main"], hash('2'));
     }
