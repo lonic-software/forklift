@@ -684,8 +684,9 @@ it from work that descends from the deleted head.
 
 ### `mirror_incomplete` (exit 33)
 
-A `git mirror` run left a pallet out of step with git; the others went through. Follow the step each
-pallet's message names, then run `forklift git mirror` again.
+A `git mirror` run left a pallet out of step with git, or could not write its record of mirrored
+roots; the rest went through. Follow the step each line of the message names, then run
+`forklift git mirror` again.
 
 ### `remote_protocol_violation` (exit 23)
 

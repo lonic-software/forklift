@@ -273,8 +273,8 @@ prompt for credentials; one that would fails at once and is reported.
 
 A pallet whose name git does not accept as a branch name (`feature.lock`, `a..b`) is skipped,
 as is one in `mirror.pallets` the remote does not have; neither is a failure. `git mirror` fails
-with `mirror_incomplete` (exit 33) when any pallet is refused or its push fails, after the
-others went through; under `--json` the error's `details` carry the whole run's report. The
+with `mirror_incomplete` (exit 33) when any pallet is refused or its push fails, or the run's last
+write of its record of mirrored roots fails, after the others went through; under `--json` the error's `details` carry the whole run's report. The
 signed office, the `@manifest` and signatures are not mirrored: git has no equivalent.
 
 Tags follow the pallets. Each tag the remote holds, verified like its heads, whose parcel is on a
