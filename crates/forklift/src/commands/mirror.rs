@@ -1513,7 +1513,7 @@ mod tests {
         assert_eq!(mirror_utils::read_mirror_roots().unwrap(), record);
 
         // A folder where the record belongs fails the last write, and the retry too.
-        std::fs::remove_file(&path).unwrap();
+        forklift_core::util::file_utils::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         let mut outcomes = vec![PalletMirror::new("main", MirrorStatus::Failed, "Refused.".to_string())];
         assert!(finish_record(&record, &["main".to_string()], &mut outcomes).is_some());
