@@ -58,6 +58,8 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift-core/src/util/operation_utils.rs", "recover_operation", Class::Verifies),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_pallet_head", Class::Primitive),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_meta_pallet_head", Class::Meta),
+    // An un-restore whose basis no longer judges its head falls back to the checked write.
+    ("crates/forklift-core/src/util/pallet_utils.rs", "compensating_head_write", Class::Primitive),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_pallet_head_checked", Class::Primitive),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_pallet_head_locked", Class::Primitive),
     // A rebuilt or chosen head of a damaged ref is verified as the anchor and office stand now, as
