@@ -1622,12 +1622,14 @@ fn parse_operator_tokens(path: &str) -> Result<Vec<(TokenDigest, String)>, Strin
 /// fixed text that no test reaches.
 pub(crate) fn toml_error_line(content: &str, error: &toml_edit::TomlError) -> String {
     match error.span() {
-        Some(span) => {
-            let line = content.as_bytes()[..span.start.min(content.len())].iter().filter(|&&b| b == b'\n').count() + 1;
-            format!(" (line {})", line)
-        }
+        Some(span) => format!(" (line {})", line_of(content, span.start)),
         None => String::new(),
     }
+}
+
+/// The 1-based line of a byte offset into `content`.
+pub(crate) fn line_of(content: &str, offset: usize) -> usize {
+    content.as_bytes()[..offset.min(content.len())].iter().filter(|&&b| b == b'\n').count() + 1
 }
 
 /// Build the JSON error response of a handler error. A `503` says when to try again: each one is

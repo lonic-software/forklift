@@ -500,9 +500,9 @@ fn optional_integer(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Re
 fn optional_non_negative_integer(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<i64>, String> {
     match optional_integer(item, path, key)? {
         Some(v) if v < 0 => Err(format!(
-            "The config file \"{}\" has a \"{}\" entry that is negative ({}); it must be zero or \
+            "The config file \"{}\" has a \"{}\" entry that is negative; it must be zero or \
             positive.",
-            path, key, v
+            path, key
         )),
         other => Ok(other),
     }
@@ -522,10 +522,10 @@ fn bounded_authentication_cache_secs(
 ) -> Result<Option<u64>, String> {
     match optional_non_negative_integer(item, path, key)? {
         Some(v) if v > server::MAX_HOOK_CACHE_SECS as i64 => Err(format!(
-            "The config file \"{}\" has a \"{}\" entry of {} seconds, which is over the \
-            {}-second (24h) ceiling: a revoked credential must not be able to outlive its \
-            revocation by more than about a day.",
-            path, key, v, server::MAX_HOOK_CACHE_SECS
+            "The config file \"{}\" has a \"{}\" entry over the {}-second (24h) ceiling: a \
+            revoked credential must not be able to outlive its revocation by more than about a \
+            day.",
+            path, key, server::MAX_HOOK_CACHE_SECS
         )),
         other => Ok(other.map(|v| v as u64)),
     }
@@ -538,10 +538,9 @@ fn bounded_admission_cache_secs(
 ) -> Result<Option<u64>, String> {
     match optional_non_negative_integer(item, path, key)? {
         Some(v) if v > server::MAX_HOOK_CACHE_SECS as i64 => Err(format!(
-            "The config file \"{}\" has a \"{}\" entry of {} seconds, which is over the \
-            {}-second (24h) ceiling: a suspended caller must not keep being admitted for more \
-            than about a day.",
-            path, key, v, server::MAX_HOOK_CACHE_SECS
+            "The config file \"{}\" has a \"{}\" entry over the {}-second (24h) ceiling: a \
+            suspended caller must not keep being admitted for more than about a day.",
+            path, key, server::MAX_HOOK_CACHE_SECS
         )),
         other => Ok(other.map(|v| v as u64)),
     }
@@ -559,9 +558,9 @@ fn bounded_admission_cache_secs(
 fn optional_u32(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<u32>, String> {
     match optional_non_negative_integer(item, path, key)? {
         Some(v) => u32::try_from(v).map(Some).map_err(|_| format!(
-            "The config file \"{}\" has a \"{}\" entry of {}, which is over u32::MAX ({}) and \
-            would silently truncate.",
-            path, key, v, u32::MAX
+            "The config file \"{}\" has a \"{}\" entry over u32::MAX ({}), which would silently \
+            truncate.",
+            path, key, u32::MAX
         )),
         None => Ok(None),
     }
@@ -574,13 +573,13 @@ fn optional_u32(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result
 fn positive_u32(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Result<Option<u32>, String> {
     match optional_integer(item, path, key)? {
         Some(v) if v < 1 => Err(format!(
-            "The config file \"{}\" has a \"{}\" entry of {}; it must be positive (zero would \
-            refuse every costly request), or left unset.",
-            path, key, v
+            "The config file \"{}\" has a \"{}\" entry below one; it must be positive (zero \
+            would refuse every costly request), or left unset.",
+            path, key
         )),
         Some(v) => u32::try_from(v).map(Some).map_err(|_| format!(
-            "The config file \"{}\" has a \"{}\" entry of {}, which is over u32::MAX ({}).",
-            path, key, v, u32::MAX
+            "The config file \"{}\" has a \"{}\" entry over u32::MAX ({}).",
+            path, key, u32::MAX
         )),
         None => Ok(None),
     }
@@ -625,7 +624,9 @@ const HOOKS_KEYS: [&str; 10] = [
 
 /// Refuse a key that is not in `known` — the mechanism behind [`CONFIG_TOP_LEVEL_KEYS`] and
 /// [`HOOKS_KEYS`]: every key actually present in the parsed table must be one this function
-/// recognizes, or this errors naming the file, the offending key and where it was found.
+/// recognizes, or this errors naming the file, where the key was found and its line. The key
+/// itself is never quoted: an unrecognized key is whatever was typed, and a token pasted into
+/// the config file is one.
 ///
 /// Takes `&dyn TableLike` rather than `&toml_edit::Table` so it works on an inline table too
 /// (`hooks = { authentication_url = "…", authentication_secret = "…" }`), not only the
@@ -633,14 +634,17 @@ const HOOKS_KEYS: [&str; 10] = [
 /// `TableLike` is implemented by both.
 fn reject_unknown_keys(table: &dyn toml_edit::TableLike,
                        known: &[&str],
+                       content: &str,
                        path: &str,
                        location: &str) -> Result<(), String> {
     for (key, _) in table.iter() {
         if !known.contains(&key) {
+            let line = table.key(key).and_then(|key| key.span())
+                .map(|span| format!(" (line {})", server::line_of(content, span.start)))
+                .unwrap_or_default();
             return Err(format!(
-                "The config file \"{}\" has an unrecognized key \"{}\" in {}. Recognized keys: \
-                {}.",
-                path, key, location, known.join(", ")
+                "The config file \"{}\" has an unrecognized key in {}{}. Recognized keys: {}.",
+                path, location, line, known.join(", ")
             ));
         }
     }
@@ -670,7 +674,9 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Error while reading the config file \"{}\": {}", path, e))?;
 
-    let doc: toml_edit::DocumentMut = content.parse()
+    // Parsed as a `Document`, not a `DocumentMut`, which keeps each key's place in the file for
+    // the unrecognized-key refusal.
+    let doc = toml_edit::Document::parse(content.as_str())
         .map_err(|e| format!("The config file \"{}\" is not valid TOML{}.", path, server::toml_error_line(&content, &e)))?;
 
     // A plaintext token is refused by name, so the message can say what replaced it. Its value
@@ -684,7 +690,7 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         ));
     }
 
-    reject_unknown_keys(doc.as_table(), &CONFIG_TOP_LEVEL_KEYS, path, "the top-level config")?;
+    reject_unknown_keys(doc.as_table(), &CONFIG_TOP_LEVEL_KEYS, &content, path, "the top-level config")?;
 
     let hooks = match doc.get("hooks") {
         None => None,
@@ -695,7 +701,7 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
     };
 
     if let Some(hooks) = hooks {
-        reject_unknown_keys(hooks, &HOOKS_KEYS, path, "the [hooks] table")?;
+        reject_unknown_keys(hooks, &HOOKS_KEYS, &content, path, "the [hooks] table")?;
     }
 
     let hook_of = |name: &str| -> Result<Option<server::HookEndpoint>, String> {
@@ -1109,8 +1115,7 @@ mod tests {
         );
         let error = parse_config(path.to_str().unwrap()).unwrap_err();
 
-        assert!(error.contains("\"autentication_url\""), "{}", error);
-        assert!(error.contains("[hooks]"), "{}", error);
+        assert!(error.contains("an unrecognized key in the [hooks] table (line 1)"), "{}", error);
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }
@@ -1139,9 +1144,9 @@ mod tests {
     #[test]
     fn max_heavy_requests_must_be_a_positive_count() {
         for (value, expected) in [
-            ("0", "has a \"max_heavy_requests\" entry of 0; it must be positive"),
-            ("-2", "has a \"max_heavy_requests\" entry of -2; it must be positive"),
-            ("4294967296", "has a \"max_heavy_requests\" entry of 4294967296, which is over u32::MAX"),
+            ("0", "has a \"max_heavy_requests\" entry below one; it must be positive"),
+            ("-2", "has a \"max_heavy_requests\" entry below one; it must be positive"),
+            ("4294967296", "has a \"max_heavy_requests\" entry over u32::MAX"),
             ("\"4\"", "has a \"max_heavy_requests\" entry that is present but is not an integer"),
         ] {
             let path = scratch_config("max-heavy-requests-refused", &format!("max_heavy_requests = {value}\n"));
@@ -1466,11 +1471,10 @@ mod tests {
     /// startup error, never a silently-never-applied setting.
     #[test]
     fn a_misspelled_top_level_key_is_an_error() {
-        let path = scratch_config("misspelled-top-level", "tokenn = \"secret\"\n");
+        let path = scratch_config("misspelled-top-level", "addr = \"127.0.0.1:1\"\ntokenn = \"secret\"\n");
         let error = parse_config(path.to_str().unwrap()).unwrap_err();
 
-        assert!(error.contains("\"tokenn\""), "{}", error);
-        assert!(error.contains("top-level"), "{}", error);
+        assert!(error.contains("an unrecognized key in the top-level config (line 2)"), "{}", error);
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }
@@ -1485,8 +1489,7 @@ mod tests {
         );
         let error = parse_config(path.to_str().unwrap()).unwrap_err();
 
-        assert!(error.contains("\"autentication_url\""), "{}", error);
-        assert!(error.contains("[hooks]"), "{}", error);
+        assert!(error.contains("an unrecognized key in the [hooks] table (line 2)"), "{}", error);
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }
@@ -1554,8 +1557,7 @@ mod tests {
 
     /// No refusal of a malformed config file quotes a secret it holds: a marker written as a
     /// hook secret or a token digest, in a line the parser cannot read or a value of the wrong
-    /// kind, never appears in the message. (Unknown key names are quoted on purpose, as the
-    /// config's vocabulary is closed and nothing in it is keyed by a secret.)
+    /// kind, never appears in the message.
     #[test]
     fn a_malformed_config_file_never_echoes_a_secret() {
         const MARK: &str = "CANARY-7f3a";
@@ -1574,6 +1576,72 @@ mod tests {
             assert!(error.contains(expected), "{:?}: {}", contents, error);
             assert!(!error.contains(MARK), "{:?}: the refusal quotes the file: {}", contents, error);
         }
+    }
+
+    /// No refusal `parse_config` returns quotes what the file holds. The rows are generated from
+    /// [`CONFIG_TOP_LEVEL_KEYS`] and [`HOOKS_KEYS`], so a key added to the vocabulary is in the
+    /// grid without an edit here: each key is given a marker as a string, inside an array and an
+    /// inline table, and as an integer of each sign, and a marker key is written at every place
+    /// a key can stand. A refusal of an unrecognized key names its line. A value that is a place
+    /// (`root`, `tokens`, a hook's URL) is accepted here and checked later, at startup.
+    #[test]
+    fn no_config_refusal_quotes_the_file() {
+        const MARK: &str = "CANARY-7f3a";
+        const NUMBER: &str = "4294967296123";
+        let shapes = |key: &str| [
+            format!("{key} = \"{MARK}\""),
+            format!("{key} = [\"{MARK}\"]"),
+            format!("{key} = {{ \"{MARK}\" = \"a\" }}"),
+            format!("{key} = {NUMBER}"),
+            format!("{key} = -{NUMBER}"),
+        ];
+
+        let mut cases: Vec<String> = Vec::new();
+        for key in CONFIG_TOP_LEVEL_KEYS {
+            cases.extend(shapes(key).into_iter().map(|line| format!("{line}\n")));
+        }
+        for key in HOOKS_KEYS {
+            cases.extend(shapes(key).into_iter().map(|line| format!("[hooks]\n{line}\n")));
+        }
+
+        let unknown = "an unrecognized key in the top-level config (line 2).";
+        let unknown_hooks = "an unrecognized key in the [hooks] table";
+        let keyed = [
+            (format!("open = true\n{MARK} = 1\n"), unknown),
+            (format!("open = true\n\"{MARK}\" = 1\n"), unknown),
+            (format!("open = true\n{MARK}.x = 1\n"), unknown),
+            (format!("open = true\n[{MARK}]\nx = 1\n"), unknown),
+            (format!("open = true\n[[{MARK}]]\nx = 1\n"), unknown),
+            (format!("[hooks]\n{MARK} = 1\n"), "an unrecognized key in the [hooks] table (line 2)."),
+            (format!("[hooks]\n\"{MARK}\" = \"a\"\n"), "an unrecognized key in the [hooks] table (line 2)."),
+            (format!("hooks = {{ {MARK} = 1 }}\n"), unknown_hooks),
+            (format!("hooks.{MARK} = 1\n"), unknown_hooks),
+        ];
+
+        let mut refused = 0;
+        for contents in cases.iter().cloned().map(|c| (c, None)).chain(keyed.into_iter().map(|(c, e)| (c, Some(e)))) {
+            let (contents, expected) = contents;
+            let path = scratch_config("generated-canary", &contents);
+            assert!(!path.to_str().unwrap().contains(MARK));
+            let result = parse_config(path.to_str().unwrap());
+            let _ = forklift_core::util::file_utils::remove_file(&path);
+
+            match (result, expected) {
+                (Err(error), expected) => {
+                    refused += 1;
+                    assert!(!error.contains(MARK) && !error.contains(NUMBER),
+                            "{:?}: the refusal quotes the file: {}", contents, error);
+                    if let Some(expected) = expected {
+                        assert!(error.contains(expected), "{:?}: {}", contents, error);
+                    }
+                }
+                (Ok(_), None) => {}
+                (Ok(_), Some(_)) => panic!("{:?}: a marker key was accepted", contents),
+            }
+        }
+
+        // The domain is not empty: most values of the wrong shape are refused.
+        assert!(refused > cases.len() / 2, "only {} of {} refused", refused, cases.len());
     }
 
     /// A config file still setting the plaintext `token` is refused, naming what replaced it,
