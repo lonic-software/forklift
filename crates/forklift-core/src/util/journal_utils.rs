@@ -7,6 +7,7 @@ use crate::util::merge_utils::{self, ConsolidationState, OutOfScopeSkeleton};
 use crate::util::object_utils;
 use crate::util::pallet_utils::{self, PalletNamespace, PalletRef, RefUpdateError};
 use crate::util::file_utils;
+use crate::util::lock_utils::StoreAccessLock;
 
 /// The undo journal (§7.8): an append-only list of operation records kept in the bay, so `undo`
 /// can reverse the last state-changing operation — not just the last `stack`. Content addressing
@@ -1032,15 +1033,17 @@ fn current_pallet_moved(pallet: &str, op: &str) -> String {
 /// leaves the half-undone state [`check_undoable`] accepts, and a retry resumes here.
 ///
 /// # Arguments
-/// * `entry` - The entry to reverse.
-pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
+/// * `entry`        - The entry to reverse.
+/// * `store_access` - The command's shared store-access hold, which an un-restore of the current
+///                    pallet is judged under (see [`un_restore_current`]).
+pub fn restore_refs(entry: &JournalEntry, store_access: &StoreAccessLock) -> Result<(), String> {
     let current = &entry.after.current_pallet;
 
     pallet_utils::write_position(&pallet_utils::BayPosition::new(
         &entry.before.current_pallet, entry.before.current_head().cloned(),
     ))?;
 
-    if let Err(error) = put_back_refs(entry) {
+    if let Err(error) = put_back_refs(entry, store_access) {
         // Which base the bay stands on now: the operation's result while the ref still holds it
         // or a parcel built on it, else the earlier one. An ancestry that cannot be read keeps the
         // earlier base, whose catch-up parks the operation's change rather than losing it.
@@ -1098,8 +1101,19 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
 }
 
 /// Put back the refs `entry`'s operation wrote, the current pallet's first: see [`restore_refs`].
-fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
+fn put_back_refs(entry: &JournalEntry, store_access: &StoreAccessLock) -> Result<(), String> {
     let current = &entry.after.current_pallet;
+
+    // What the current pallet's head stands on before its put-back moves it, should it have to be
+    // moved back there. Read before the first put-back, while the ref still holds that head, and
+    // only when the operation moved it, since otherwise no un-restore follows; one that fails
+    // refuses nothing, and leaves an un-restore to the ordinary checked write.
+    let un_restore = match (entry.before.head(current), entry.after.head(current)) {
+        (Some(pre_head), Some(post_head)) if pre_head != post_head => {
+            Some(UnRestore { pre_head, post_head, basis: pallet_utils::PutBackBasis::read(current, store_access) })
+        },
+        _ => None,
+    };
 
     for wire in put_back_order(entry) {
         let (Some(pre_head), Some(post_after)) = (entry.before.head(wire), entry.after.heads.get(wire)) else {
@@ -1134,11 +1148,19 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
             // complete (no precondition is consumed, so nothing else refuses it): put the current
             // pallet back where the operation left it, so the bay still matches the entry and a
             // retried undo passes the gate again.
-            Err(e) => return Err(un_restore_current(entry, e.into())),
+            Err(e) => return Err(un_restore_current(current, un_restore.as_ref(), e.into())),
         }
     }
 
     Ok(())
+}
+
+/// The current pallet's move an undo would reverse, when the operation moved it: the head it put
+/// back to, the head the operation left, and the basis read before the put-back.
+struct UnRestore<'a> {
+    pre_head: &'a String,
+    post_head: &'a String,
+    basis: Result<pallet_utils::PutBackBasis<'a>, String>,
 }
 
 /// The wires of `entry`'s refs in the order an undo puts them back: the current pallet first.
@@ -1154,13 +1176,18 @@ fn put_back_order(entry: &JournalEntry) -> impl Iterator<Item = &String> {
 /// from its restored head to the one the operation left (if it was restored), and return the
 /// error to report. Other refs restored before the failure stay restored: a retried undo finds
 /// them moved off the operation's heads and leaves them alone.
-fn un_restore_current(entry: &JournalEntry, error: String) -> String {
-    let current = &entry.after.current_pallet;
-    let (Some(pre_head), Some(post_head)) = (entry.before.head(current), entry.after.head(current)) else {
+///
+/// `un_restore` is `None` when the operation did not move the current pallet: nothing is written.
+/// Otherwise the move back is a compensating write ([`pallet_utils::compensating_head_write`])
+/// while its `basis` still judges the head it puts back: a taint the failed write left standing
+/// does not refuse it, so the bay is left where a retried undo passes its check once `forklift
+/// heal` has cleared that taint. Once the basis no longer does, it is the ordinary checked write.
+fn un_restore_current(current: &str, un_restore: Option<&UnRestore<'_>>, error: String) -> String {
+    let Some(UnRestore { pre_head, post_head, basis }) = un_restore else {
         return error;
     };
 
-    let e = match pallet_utils::update_pallet_head_in(PalletNamespace::User, current, Some(pre_head), post_head, &pallet_utils::RefPreconditions::NONE) {
+    let e = match pallet_utils::compensating_head_write(current, pre_head, post_head, basis) {
         Ok(()) | Err(RefUpdateError::Moved(_)) => return error,
         Err(e) => e.to_string(),
     };
@@ -1352,6 +1379,11 @@ pub(crate) fn path_for_test() -> PathBuf {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+
+    /// A shared store-access hold, as undo's command holds one for its whole run.
+    fn held() -> StoreAccessLock {
+        StoreAccessLock::shared(|| panic!("nothing holds the store exclusively")).unwrap()
+    }
 
     /// A fresh warehouse root for one test (its own `.forklift` folder exists, but
     /// nothing is prepared beyond that — the journal only ever needs `bay_root()` to
@@ -1622,7 +1654,7 @@ mod tests {
         assert_eq!(entry.after.heads, BTreeMap::from([("main".to_string(), Some(hash('c')))]),
             "after holds each written ref's last written head, and nothing else");
 
-        restore_refs(&entry).unwrap();
+        restore_refs(&entry, &held()).unwrap();
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('a')));
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(hash('2')),
@@ -2186,7 +2218,7 @@ mod tests {
         check_undoable(&entry).unwrap();
 
         assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
-        let refused = restore_refs(&entry).unwrap_err();
+        let refused = restore_refs(&entry, &held()).unwrap_err();
 
         assert!(refused.contains("has been served"), "{}", refused);
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(post.clone()));
@@ -2206,7 +2238,7 @@ mod tests {
         assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
 
         check_undoable(&entry).expect("a half-undone entry is resumed");
-        let refused = restore_refs(&entry).unwrap_err();
+        let refused = restore_refs(&entry, &held()).unwrap_err();
 
         assert!(refused.contains("has been served"), "the core's refusal, not another failure: {}", refused);
 
@@ -2364,7 +2396,7 @@ mod tests {
         restored.before.consolidation = Some(journaled);
         restored.after.heads.insert("@office".to_string(), Some(hash('4')));
 
-        restore_refs(&restored).unwrap();
+        restore_refs(&restored, &held()).unwrap();
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('a')));
         assert_eq!(pallet_utils::get_meta_pallet_head("office").unwrap(), Some(hash('b')));
@@ -2407,7 +2439,7 @@ mod tests {
         restored.before.heads.insert("@office".to_string(), Some(hash('b')));
         restored.after.heads.insert("@office".to_string(), Some(hash('4')));
 
-        let restored = restore_refs(&restored);
+        let restored = restore_refs(&restored, &held());
 
         assert_eq!(pallet_utils::get_meta_pallet_head("office").unwrap(), Some(hash('b')), "{:?}", restored);
         assert!(restored.is_ok(), "the put-back happened, so the undo stands: {:?}", restored);
@@ -2436,7 +2468,7 @@ mod tests {
             ..consolidating(&hash('c'), "side")
         });
 
-        restore_refs(&completed).unwrap();
+        restore_refs(&completed, &held()).unwrap();
 
         let state = merge_utils::read_consolidation_state().unwrap().unwrap();
         assert!(OutOfScopeSkeleton::read_required(&state).unwrap() == skeleton, "the recorded skeleton must be restored");
@@ -2447,7 +2479,7 @@ mod tests {
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
         ).unwrap();
-        restore_refs(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap();
+        restore_refs(&entry("stack", "main", &hash('1'), &hash('2')), &held()).unwrap();
         assert!(merge_utils::read_consolidation_state().unwrap().is_none());
         assert!(std::fs::symlink_metadata(OutOfScopeSkeleton::path()).is_err(), "no skeleton stays behind");
     }
@@ -2498,13 +2530,56 @@ mod tests {
             return;
         }
 
-        let restored = restore_refs(&entry);
+        let restored = restore_refs(&entry, &held());
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(restored.is_err(), "the \"@kv\" write must fail");
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('2')),
             "the current pallet must be back where the operation left it");
         check_undoable(&entry).expect("a retried undo must still pass the gate");
+    }
+
+    /// A stack of "main" (1 → 2) and "side" (a → b), undone with the put-back of the current
+    /// pallet's own ref, then of a later one, landing with an error that leaves a taint standing:
+    /// the un-restore still moves "main" back where the operation left it, and once the taint is
+    /// cleared (as `forklift heal` clears it) the retried undo passes its check and lands.
+    #[test]
+    fn an_undo_whose_put_back_leaves_a_taint_is_retried_once_the_taint_is_healed() {
+        for failing in ["main", "side"] {
+            let _scratch = Scratch::new(&format!("restore-under-own-taint-{}", failing));
+
+            pallet_utils::write_position(&pallet_utils::BayPosition::new("main", pallet_utils::get_pallet_head("main").unwrap())).unwrap();
+            advance("main", None, &hash('1')).unwrap();
+            pallet_utils::update_pallet_head("side", None, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap();
+
+            let before = capture().unwrap();
+            advance("main", Some(&hash('1')), &hash('2')).unwrap();
+            pallet_utils::update_pallet_head("side", Some(&hash('a')), &hash('b'), &pallet_utils::RefPreconditions::NONE).unwrap();
+            push_if_changed("stack", before).unwrap();
+            let entry = peek().unwrap().unwrap();
+
+            let serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::util::taint_utils::activate();
+            let seam = file_utils::PostRenameTaintSeam::arm_standing_at(&pallet_utils::get_pallet_ref_path(PalletNamespace::User, failing));
+
+            let restored = restore_refs(&entry, &held());
+            let main = pallet_utils::get_pallet_head("main").unwrap();
+
+            // The taint cleared, as heal clears it.
+            drop(seam);
+            let gate = check_undoable(&entry);
+            let retried = gate.as_ref().ok().map(|()| restore_refs(&entry, &held()));
+            drop(serial);
+
+            assert!(restored.is_err(), "{}: the put-back must fail", failing);
+            assert!(!restored.as_ref().unwrap_err().contains("could not be put back where the operation left it"),
+                "{}: an un-restore that landed must not report itself failed: {:?}", failing, restored);
+            assert_eq!(main, Some(hash('2')), "{}: the un-restore must put \"main\" back where the operation left it", failing);
+            assert_eq!(gate, Ok(()), "{}: once healed, a retried undo must pass the gate", failing);
+            assert_eq!(retried, Some(Ok(())), "{}: the retried undo must land", failing);
+            assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('1')), "{}: the retry must undo \"main\"", failing);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(hash('a')), "{}: the retry must undo \"side\"", failing);
+        }
     }
 
     #[test]
@@ -2543,7 +2618,7 @@ mod tests {
         restored.before.heads.insert("feature".to_string(), Some(hash('3')));
         restored.after.heads.insert("feature".to_string(), Some(hash('4')));
 
-        restore_refs(&restored).unwrap();
+        restore_refs(&restored, &held()).unwrap();
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('1')), "unmoved ref must be restored");
         assert_eq!(
@@ -2574,7 +2649,7 @@ mod tests {
         let mut restored = entry("stack", "main", &hash('1'), &hash('2'));
         restored.before.heads.insert("@office".to_string(), Some(hash('7')));
 
-        restore_refs(&restored).unwrap();
+        restore_refs(&restored, &held()).unwrap();
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('1')));
         assert_eq!(pallet_utils::get_meta_pallet_head("office").unwrap(), Some(hash('8')));
@@ -2594,7 +2669,7 @@ mod tests {
         restored.before.heads.insert("gone".to_string(), Some(hash('3')));
         restored.after.heads.insert("gone".to_string(), Some(hash('4')));
 
-        restore_refs(&restored).unwrap();
+        restore_refs(&restored, &held()).unwrap();
 
         assert!(!pallet_utils::does_pallet_exist("gone").unwrap());
     }
@@ -2611,7 +2686,7 @@ mod tests {
         }).unwrap();
         advance("main", None, &hash('b')).unwrap();
 
-        restore_refs(&entry("stack", "main", &hash('a'), &hash('b'))).unwrap();
+        restore_refs(&entry("stack", "main", &hash('a'), &hash('b')), &held()).unwrap();
 
         assert!(merge_utils::read_consolidation_state().unwrap().is_none());
     }
@@ -2630,7 +2705,7 @@ mod tests {
         let mut completed = entry("stack", "main", &hash('1'), &hash('2'));
         completed.before.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('e'), our_pallet: "side".to_string(), description: Some("pick".to_string()) });
 
-        restore_refs(&completed).unwrap();
+        restore_refs(&completed, &held()).unwrap();
 
         let state = cherry_pick_utils::read_state().unwrap().expect("the pick must be in progress again");
         assert_eq!(state.source, hash('c'));
@@ -2643,7 +2718,7 @@ mod tests {
             pallet_utils::get_pallet_head("main").unwrap().as_deref(),
             &hash('2'),
         ).unwrap();
-        restore_refs(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap();
+        restore_refs(&entry("stack", "main", &hash('1'), &hash('2')), &held()).unwrap();
         assert!(cherry_pick_utils::read_state().unwrap().is_none());
     }
 

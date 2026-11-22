@@ -1732,7 +1732,6 @@ impl<'a> PutBackBasis<'a> {
     /// # Returns
     /// * `Err(String)` - The ref holds no head, or it, the fetch scope, the warehouse's mode or a
     ///                   record could not be read, or the ref lock could not be taken.
-    #[cfg_attr(not(test), expect(dead_code, reason = "undo's un-restore reads it (FORK-574)"))]
     pub(crate) fn read(name: &str, store_access: &'a crate::util::lock_utils::StoreAccessLock) -> Result<PutBackBasis<'a>, String> {
         let _lock = crate::util::lock_utils::RefLock::acquire()?;
 
@@ -1765,7 +1764,6 @@ impl<'a> PutBackBasis<'a> {
 ///
 /// # Returns
 /// The returns of [`update_pallet_head_in`].
-#[cfg_attr(not(test), expect(dead_code, reason = "undo's un-restore calls it (FORK-574)"))]
 pub(crate) fn compensating_head_write(name: &str,
                                       expected: &str,
                                       new: &str,
