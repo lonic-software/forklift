@@ -2496,12 +2496,13 @@ fn write_copy_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Put a meta ref's copy at `path` back to `prior`, after the write `error` left the ref at its
 /// own prior head, and return the error to report. The restore is read back, since a write can
 /// land and still return an error; one that did not land leaves the copy at the new head, which
-/// passed every check of the write, and says so.
+/// passed every check of the write, and says so. A compensating write
+/// ([`file_utils::compensating`]): a taint the failed write left standing does not stop it.
 fn restore_copy(path: &Path, prior: &MetaCopyState, error: String) -> String {
     let restored = match read_file_state(path) {
         Ok(state) if state == *prior => return error,
         _ => match prior {
-            MetaCopyState::Bytes(bytes) => file_utils::write_file_atomically(path, bytes),
+            MetaCopyState::Bytes(bytes) => file_utils::compensating(|| file_utils::write_file_atomically(path, bytes)),
             MetaCopyState::Absent => match file_utils::remove_file(path) {
                 Ok(()) => path.parent().map_or(Ok(()), |parent| file_utils::sync_dir_or_taint(parent, &[path])),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -3231,6 +3232,15 @@ pub(crate) mod tests {
             (serial, file_utils::PostRenameTaintSeam::arm())
         }
 
+        /// The taint machinery activated, and the write to `path` landing with an error that leaves
+        /// a taint standing, as a failed folder sync does: every write after it runs under that
+        /// taint, until the guard drops.
+        fn land_next_write_leaving_a_taint(path: &Path) -> (std::sync::MutexGuard<'static, ()>, file_utils::PostRenameTaintSeam) {
+            let serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            taint_utils::activate();
+            (serial, file_utils::PostRenameTaintSeam::arm_standing_at(path))
+        }
+
         /// A forward write over a standing ref writes the copy first, and a copy that cannot be
         /// written fails the write with the ref still at its prior head.
         /// Revert: write the ref before the copy → the ref moves to H2 → red.
@@ -3249,12 +3259,14 @@ pub(crate) mod tests {
         }
 
         /// A forward write whose copy landed and whose ref was never written puts the copy back to
-        /// its own prior state: its prior bytes, or its absence, never the ref's bytes.
+        /// its own prior state: its prior bytes, or its absence, never the ref's bytes. It does so
+        /// too when the copy write's failure leaves a taint standing.
         /// Revert: drop the restore → every case red; restore to the ref's bytes → the absent and
-        /// older cases red.
+        /// older cases red; write the prior bytes back outside the compensating scope → the
+        /// standing cases red.
         #[test]
         fn a_copy_that_landed_beside_a_ref_that_did_not_is_put_back_as_it_was() {
-            for case in ["same", "absent", "older"] {
+            for case in ["same", "absent", "older", "same, taint standing", "older, taint standing"] {
                 let (_root, _scope) = scratch(&format!("meta-copy-restore-{}", case));
                 let (h0, h1, h2) = (stub_parcel("h0"), stub_parcel("h1"), stub_parcel("h2"));
                 write("tags", None, &h0).unwrap();
@@ -3263,17 +3275,21 @@ pub(crate) mod tests {
                 // Both parse, so the write takes the forward path over a standing ref.
                 match case {
                     "absent" => file_utils::remove_file(get_meta_copy_path("tags")).unwrap(),
-                    "older" => set_copy("tags", &h0),
+                    "older" | "older, taint standing" => set_copy("tags", &h0),
                     _ => {}
                 }
                 let before = copy_state("tags");
-                let _landed = land_next_write_with_an_error();
+                let standing = case.ends_with("taint standing");
+                let _landed = if standing { land_next_write_leaving_a_taint(&get_meta_copy_path("tags")) } else { land_next_write_with_an_error() };
 
                 let written = write("tags", Some(&h1), &h2);
 
                 assert!(written.is_err(), "{}: the copy write returns the taint's error", case);
                 assert_eq!(head("tags").as_deref(), Some(h1.as_str()), "{}: the ref is never written", case);
                 assert_eq!(copy_state("tags"), before, "{}: the copy must be back as it was", case);
+                let Err(RefUpdateError::Failed(message)) = written else { panic!("{}: {:?}", case, written) };
+                assert!(!message.contains("could not be put back"), "{}: {}", case, message);
+                assert_eq!(taint_utils::read_taints(&forklift_root()).unwrap().standing(), standing, "{}", case);
             }
         }
 

@@ -1781,12 +1781,13 @@ fn write_trust_office(lock: &crate::util::lock_utils::RefLock,
 
 /// Put the trust file back to `previous` (`None`: remove it), under [`install_trust`]'s hold. The
 /// copy is left as it is: an install fails back only before its copy write
-/// ([`write_trust_install`]), so the copy is still the one the install found.
+/// ([`write_trust_install`]), so the copy is still the one the install found. A compensating
+/// write ([`file_utils::compensating`]): a taint the failed install left standing does not stop it.
 fn restore_trust_file(previous: Option<&[u8]>) -> Result<(), String> {
     let path = forklift_root().join(FILE_NAME_TRUST);
 
     match previous {
-        Some(previous) => file_utils::write_file_atomically(&path, previous),
+        Some(previous) => file_utils::compensating(|| file_utils::write_file_atomically(&path, previous)),
         None => {
             file_utils::remove_file(&path)
                 .map_err(|e| format!("Error while removing the trust file: {}", e))?;

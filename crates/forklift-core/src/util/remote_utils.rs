@@ -9668,16 +9668,34 @@ mod tests {
         assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.local_head.clone()));
     }
 
-    // Revert: skip `restore_trust_file` → the new anchor stands beside the old office.
+    // Revert: skip `restore_trust_file` → the new anchor stands beside the old office. Revert:
+    // write the anchor back outside the compensating scope → a taint standing after the trust
+    // write refuses it, and the new anchor stands → red.
     #[test]
     fn a_trust_install_whose_office_write_fails_puts_the_previous_anchor_back() {
-        let fixture = Regenesis::new("office-refused");
-        office_utils::tests::OFFICE_WRITE_FAULT.with(|fault| fault.set(office_utils::tests::OfficeWriteFault::Refuse));
+        for taint_stands in [false, true] {
+            let fixture = Regenesis::new(&format!("office-refused-{}", taint_stands));
+            office_utils::tests::OFFICE_WRITE_FAULT.with(|fault| fault.set(office_utils::tests::OfficeWriteFault::Refuse));
 
-        let error = fixture.install().expect_err("a failed office write must fail the install");
+            // A taint recorded after the trust write, as a failed folder sync records one.
+            let _serial = taint_stands.then(|| {
+                let serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                crate::util::taint_utils::activate();
+                office_utils::tests::BETWEEN_TRUST_WRITES.with(|seam| seam.set(Some(Box::new(|| {
+                    let folder = crate::globals::forklift_root().join("taint");
+                    std::fs::create_dir_all(&folder).unwrap();
+                    std::fs::write(folder.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/left"])).unwrap();
+                }))));
+                serial
+            });
 
-        fixture.assert_untouched();
-        assert!(error.to_string().contains("injected office write refusal"), "{}", error);
+            let error = fixture.install().expect_err("a failed office write must fail the install");
+
+            fixture.assert_untouched();
+            assert!(error.to_string().contains("injected office write refusal"), "{}", error);
+            assert!(!error.to_string().contains("could not be put back"), "{}", error);
+            assert_eq!(crate::util::taint_utils::read_taints(&crate::globals::forklift_root()).unwrap().standing(), taint_stands);
+        }
     }
 
     // Revert: restore on any office error without reading back → the old anchor beside the new
