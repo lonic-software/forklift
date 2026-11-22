@@ -2887,7 +2887,8 @@ choose a head yourself:
   replaces those bytes without keeping them. Repeatable.
 - `forklift heal --remove-ref <pallet>` drops a damaged ref that nothing names a head the store
   holds for, its bytes included, and no checkout stands on, once every checkout's saved state could
-  be read. Its bytes are kept under `.forklift/removed-refs`, and whatever only that ref reached is
+  be read and no durability taint stands (while one does, it is refused naming `forklift heal`
+  first). Its bytes are kept under `.forklift/removed-refs`, and whatever only that ref reached is
   no longer kept by any pallet. Repeatable.
 - `--remove-ref` takes a user pallet only: `heal` never removes a metadata pallet's ref (`@<name>`),
   and refuses the option for one before it changes anything. Where `heal` has no head it can

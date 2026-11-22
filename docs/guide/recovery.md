@@ -105,8 +105,8 @@ journals, an interrupted operation, and what the damaged file still names. If th
 nothing, it changes nothing and lists every head it found. If the damaged file names a parcel the
 store no longer holds, it changes nothing and names that parcel; if the parcel was lost, restore it
 from a backup or from a remote that holds it and run `heal` again. Otherwise pick a head with
-`forklift heal --ref <pallet>=<parcel>`. If nothing names a head the store holds and no checkout
-stands on the pallet, `forklift heal --remove-ref <pallet>` drops the ref and keeps its bytes under
+`forklift heal --ref <pallet>=<parcel>`. If nothing names a head the store holds, no checkout
+stands on the pallet and no durability taint stands, `forklift heal --remove-ref <pallet>` drops the ref and keeps its bytes under
 `.forklift/removed-refs`; what only that ref reached is then no longer kept by any pallet.
 
 **Do not** write the ref file by hand: `heal --ref` checks that the parcel's history is complete.

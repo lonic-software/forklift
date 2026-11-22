@@ -1181,7 +1181,7 @@ fn taint_recheck(final_paths: &[&Path]) -> Result<(), String> {
     };
 
     let state = taint_utils::read_taints(&root)?;
-    if state.recorded.is_empty() && !state.torn {
+    if !state.standing() {
         return Ok(());
     }
 

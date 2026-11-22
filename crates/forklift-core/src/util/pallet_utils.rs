@@ -2498,7 +2498,7 @@ pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState
 
     let taints = crate::util::taint_utils::read_taints(&forklift_root()).map_err(CopyMendError::Refused)?;
 
-    if taints.torn || !taints.recorded.is_empty() {
+    if taints.standing() {
         return Ok(CopyMend::AfterTaint);
     }
 

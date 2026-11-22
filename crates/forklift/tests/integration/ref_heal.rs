@@ -2663,3 +2663,92 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
         }
     }
 }
+
+/// A damaged user ref is removed only once nothing names a head for it; while something does, the
+/// refusal names the write that sets it. While a durability taint stands, neither that write nor
+/// the removal can complete, so the removal is refused naming the heal that resolves the taint
+/// first, whether or not something names a head. That heal either resolves it, rebuilding the ref
+/// at the head named, or says what keeps it standing: with nothing named, the unreadable ref.
+// The step rests on one choice, the taint standing or not, read as the writes' re-check reads it:
+// something recorded, or a file torn. The cases cross that read's three cells with named and not,
+// so each mutant of the choice goes red in one: the write named under a taint (recorded, torn);
+// the heal named with none (clean); only a recorded object counted (torn); the taint judged only
+// where something names a head (not named, under a taint). What heal does next is asserted right
+// after the refusal, with nothing run between, so no earlier step can have produced it.
+#[test]
+fn remove_ref_under_a_standing_taint_names_heal_first() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Taint { Clean, Recorded, Torn }
+    for named in [true, false] {
+        for taint in [Taint::Clean, Taint::Recorded, Taint::Torn] {
+            let case = format!("{}-{:?}", if named { "named" } else { "unnamed" }, taint);
+            let area = Area::new(&format!("remove-taint-{}", case));
+            let (root, side) = side_only_its_bytes_name(&area);
+            if named {
+                // A journal entry names side's head, so the removal is refused.
+                area.run_ok(&root, &["shift", "side"]);
+                area.run_ok(&root, &["shift", "main"]);
+            }
+            damage(&root, "side", Damage::Zero);
+            let zeros = vec![0u8; side.len() + 1];
+            let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
+            match taint {
+                // A vanished object nothing reaches.
+                Taint::Recorded => plant_taint(&root, &[&"0".repeat(side.len())]),
+                Taint::Torn => {
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("taint-1-0"), b"torn").unwrap();
+                }
+                Taint::Clean => {}
+            }
+            let standing = || dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some();
+
+            let named_head = format!("Something still names a head for pallet \"side\": {} (", side);
+            let set = "so its ref is not removed: set it with \"forklift heal --ref side=<parcel>\". Nothing was changed.";
+            let first = "A durability taint stands, so neither this removal nor \"forklift heal --ref\" can complete until \
+                it is resolved: run \"forklift heal\" first, which resolves it or says what keeps it standing. Nothing was changed.";
+            let removal = area.run(&root, &["heal", "--remove-ref", "side"]);
+            let said = text(&removal.stderr);
+            let removed = !named && taint == Taint::Clean;
+            assert_eq!(removal.status.success(), removed, "{}: {}{}", case, text(&removal.stdout), said);
+            assert_eq!(said.contains(&named_head), named, "{}: {}", case, said);
+            assert_eq!(said.contains(set), named && taint == Taint::Clean, "{}: {}", case, said);
+            assert_eq!(said.contains(first), taint != Taint::Clean, "{}: {}", case, said);
+            assert_eq!(std::fs::read(ref_path(&root, "side")).ok(), (!removed).then(|| zeros.clone()), "{}: the ref is left as it was", case);
+            assert_eq!(standing(), taint != Taint::Clean, "{}: the taint is left as it was", case);
+            if !removed {
+                assert!(!root.join(".forklift").join("removed-refs").exists(), "{}: nothing is kept", case);
+            }
+
+            // The step it named, run next.
+            match (named, taint) {
+                (true, Taint::Clean) => {
+                    area.run_ok(&root, &["heal", "--ref", &format!("side={}", side)]);
+                    assert_eq!(head(&root, "side"), side, "{}", case);
+                }
+                (false, Taint::Clean) => {}
+                // The taint resolves, and the ref is rebuilt at the head the journal names.
+                (true, Taint::Recorded | Taint::Torn) => {
+                    let heal = area.run(&root, &["heal"]);
+                    assert!(heal.status.success(), "{}: {}{}", case, text(&heal.stdout), text(&heal.stderr));
+                    assert!(!standing(), "{}: the taint is resolved", case);
+                    assert_eq!(head(&root, "side"), side, "{}", case);
+                }
+                // Nothing names a head, so the unreadable ref keeps the taint, and heal says so.
+                (false, Taint::Recorded | Taint::Torn) => {
+                    let heal = area.run(&root, &["heal"]);
+                    let said = text(&heal.stderr);
+                    assert_eq!(heal.status.code(), Some(21), "{}: {}{}", case, text(&heal.stdout), said);
+                    assert!(said.contains("The ref of pallet \"side\" is damaged. While it cannot be read, the durability taint's recovery"), "{}: {}", case, said);
+                    assert!(standing(), "{}: the taint stands", case);
+                    assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), zeros, "{}: the ref is left as it was", case);
+                    // The write the old step named is refused while the taint stands. Whether it
+                    // lands before that refusal is not asserted here, so nothing follows it.
+                    let write = area.run(&root, &["heal", "--ref", &format!("side={}", side)]);
+                    assert!(!write.status.success(), "{}: {}", case, text(&write.stdout));
+                    assert!(text(&write.stderr).contains("existence cannot be trusted here until it is healed"), "{}: {}", case, text(&write.stderr));
+                }
+            }
+        }
+    }
+}
