@@ -2649,6 +2649,10 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
             assert_eq!(message.contains(&way_out("side")), kept, "{}: {}", case, message);
             assert_eq!(message.contains(promise), lost, "{}: {}", case, message);
             assert!(!message.contains(&way_out("other")), "{}: {}", case, message);
+            assert!(!message.contains("(Next step: forklift heal)"), "{}: {}", case, message);
+            // The note on the unread ref is said, with its read's refusal and no step after it.
+            assert_eq!(message.contains("the ref of pallet \"side\" could not be read this run (The ref of pallet \"side\""), kept, "{}: {}", case, message);
+            assert_eq!(message.contains("does not hold a parcel hash. Nothing was changed.); what only it reaches"), kept, "{}: {}", case, message);
             assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), side_bytes, "{}: the ref is left as it was", case);
         }
 

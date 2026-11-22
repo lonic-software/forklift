@@ -606,10 +606,10 @@ pub(crate) mod tests {
         served_with(&Tombstones::default());
         std::fs::write(tombstones_path(), b"\xff\xfe not a list").unwrap();
 
-        let refused = recovery_utils::gc_root_sources(&[], BayReadPolicy::FailClosed, TrustPinReadPolicy::FailClosed).err().unwrap_or_default();
+        let refused = recovery_utils::gc_root_sources(&[], BayReadPolicy::FailClosed, TrustPinReadPolicy::FailClosed, recovery_utils::NotedIn::Other).err().unwrap_or_default();
         assert!(is_damage(&refused), "gc and prune refuse: {}", refused);
 
-        let tolerated = recovery_utils::gc_root_sources(&[], BayReadPolicy::Tolerate, TrustPinReadPolicy::Tolerate).unwrap();
+        let tolerated = recovery_utils::gc_root_sources(&[], BayReadPolicy::Tolerate, TrustPinReadPolicy::Tolerate, recovery_utils::NotedIn::Heal).unwrap();
         assert!(
             tolerated.degraded.iter().any(|note| note.contains("forklift-server tombstone repair --root") && note.contains("nothing was freed")),
             "{:?}", tolerated.degraded

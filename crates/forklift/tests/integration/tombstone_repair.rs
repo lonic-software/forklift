@@ -491,7 +491,15 @@ fn heal_over_damaged_tombstones_answers_with_the_repair_and_rebuilds_once_it_is_
         assert!(message.contains("The ref of pallet \"zeta\" is lost or damaged; this run stopped before judging it."), "{}: {}", what, message);
         forklift_core::util::file_utils::remove_file(&zeta_ref).unwrap();
 
-        area.server_ok(&root, &["tombstone", "repair"]);
+        // A repair of a damaged list walks the refs: it keeps what the damaged ref reaches, and
+        // names heal, which rebuilds it once the list is repaired. (A lost mark beside a whole list
+        // is repaired without the walk.) Revert: leave the read's heal step out in the repair too
+        // → red.
+        let report = area.server_ok(&root, &["tombstone", "repair"]);
+        if what == "a damaged list" {
+            assert!(report.contains("that does not read: the ref of pallet \"main\" could not be read this run ("), "{}: {}", what, report);
+            assert!(report.contains("does not hold a parcel hash. Nothing was changed. (Next step: forklift heal)); what only it reaches"), "{}: {}", what, report);
+        }
         assert!(area.server_ok(&root, &["tombstone", "list"]).contains("side"), "{}: the repair keeps side", what);
     }
 

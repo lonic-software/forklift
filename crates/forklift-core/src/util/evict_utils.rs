@@ -163,7 +163,7 @@ pub fn plan_evict(held_heads: &[String],
 
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = recovery_utils::gc_root_sources(
-        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed, recovery_utils::NotedIn::Other,
     )?;
 
     let local_parcels = sorted(gc_utils::collect_reachable_for_sweep(&sources.heads())?);

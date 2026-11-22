@@ -1156,7 +1156,7 @@ impl Walked {
 pub fn walk(parcels: &[String], tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Result<Walked, WalkDamage>, String> {
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = recovery_utils::gc_root_sources(
-        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed, recovery_utils::NotedIn::Other,
     )?;
 
     let mut heads: Vec<String> = parcels.to_vec();
