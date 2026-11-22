@@ -1558,14 +1558,19 @@ async fn shutdown_signal() {
 /// [`Credentials::new`] refuses a blank identifier and a digest bound twice.
 ///
 /// An `[operators]` table, the plaintext form this file had before, is refused by name rather
-/// than ignored, and so is any other table: a token in the wrong place is never read as no
-/// token. A malformed key is refused without echoing it, since it may be a plaintext token.
+/// than ignored, and so is anything else outside the `[operators_sha256]` table: a token in the
+/// wrong place is never read as no token.
+///
+/// Every refusal here is built from fixed text, the file's path and a line number, and never
+/// from the file's content: no key, table name, value or parser message, since any of them may
+/// be a token in the wrong place. The `the_token_file_never_echoes_its_content` canary grid pins
+/// it.
 fn parse_operator_tokens(path: &str) -> Result<Vec<(TokenDigest, String)>, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Error while reading the token file \"{}\": {}", path, e))?;
 
     let doc: toml_edit::DocumentMut = content.parse()
-        .map_err(|e| format!("The token file \"{}\" is not valid TOML: {}", path, e))?;
+        .map_err(|e| format!("The token file \"{}\" is not valid TOML{}.", path, toml_error_line(&content, &e)))?;
 
     if doc.contains_key("operators") {
         return Err(format!(
@@ -1577,14 +1582,11 @@ fn parse_operator_tokens(path: &str) -> Result<Vec<(TokenDigest, String)>, Strin
         ));
     }
 
-    // A misnamed table is named, to point at the typo. Any other entry outside the table is
-    // not, since it may be a token written without the table's header.
-    if let Some((key, item)) = doc.as_table().iter().find(|(key, _)| *key != "operators_sha256") {
-        let entry = if item.is_table() { format!("an unrecognized table [{}]", key) }
-                    else { "an entry outside any table".to_string() };
+    if doc.as_table().iter().any(|(key, _)| key != "operators_sha256") {
         return Err(format!(
-            "The token file \"{}\" has {}; it holds only an [operators_sha256] table.",
-            path, entry
+            "The token file \"{}\" holds something other than an [operators_sha256] table, \
+            which is all it may hold.",
+            path
         ));
     }
 
@@ -1612,6 +1614,20 @@ fn parse_operator_tokens(path: &str) -> Result<Vec<(TokenDigest, String)>, Strin
     }
 
     Ok(tokens)
+}
+
+/// Where a TOML parse error lies, as ` (line N)`, or nothing when the parser names no place. The
+/// parser's own message is never used: it quotes the offending line, and a file holding a
+/// secret, a token or a hook's MAC key, must not have that line printed. The no-place arm is
+/// fixed text that no test reaches.
+pub(crate) fn toml_error_line(content: &str, error: &toml_edit::TomlError) -> String {
+    match error.span() {
+        Some(span) => {
+            let line = content.as_bytes()[..span.start.min(content.len())].iter().filter(|&&b| b == b'\n').count() + 1;
+            format!(" (line {})", line)
+        }
+        None => String::new(),
+    }
 }
 
 /// Build the JSON error response of a handler error. A `503` says when to try again: each one is
@@ -7833,6 +7849,49 @@ mod tests {
     /// order with identifiers untrimmed. Everything else is refused: the plaintext `[operators]`
     /// table by name, any other key, a missing table, a key that is not a digest (never echoed,
     /// since it may be a plaintext token), the empty string's digest, and a non-string value.
+    /// No tokens-file refusal quotes the file's content. A marker planted in every place a token
+    /// could be written by mistake is refused by the arm named, and never appears in the message.
+    /// The scratch path, which a refusal does name, holds no marker.
+    #[test]
+    fn the_token_file_never_echoes_its_content() {
+        const MARK: &str = "CANARY-7f3a";
+        let dir = scratch_dir("tokens-canary");
+        let path = dir.join("tokens.toml");
+        assert!(!path.to_str().unwrap().contains(MARK));
+        let alice = hex_digest("tok-a");
+        let outside = "holds something other than an [operators_sha256] table";
+        let bad_key = "has an invalid key: a token digest must be 64 lowercase hex";
+        let not_string = "maps a token digest to a non-string value";
+        let no_table = "has no [operators_sha256] table";
+
+        for (content, expected) in [
+            (format!("{MARK} = \"a\"\n"), outside),
+            (format!("\"{MARK}\" = \"a\"\n"), outside),
+            (format!("[{MARK}]\nx = \"a\"\n"), outside),
+            (format!("[[{MARK}]]\nx = \"a\"\n"), outside),
+            (format!("{MARK}.x = \"a\"\n"), outside),
+            (format!("x.{MARK} = \"a\"\n"), outside),
+            (format!("[operators_sha256]\n\"{MARK}\" = \"a\"\n"), bad_key),
+            (format!("[operators_sha256]\n{MARK} = \"a\"\n"), bad_key),
+            (format!("[operators_sha256]\n\"{MARK}\".x = \"a\"\n"), bad_key),
+            (format!("[operators_sha256.{MARK}]\nx = \"a\"\n"), bad_key),
+            (format!("[operators_sha256]\n\"{alice}\" = [\"{MARK}\"]\n"), not_string),
+            (format!("[operators_sha256]\n\"{alice}\" = {{ \"{MARK}\" = \"a\" }}\n"), not_string),
+            (format!("operators_sha256 = \"{MARK}\"\n"), no_table),
+            (format!("operators_sha256 = {{ \"{MARK}\" = \"a\" }}\n"), no_table),
+            (format!("[operators_sha256]\n\"{MARK} = \"a\"\n"), "is not valid TOML (line 2)."),
+            (format!("[operators_sha256]\n{MARK}+x = \"a\"\n"), "is not valid TOML (line 2)."),
+            (format!("[operators_sha256]\n\"{MARK}\" = \"a\"\n\"{MARK}\" = \"b\"\n"), "is not valid TOML (line 3)."),
+        ] {
+            std::fs::write(&path, &content).unwrap();
+            let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+            assert!(error.contains(expected), "{:?}: {}", content, error);
+            assert!(!error.contains(MARK), "{:?}: the refusal quotes the file: {}", content, error);
+        }
+
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_operator_token_file_holds_only_digests_and_refuses_everything_else() {
         let dir = scratch_dir("tokens-file");
@@ -7857,14 +7916,13 @@ mod tests {
         for (content, expected, why) in [
             ("[operators]\n\"tok-a\" = \"alice\"\n".to_string(), "has an [operators] table of plaintext tokens", "the plaintext table"),
             (format!("[operators_sha256]\n\"{alice}\" = \"alice\"\n[operators]\n"), "[operators] table", "the plaintext table beside the digests"),
-            (format!("[operators_sha265]\n\"{alice}\" = \"alice\"\n"), "has an unrecognized table [operators_sha265]", "a misnamed table"),
-            ("\"tok-a\" = \"alice\"\n".to_string(), "has an entry outside any table", "a token with no table header"),
+            (format!("[operators_sha265]\n\"{alice}\" = \"alice\"\n"), "holds something other than an [operators_sha256] table", "a misnamed table"),
             ("".to_string(), "has no [operators_sha256] table", "no table"),
             ("operators_sha256 = 1\n".to_string(), "has no [operators_sha256] table", "not a table"),
             ("[operators_sha256]\n\"tok-a\" = \"alice\"\n".to_string(), "invalid key: a token digest must be 64 lowercase hex", "a plaintext key"),
             (format!("[operators_sha256]\n\"{}\" = \"alice\"\n", hex_digest("")), "must not be the SHA-256 of the empty string", "the empty string's digest"),
             (format!("[operators_sha256]\n\"{alice}\" = 42\n"), "maps a token digest to a non-string value", "a non-string value"),
-            ("not [ valid toml".to_string(), "is not valid TOML", "invalid TOML"),
+            ("not [ valid toml".to_string(), "is not valid TOML (line 1).", "invalid TOML"),
         ] {
             let error = parse(&content).unwrap_err();
             assert!(error.contains(expected), "{}: {}", why, error);

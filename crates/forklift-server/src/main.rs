@@ -671,7 +671,7 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         .map_err(|e| format!("Error while reading the config file \"{}\": {}", path, e))?;
 
     let doc: toml_edit::DocumentMut = content.parse()
-        .map_err(|e| format!("The config file \"{}\" is not valid TOML: {}", path, e))?;
+        .map_err(|e| format!("The config file \"{}\" is not valid TOML{}.", path, server::toml_error_line(&content, &e)))?;
 
     // A plaintext token is refused by name, so the message can say what replaced it. Its value
     // is never echoed.
@@ -1549,6 +1549,30 @@ mod tests {
             let error = options(flag_value, file_value).unwrap_err();
             assert!(error.contains(names), "{:?}/{:?}: {}", flag_value, file_value, error);
             assert!(!error.contains("plain-secret"), "the refusal must not echo the value: {}", error);
+        }
+    }
+
+    /// No refusal of a malformed config file quotes a secret it holds: a marker written as a
+    /// hook secret or a token digest, in a line the parser cannot read or a value of the wrong
+    /// kind, never appears in the message. (Unknown key names are quoted on purpose, as the
+    /// config's vocabulary is closed and nothing in it is keyed by a secret.)
+    #[test]
+    fn a_malformed_config_file_never_echoes_a_secret() {
+        const MARK: &str = "CANARY-7f3a";
+        for (contents, expected) in [
+            (format!("[hooks]\nadmission_secret = {MARK}\n"), "is not valid TOML (line 2)."),
+            (format!("[hooks]\nadmission_secret = \"{MARK}\n"), "is not valid TOML (line 2)."),
+            (format!("token_sha256 = \"{MARK}\"\ntoken_sha256 = \"{MARK}\"\n"), "is not valid TOML (line 2)."),
+            (format!("[hooks]\nadmission_secret = [\"{MARK}\"]\n"), "\"admission_secret\""),
+            (format!("token_sha256 = \"{MARK}\"\n"), "has an invalid \"token_sha256\""),
+        ] {
+            let path = scratch_config("canary", &contents);
+            assert!(!path.to_str().unwrap().contains(MARK));
+            let error = parse_config(path.to_str().unwrap()).unwrap_err();
+            let _ = forklift_core::util::file_utils::remove_file(&path);
+
+            assert!(error.contains(expected), "{:?}: {}", contents, error);
+            assert!(!error.contains(MARK), "{:?}: the refusal quotes the file: {}", contents, error);
         }
     }
 

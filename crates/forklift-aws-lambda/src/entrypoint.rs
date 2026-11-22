@@ -265,7 +265,11 @@ fn parse_operator_tokens(json: &str) -> Result<Vec<(TokenDigest, String)>, Strin
         }
     }
 
-    let Entries(entries) = serde_json::from_str(json).map_err(|e| format!("not a JSON object of strings ({})", e))?;
+    // serde_json's message quotes a mistyped value, which may be a token, so only its place is
+    // kept.
+    let Entries(entries) = serde_json::from_str(json).map_err(|e: serde_json::Error| {
+        format!("not a JSON object of strings (line {}, column {})", e.line(), e.column())
+    })?;
 
     entries
         .into_iter()
@@ -1256,6 +1260,28 @@ mod tests {
 
     /// Operator tokens alone suit one warehouse, never many: in multi routing nobody could set a
     /// warehouse up. The shared bearer, or open access, suits either.
+    /// No refusal of `FORKLIFT_OPERATOR_TOKENS` quotes its content: a marker written where a
+    /// token could land by mistake is refused, and never appears in the message.
+    #[test]
+    fn the_operator_tokens_variable_never_echoes_its_content() {
+        const MARK: &str = "CANARY-7f3a";
+        let digest = hex_digest("ada-token");
+        let not_object = "not a JSON object of strings (line 1, column";
+
+        for (json, expected) in [
+            (format!("\"{MARK}\""), not_object),
+            (format!("[\"{MARK}\"]"), not_object),
+            (format!("{{\"{digest}\": [\"{MARK}\"]}}"), not_object),
+            (format!("{{\"{digest}\": 5, \"{MARK}\": \"a\"}}"), not_object),
+            (format!("{{\"{MARK}\": \"a\"}}"), "a token digest must be 64 lowercase hex"),
+            (format!("{{\"{MARK}"), not_object),
+        ] {
+            let error = parse_operator_tokens(&json).unwrap_err();
+            assert!(error.contains(expected), "{:?}: {}", json, error);
+            assert!(!error.contains(MARK), "{:?}: the refusal quotes the variable: {}", json, error);
+        }
+    }
+
     #[test]
     fn operator_tokens_alone_are_refused_for_multi_warehouse_routing() {
         let operators_only = auth_from(vars(&[(
