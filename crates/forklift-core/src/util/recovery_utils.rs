@@ -1708,10 +1708,10 @@ fn pallet_ref_heads(
                     bay_utils::BayReadPolicy::FailClosed => return Err(e),
                     bay_utils::BayReadPolicy::Tolerate => {
                         let wire = pallet_utils::PalletRef { namespace, name: name.clone() }.to_wire();
-                        let said = match crate::error::CoreError::from(e) {
-                            crate::error::CoreError::Refusal { message, next_step, .. }
-                                if noted_in == NotedIn::Heal && next_step == pallet_utils::HEAL_STEP => message,
-                            error => error.to_string(),
+                        let said = match crate::error::deframe(&e) {
+                            Some((_, message, next_step))
+                                if noted_in == NotedIn::Heal && next_step == pallet_utils::HEAL_STEP => message.into_owned(),
+                            _ => crate::error::CoreError::from(e).to_string(),
                         };
                         degraded.push(format!(
                             "the ref of pallet \"{}\" could not be read this run ({}); what only it \
@@ -6471,17 +6471,22 @@ mod tests {
     /// out that is to run heal is left out, since heal is the command running. Any other way out
     /// stays, inside heal too.
     // Each mutant goes red in one cell: the heal step left in inside heal (side, heal); left out
-    // in every command (side, other); every way out left out inside heal (tags, heal).
+    // in every command (side, other); every way out left out inside heal (tags, heal); the step
+    // left out by namespace rather than by what it is (kv, heal: a meta ref whose copy parses
+    // reads with the heal step).
     #[test]
     fn a_note_about_an_unread_ref_names_heal_only_outside_heal() {
-        use crate::util::pallet_utils::{self, tests::scratch, PalletNamespace};
+        use crate::util::pallet_utils::{self, tests::{scratch, stub_parcel}, PalletNamespace};
 
         let (_root, _scope) = scratch("recovery-unread-ref-step");
-        for (namespace, name) in [(PalletNamespace::User, "side"), (PalletNamespace::Meta, "tags")] {
+        for (namespace, name) in [(PalletNamespace::User, "side"), (PalletNamespace::Meta, "tags"), (PalletNamespace::Meta, "kv")] {
             let path = pallet_utils::get_pallet_ref_path(namespace, name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "not a hash\n").unwrap();
         }
+        let copy = pallet_utils::get_meta_copy_path("kv");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(&copy, format!("{}\n", stub_parcel("kv"))).unwrap();
 
         let heal_step = "does not hold a parcel hash. Nothing was changed. (Next step: forklift heal))";
         let backup_step = "does not hold a parcel hash. Nothing was changed. (Next step: Restore the ref of @tags and \
@@ -6489,12 +6494,15 @@ mod tests {
         for (noted_in, heal_named) in [(NotedIn::Heal, false), (NotedIn::Other, true)] {
             let (mut degraded, mut unread) = (Vec::new(), Vec::new());
             pallet_ref_heads(&bay_utils::BayReadPolicy::Tolerate, noted_in, &mut degraded, &mut unread).unwrap();
-            assert_eq!(unread, vec!["side".to_string(), "@tags".to_string()], "{:?}", degraded);
+            assert_eq!(unread, vec!["side".to_string(), "@kv".to_string(), "@tags".to_string()], "{:?}", degraded);
             let side = degraded.iter().find(|note| note.contains("the ref of pallet \"side\"")).expect("side is noted");
             assert!(side.contains("does not hold a parcel hash. Nothing was changed."), "{:?}: {}", noted_in, side);
             assert_eq!(side.contains(heal_step), heal_named, "{:?}: {}", noted_in, side);
             let tags = degraded.iter().find(|note| note.contains("the ref of pallet \"@tags\"")).expect("@tags is noted");
             assert!(tags.contains(backup_step), "{:?}: {}", noted_in, tags);
+            let kv = degraded.iter().find(|note| note.contains("the ref of pallet \"@kv\" could not be read")).expect("@kv is noted");
+            assert!(kv.contains("does not hold a parcel hash. Nothing was changed."), "{:?}: {}", noted_in, kv);
+            assert_eq!(kv.contains(heal_step), heal_named, "{:?}: {}", noted_in, kv);
         }
     }
 
