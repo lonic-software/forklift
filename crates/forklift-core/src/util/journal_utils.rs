@@ -769,7 +769,7 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// its after records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
 /// and its undo depends on no bay state. Any other entry is kept, so a rerun of an interrupted
 /// abort, whose entry is already gone, removes nothing more. A kept entry loses an undo's mark,
-/// which on such a rerun leaves an older interrupted undo refused (see
+/// which on such a rerun leaves an older interrupted undo refused, not resumed (see
 /// [`pop_latest_left_in_progress_if`]).
 ///
 /// # Returns
@@ -820,9 +820,9 @@ pub fn pop_if_it_left_in_progress_unread() -> Result<bool, String> {
 ///
 /// The mark is cleared on whichever entry is latest. A rerun of an abort interrupted after its pop
 /// therefore finds an older entry there, and clears that entry's mark too: an undo interrupted
-/// before that merge started is then refused as an unmarked one, which is the refusal it met
-/// before the mark existed. That takes two faults, and a combination of faults keeps today's
-/// refusal.
+/// before that merge started is then refused as an unmarked one, even where the bay sits in the
+/// window its retry would otherwise resume from. That takes two faults, an interrupted undo and
+/// then an interrupted abort, and the undo is refused rather than resumed wrongly.
 ///
 /// # Returns
 /// * `Ok(true)`    - The entry was removed.
