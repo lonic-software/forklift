@@ -1505,9 +1505,8 @@ mod tests {
     /// on disk cannot be read); when it fails, the owed entries alone are tried again and the
     /// message says how that went.
     /// Revert: retry even when the last write landed → the retry's own reading, not the write that
-    /// put the record back, is said → red. The table test in `mirror_utils` pins which outcomes
-    /// hold the put-backs; that a not-durable last write is said rather than retried is reached by
-    /// no test, since no test can make a write land and its folder sync fail.
+    /// put the record back, is said → red. A last write that landed but may not be durable is
+    /// said, not retried: `a_not_durable_last_write_is_said_with_its_caveat_and_not_retried`.
     #[test]
     fn the_last_write_says_an_owed_put_back_landed_and_its_failure_falls_back_to_the_retry() {
         let _warehouse = crate::test_support::Warehouse::storage_only("mirror-finish-owed");
@@ -1528,6 +1527,26 @@ mod tests {
         assert!(finish_record(&record, &["main".to_string()], &mut outcomes).is_some());
         let said = outcomes[0].message.clone().unwrap();
         assert!(said.starts_with("Refused. Whether the mirror record was put back is not known: "), "{}", said);
+    }
+
+    /// A last write that landed but may not be on disk durably settles the owed put-backs: its
+    /// caveat is said, and nothing is retried (the record on disk, which here still differs in the
+    /// owed entry, is left as it is).
+    /// Revert: retry whatever the last write did → the retry lands and is said plainly → red.
+    #[test]
+    fn a_not_durable_last_write_is_said_with_its_caveat_and_not_retried() {
+        let _warehouse = crate::test_support::Warehouse::storage_only("mirror-owed-not-durable");
+        let on_disk = BTreeMap::from([("main".to_string(), "b2".repeat(32))]);
+        mirror_utils::write_mirror_roots(&on_disk).unwrap();
+        let record = BTreeMap::from([("main".to_string(), "a1".repeat(32))]);
+        let mut outcomes = vec![PalletMirror::new("main", MirrorStatus::Failed, "Refused.".to_string())];
+
+        put_back_owed(&record, &["main".to_string()], Some(&RootsWrite::NotDurable("Sync failed.".to_string())), &mut outcomes);
+        assert_eq!(
+            outcomes[0].message.as_deref(),
+            Some("Refused. The mirror record reads as put back, but it may not be on disk durably yet (Sync failed.).")
+        );
+        assert_eq!(mirror_utils::read_mirror_roots().unwrap(), on_disk);
     }
 
     /// The retry writes only when a put-back is owed, and then changes only the owed entries (a
