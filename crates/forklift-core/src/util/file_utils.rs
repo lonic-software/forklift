@@ -1459,7 +1459,7 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
     // refusal need not wait for the effect. The temp file goes, and `file_path` keeps exactly
     // what it held.
     if let Err(refused) = taint_recheck(&[file_path]) {
-        let _ = std::fs::remove_file(&temporary_file_path);
+        let _ = remove_file(&temporary_file_path);
         return Err(refused);
     }
 
@@ -1483,7 +1483,7 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 
     #[cfg(test)]
     if let Some(planted) = seam_taint {
-        std::fs::remove_file(&planted).expect("the seam's planted taint file is removed");
+        remove_file(&planted).expect("the seam's planted taint file is removed");
     }
 
     synced?;
