@@ -196,12 +196,12 @@ being echoed, and so is the digest of the empty string. A config file still sett
 tokens file with an `[operators]` table of plaintext tokens, is refused by name, never read as no
 token.
 
-No refusal about a credential quotes where it came from. A malformed tokens file, config file or
-`FORKLIFT_OPERATOR_TOKENS` is refused with the file's path (or the variable's name) and the line
-of the fault, never with the key, table name, value or parser message found there, since any of
-them may be a token or a hook secret put in the wrong place. Two things are quoted on purpose: the
-path of a file the server could not read, and the name of an unrecognized config-file key, since
-the config's keys are a fixed vocabulary that nothing names after a secret.
+A refusal of the tokens file, of `FORKLIFT_OPERATOR_TOKENS`, or of the config file's syntax, keys
+or value types and ranges names the file (or the variable), the key from the server's own
+vocabulary and the line of the fault. It never quotes a key, table name, value or parser message
+found there, since any of them may be a token or a hook secret put in the wrong place: an
+unrecognized key is named by its table and line only. Not yet covered: a refusal at startup of a
+value that names a place, such as `root`, `addr`, `tokens` or a hook's URL, quotes that value.
 
 ## Per-operator tokens (FORK-10)
 
