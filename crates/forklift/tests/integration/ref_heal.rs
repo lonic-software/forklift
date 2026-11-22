@@ -2761,7 +2761,8 @@ fn remove_ref_under_a_standing_taint_names_heal_first() {
 /// with its folder left unsynced, and no taint recording that, reads as undamaged. A folder that
 /// cannot be synced (here, one that cannot be opened) stops the run with nothing changed: the
 /// damaged ref beside it is not rebuilt yet. Once the folder opens, the same heal goes on.
-/// Mutation: drop the sync from heal → the run rebuilds main and succeeds, red.
+/// Mutation: drop the sync from heal → the run is refused later, by a pass that cannot list the
+/// folder, with no word of the sync, red.
 #[cfg(unix)]
 #[test]
 fn heal_stops_on_a_ref_folder_it_cannot_sync() {
