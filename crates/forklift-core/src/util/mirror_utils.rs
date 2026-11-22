@@ -71,29 +71,27 @@ pub fn write_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String
 /// ordinary write, does not fail the run. A write can land and still return an error, when its
 /// folder sync fails, so a failed write is read back, and the error is a sentence naming the
 /// record that says only what that read shows: the record holds `roots` but may not be durable
-/// yet, it could not be written, or whether it was is not known. Only the last two say the next
-/// run writes it again: a record that already reads as `roots` is one the next run leaves alone,
-/// and the taint its failed folder sync recorded is what keeps the warehouse gated until heal.
+/// yet, it could not be written, or whether it was is not known ([`failed_write`]).
 pub fn update_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String> {
     if read_mirror_roots().ok().as_ref() == Some(roots) {
         return Ok(());
     }
 
     let Err(failed) = write_mirror_roots(roots) else { return Ok(()) };
-    Err(match read_mirror_roots() {
-        Ok(now) if now == *roots => format!(
-            "The mirror record holds what this run wrote, but it may not be on disk durably yet ({}).", failed
-        ),
-        Ok(_) => format!("The mirror record could not be written: {} {}", failed, WRITTEN_AGAIN),
-        Err(unread) => format!(
-            "Whether the mirror record was written is not known: {} It could not be read back: {} {}",
-            failed, unread, WRITTEN_AGAIN
-        ),
-    })
+    Err(failed_write(&failed, read_mirror_roots().map(|now| now == *roots)))
 }
 
-/// What a failed write of the record that did not leave it as written says of the next run.
-const WRITTEN_AGAIN: &str = "The next \"forklift git mirror\" writes it again.";
+/// The sentence for a write of the record that failed with `failed`, from what reading it back
+/// showed: whether it holds what was written, or why it could not be read. It says only that, and
+/// nothing of what a later run will do: a taint that refused the write refuses the next one too,
+/// until it is healed.
+fn failed_write(failed: &str, read_back: Result<bool, String>) -> String {
+    match read_back {
+        Ok(true) => format!("The mirror record holds what this run wrote, but it may not be on disk durably yet ({}).", failed),
+        Ok(false) => format!("The mirror record could not be written: {}", failed),
+        Err(unread) => format!("Whether the mirror record was written is not known: {} It could not be read back: {}", failed, unread),
+    }
+}
 
 /// Put the record back to `before`, what it held before a mirror step that then failed with
 /// `error`, and return `error` with what happened to the record appended
@@ -228,6 +226,20 @@ mod tests {
         assert!(changed.starts_with("The mirror record could not be written: "), "got: {}", changed);
         assert!(changed.contains(crate::util::taint_utils::GATE_TAINT_MARKER), "got: {}", changed);
         assert_eq!(read_mirror_roots().unwrap(), before);
+    }
+
+    /// Each read-back is said as it is, and nothing is promised of a later run.
+    #[test]
+    fn a_failed_write_says_only_what_reading_the_record_back_shows() {
+        assert_eq!(
+            failed_write("Disk full.", Ok(true)),
+            "The mirror record holds what this run wrote, but it may not be on disk durably yet (Disk full.)."
+        );
+        assert_eq!(failed_write("Disk full.", Ok(false)), "The mirror record could not be written: Disk full.");
+        assert_eq!(
+            failed_write("Disk full.", Err("Unreadable.".to_string())),
+            "Whether the mirror record was written is not known: Disk full. It could not be read back: Unreadable."
+        );
     }
 
     /// Anything this build does not understand is refused, naming the record and the way out,

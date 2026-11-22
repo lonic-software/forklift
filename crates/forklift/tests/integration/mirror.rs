@@ -1097,7 +1097,9 @@ fn a_taint_recorded_during_the_run_joins_the_report_instead_of_replacing_it() {
     assert_eq!(outcome(&document["error"]["details"], "main")["status"], "pushed", "{}", document);
     let message = document["error"]["message"].as_str().unwrap();
     assert!(message.contains("The mirror record could not be written: "), "{}", message);
-    assert!(message.contains("The next \"forklift git mirror\" writes it again."), "{}", message);
+    let line = message.lines().find(|line| line.starts_with("The mirror record could not be written: ")).unwrap();
+    // The line ends on the taint's own refusal: nothing after it promises what a later run does.
+    assert!(line.ends_with("until it is healed."), "{}", line);
     assert!(message.contains(forklift_core::util::taint_utils::GATE_TAINT_MARKER), "{}", message);
     assert!(taint_dir.join("taint-99999-0").is_file(), "the hook recorded the taint");
 
