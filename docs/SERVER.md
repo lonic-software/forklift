@@ -392,7 +392,7 @@ revocation by more than about a day.
   tombstone drop` frees it. From
   then on it refuses that content on every route with `410` (`content_redacted`), takes the
   latest bundle down (every bundle built after leaves the content out, and with
-  `rebuild_after_lifts` set the next one is built at once, unless the costly-request cap is full),
+  `rebuild_after_lifts` set the next one is built as soon as the costly-request cap has room),
   and accepts lifts whose history names it
   without the content. The applied redactions are kept in `<root>/.forklift/redactions-applied`.
   No content is served while an apply may be owed: from just before a pallet update or deletion
@@ -505,9 +505,11 @@ report one). It is uncalibrated: no benchmark of these routes exists yet, so siz
 host if lifts or fetches queue; each refusal is logged as a warning. The cap counts requests,
 not callers or warehouses, so a burst on one warehouse can refuse requests on another: per-caller
 budgets and a cap on reads are not part of it. Background bundle rebuilds (`rebuild_after_lifts`,
-at most one per warehouse) count against the same cap, but never wait for it: a rebuild that finds
-it full is put off, and the next lift past the threshold or the next redaction round asks again.
-Until one runs, clients fetch the objects the bundle would have carried one by one. Redaction runs
+at most one per warehouse) count against the same cap: a rebuild that finds it full waits its turn
+in arrival order with the requests, without holding the warehouse, so it never holds up a drain.
+Meanwhile clients get the bundle already built, or none if a redaction took it down, and fetch the
+rest object by object. A build holds its slot until it ends, so with several warehouses rebuilding
+at once, costly requests can be refused for capacity for as long as the builds run. Redaction runs
 stay outside the cap.
 
 **The single-writer rule:** exactly one serving process per warehouse root; a second server

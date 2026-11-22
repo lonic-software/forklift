@@ -18,8 +18,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   host's available parallelism; zero is refused). A request that finds the cap full waits up to 5
   seconds and is then refused with a `503` and `Retry-After`, before it changes anything, and the
   client sends it again after the wait. Background bundle rebuilds count against the same cap: one
-  that finds it full is put off until the next lift past `rebuild_after_lifts` or the next
-  redaction round, rather than waiting. A burst of pushes no longer fills the server's blocking
+  that finds it full waits its turn with the requests. A burst of pushes no longer fills the server's blocking
   threads with history walks or bundle builds.
 - **`park` can park part of the work in progress.** `park <paths>…` parks and resets only the
   changes at or under the paths; every other file keeps its working content and its staging. An
