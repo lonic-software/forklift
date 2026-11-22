@@ -1105,9 +1105,13 @@ fn put_back_refs(entry: &JournalEntry, store_access: &StoreAccessLock) -> Result
     let current = &entry.after.current_pallet;
 
     // What the current pallet's head stands on before its put-back moves it, should it have to be
-    // moved back there. Read before the first put-back, while the ref still holds that head; one
-    // that fails refuses nothing, and leaves an un-restore to the ordinary checked write.
-    let basis = pallet_utils::PutBackBasis::read(current, store_access);
+    // moved back there. Read before the first put-back, while the ref still holds that head, and
+    // only when the operation moved it, since otherwise no un-restore follows; one that fails
+    // refuses nothing, and leaves an un-restore to the ordinary checked write.
+    let basis = match (entry.before.head(current), entry.after.head(current)) {
+        (Some(pre_head), Some(post_head)) if pre_head != post_head => pallet_utils::PutBackBasis::read(current, store_access),
+        _ => Err(format!("the operation did not move \"{}\", so nothing un-restores it.", current)),
+    };
 
     for wire in put_back_order(entry) {
         let (Some(pre_head), Some(post_after)) = (entry.before.head(wire), entry.after.heads.get(wire)) else {
@@ -2562,6 +2566,8 @@ mod tests {
             drop(serial);
 
             assert!(restored.is_err(), "{}: the put-back must fail", failing);
+            assert!(!restored.as_ref().unwrap_err().contains("could not be put back where the operation left it"),
+                "{}: an un-restore that landed must not report itself failed: {:?}", failing, restored);
             assert_eq!(main, Some(hash('2')), "{}: the un-restore must put \"main\" back where the operation left it", failing);
             assert_eq!(gate, Ok(()), "{}: once healed, a retried undo must pass the gate", failing);
             assert_eq!(retried, Some(Ok(())), "{}: the retried undo must land", failing);
