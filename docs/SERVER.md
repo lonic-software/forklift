@@ -508,8 +508,9 @@ refused with a `503` carrying `Retry-After`, before it has changed anything; the
 out and sends it again. The default is the host's available parallelism (4 when the host does not
 report one). It is uncalibrated: no benchmark of these routes exists yet, so size it to your
 host if lifts or fetches queue; each refusal is logged as a warning. The cap counts requests,
-not callers or warehouses, so a burst on one warehouse can refuse requests on another; the
-per-caller limits below, when set, keep one caller's burst to its own budget. Background bundle rebuilds (`rebuild_after_lifts`)
+not callers or warehouses, so a burst on one warehouse can refuse requests on another. The
+per-caller limits below bound how fast each caller sends, not how many of its requests run at
+once, so a caller within its limit can still fill the cap. Background bundle rebuilds (`rebuild_after_lifts`)
 are bounded apart from that cap: a serving process runs one build at a time, across every
 warehouse it serves, so a rebuild never refuses a request, and the most costly requests and builds
 running at once are the cap plus one build. A rebuild that finds a build running for another warehouse waits its
@@ -529,17 +530,26 @@ class is the four routes `max_heavy_requests` caps; every other authenticated ro
 request or changed; the client waits it out and sends the request again, for up to 30 seconds. A
 budget holds a minute of requests and refills continuously, so a caller may send a minute's worth
 at once. One caller spending its budget never spends another's, and costly requests never spend
-the cheap budget. The budgets are kept per serving process, across every warehouse it serves, and
-start full when the process starts. A limit is at least 4 a minute: below it a caller would be told
-to wait longer than its client waits. Each class is unlimited unless set, and so is a caller that
+the cheap budget. A request refused for now with a `503` and `Retry-After` (the costly-request cap
+was full, or the warehouse was briefly unavailable) is given back to its caller's budget, so other
+callers' load does not spend it. The limits bound how fast a caller sends, not how many of its
+requests run at once: a caller within its costly limit can still hold every `max_heavy_requests`
+slot for a while. The budgets are kept per serving process, across every warehouse it serves, and
+start full when the process starts. A limit is at least 4 a minute, since below it even one refused
+request is told to wait longer than its client waits; that floor does not make a low limit safe
+for a client sending many requests at once (below). Each class is unlimited unless set, and so is a caller that
 fails authentication. The first refusal of a caller and class each minute is logged as a warning.
 
-Size them to the traffic of one busy client, not to a request rate. A lift sends one request per
-new object on this head (up to 24 at once) and a fetch that falls back to loose objects one per
-object, all cheap, so a cheap limit near the number of objects a lift uploads in a minute slows
-lifts, and a much lower one can fail them, since each refused request is given up after 30
-seconds of refusals. A clone sends one batch fetch, a costly
-request, per 512 objects, so a costly limit also bounds how fast a large clone can go. A
+Size them to the traffic of one busy client, not to a request rate. All of these are cheap: a lift
+sends one request per new object on this head, up to 24 at once, one per signature it uploads,
+and a few to negotiate what is missing; a fetch that falls back to loose objects sends one per
+object and one per signature; a clone that takes the bundle reads it with one request. Requests
+refused together are each told the same wait and come back together, so under a cheap limit
+well below what a lift sends most of them are refused again, and each one is given up after 30
+seconds of refusals: the lift fails, having sent each refused upload's body again on every try.
+Set the cheap limit well above the requests a busy lift sends in a minute. A clone that fetches
+objects in batches sends one batch fetch, a costly request, per 512 objects, so a costly limit
+also bounds how fast such a clone can go. A
 `POST /v1/resolve` refused for its limit shows pseudonyms instead of display names, as any refusal
 of it does. No defaults are set because nothing has measured these routes yet; the serverless head
 has no per-caller limit, only API Gateway's throttle for all callers together.

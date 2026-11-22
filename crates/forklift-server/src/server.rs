@@ -1359,8 +1359,10 @@ fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
 
 /// The authentication layer: refuse the request from its headers alone, or pass it on with its
 /// [`Principal`] in the request extensions. A caller whose bucket for the route's cost class is
-/// empty ([`RequestLimits`]) is refused here too, with a `429`, before its body is read. See
-/// [`router`].
+/// empty ([`RequestLimits`]) is refused here too, with a `429`, before its body is read. A request
+/// its handler refuses for now, a `503` with `Retry-After` (at the costly-request cap, or for a
+/// drained warehouse), is refunded to that bucket: the protocol promises such a refusal changed
+/// nothing, and the caller sends it again. See [`router`].
 async fn authenticate(State((state, cost)): State<(Arc<AppState>, Cost)>,
                       mut request: Request,
                       next: Next) -> Response {
@@ -1383,8 +1385,15 @@ async fn authenticate(State((state, cost)): State<(Arc<AppState>, Cost)>,
         return refuse_unread(request, throttled_response(throttled.retry_after_secs));
     }
 
-    request.extensions_mut().insert(principal);
-    next.run(request).await
+    request.extensions_mut().insert(principal.clone());
+    let response = next.run(request).await;
+
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE
+        && response.headers().contains_key(axum::http::header::RETRY_AFTER) {
+        state.limits.refund(&principal, cost);
+    }
+
+    response
 }
 
 /// Answer `request` with `refusal` without reading its body first: a body still arriving is read
@@ -6167,8 +6176,10 @@ mod tests {
     /// whose `Retry-After` is one request's refill and with its body still owed, and on no Light
     /// route; a caller whose Light bucket is spent is refused on every Light route and on no Heavy
     /// one; a caller that has spent nothing is refused nowhere. `/healthz` is charged to nobody.
-    /// The `Retry-After` value itself is pinned in `request_limits`' tests: here a spent bucket
-    /// refills while the test runs, so only its bound is asserted.
+    /// Each bucket is spent just before the request it must refuse, so no refill while the test
+    /// runs can admit that request. The `Retry-After` value itself is pinned in `request_limits`'
+    /// tests: a spent bucket refills between the spending and the answer, so only its bound is
+    /// asserted here.
     ///
     /// Reverts: charge every request as Light (or as Heavy) → red on the other class's routes; key
     /// the bucket on the class alone → red on the fresh callers; charge after the handler reads its
@@ -6184,21 +6195,12 @@ mod tests {
                 .into_iter()
                 .chain((0..64).map(|index| (format!("tok-{index}"), format!("fresh-{index}"))))
                 .collect();
-            let state = Arc::new(AppState {
+            Arc::new(AppState {
                 operator_tokens,
                 open: false,
                 limits: RequestLimits::new(Some(6), Some(4)).unwrap(),
                 ..base_state(mode)
-            });
-
-            for _ in 0..4 {
-                state.limits.charge(&Principal::Operator("alice".to_string()), Cost::Heavy).unwrap();
-            }
-            for _ in 0..6 {
-                state.limits.charge(&Principal::Operator("bob".to_string()), Cost::Light).unwrap();
-            }
-
-            state
+            })
         };
         let cases = [
             (state_for(ServeMode::Single(Arc::new(WarehouseHandle::new(single)))), false),
@@ -6207,7 +6209,7 @@ mod tests {
         let mut refused = Vec::new();
 
         for (state, is_multi) in cases {
-            let addr = serve_router(state, 1 << 20).await;
+            let addr = serve_router(Arc::clone(&state), 1 << 20).await;
             let mut fresh = (0..64).map(|index| format!("tok-{index}"));
 
             for (entry, path) in registered_routes(is_multi) {
@@ -6222,10 +6224,12 @@ mod tests {
                 }
 
                 // At most one request's refill: 15 s at 4 a minute, 10 s at 6.
-                let (spent, unspent, most_wait) = match entry.cost {
-                    Cost::Heavy => ("tok-alice", "tok-bob", 15),
-                    Cost::Light => ("tok-bob", "tok-alice", 10),
+                let (spent, spender, unspent, most_wait) = match entry.cost {
+                    Cost::Heavy => ("tok-alice", "alice", "tok-bob", 15),
+                    Cost::Light => ("tok-bob", "bob", "tok-alice", 10),
                 };
+                let spender = Principal::Operator(spender.to_string());
+                while state.limits.charge(&spender, entry.cost).is_ok() {}
 
                 let mut stream = send_head(addr, method, &path, Some(spent), 1 << 19).await;
                 let head = response_head(&mut stream).await;
@@ -6258,6 +6262,39 @@ mod tests {
         let heavy = refused.iter().filter(|(_, cost, _)| *cost == Cost::Heavy).count();
         assert_eq!(heavy, 8, "the four Heavy routes, in each mode: {refused:?}");
         assert!(refused.len() > heavy, "some Light route was asked: {refused:?}");
+    }
+
+    /// A request its handler refuses for now, a `503` with `Retry-After`, is refunded to its
+    /// caller's bucket for the route's class: a drained warehouse answers every request so, and a
+    /// caller with a budget of 4 a minute in each class sends 8 requests of each and is answered
+    /// `503` every time, never `429`.
+    ///
+    /// Revert: drop the refund → the fifth request of each class is a `429` → red.
+    #[tokio::test]
+    async fn a_request_refused_for_now_is_refunded() {
+        let handle = Arc::new(WarehouseHandle::new(scratch_dir("limits-refund")));
+        handle.draining.store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = Arc::new(AppState {
+            operator_tokens: [("tok-alice".to_string(), "alice".to_string())].into_iter().collect(),
+            open: false,
+            limits: RequestLimits::new(Some(4), Some(4)).unwrap(),
+            ..base_state(ServeMode::Single(handle))
+        });
+        let addr = serve_router(state, 1 << 20).await;
+
+        let batch = br#"{"hashes":[]}"#;
+
+        for (method, path, body) in [("POST", "/v1/objects/batch", &batch[..]), ("GET", "/v1/bundles/latest", &[][..])] {
+            for attempt in 1..=8 {
+                use tokio::io::AsyncWriteExt;
+
+                let mut stream = send_head(addr, method, path, Some("tok-alice"), body.len()).await;
+                stream.write_all(body).await.unwrap();
+                let head = response_head(&mut stream).await;
+                assert!(head.starts_with("http/1.1 503 "), "{method} {path}, request {attempt}: {head}");
+                assert!(head.contains("\r\nretry-after: "), "{method} {path}, request {attempt}: {head}");
+            }
+        }
     }
 
     const REMOTE_PROTOCOL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/format/REMOTE_PROTOCOL.md");

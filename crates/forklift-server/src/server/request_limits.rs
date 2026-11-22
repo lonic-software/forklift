@@ -2,6 +2,9 @@
 //! spending its budget never spends another's, and costly requests never spend the budget of cheap
 //! ones. The authentication layer ([`super::authenticate`]) charges each request once its
 //! principal is known and before its body is read; an empty bucket is a `429` with `Retry-After`.
+//! A request its handler then refuses for now (a `503` with `Retry-After`, sent before anything
+//! changed) is refunded, so a caller's budget is spent by what it sent and not by other callers'
+//! load. The limits bound how fast a caller sends, not how many of its requests run at once.
 //!
 //! A class with no limit configured is never charged. The buckets are kept per serving process,
 //! across every warehouse it serves: a principal is the server's identity for its caller, not one
@@ -18,8 +21,10 @@ use super::Cost;
 /// The fewest requests per minute a limit may allow. An empty bucket's caller is told to wait the
 /// time one request takes to refill (60 s over the limit), and the client gives up on a run of
 /// `429`s after 30 s (`FETCH_THROTTLE_PATIENCE` in `forklift-core`'s `remote_utils`, private
-/// there, so this is stated, not asserted). At 4 a minute the wait is 15 s, half that patience;
-/// a lower limit would fail a caller's first throttled request outright.
+/// there, so this is stated, not asserted). At 4 a minute the wait is 15 s, half that patience,
+/// so one refused request can still be admitted; a lower limit would fail it outright. It is only
+/// that floor: the client sends many requests at once, each refused one is told the same wait,
+/// and a limit far under what a caller sends fails its requests at any value of this.
 pub(super) const MIN_REQUESTS_PER_MINUTE: u32 = 4;
 
 /// How many buckets are held before full ones are let go. A full bucket admits exactly what a
@@ -138,6 +143,9 @@ impl RequestLimits {
 
         let bucket = buckets.by_caller.entry(key)
             .or_insert_with(|| Bucket { tokens: f64::from(limit), at: now, logged: None });
+        // `now` was read before the lock, so a later charge may hold an earlier time: it refills
+        // nothing and never moves the bucket back, or the interval between would be refilled twice.
+        let now = now.max(bucket.at);
         bucket.tokens = refilled(bucket, limit, now);
         bucket.at = now;
 
@@ -156,6 +164,17 @@ impl RequestLimits {
         }
 
         Err(Throttled { retry_after_secs, log })
+    }
+
+    /// Give back the request [`Self::charge`] took from `principal`'s bucket of class `cost`, for a
+    /// request refused for now before it changed anything. A bucket is never refunded past full.
+    pub(super) fn refund(&self, principal: &Principal, cost: Cost) {
+        let Some(limit) = self.limit_of(cost) else { return };
+        let mut buckets = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(bucket) = buckets.by_caller.get_mut(&(Caller::of(principal), cost)) {
+            bucket.tokens = (bucket.tokens + 1.0).min(f64::from(limit));
+        }
     }
 }
 
@@ -282,5 +301,45 @@ mod tests {
         let held = limits.buckets.lock().unwrap().by_caller.len();
         assert_eq!(held, 2, "the spender (refilled one, short of four) and the newcomer");
         assert_eq!(admitted(&limits, &spender, Cost::Light, 4, later), 1, "the spender kept its spent bucket");
+    }
+
+    /// A charge holding an earlier time than the bucket's (it read the clock before another took
+    /// the lock) refills nothing and leaves the bucket's time where it was.
+    ///
+    /// Revert: drop the `now.max(bucket.at)` → the stale charge moves the bucket back 5 s, which
+    /// the next charge refills again → 13 admitted, not 8 → red.
+    #[test]
+    fn a_stale_charge_refills_nothing_twice() {
+        let limits = RequestLimits::new(Some(60), None).unwrap();
+        let start = Instant::now();
+        let alice = operator("alice");
+
+        assert_eq!(admitted(&limits, &alice, Cost::Light, 60, start), 60);
+        assert_eq!(admitted(&limits, &alice, Cost::Light, 1, start + Duration::from_secs(10)), 1);
+        assert_eq!(admitted(&limits, &alice, Cost::Light, 1, start + Duration::from_secs(5)), 1);
+        assert_eq!(
+            admitted(&limits, &alice, Cost::Light, 60, start + Duration::from_secs(10)), 8,
+            "ten seconds at one a second, less the two already admitted"
+        );
+    }
+
+    /// A refund gives back one request, and never fills a bucket past its limit.
+    ///
+    /// Reverts: refund nothing → red on the first; refund without the cap → red on the second.
+    #[test]
+    fn a_refund_gives_back_one_request_up_to_full() {
+        let limits = RequestLimits::new(Some(6), Some(6)).unwrap();
+        let start = Instant::now();
+        let alice = operator("alice");
+
+        assert_eq!(admitted(&limits, &alice, Cost::Heavy, 6, start), 6);
+        limits.refund(&alice, Cost::Heavy);
+        assert_eq!(admitted(&limits, &alice, Cost::Heavy, 6, start), 1, "the refunded request");
+
+        let bob = operator("bob");
+        assert_eq!(admitted(&limits, &bob, Cost::Heavy, 1, start), 1);
+        limits.refund(&bob, Cost::Heavy);
+        limits.refund(&bob, Cost::Heavy);
+        assert_eq!(admitted(&limits, &bob, Cost::Heavy, 10, start), 6, "full is the limit, not more");
     }
 }
