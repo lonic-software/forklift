@@ -506,8 +506,8 @@ host if lifts or fetches queue; each refusal is logged as a warning. The cap cou
 not callers or warehouses, so a burst on one warehouse can refuse requests on another: per-caller
 budgets and a cap on reads are not part of it. Background bundle rebuilds (`rebuild_after_lifts`)
 are bounded apart from that cap: a serving process runs one build at a time, across every
-warehouse it serves, so a rebuild never refuses a request, and the most costly work running at once
-is the cap plus one build. A rebuild that finds a build running for another warehouse waits its
+warehouse it serves, so a rebuild never refuses a request, and the most costly requests and builds
+running at once are the cap plus one build. A rebuild that finds a build running for another warehouse waits its
 turn in arrival order, holding nothing of the warehouse; once it runs, a redaction run that must
 drain the warehouse waits for it to end. Meanwhile clients get the bundle already built, or none if
 a redaction took it down, and fetch the rest object by object. With many warehouses rebuilding,

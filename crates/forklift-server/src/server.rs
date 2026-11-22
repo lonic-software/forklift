@@ -12228,8 +12228,8 @@ mod tests {
 
     /// The cost class each route declares matches its handler: a route is `Heavy` exactly when its
     /// handler calls `acquire_heavy`, and nothing but a Heavy route's handler calls it. Each of them
-    /// also hands a binding named `permit` to `.spawn`, the use [`HeavyPermit`] has for a request's
-    /// work, so that work runs with the permit inside. The scan reads server.rs alone: `acquire_heavy` is private
+    /// also hands a binding named `permit` to `.spawn`, the one use [`HeavyPermit`] has, so its
+    /// work runs with the permit inside. The scan reads server.rs alone: `acquire_heavy` is private
     /// to it, so no other file can call it. It checks that the calls are there, not where they sit
     /// or that the spawned permit is the one acquired; the capacity, drain and hang-up tests do.
     ///
