@@ -71,7 +71,9 @@ pub fn write_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String
 /// ordinary write, does not fail the run. A write can land and still return an error, when its
 /// folder sync fails, so a failed write is read back, and the error is a sentence naming the
 /// record that says only what that read shows: the record holds `roots` but may not be durable
-/// yet, it could not be written, or whether it was is not known.
+/// yet, it could not be written, or whether it was is not known. Only the last two say the next
+/// run writes it again: a record that already reads as `roots` is one the next run leaves alone,
+/// and the taint its failed folder sync recorded is what keeps the warehouse gated until heal.
 pub fn update_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String> {
     if read_mirror_roots().ok().as_ref() == Some(roots) {
         return Ok(());
@@ -82,12 +84,16 @@ pub fn update_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), Strin
         Ok(now) if now == *roots => format!(
             "The mirror record holds what this run wrote, but it may not be on disk durably yet ({}).", failed
         ),
-        Ok(_) => format!("The mirror record could not be written: {}", failed),
+        Ok(_) => format!("The mirror record could not be written: {} {}", failed, WRITTEN_AGAIN),
         Err(unread) => format!(
-            "Whether the mirror record was written is not known: {} It could not be read back: {}", failed, unread
+            "Whether the mirror record was written is not known: {} It could not be read back: {} {}",
+            failed, unread, WRITTEN_AGAIN
         ),
     })
 }
+
+/// What a failed write of the record that did not leave it as written says of the next run.
+const WRITTEN_AGAIN: &str = "The next \"forklift git mirror\" writes it again.";
 
 /// Put the record back to `before`, what it held before a mirror step that then failed with
 /// `error`, and return `error` with what happened to the record appended

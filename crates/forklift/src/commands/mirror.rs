@@ -127,7 +127,7 @@ pub async fn handle_command() -> Result<(), String> {
         }
     }
     lines.extend(report.tags.failure_lines());
-    lines.extend(record_failure.map(|failed| format!("{} The next \"forklift git mirror\" tries it again.", failed)));
+    lines.extend(record_failure);
     let message = lines.join("\n");
 
     Err(CoreError::refusal_with_details(
