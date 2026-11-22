@@ -11981,10 +11981,10 @@ mod tests {
     }
 
     /// With one permit, a lift past `rebuild_after_lifts` asks for its rebuild while it still holds
-    /// that permit itself; the rebuild runs once the lift's permit is given back.
-    ///
-    /// Revert: take a permit only when one is free → the lift's own permit is never free to it →
-    /// the build never runs → red.
+    /// that permit itself; the rebuild runs once the lift's permit is given back. End to end only:
+    /// the redaction round that follows the lift asks again, and can find the permit free, so a
+    /// rebuild that only took a free permit can pass here too. The waiting that makes it certain
+    /// is pinned by `a_rebuild_at_capacity_waits_its_turn_without_holding_the_warehouse`.
     #[tokio::test]
     async fn a_lift_with_the_only_permit_still_gets_its_rebuild() {
         let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
