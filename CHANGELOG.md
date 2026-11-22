@@ -822,10 +822,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 ### Fixed
 
 - When a write fails in a way that records a durability taint, the command now still puts back
-  what it had already changed. This covers three cases:
+  what it had already changed. This covers four cases:
   - a trust install whose office write failed puts back the previous trust anchor;
   - a metadata pallet write whose ref write failed puts its copy back as it was;
-  - a pallet removal that failed puts back the undo journal and the tombstone list.
+  - a pallet removal that failed puts back the undo journal and the tombstone list;
+  - an `undo` whose put-back of a pallet failed moves the current pallet back to where the undone
+    operation left it.
 
   Before, the taint left by the failure refused each of these put-backs, and the trust anchor or
   the copy was left at the new value beside an unchanged office or ref. The taint still stands
@@ -840,6 +842,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   was put back. When a put-back itself fails, it says what reading the record back shows: that it
   holds what it held before but may not be durable yet, that it could not be put back, or that
   whether it was is not known.
+
+  An `undo` of a `stack`, `consolidate` or `pick` whose put-back of a pallet failed in this way
+  could not be retried, even after `forklift heal`: the current pallet stayed put back while the
+  bay recorded the undone operation, so every retry refused with "has moved since that operation".
+  Now the current pallet is moved back where the operation left it, and the retry runs once
+  `forklift heal` has cleared the taint. In a served or sparse warehouse that move still reads the
+  pallet's history, and a read the taint refuses leaves the undo as before. If a redaction was
+  recorded or applied, or the fetch scope changed, while the undo ran, the current pallet is not
+  moved back, and the error says a retried undo will not pass its check.
 - `heal` no longer refuses forever over a durability taint that records a lost metadata ref copy
   (`.forklift/meta-copy/<name>`), as a crash can leave one after a metadata pallet's first write.
   When the ref beside it is a file holding a parcel hash, that part of the taint is resolved, and
