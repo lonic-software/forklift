@@ -219,7 +219,8 @@ pub struct Repair {
     /// The rebuilds whose ref (or a meta ref's copy) landed but is not durable, each said in a
     /// sentence: heal synced its folder again, and neither that sync nor a taint recording it
     /// held. A later pass reads such a ref as undamaged, so the pass that wrote it is the only one
-    /// that can say so, and heal ends the run with it.
+    /// that can say so, and heal ends the run with it. A later heal syncs it again, as every
+    /// folder of a ref ([`pallet_utils::sync_ref_folders`]), before anything else.
     pub undurable: Vec<String>,
 }
 
@@ -1065,8 +1066,8 @@ fn synced_again(pallet: &str, error: &str) -> String {
 fn undurable(pallet: &str, head: &str, why: &str) -> String {
     format!(
         "The ref of pallet \"{}\" was rebuilt at {}, but {}. Heal synced its folder again, and neither \
-        that sync nor a taint recording it held, so a crash can still lose the rebuild; a later heal reads \
-        the ref as undamaged and does not sync it again.",
+        that sync nor a taint recording it held, so a crash can still lose the rebuild. Every heal syncs the \
+        folder of every ref first, so once what stopped the sync is fixed, running \"forklift heal\" again syncs it again.",
         pallet, head, why.trim_end_matches('.')
     )
 }
@@ -1084,8 +1085,8 @@ fn landed_despite(pallet: &str, head: &str, error: &RefUpdateError) -> String {
 fn undurable_if_landed(pallet: &str, head: &str, why: &str) -> String {
     format!(
         "The ref of pallet \"{}\" may have been rebuilt at {}, and if it was, {}. Heal synced its folder again, and \
-        neither that sync nor a taint recording it held, so a crash can still lose the rebuild; a later heal reads \
-        the ref as undamaged and does not sync it again.",
+        neither that sync nor a taint recording it held, so a crash can still lose the rebuild. Every heal syncs the \
+        folder of every ref first, so once what stopped the sync is fixed, running \"forklift heal\" again syncs it again.",
         pallet, head, why.trim_end_matches('.')
     )
 }
@@ -2153,14 +2154,15 @@ fn copy_write_failed(state: &MetaState, head: &str, pass: Pass, error: &pallet_u
     match (again, read) {
         (Err(why), ReadBack::Landed) => report.undurable.push(format!(
             "The copy of pallet \"{}\"'s ref was set to the ref's head {}, but {}. Heal synced its folder again, and \
-            neither that sync nor a taint recording it held, so a crash can still lose the copy's write; a later heal \
-            reads the copy as matching its ref and does not sync it again.",
+            neither that sync nor a taint recording it held, so a crash can still lose the copy's write. Every heal \
+            syncs the folder of every ref and copy first, so once what stopped the sync is fixed, running \"forklift heal\" again \
+            syncs it again.",
             wire, head, why.trim_end_matches('.')
         )),
         (Err(why), ReadBack::Unread(_)) => report.undurable.push(format!(
             "The copy of pallet \"{}\"'s ref may have been set to the ref's head {}, and if it was, {}. Heal synced its \
             folder again, and neither that sync nor a taint recording it held, so a crash can still lose the copy's \
-            write; a later heal reads the copy as matching its ref and does not sync it again.",
+            write. Every heal syncs the folder of every ref and copy first, so once what stopped the sync is fixed, running \"forklift heal\" again syncs it again.",
             wire, head, why.trim_end_matches('.')
         )),
         (Ok(again), read @ (ReadBack::Landed | ReadBack::Unread(_))) => {
@@ -2932,8 +2934,8 @@ mod tests {
         assert_eq!(before.undurable, vec![format!(
             "The ref of pallet \"main\" was rebuilt at {}, but its ref is not durable: injected directory-sync failure for \"{}\" \
             (additionally, while recording a durability taint for the affected object(s): injected taint-record failure). Heal synced \
-            its folder again, and neither that sync nor a taint recording it held, so a crash can still lose the rebuild; a later \
-            heal reads the ref as undamaged and does not sync it again.",
+            its folder again, and neither that sync nor a taint recording it held, so a crash can still lose the rebuild. Every \
+            heal syncs the folder of every ref first, so once what stopped the sync is fixed, running \"forklift heal\" again syncs it again.",
             head, folder.to_string_lossy()
         )]);
         assert!(after.rebuilt.is_empty() && after.refused.is_empty() && after.undurable.is_empty(), "{:?}", after);
@@ -3173,8 +3175,8 @@ mod tests {
         );
         let undurable_tail = format!(
             "its copy is not durable: {}. Heal synced its folder again, and neither that sync nor a taint recording it \
-            held, so a crash can still lose the copy's write; a later heal reads the copy as matching its ref and does not \
-            sync it again.",
+            held, so a crash can still lose the copy's write. Every heal syncs the folder of every ref and copy first, so once what stopped the sync is fixed, \
+            running \"forklift heal\" again syncs it again.",
             unrecorded
         );
 

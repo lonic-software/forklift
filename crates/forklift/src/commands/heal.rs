@@ -134,6 +134,15 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
         false => Some(StoreAccessLock::try_exclusive()?),
     };
 
+    // First of all: a ref an earlier heal rebuilt with its folder left unsynced, and no taint
+    // recording that, reads as undamaged, and nothing on disk says which it was. So every run
+    // syncs the folder of every ref and copy before it reads or writes anything else.
+    pallet_utils::sync_ref_folders().map_err(|error| format!(
+        "Heal syncs the folders of the pallet refs first, and one could not be synced: {}. Heal went no further, and \
+        nothing was changed: once that folder can be opened and synced, run \"forklift heal\" again.",
+        error.trim_end_matches('.')
+    ))?;
+
     // Before everything else: every later step reads the configuration, and a damaged file would
     // stop it or, worse, be read around. Nothing here is written yet, so a refusal stops the run
     // with nothing changed. A file that is not damaged is left to those readers.
