@@ -2785,7 +2785,12 @@ carries no report, so its `message` says, after the failure, what the run repair
 every other command refuses first, precisely so nothing durable is ever recorded on top of
 unproven state.
 
-Every `heal` run first rebuilds each lost, unparseable or damaged pack index whose data file is
+Before anything else, every `heal` run syncs the folder of every pallet ref, metadata ref and
+metadata ref copy, so a ref an earlier `heal` rebuilt with its folder sync failing, and no taint
+recording that, is made durable by running `heal` again. A folder that cannot be synced stops the
+run with nothing changed, naming the folder; with fsync turned off this sync does nothing.
+
+Every `heal` run also rebuilds each lost, unparseable or damaged pack index whose data file is
 sound, from that data file: it checks the file's records parse end to end, decodes each object
 (a delta's base from the same file first, then the store), and publishes the index only when it
 re-derives the pack's name. A replaced index is kept beside it as `<name>.idx.damaged-<time>`.

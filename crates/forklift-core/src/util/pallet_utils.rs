@@ -166,6 +166,72 @@ pub(crate) fn get_meta_copy_path(name: &str) -> PathBuf {
     path
 }
 
+/// Sync every folder that holds a pallet ref or a meta ref's copy: the user and meta ref trees and
+/// the copies' tree, each tree's root with the folders above it, and every folder inside it. A ref
+/// write whose folder sync failed, with no taint recording that, is visible and not durable, and
+/// nothing on disk says which ref it was; heal runs this first, so a later heal syncs it.
+///
+/// No link is followed: a tree whose root is a link, and a link inside one, are left alone. A tree
+/// that is not there has nothing to sync.
+///
+/// # Returns
+/// * `Ok(())`     - Every folder synced (or syncs are off, see [`file_utils::fsync_enabled`]).
+/// * `Err(error)` - The first folder that could not be synced or listed, with the error. Every
+///   folder is attempted all the same.
+pub fn sync_ref_folders() -> Result<(), String> {
+    let trees = [
+        get_namespace_folder(PalletNamespace::User),
+        get_namespace_folder(PalletNamespace::Meta),
+        forklift_root().join(FOLDER_NAME_META_COPY_ROOT),
+    ];
+    let mut first: Option<String> = None;
+    let listing = |folder: &Path, error: std::io::Error| format!("Error while listing directory \"{}\": {}", folder.to_string_lossy(), error);
+
+    for tree in trees {
+        match tree.symlink_metadata() {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                first.get_or_insert(format!("Error while reading \"{}\": {}", tree.to_string_lossy(), error));
+                continue;
+            }
+        }
+        if let Err(error) = file_utils::sync_dir(&tree) {
+            first.get_or_insert(error);
+        }
+
+        let mut pending = vec![tree];
+        while let Some(folder) = pending.pop() {
+            let entries = match std::fs::read_dir(&folder) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    first.get_or_insert(listing(&folder, error));
+                    continue;
+                }
+            };
+            for entry in entries {
+                // A directory entry's type is the entry's own, never a link's target.
+                let folder_in = entry.and_then(|entry| entry.file_type().map(|kind| (kind.is_dir(), entry.path())));
+                match folder_in {
+                    Ok((true, inner)) => {
+                        if let Err(error) = file_utils::sync_dir_alone(&inner) {
+                            first.get_or_insert(error);
+                        }
+                        pending.push(inner);
+                    }
+                    Ok((false, _)) => {}
+                    Err(error) => {
+                        first.get_or_insert(listing(&folder, error));
+                    }
+                }
+            }
+        }
+    }
+
+    first.map_or(Ok(()), Err)
+}
+
 /// What stands at a meta ref's copy path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaCopyState {
@@ -2919,6 +2985,53 @@ pub(crate) mod tests {
         if let Some(run) = BEFORE_HOLD.with(|slot| slot.borrow_mut().take()) {
             run();
         }
+    }
+
+    // Every folder of a ref or of a meta ref's copy is synced: each tree's root and the folders
+    // nested in it, and nothing a link points to. A folder that fails is named, and the folders
+    // after it are synced all the same. Mutations: skip the nested folders → "a/b" unsynced, red;
+    // skip the copies' tree → red; follow a link to a folder → the linked folder synced, red;
+    // stop at the first failure → the copies' folders unsynced, red.
+    // Unix only: a folder sync is a no-op elsewhere, so nothing is recorded.
+    #[cfg(unix)]
+    #[test]
+    fn every_folder_of_a_ref_is_synced() {
+        use crate::util::file_utils::{sync_dir_attempts, SyncDirFaultGuard};
+
+        let (root, _scope) = scratch("sync-ref-folders");
+        let user = get_pallet_ref_path(PalletNamespace::User, "a/b/c");
+        let meta = get_pallet_ref_path(PalletNamespace::Meta, "tags");
+        let copy = get_meta_copy_path("x/tags");
+        for path in [&user, &meta, &copy] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"ref").unwrap();
+        }
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        let link = user.parent().unwrap().join("linked");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let pallets = get_namespace_folder(PalletNamespace::User);
+        let copies = forklift_root().join(FOLDER_NAME_META_COPY_ROOT);
+        let folders = [
+            pallets.clone(), pallets.join("a"), pallets.join("a").join("b"),
+            get_namespace_folder(PalletNamespace::Meta), copies.clone(), copies.join("x"),
+        ];
+        {
+            let _syncs = SyncDirFaultGuard::recording();
+            assert_eq!(sync_ref_folders(), Ok(()));
+            let attempted = sync_dir_attempts();
+            for folder in &folders {
+                assert!(attempted.contains(folder), "{:?} unsynced: {:?}", folder, attempted);
+            }
+            assert!(!attempted.iter().any(|folder| folder.starts_with(&outside) || folder.starts_with(&link)), "{:?}", attempted);
+        }
+
+        let failing = pallets.join("a");
+        let _fault = SyncDirFaultGuard::failing_exactly(&failing);
+        assert_eq!(sync_ref_folders(), Err(format!("injected directory-sync failure for \"{}\"", failing.to_string_lossy())));
+        let attempted = sync_dir_attempts();
+        assert!(attempted.contains(&copies.join("x")), "the folders after the failure are synced: {:?}", attempted);
     }
 
     /// A copy that can be neither written nor removed fails the write loudly, after the primary

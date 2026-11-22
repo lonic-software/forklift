@@ -48,7 +48,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   recovery said nothing of it and the pass after read the copy as in step. Where no taint records
   the folder it left unsynced, `heal` syncs that folder again, also for a copy it cannot read
   back, and says what that sync reported; when it does not hold either, `heal` says in place of
-  the note that the copy may not be durable, and goes no further. The office's ref is rebuilt first, at a
+  the note that the copy may not be durable, and goes no further. Every `heal` now first syncs the
+  folder of every pallet ref, metadata ref and copy, so a rebuild or copy write left that way is
+  made durable by running `heal` again, as the note now says; before, the note said a later `heal`
+  would not sync it again. A folder that cannot be synced stops `heal` before it changes anything,
+  naming the folder. The office's ref is rebuilt first, at a
   head that verifies against the anchor of the trust file or of its copy, and a trust file lost
   beside it is then restored from its copy. The redactions' own ref (`@redactions`) is rebuilt
   next, ahead of every other metadata ref, which is checked against it; beside a damaged office
