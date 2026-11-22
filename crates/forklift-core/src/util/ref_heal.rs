@@ -1385,7 +1385,8 @@ const FOLDER_NAME_REMOVED_REFS: &str = "removed-refs";
 /// `forklift heal --remove-ref <pallet>`: remove damaged `pallet`'s unreadable ref, keeping its
 /// bytes in a file of their own. Allowed only when no checkout stands on the pallet, nothing names
 /// a head the store holds for it (its own bytes included: bytes naming a parcel the store decided
-/// is gone are kept, so they allow it), and every checkout's state could be read.
+/// is gone are kept, so they allow it), every checkout's state could be read, and no durability
+/// taint stands.
 pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Removed, String> {
     let damaged = admit_remove(pallet, notes)?;
     let RefDamage::Unreadable(bytes) = &damaged.damage else {

@@ -2676,7 +2676,7 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
 // where something names a head (not named, under a taint). What heal does next is asserted right
 // after the refusal, with nothing run between, so no earlier step can have produced it.
 #[test]
-fn remove_ref_under_a_standing_taint_names_the_heal_that_resolves_it() {
+fn remove_ref_under_a_standing_taint_names_heal_first() {
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Taint { Clean, Recorded, Torn }
     for named in [true, false] {
