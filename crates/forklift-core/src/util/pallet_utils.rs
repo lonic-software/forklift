@@ -1699,48 +1699,56 @@ pub(crate) fn put_back_pallet_head_in(
 }
 
 /// What a compensating write of user pallet `name` back to the head it holds now is judged
-/// against ([`compensating_head_write`]): that head, the fetch scope, and the records the ordinary
-/// write's closure walk would tolerate an absence by, all read in one hold of the ref lock, which
-/// every writer of the scope and the sealed-by-hash record commits under.
+/// against ([`compensating_head_write`]): the pallet, that head, the fetch scope, and the records
+/// the ordinary write's closure walk would tolerate an absence by, all read in one hold of the ref
+/// lock, which every writer of the scope and the sealed-by-hash record commits under. It borrows
+/// the command's shared store-access hold, so the hold outlives every write judged by it, and
+/// objects the basis vouches for are not deleted meanwhile.
 ///
 /// A head a user ref holds is one the ordinary write already trusts, as complete at the scope and
 /// against the records standing then (see
 /// [`audit_utils::verify_ref_head_closure`](crate::util::audit_utils::verify_ref_head_closure)), so
 /// the basis stands in for that write's walk of it. The tolerated records are read as
 /// [`verify_new_head`] reads them, so they hold everything any one walk could have leaned on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PutBackBasis {
+pub(crate) struct PutBackBasis<'a> {
+    pallet: String,
     head: String,
     scope: PathScope,
     tolerated: Tolerated,
+    _store_access: &'a crate::util::lock_utils::StoreAccessLock,
 }
 
-impl PutBackBasis {
-    /// Read the basis of user pallet `name` as it stands now.
+impl std::fmt::Debug for PutBackBasis<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PutBackBasis").field("pallet", &self.pallet).field("head", &self.head)
+            .field("scope", &self.scope).field("tolerated", &self.tolerated).finish_non_exhaustive()
+    }
+}
+
+impl<'a> PutBackBasis<'a> {
+    /// Read the basis of user pallet `name` as it stands now, under `store_access`, the command's
+    /// shared store-access hold.
     ///
     /// # Returns
     /// * `Err(String)` - The ref holds no head, or it, the fetch scope, the warehouse's mode or a
     ///                   record could not be read, or the ref lock could not be taken.
     #[cfg_attr(not(test), expect(dead_code, reason = "undo's un-restore reads it (FORK-574)"))]
-    pub(crate) fn read(name: &str) -> Result<PutBackBasis, String> {
+    pub(crate) fn read(name: &str, store_access: &'a crate::util::lock_utils::StoreAccessLock) -> Result<PutBackBasis<'a>, String> {
         let _lock = crate::util::lock_utils::RefLock::acquire()?;
 
         let head = get_pallet_head_in(PalletNamespace::User, name)?
             .ok_or_else(|| format!("Pallet \"{}\" holds no head to put back.", name))?;
         let scope = crate::util::scope_utils::read_fetch_scope()?;
-        let tolerated = match crate::util::scope_utils::content_may_be_absent()? {
-            true => crate::util::sealed_utils::read_tolerated()?,
-            false => crate::util::sealed_utils::read_removed()?,
-        };
+        let tolerated = crate::util::sealed_utils::read_tolerated_for(crate::util::scope_utils::content_may_be_absent()?)?;
 
-        Ok(PutBackBasis { head, scope, tolerated })
+        Ok(PutBackBasis { pallet: name.to_string(), head, scope, tolerated, _store_access: store_access })
     }
 }
 
 /// Move user pallet `name` from `expected` back to `new`, a head it held when `basis` was read,
 /// after a later step of the same command failed: a compensating write. It is the ordinary
 /// checked write ([`update_pallet_head_in`]) with two differences, taken only when `basis` was
-/// read and records `new` as its head. The basis stands in for the walk of `new`'s closure, and
+/// read for `name` and records `new` as its head. The basis stands in for the walk of `new`'s closure, and
 /// the ref file is written as a compensating write
 /// ([`file_utils::write_file_compensating`]), so a taint the failed step left standing does not
 /// refuse it.
@@ -1749,12 +1757,11 @@ impl PutBackBasis {
 /// ledger record included. The hold re-reads the fetch scope and the records the basis tolerated,
 /// and when the scope changed or an entry left a record, the write is the ordinary one in full:
 /// it walks `new` and writes as any other write does, and while a taint stands it is refused.
-/// So is a write whose basis could not be read or names another head.
+/// So is a write whose basis could not be read or was read for another pallet or head.
 ///
-/// The basis and the write must be made under one command's shared store-access hold, released by
-/// neither in between, since that is what keeps the objects the basis vouched for from being
-/// deleted meanwhile; nothing here can check it. The basis is read while the ref holds `new`,
-/// before the write that may fail moves it.
+/// The basis borrows the store-access hold it was read under, so that hold stands through this
+/// write. The basis is read while the ref holds `new`, before the write that may fail moves it;
+/// nothing here can check that.
 ///
 /// # Returns
 /// The returns of [`update_pallet_head_in`].
@@ -1762,13 +1769,15 @@ impl PutBackBasis {
 pub(crate) fn compensating_head_write(name: &str,
                                       expected: &str,
                                       new: &str,
-                                      basis: &Result<PutBackBasis, String>) -> Result<(), RefUpdateError> {
+                                      basis: &Result<PutBackBasis<'_>, String>) -> Result<(), RefUpdateError> {
     let source = match basis {
-        Ok(basis) if basis.head == new => ClosureSource::PutBack(basis),
+        Ok(basis) if basis.pallet == name && basis.head == new => ClosureSource::PutBack(basis),
         _ => ClosureSource::Verify,
     };
 
-    update_pallet_head_checked(PalletNamespace::User, name, Some(expected), new, &RefPreconditions::NONE, source, None, None, None, None, None, WriteOrder::Forward)
+    // A put-back moves the ref back, as `put_back_pallet_head_in` does; only a meta ref reads the
+    // order, so the user write is the same either way.
+    update_pallet_head_checked(PalletNamespace::User, name, Some(expected), new, &RefPreconditions::NONE, source, None, None, None, None, None, WriteOrder::Backward)
 }
 
 /// Where a head write's judgement of the new head's closure comes from.
@@ -1780,7 +1789,7 @@ enum ClosureSource<'a> {
     Verified(&'a VerifiedClosure),
     /// A compensating write's basis, which records the head ([`compensating_head_write`]): no
     /// walk, and the ref file is written as a compensating write.
-    PutBack(&'a PutBackBasis),
+    PutBack(&'a PutBackBasis<'a>),
 }
 
 /// Which way a head write moves its ref, which orders a meta ref's copy write against the ref
@@ -2348,10 +2357,7 @@ pub(crate) fn verify_new_head(name: &str,
         &new[..new.len().min(12)], missing.trim_end_matches('.'), error
     ));
 
-    let tolerated = match partial {
-        true => crate::util::sealed_utils::read_tolerated().map_err(unreadable)?,
-        false => crate::util::sealed_utils::read_removed().map_err(unreadable)?,
-    };
+    let tolerated = crate::util::sealed_utils::read_tolerated_for(partial).map_err(unreadable)?;
 
     if tolerated.is_empty() {
         return Err(incomplete(missing));
@@ -3312,6 +3318,8 @@ pub(crate) mod tests {
         BasisAtOtherHead,
         /// The basis could not be read.
         BasisUnread,
+        /// The basis is read for another pallet holding the head written.
+        BasisForOtherPallet,
         /// The unavailable record turns unreadable between the closure step and the hold.
         HoldReadFails,
         /// A redaction is recorded before the write.
@@ -3335,8 +3343,9 @@ pub(crate) mod tests {
     // hold's scope compare dropped → "scope widened, tainted" lands, red; its dropped-entry test
     // dropped → "unavailable dropped, tainted" lands, red; the drift branch keeps the put-back
     // source → "dropped, reached elsewhere, tainted" lands, red; the basis.head guard dropped →
-    // "basis at another head, tainted" lands, red; the hold's unreadable record read as unmoved →
-    // "hold read fails" lands, red.
+    // "basis at another head, tainted" lands, red; the basis.pallet guard dropped → "basis for
+    // another pallet, tainted" lands, red; the hold's unreadable record read as unmoved → "hold
+    // read fails" lands, red.
     #[test]
     fn a_compensating_head_write_lands_under_a_taint_only_on_a_basis_that_still_judges_its_head() {
         use crate::util::sealed_utils::{append, SealOp};
@@ -3355,6 +3364,7 @@ pub(crate) mod tests {
             ("3 dropped, reached elsewhere", BOTH, Around::DroppedReachedElsewhere, Then::Lands, Then::Failed),
             ("4 basis at another head", BOTH, Around::BasisAtOtherHead, Then::Lands, Then::Incomplete),
             ("4 basis unread", BOTH, Around::BasisUnread, Then::Lands, Then::Incomplete),
+            ("4 basis for another pallet", BOTH, Around::BasisForOtherPallet, Then::Lands, Then::Failed),
             ("5 hold read fails", BOTH, Around::HoldReadFails, Then::Refused, Then::Refused),
             ("6 redacted", SPARSE, Around::Redacted, Then::Lands, Then::Failed),
             ("7 not at expected", BOTH, Around::NotAtExpected, Then::Moved, Then::Moved),
@@ -3370,6 +3380,7 @@ pub(crate) mod tests {
                     let label = format!("{}, {:?}{}", label, mode, if tainted { ", tainted" } else { "" });
                     let (_root, _scope) = scratch(&format!("compensating-{}", label.replace([' ', ','], "-")));
                     crate::util::warehouse_utils::mark_for_test(mode);
+                    let store_access = crate::util::lock_utils::StoreAccessLock::shared(|| {}).unwrap();
                     if mode == Sparse {
                         crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
                         // Only a partial warehouse holds anything by hash alone.
@@ -3390,22 +3401,22 @@ pub(crate) mod tests {
                             (two.clone(), one.clone())
                         }
                     };
-                    if around == Around::DroppedReachedElsewhere {
+                    if matches!(around, Around::DroppedReachedElsewhere | Around::BasisForOtherPallet) {
                         update_pallet_head("other", None, &two, &RefPreconditions::NONE).unwrap();
                     }
-                    let mut basis = PutBackBasis::read("main");
+                    let mut basis = PutBackBasis::read(if around == Around::BasisForOtherPallet { "other" } else { "main" }, &store_access);
                     assert_eq!(basis.as_ref().map(|basis| basis.head.clone()), Ok(from.clone()), "{}", label);
                     update_pallet_head("main", Some(&from), &to, &RefPreconditions::NONE).unwrap();
 
                     // Made before a taint stands, which refuses writing the records.
                     let mut expected = to.clone();
                     match around {
-                        Around::Kept | Around::ReversesAdvance => {}
+                        Around::Kept | Around::ReversesAdvance | Around::BasisForOtherPallet => {}
                         Around::UnavailableAdded => crate::util::unavailable::record([(hash('v'), "notice 2".to_string())]).unwrap(),
                         Around::ScopeWidened => crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src", "web"])).unwrap(),
                         Around::UnavailableDropped | Around::DroppedReachedElsewhere => assert_eq!(crate::util::unavailable::drop_present().unwrap(), 1),
                         Around::SealedDropped => { append(&[(SealOp::Remove, hash('s').as_str())]).unwrap(); }
-                        Around::BasisAtOtherHead => basis = PutBackBasis::read("main"),
+                        Around::BasisAtOtherHead => basis = PutBackBasis::read("main", &store_access),
                         Around::BasisUnread => basis = Err("the basis could not be read".to_string()),
                         Around::HoldReadFails => set_before_hold(|| {
                             std::fs::write(crate::globals::forklift_root().join("unavailable"), b"not a record").unwrap();
@@ -3439,7 +3450,10 @@ pub(crate) mod tests {
                                 Then::Failed => assert!(matches!(&written, Err(error @ RefUpdateError::Failed(_)) if names_taint(error)),
                                     "{}: refused as failed, naming the taint: {:?}", label, written),
                                 Then::Moved => assert!(matches!(written, Err(RefUpdateError::Moved(_))), "{}: {:?}", label, written),
-                                _ => assert!(written.is_err(), "{}: refused", label),
+                                // The hold's own read of the record refuses, with that read's error
+                                // unwrapped, not an error from another reader of the file.
+                                _ => assert_eq!(written, Err(RefUpdateError::Failed(crate::util::unavailable::read_unavailable().unwrap_err())),
+                                    "{}: refused by the hold's re-read", label),
                             }
                             assert_eq!(after.as_ref(), Some(&to), "{}: a refused write leaves the ref where it was", label);
                         }
