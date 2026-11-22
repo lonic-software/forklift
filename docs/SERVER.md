@@ -509,7 +509,7 @@ out and sends it again. The default is the host's available parallelism (4 when 
 report one). It is uncalibrated: no benchmark of these routes exists yet, so size it to your
 host if lifts or fetches queue; each refusal is logged as a warning. The cap counts requests,
 not callers or warehouses, so a burst on one warehouse can refuse requests on another; the
-per-caller limits below are what keep one caller's burst to its own budget. Background bundle rebuilds (`rebuild_after_lifts`)
+per-caller limits below, when set, keep one caller's burst to its own budget. Background bundle rebuilds (`rebuild_after_lifts`)
 are bounded apart from that cap: a serving process runs one build at a time, across every
 warehouse it serves, so a rebuild never refuses a request, and the most costly requests and builds
 running at once are the cap plus one build. A rebuild that finds a build running for another warehouse waits its
