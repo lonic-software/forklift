@@ -445,14 +445,17 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     let outcome = match recovery_utils::run(Some(&|line: &str| crate::human!("{}", line))).await {
         Ok(outcome) => outcome,
         Err(refused) => {
-            // A deferred ref the taint stands on is never judged again while it stays unread.
-            refs_left.borrow_mut().kept = refused.kept_by_unread_refs;
+            // A deferred meta ref, or a damaged user ref, the taint stands on is never judged
+            // again while it stays unread: changed_after says so for the meta refs, through
+            // refs_left (so it is set first), and the loop below for the user refs.
+            let kept = refused.kept_by_unread_refs;
+            refs_left.borrow_mut().kept = kept.clone();
             // An interrupted operation waits for the taint (below), so the refusal says so: it
             // is not the only thing left standing.
             let mut error = changed_after(String::from(refused.error), &refs_rebuilt, &refs_removed, &ref_notes);
-            if ref_heal::detect(&mut Vec::new()).is_ok_and(|damaged| !damaged.is_empty()) {
-                error = forklift_core::error::append_to_message(error,
-                    "A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.");
+            let damaged = ref_heal::detect(&mut Vec::new()).unwrap_or_default();
+            for sentence in damaged_user_ref_sentences(&damaged, &kept) {
+                error = forklift_core::error::append_to_message(error, &sentence);
             }
             return Err(match operation_utils::read() {
                 Ok(Some(operation)) => forklift_core::error::append_to_message(error, &format!(
@@ -1662,6 +1665,26 @@ fn append_notes(error: String, notes: &[String]) -> String {
         said.push(note);
         error
     })
+}
+
+/// The sentences a refusal at a standing taint carries for the damaged user refs `damaged`: one
+/// for each whose unread head kept the taint standing (`kept`, as wire names), and one for the
+/// rest, if any. The pass that rebuilds a user ref heal could not settle before the taint recovery
+/// runs only once the taint is resolved, and while a ref in `kept` stays unread, the recovery
+/// cannot check what it reaches, so that ref gets the way out for when the taint is not resolved.
+/// None for none.
+fn damaged_user_ref_sentences(damaged: &[ref_heal::DamagedRef], kept: &[String]) -> Vec<String> {
+    let wire = |damaged: &ref_heal::DamagedRef| pallet_utils::PalletRef { namespace: pallet_utils::PalletNamespace::User, name: damaged.pallet.clone() }.to_wire();
+    let (stuck, rest): (Vec<_>, Vec<_>) = damaged.iter().partition(|damaged| kept.contains(&wire(damaged)));
+    let mut sentences: Vec<String> = stuck.iter().map(|damaged| format!(
+        "The ref of pallet \"{}\" is damaged. While it cannot be read, the durability taint's recovery cannot check \
+        what it reaches, and heal judges the ref again only once the taint is resolved; if it is not, restore the warehouse \
+        from a backup, or clone it afresh, then run \"forklift heal\" again.", wire(damaged)
+    )).collect();
+    if !rest.is_empty() {
+        sentences.push("A damaged pallet ref also stands; heal rebuilds it once the taint is resolved.".to_string());
+    }
+    sentences
 }
 
 /// The sentences a refusal carries for the meta refs `deferred` that the pass before the taint
