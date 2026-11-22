@@ -189,8 +189,9 @@ treated as unset — and an unrecognized key name (a typo) is refused the same w
 The server never holds a bearer token itself, only its SHA-256 digest: 64 lowercase hex
 characters, such as `printf '%s' "$TOKEN" | shasum -a 256` prints. It hashes the token a request
 presents and compares digests, so a reader of the config file, the tokens file or the command
-line learns no credential. Tokens are high-entropy secrets (`openssl rand -hex 32`), so an
-unsalted digest gives nothing away. A value that is not a digest is refused at startup without
+line learns no credential. Tokens are high-entropy secrets, so an unsalted digest gives nothing
+away. Generate them as `openssl rand -base64 32`, not as hex: a hex token is spelled like a
+digest, so one put where its digest belongs would be taken as the digest without complaint. A value that is not a digest is refused at startup without
 being echoed, and so is the digest of the empty string. A config file still setting `token`, or a
 tokens file with an `[operators]` table of plaintext tokens, is refused by name, never read as no
 token.
@@ -222,13 +223,13 @@ What an operator may do derives from their **role** in the target warehouse's of
 
 **Per-pallet grants apply only to a request that resolves to an office operator identity** —
 one authenticated via this token file or an `authentication` hook, never to the shared static
-`--token` or an `--open` server. Every row below is a distinct check `post_ref_update`
+token (`--token-sha256`) or an `--open` server. Every row below is a distinct check `post_ref_update`
 (`crates/forklift-server/src/server.rs`) runs against a ref-update request, in the order it
 runs:
 
 | # | Check | Function | Runs when | What it verifies | What it does *not* cover |
 |---|-------|----------------------|-----------|-------------------|---------------------------|
-| 1 | Authentication | `check_auth` | every request | resolves the request to a `Principal`: `Operator(id)` (a per-operator token or `authentication` hook), `Static` (the shared `--token`), or `Open` (no auth configured, `--open`) | nothing about what that principal may do |
+| 1 | Authentication | `check_auth` | every request | resolves the request to a `Principal`: `Operator(id)` (a per-operator token or `authentication` hook), `Static` (the shared static token, `--token-sha256`), or `Open` (no auth configured, `--open`) | nothing about what that principal may do |
 | 2 | Admission hook | `check_admission`, called for a ref update from `post_ref_update`; the same hook also gates uploads, ref deletes and warehouse creation from their handlers, and every read and fetch from the authentication layer (`docs/format/HOOK_PROTOCOL.md`) | every principal, every authenticated request but `PUT /v1/trust` (a ref update among them), only when `[hooks] admission_url` is configured (below) | a deployer-supplied soft-policy decision (quotas, plan limits, suspensions), given the pallet name — regardless of how the caller authenticated | not an office role/grant check; a no-op when unconfigured |
 | 3 | Transport authorization | `authority_utils::may_move` (`crates/forklift-core/src/util/authority_utils.rs`), called from `post_ref_update`; `user.may_write_pallet` is its working-pallet arm | **only** for `Principal::Operator` that `authority_utils::office_user_of` resolves to a user — trust established (the anchor is set) and the office roster non-empty; an authenticated operator pushing to an untrusted warehouse, or during the bootstrap window before the office is lifted, clears this check with no test run at all (`office_user_of`'s two `None` arms) | for a **working** pallet: the operator's `role`/`pallets` grant permits moving *this* pallet ref (`may_write_pallet`); for a **meta** pallet — one of the fixed set `@office`, `@manifest`, `@haul`, `@tags`, `@kv`; an `@name` outside it is refused (422) before this check, by `meta_tree::check_meta_pallet_name` — `may_write_pallet` is never consulted — only `role != Reader` is required, so a `writer` granted only some other pallet may still transport any meta pallet's ref | never runs for `Principal::Static` (the shared token) or an unauthenticated `--open` caller — they clear this check by never being subject to it; and for a meta pallet, never checks the `pallets` grant list at all, regardless of principal |
 | 4 | Office chain authenticity | `verify_office_chain_memoized`, in `post_ref_update` (for an office update, the new chain; for any other pallet, to obtain the office state) | only once the warehouse is trusted | every office parcel is signed by a key active in the office at the point it signed, chain reaches genesis | a non-office parcel's own signer's role — nothing below checks it: check 6 explicitly finds no role check in any of its three arms |
@@ -538,7 +539,7 @@ outside both bounds.
 
 `light_requests_per_minute` and `heavy_requests_per_minute` limit what each caller may send. A
 caller is the principal its request authenticates as: an operator token or an `authentication`
-hook identity is one caller, everyone holding the static `--token` is one caller, and every
+hook identity is one caller, everyone holding the static token is one caller, and every
 request to an `--open` server is one caller. Each caller has one budget per class, and the costly
 class is the four routes `max_heavy_requests` caps; every other authenticated route is cheap, and
 `/healthz` is never limited. A caller who has spent its budget is refused with a `429` carrying

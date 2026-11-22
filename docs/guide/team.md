@@ -64,7 +64,7 @@ Prepared warehouse at "server".
 Write the token file. Each line maps a secret token to the identifier of the person who holds it,
 but the server is never given the token itself: each line names the token by its SHA-256 digest,
 which `printf '%s' ada-secret | shasum -a 256` prints. Use long random tokens in practice, such as
-`openssl rand -hex 32`, and hand each person their own.
+`openssl rand -base64 32`, and hand each person their own.
 
 ```console
 $ echo '[operators_sha256]' > tokens.toml

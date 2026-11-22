@@ -1577,11 +1577,14 @@ fn parse_operator_tokens(path: &str) -> Result<Vec<(TokenDigest, String)>, Strin
         ));
     }
 
-    if let Some((key, _)) = doc.as_table().iter().find(|(key, _)| *key != "operators_sha256") {
+    // A misnamed table is named, to point at the typo. Any other entry outside the table is
+    // not, since it may be a token written without the table's header.
+    if let Some((key, item)) = doc.as_table().iter().find(|(key, _)| *key != "operators_sha256") {
+        let entry = if item.is_table() { format!("an unrecognized table [{}]", key) }
+                    else { "an entry outside any table".to_string() };
         return Err(format!(
-            "The token file \"{}\" has an unrecognized key \"{}\"; it holds only an \
-            [operators_sha256] table.",
-            path, key
+            "The token file \"{}\" has {}; it holds only an [operators_sha256] table.",
+            path, entry
         ));
     }
 
@@ -2997,7 +3000,7 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
         return error_response((
             StatusCode::FORBIDDEN,
             "Warehouse creation requires the server's static token (start the server \
-            with --token).".to_string()
+            with --token-sha256, or token_sha256 in the config file).".to_string()
         ));
     }
 
@@ -7049,13 +7052,15 @@ mod tests {
 
     /// A blank bearer (empty, or whitespace-only: the h2c/HPACK case, where no transport trims
     /// it first) is refused locally and never put to the authentication hook. The hook here is
-    /// unreachable, so a blank bearer that reached it would read `503`, not `401`; a real
-    /// unknown token is the positive control that the hook is asked at all.
+    /// a port this test bound and released, so nothing answers it, and a blank bearer that
+    /// reached it would read `503`, not `401`; a real unknown token is the positive control that
+    /// the hook is asked at all.
     #[tokio::test]
     async fn a_blank_bearer_is_unauthorized_and_never_reaches_the_authentication_hook() {
+        let released = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let state = AppState {
             credentials: credentials(Some("secret"), &[]),
-            authentication_hook: Some(HookEndpoint { url: "http://127.0.0.1:9/".to_string(), secret: "s".to_string() }),
+            authentication_hook: Some(HookEndpoint { url: format!("http://{}/", released), secret: "s".to_string() }),
             ..single_mode_state(PathBuf::from("/unused"))
         };
 
@@ -7852,7 +7857,8 @@ mod tests {
         for (content, expected, why) in [
             ("[operators]\n\"tok-a\" = \"alice\"\n".to_string(), "has an [operators] table of plaintext tokens", "the plaintext table"),
             (format!("[operators_sha256]\n\"{alice}\" = \"alice\"\n[operators]\n"), "[operators] table", "the plaintext table beside the digests"),
-            (format!("extra = 1\n[operators_sha256]\n\"{alice}\" = \"alice\"\n"), "unrecognized key \"extra\"", "another key"),
+            (format!("[operators_sha265]\n\"{alice}\" = \"alice\"\n"), "has an unrecognized table [operators_sha265]", "a misnamed table"),
+            ("\"tok-a\" = \"alice\"\n".to_string(), "has an entry outside any table", "a token with no table header"),
             ("".to_string(), "has no [operators_sha256] table", "no table"),
             ("operators_sha256 = 1\n".to_string(), "has no [operators_sha256] table", "not a table"),
             ("[operators_sha256]\n\"tok-a\" = \"alice\"\n".to_string(), "invalid key: a token digest must be 64 lowercase hex", "a plaintext key"),
