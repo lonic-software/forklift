@@ -429,7 +429,28 @@ fn diverged_evidence_is_refused_and_ref_settles_it() {
     assert!(candidates.contains(&base) && candidates.contains(&side), "{}", refused);
     assert_eq!(refused["error"]["next_step"], "forklift heal --ref main=<parcel>", "{}", refused);
 
-    area.run_ok(&root, &["heal", "--ref", &format!("main={}", base)]);
+    // Every named pallet is judged before heal writes, so a refusal for a later spec leaves the
+    // settable main as it was. Mutation: drop the up-front name check → main is set, then the bad
+    // name is refused → "main's bytes stand", red. Mutation: drop the up-front meta refusal for
+    // --ref → "@tags" reads as an invalid name → the message, red.
+    let damaged = std::fs::read(ref_path(&root, "main")).unwrap();
+    let set_main = format!("main={}", base);
+    let invalid = area.run(&root, &["heal", "--ref", &set_main, "--remove-ref", "Bad Name"]);
+    assert!(!invalid.status.success(), "{}", text(&invalid.stdout));
+    assert_eq!(std::fs::read(ref_path(&root, "main")).unwrap(), damaged, "main's bytes stand");
+    assert!(text(&invalid.stderr).contains("\"Bad Name\" is not a valid pallet name: ") && text(&invalid.stderr).contains(". Nothing was changed."),
+            "{}", text(&invalid.stderr));
+    let tags = format!("@tags={}", base);
+    let meta = area.run(&root, &["heal", "--ref", &set_main, "--ref", &tags, "--ref", "@redactions=x", "--ref", "@tags=y"]);
+    assert!(!meta.status.success(), "{}", text(&meta.stdout));
+    assert_eq!(std::fs::read(ref_path(&root, "main")).unwrap(), damaged, "main's bytes stand");
+    assert!(text(&meta.stderr).contains(&format!(
+        "--ref sets only a user pallet's ref, and \"@tags\" is not one: heal never sets the ref of a metadata pallet. \
+        Run the command again without \"--ref @tags={}\" and \"--ref @redactions=x\": heal rebuilds a damaged metadata ref where it can \
+        and otherwise names the way out. Nothing was changed.", base
+    )), "{}", text(&meta.stderr));
+
+    area.run_ok(&root, &["heal", "--ref", &set_main]);
     assert_eq!(head(&root, "main"), base);
     area.stack(&root, "n.txt", "after");
 }
