@@ -766,8 +766,9 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// Remove the most recent entry other than a pallet delete when it is the operation that left the
 /// bay's consolidation or pick in progress (a consolidate or pick that stopped at conflicts), and
 /// the bay is still exactly where it left it — for an abort, which abandons that operation outside
-/// `undo`, and for a stack that clears an empty pick, which abandons it the same way. Kept, the entry would refuse every later undo: the bay no longer holds the consolidation
-/// its after records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
+/// `undo`, and for a stack that clears an empty pick, which abandons it the same way. Kept, the
+/// entry would refuse every later undo: the bay no longer holds the consolidation its after
+/// records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
 /// and its undo depends on no bay state. Any other entry is kept, so a rerun of an interrupted
 /// abort, whose entry is already gone, removes nothing more. A kept entry loses an undo's mark,
 /// which on such a rerun leaves an older interrupted undo refused, not resumed (see

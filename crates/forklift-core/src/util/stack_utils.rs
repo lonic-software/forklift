@@ -463,9 +463,12 @@ pub async fn stack_parcel(description: Option<String>,
             // settled the same way first: the conflicted pick's own entry comes off while the bay
             // still stands where it left it, and otherwise the latest entry loses any undo mark,
             // so that a later undo does not take the bay without the pick for its own interrupted
-            // run and write the pick back.
+            // run and write the pick back. A pick completing inside its own command
+            // (`expected_base`) has no entry yet, and leaves the journal alone.
             if cherry_pick.is_some() {
-                journal_utils::pop_if_it_left_in_progress()?;
+                if expected_base.is_none() {
+                    journal_utils::pop_if_it_left_in_progress()?;
+                }
                 cherry_pick_utils::clear_state()?;
 
                 return Err(StackError::Other(

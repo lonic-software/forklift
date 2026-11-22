@@ -11634,6 +11634,9 @@ fn an_empty_pick_lets_undo_reach_past_the_pick() {
 
     stack_an_empty_pick(&warehouse);
 
+    let journal = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+    assert!(!journal.contains("\"op\":\"pick\""), "the pick's entry is off the journal: {}", journal);
+
     let undone = json(&warehouse.run(&["--json", "undo"]));
     assert_eq!(undone["data"]["op"], "stack", "{}", undone);
     assert_ne!(std::fs::read_to_string(&main_path).unwrap(), main_head, "the undo takes \"main edits beta\" off");
@@ -11663,10 +11666,12 @@ fn an_empty_pick_clears_an_interrupted_undos_mark() {
     let undone = json(&warehouse.run(&["--json", "undo"]));
     assert_eq!(undone["data"]["op"], "stack");
     assert!(pick_state.exists(), "the undo put the pick back");
-    let marked = completed.rmatch_indices("\"undo_started\":false").next()
-        .map(|(at, old)| format!("{}\"undo_started\":true{}", &completed[..at], &completed[at + old.len()..]))
+    let mut marked: serde_json::Value = serde_json::from_str(&completed).unwrap();
+    let latest = marked["entries"].as_array_mut().and_then(|entries| entries.last_mut())
         .unwrap_or_else(|| panic!("no entry to mark: {}", completed));
-    std::fs::write(&journal, &marked).unwrap();
+    assert_eq!(latest["op"], "stack", "the latest entry is the completing stack: {}", completed);
+    latest["undo_started"] = serde_json::Value::Bool(true);
+    std::fs::write(&journal, serde_json::to_string(&marked).unwrap()).unwrap();
 
     stack_an_empty_pick(&warehouse);
     let main_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
