@@ -963,7 +963,8 @@ pub(crate) fn sync_dir_attempts() -> Vec<PathBuf> {
 }
 
 /// The single routine every post-rename directory-sync failure point in this store reports
-/// through: given the already-attempted `Result` of syncing the directory (or directories) a
+/// through (a later re-sync of what a rename may have landed goes through
+/// [`sync_dir_again_or_taint`] instead, which shares only its failure half): given the already-attempted `Result` of syncing the directory (or directories) a
 /// rename just landed in, and the exact FINAL object paths — never a temp, never a parent, the
 /// schema [`taint_utils::record_taint`] expects — whose durability that sync was supposed to
 /// prove:
@@ -999,6 +1000,18 @@ fn sync_result_or_taint(sync_result: Result<(), String>, final_paths: &[&Path]) 
 /// uses it directly.
 pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(), String> {
     sync_result_or_taint(sync_dir(dir), final_paths)
+}
+
+/// Sync `dir` again for `final_paths`, which an earlier write reported unsynced and may have
+/// landed, recording a taint when this sync fails too, through the same
+/// [`taint_after_sync_failure`] as [`sync_dir_or_taint`]. Unlike it, there is no standing-taint
+/// re-check, so a sync that holds returns `Ok` whatever taint stands, or fails to read: the
+/// re-check refuses whenever a taint stands, so for a sync that held it would say only that a
+/// taint stands, never what the sync did. It also no longer refuses a taint a sibling process
+/// recorded since the write. Heal, the one caller, is the process resolving taints, and while
+/// it runs, [`SelfTripExemptionGuard`] skips that re-check anyway.
+pub(crate) fn sync_dir_again_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(), String> {
+    sync_dir(dir).map_err(|sync_error| taint_after_sync_failure(sync_error, final_paths))
 }
 
 /// Record a taint for `final_paths` after a directory sync just failed, folding the taint
