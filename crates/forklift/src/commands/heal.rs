@@ -1113,11 +1113,6 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
     Err(ref_refusal(&report, None).into())
 }
 
-/// Plan the inventory's rebuild for `marker`, and write it when it is complete or `accept_loss`.
-///
-/// # Returns
-/// * `Ok((view, written))` - What the rebuild found, and whether it was written.
-/// * `Err(String)`         - If the shard store could not be listed, or the set not written.
 /// Refuse the specs of one flag that name a meta pallet, each named once in the order given (by
 /// the first spec naming it), so naming one twice still reads as one flag to drop.
 ///
@@ -1144,6 +1139,11 @@ fn refuse_meta<'a>(flag_does: &str, verb: &str, specs: impl Iterator<Item = (&'a
     ))
 }
 
+/// Plan the inventory's rebuild for `marker`, and write it when it is complete or `accept_loss`.
+///
+/// # Returns
+/// * `Ok((view, written))` - What the rebuild found, and whether it was written.
+/// * `Err(String)`         - If the shard store could not be listed, or the set not written.
 fn rebuild_inventory(marker: Option<&Operation>, accept_loss: bool) -> Result<(InventoryRebuilt, bool), String> {
     let rebuild = inventory_heal::plan(marker)?;
     let written = rebuild.complete() || accept_loss;
