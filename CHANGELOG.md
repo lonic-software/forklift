@@ -12,6 +12,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **`forklift-server` caps how many costly requests run at once.** Ref updates, pallet deletions,
+  trust installs and batch fetches, which can walk a whole history or build a bundle, now share a
+  cap per serving process, set with `--max-heavy-requests` or `max_heavy_requests` (default: the
+  host's available parallelism; zero is refused). A request that finds the cap full waits up to 5
+  seconds and is then refused with a `503` and `Retry-After`, before it changes anything, and the
+  client sends it again after the wait. Background bundle rebuilds now run one at a time per serving
+  process, across every warehouse it serves, apart from that cap, so a rebuild never refuses a
+  request. A burst of pushes no longer fills the server's blocking
+  threads with history walks or bundle builds.
 - **`park` can park part of the work in progress.** `park <paths>…` parks and resets only the
   changes at or under the paths; every other file keeps its working content and its staging. An
   interrupted partial park is finished over its paths only. A path that names nothing refuses, so
@@ -204,7 +213,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   as the full scope. Such a record now refuses as damaged. A full scope is no longer the empty
   file, so an empty scope file refuses too. **Breaking:** these records written before this
   change refuse as an older version's, so clone or make the warehouse again. The undo journal
-  moves to version 4 with them, and an older one is refused, so undo history from before the
+  moves to version 5 as well, and an older one is refused, so undo history from before the
   upgrade is lost.
 - **A server's withheld record, tombstone list and served mark carry a digest.** Damage that still
   parsed, such as a flipped digit in a hash, was read as true: a takedown was served again under

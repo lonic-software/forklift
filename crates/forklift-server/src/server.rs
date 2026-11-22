@@ -69,6 +69,10 @@ struct WarehouseHandle {
     /// so it publishes nothing.
     rebuild_again: std::sync::atomic::AtomicBool,
 
+    /// Whether this warehouse's rebuild waiter ([`queue_rebuild`]) waits for a rebuild slot. Shared
+    /// with the waiter, which holds no reference to the handle while it waits.
+    rebuild_queued: Arc<std::sync::atomic::AtomicBool>,
+
     /// Whether a redaction run's round must rebuild the bundle after its deletion: a ref write
     /// applied a redaction, withdrawing it. Read only by the round, never by a running rebuild, so
     /// the build waits for the drain rather than run beside it.
@@ -190,6 +194,7 @@ impl WarehouseHandle {
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
             rebuild_again: std::sync::atomic::AtomicBool::new(false),
+            rebuild_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rebuild_after_drain: std::sync::atomic::AtomicBool::new(false),
             _serve_lock: None,
             store_access: std::sync::Mutex::new(None),
@@ -646,6 +651,18 @@ struct AppState {
     authentication_cache: Mutex<HashMap<String, (String, std::time::Instant)>>,
     authentication_cache_ttl: std::time::Duration,
 
+    /// The permits of Heavy requests in flight ([`acquire_heavy`]): one cap per serving process,
+    /// shared by every warehouse it serves. Sized by [`heavy_capacity`].
+    heavy: Arc<tokio::sync::Semaphore>,
+
+    /// The permits of background bundle builds ([`queue_rebuild`]): [`REBUILD_SLOTS`] per serving
+    /// process, shared by every warehouse it serves, apart from the Heavy cap so a build never
+    /// refuses a request.
+    rebuilds: Arc<tokio::sync::Semaphore>,
+
+    /// How long a Heavy request waits for a permit: [`HEAVY_WAIT`] when served, shorter in tests.
+    heavy_wait: std::time::Duration,
+
     /// The explicit opt-out of authentication — see [`ServeOptions::open`]. `check_auth` reads
     /// this, and only this, to decide whether an otherwise-empty auth config means `Open`;
     /// `serve` refuses to start rather than ever construct an `AppState` with this `false` and
@@ -752,6 +769,11 @@ pub struct ServeOptions {
 
     /// How long a positive authentication-hook answer is cached (seconds; default 60).
     pub authentication_cache_secs: Option<u64>,
+
+    /// How many costly requests (ref updates, pallet deletions, trust installs, batch fetches)
+    /// run at once; `None` = the host's available parallelism. Zero is refused. See
+    /// [`heavy_capacity`].
+    pub max_heavy_requests: Option<u32>,
 
     /// The explicit opt-out of authentication (`--open` / `open = true`). This is the ONLY
     /// way [`check_auth`] ever returns [`Principal::Open`] — an empty auth config (no token, no
@@ -944,6 +966,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // than trusting `main.rs::bounded_authentication_cache_secs` (the TOML reader) to be the
     // only path into this value — see `authentication_cache_ttl`'s own doc for why.
     let authentication_cache_ttl = authentication_cache_ttl(options.authentication_cache_secs)?;
+    let heavy_capacity = heavy_capacity(options.max_heavy_requests)?;
 
     // Refuse to start rather than ever construct an `AppState` that would fall through to
     // `Principal::Open` by accident: `check_auth` only returns `Open` when `options.open` is
@@ -1092,6 +1115,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         http,
         authentication_cache: Mutex::new(HashMap::new()),
         authentication_cache_ttl,
+        heavy: Arc::new(tokio::sync::Semaphore::new(heavy_capacity)),
+        rebuilds: Arc::new(tokio::sync::Semaphore::new(REBUILD_SLOTS)),
+        heavy_wait: HEAVY_WAIT,
         open: options.open,
     });
 
@@ -1192,6 +1218,19 @@ enum Access {
     Public,
 }
 
+/// What a [`RouteEntry`]'s request costs the server, and so whether it is admitted under the cap
+/// of costly requests ([`acquire_heavy`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Cost {
+    /// Nothing unbounded on the request path: no history walk, no bundle built, or only a walk
+    /// bounded otherwise (`post_holds`'s own cap, the chunk gate's one walk per warehouse).
+    Light,
+    /// An unbounded history walk or an in-memory bundle on the request path, the redaction apply a
+    /// ref write answers after included. Its handler calls [`acquire_heavy`]; a test holds the two
+    /// to each other.
+    Heavy,
+}
+
 /// One method on one path the server answers. [`ROUTES`] holds every one of them.
 struct RouteEntry {
     verb: Verb,
@@ -1199,6 +1238,10 @@ struct RouteEntry {
     mount: Mount,
     modes: Modes,
     access: Access,
+    /// Read by the test that holds it to the handlers calling [`acquire_heavy`]; the handler, not
+    /// this field, admits the request, so the field carries the class for that test and the reader.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read only by the test that holds it to the handlers"))]
+    cost: Cost,
     /// Builds the entry's method router from the entry's own method, so an entry cannot answer a
     /// method it does not name.
     handler: fn(MethodFilter) -> MethodRouter<Arc<AppState>>,
@@ -1214,40 +1257,40 @@ const MULTI_PROTOCOL_PREFIX: &str = "/warehouses/{warehouse}/v1";
 /// answers.
 const ROUTES: &[RouteEntry] = &[
     RouteEntry { verb: Verb::Get, path: "/warehouse", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, get_warehouse) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, get_warehouse) },
     RouteEntry { verb: Verb::Post, path: "/objects/missing", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, post_missing) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, post_missing) },
     RouteEntry { verb: Verb::Post, path: "/objects/upload-targets", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, post_upload_targets) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, post_upload_targets) },
     RouteEntry { verb: Verb::Post, path: "/objects/batch", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, post_objects_batch) },
+        access: Access::Authenticated, cost: Cost::Heavy, handler: |method| on(method, post_objects_batch) },
     RouteEntry { verb: Verb::Get, path: "/objects/{hash}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, get_object) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, get_object) },
     RouteEntry { verb: Verb::Put, path: "/objects/{hash}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, put_object) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, put_object) },
     RouteEntry { verb: Verb::Put, path: "/withheld/{hash}/recipe", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, put_withheld_recipe) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, put_withheld_recipe) },
     RouteEntry { verb: Verb::Get, path: "/signatures/{hash}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, get_signature) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, get_signature) },
     RouteEntry { verb: Verb::Put, path: "/signatures/{hash}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, put_signature) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, put_signature) },
     RouteEntry { verb: Verb::Put, path: "/trust", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, put_trust) },
+        access: Access::Authenticated, cost: Cost::Heavy, handler: |method| on(method, put_trust) },
     RouteEntry { verb: Verb::Post, path: "/pallets/{*name}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, post_ref_update) },
+        access: Access::Authenticated, cost: Cost::Heavy, handler: |method| on(method, post_ref_update) },
     RouteEntry { verb: Verb::Delete, path: "/pallets/{*name}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, delete_ref) },
+        access: Access::Authenticated, cost: Cost::Heavy, handler: |method| on(method, delete_ref) },
     RouteEntry { verb: Verb::Post, path: "/holds/{*name}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, post_holds) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, post_holds) },
     RouteEntry { verb: Verb::Post, path: "/resolve", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, post_resolve) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, post_resolve) },
     RouteEntry { verb: Verb::Get, path: "/bundles/latest", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, handler: |method| on(method, get_bundle) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, get_bundle) },
     RouteEntry { verb: Verb::Put, path: "/warehouses/{warehouse}", mount: Mount::Root, modes: Modes::Multi,
-        access: Access::Authenticated, handler: |method| on(method, put_warehouse) },
+        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, put_warehouse) },
     // Liveness only: unauthenticated and warehouse-free on purpose.
     RouteEntry { verb: Verb::Get, path: "/healthz", mount: Mount::Root, modes: Modes::Both,
-        access: Access::Public, handler: |method| on(method, || async { "ok" }) },
+        access: Access::Public, cost: Cost::Light, handler: |method| on(method, || async { "ok" }) },
 ];
 
 /// Register every [`ROUTES`] entry for one mount and serving mode. An authenticated entry carries
@@ -3088,14 +3131,27 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
         return error_response(error);
     }
 
+    let permit = match acquire_heavy(&state, &warehouse).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(error),
+    };
+
+    // A ref write may have owed an apply while this request waited for its permit. The request
+    // does not wait for it again holding the permit: it is refused for now.
+    match applies_settled(&warehouse) {
+        Ok(true) => {}
+        Ok(false) => return error_response(applying_refusal()),
+        Err(error) => return error_response(error),
+    }
+
     let gate = Arc::clone(&warehouse);
-    let result = blocking(warehouse, move || {
+    let result = permit.spawn(blocking(warehouse, move || {
         let removed = withholding::removed().map_err(internal)?;
         let withheld = withheld_among(&gate, &removed, &request.hashes)?;
         let hashes: Vec<String> = request.hashes.into_iter().filter(|hash| !withheld.contains(hash)).collect();
 
         partial_bundle(&hashes)
-    }).await;
+    })).await.unwrap_or_else(|e| Err(internal(format!("A batch fetch failed: {}", e))));
 
     match result {
         Ok(bytes) => (
@@ -3330,8 +3386,13 @@ async fn put_trust(State(state): State<Arc<AppState>>,
     // Trust establishment is a one-way door, held by the install's preconditions rather than by
     // ordering requests: two first contacts can both read "no anchor" below, and the second to
     // install finds the anchor no longer absent and is refused (or finds its own anchor in place).
+    let permit = match acquire_heavy(&state, &warehouse).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(error),
+    };
+
     let counted = RefWriteCounted::start(&warehouse);
-    let result = blocking(Arc::clone(&warehouse), move || {
+    let result = permit.spawn(blocking(Arc::clone(&warehouse), move || {
         let _counted = counted;
 
         match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
@@ -3447,7 +3508,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 Ok(Some(event))
             }
         }
-    }).await;
+    })).await.unwrap_or_else(|e| Err(internal(format!("A trust install failed: {}", e))));
 
     match result {
         Ok(Some(mut event)) => {
@@ -3494,6 +3555,11 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     let acting_operator = match &principal {
         Principal::Operator(identifier) => Some(identifier.clone()),
         _ => None,
+    };
+
+    let permit = match acquire_heavy(&state, &warehouse).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(error),
     };
 
     let counted = RefWriteCounted::start(&warehouse);
@@ -3795,8 +3861,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     });
 
     // The write and what follows it run apart from the request, so a client that hangs up never
-    // leaves an apply the write owed undischarged and unasked for.
-    let settled = tokio::spawn({
+    // leaves an apply the write owed undischarged and unasked for. The permit goes with them, so
+    // the Heavy slot stays taken until the apply the write answers after is done.
+    let settled = permit.spawn({
         let state = Arc::clone(&state);
         async move {
             match write.await {
@@ -3859,6 +3926,11 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     let acting_operator = match &principal {
         Principal::Operator(identifier) => Some(identifier.clone()),
         _ => None,
+    };
+
+    let permit = match acquire_heavy(&state, &warehouse).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(error),
     };
 
     let counted = RefWriteCounted::start(&warehouse);
@@ -3985,8 +4057,8 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
         }
     });
 
-    // Apart from the request, as a ref update's is ([`post_ref_update`]).
-    let settled = tokio::spawn({
+    // Apart from the request, with its permit, as a ref update's is ([`post_ref_update`]).
+    let settled = permit.spawn({
         let state = Arc::clone(&state);
         async move {
             match deletion.await {
@@ -4102,6 +4174,158 @@ const LAST_APPLY_RETRY: std::time::Duration = std::time::Duration::from_secs(300
 /// requests waiting here.
 const APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const _: () = assert!(APPLY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
+
+/// How many background bundle builds a serving process runs at once, across every warehouse it
+/// serves, beside the requests the Heavy cap admits. Uncalibrated: a server whose warehouses'
+/// bundles go stale waiting their turn could use more.
+const REBUILD_SLOTS: usize = 1;
+
+/// How long a Heavy request ([`Cost::Heavy`]) waits for one of the server's
+/// [`AppState::heavy`] permits before it is refused with a `503` ([`acquire_heavy`]).
+/// Uncalibrated policy: no benchmark of the Heavy routes exists.
+///
+/// The waiter holds its resolved warehouse, so it holds a drain open for at most this long on top
+/// of whatever it waited for first. A batch fetch may first wait [`APPLY_WAIT`], and a ref write
+/// first waits for the admission hook, up to [`HOOK_CLIENT_TIMEOUT`]. The two asserts below keep
+/// either sum under [`DRAIN_WAIT`], so a drain started meanwhile outlasts the requests waiting here.
+///
+/// The wait also counts against the client's head budget for the attempt. In `forklift-core`'s
+/// `remote_utils`, `PUT /v1/trust` and `DELETE /v1/pallets/{name}` ride `RETRYABLE_HEAD_PATIENCE`
+/// (30 s past connect) and a batch fetch rides `BATCH_HEAD_PATIENCE` (45 s past connect); both are
+/// private there, so this is stated, not asserted. The tightest case is a pallet deletion: up to
+/// 10 s on the admission hook and 5 s here leave about 15 s for the removal and the redaction apply
+/// it answers after. An overrun is an uncertain outcome at the client, whose retry is safe: a
+/// retried removal that finds its first try landed is answered as done ([`already_deleted`]). A
+/// batch fetch may wait [`APPLY_WAIT`] and this wait before its build starts; one whose answer
+/// comes past its budget is abandoned, and the client fetches the rest of that command with loose
+/// object requests, while the build it left finishes here on its permit.
+const HEAVY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const _: () = assert!(APPLY_WAIT.as_secs() + HEAVY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
+const _: () = assert!(HOOK_CLIENT_TIMEOUT.as_secs() + HEAVY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
+
+/// The number of Heavy requests a server runs at once when `max_heavy_requests` is not set: the
+/// parallelism the host reports, or this when it reports none.
+const FALLBACK_HEAVY_REQUESTS: usize = 4;
+
+/// The `503` of a Heavy request that found no permit free within [`HEAVY_WAIT`].
+fn at_capacity_refusal() -> HandlerError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The server is at capacity for costly requests. Try again shortly.".to_string(),
+    )
+}
+
+/// The cap of Heavy requests in flight: how many permits [`serve`] gives [`AppState::heavy`], on
+/// this host ([`heavy_capacity_when`]).
+fn heavy_capacity(max_heavy_requests: Option<u32>) -> Result<usize, String> {
+    let parallelism = std::thread::available_parallelism().ok().map(usize::from);
+
+    heavy_capacity_when(max_heavy_requests, parallelism, tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+/// [`heavy_capacity`] on a host reporting `parallelism`, whose semaphore holds at most
+/// `max_permits`: `max_heavy_requests` when set, else `parallelism`, else
+/// [`FALLBACK_HEAVY_REQUESTS`]. Zero is refused, here as well as in `main.rs`'s config reader,
+/// because [`ServeOptions`] is `pub`: a cap of zero would refuse every Heavy request. A cap the
+/// semaphore cannot hold is refused rather than left to panic it.
+fn heavy_capacity_when(max_heavy_requests: Option<u32>,
+                       parallelism: Option<usize>,
+                       max_permits: usize) -> Result<usize, String> {
+    match max_heavy_requests {
+        Some(0) => Err(
+            "--max-heavy-requests (\"max_heavy_requests\" in the config file) is 0, which would \
+            refuse every ref update, pallet deletion, trust install and batch fetch; pick a real \
+            limit, or leave it unset to use the host's available parallelism."
+                .to_string()
+        ),
+        Some(cap) => match usize::try_from(cap) {
+            Ok(cap) if cap <= max_permits => Ok(cap),
+            _ => Err(format!(
+                "--max-heavy-requests (\"max_heavy_requests\" in the config file) is {}, more than \
+                this server can count; the most it accepts is {}.",
+                cap, max_permits
+            )),
+        },
+        None => Ok(parallelism.unwrap_or(FALLBACK_HEAVY_REQUESTS)),
+    }
+}
+
+/// One of the server's Heavy permits ([`acquire_heavy`]). Its only use is [`HeavyPermit::spawn`],
+/// which moves it into the task that runs the work, so the slot is freed when the work ends. A
+/// permit held by the request's own future would be freed when a client hangs up, while the work
+/// it started kept running on the blocking pool.
+#[must_use = "a Heavy permit admits work only through HeavyPermit::spawn"]
+struct HeavyPermit {
+    /// Held, never read: dropping it is what frees the slot.
+    _held: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl HeavyPermit {
+    /// Run `work` as its own task, holding this permit until the work ends. Dropping the returned
+    /// handle detaches the task, which keeps running and keeps the permit.
+    fn spawn<F>(self, work: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::spawn(async move {
+            let _permit = self;
+
+            work.await
+        })
+    }
+}
+
+/// Admit one Heavy request: wait, in arrival order, up to the state's wait ([`HEAVY_WAIT`] when
+/// served) for a permit, then refuse with the `503` of [`at_capacity_refusal`], which carries
+/// `Retry-After`. A Heavy handler calls this after it has resolved its warehouse, read its body,
+/// heard the admission hook and waited for owed applies, and before it counts a ref write
+/// ([`RefWriteCounted::start`]) or builds its work, so a refusal changes nothing and no permit sits
+/// idle while a request is not yet working. A warehouse that started draining while the request
+/// waited is answered as drained.
+async fn acquire_heavy(state: &AppState, warehouse: &WarehouseHandle) -> Result<HeavyPermit, HandlerError> {
+    use std::sync::atomic::Ordering;
+
+    let deadline = tokio::time::Instant::now() + state.heavy_wait;
+    // One acquire for the whole wait, so the request keeps its place in the queue across wakes.
+    let acquire = Arc::clone(&state.heavy).acquire_owned();
+    tokio::pin!(acquire);
+
+    loop {
+        // Listening before the flag is looked at, so a drain marked after the look wakes it: a
+        // drain wakes this warehouse's waiters ([`drain`]), and a waiter would hold it open.
+        let woken = warehouse.applies_wake.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+
+        if warehouse.draining.load(Ordering::SeqCst) {
+            return Err(draining_refusal());
+        }
+
+        tokio::select! {
+            biased;
+            granted = &mut acquire => {
+                let permit = granted.map_err(|closed| internal(format!("The Heavy request cap was closed: {}", closed)))?;
+
+                // A drain marked as the permit was granted.
+                if warehouse.draining.load(Ordering::SeqCst) {
+                    return Err(draining_refusal());
+                }
+
+                return Ok(HeavyPermit { _held: permit });
+            }
+            () = woken => {}
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!(
+                    wait_secs = state.heavy_wait.as_secs(),
+                    "a costly request was refused: every max_heavy_requests permit stayed taken for the whole wait"
+                );
+
+                return Err(at_capacity_refusal());
+            }
+        }
+    }
+}
 
 /// Start a redaction run for `warehouse`, or, when one runs already, have it go round again.
 ///
@@ -4341,7 +4565,7 @@ struct RoundOwes {
 }
 
 /// One round of a redaction run ([`run_redactions`]).
-async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> RoundOwes {
+async fn redaction_round(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>) -> RoundOwes {
     use std::sync::atomic::Ordering;
 
     // A rebuild a write's apply called for, after this round's drain. Taken first, so the flag
@@ -4387,10 +4611,13 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
 ///
 /// A write that applied nothing leaves the rebuild here, so a steady stream of them does not put
 /// it off.
-fn finish_round(state: &AppState, warehouse: &Arc<WarehouseHandle>, applied: bool, held_back: bool, owed: bool) {
+fn finish_round(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>, applied: bool, held_back: bool, owed: bool) {
     use std::sync::atomic::Ordering;
 
-    // A rebuild the drain held back (`rebuild_again`) is carried on as one an apply calls for is.
+    // An asked-for rebuild (`rebuild_again`) is carried on as one an apply calls for is: one the
+    // drain held back, or one whose waiter is still queued for a slot. A queued one may build
+    // before the round this leaves it to, which then builds once more; an extra build, never a
+    // lost one.
     let due = applied || held_back || warehouse.rebuild_again.load(Ordering::SeqCst);
 
     // Each leaves a round to follow: the write asks for a run after setting the flag, and a run
@@ -4724,16 +4951,8 @@ async fn await_applies(warehouse: &WarehouseHandle) -> Result<(), HandlerError> 
         tokio::pin!(woken);
         woken.as_mut().enable();
 
-        if warehouse.draining.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(draining_refusal());
-        }
-
-        if !warehouse.applies_closed() {
+        if applies_settled(warehouse)? {
             return Ok(());
-        }
-
-        if let Some(damage) = warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
-            return Err(damage_refusal(damage));
         }
 
         tokio::select! {
@@ -4741,6 +4960,28 @@ async fn await_applies(warehouse: &WarehouseHandle) -> Result<(), HandlerError> 
             () = woken => {}
         }
     }
+}
+
+/// Whether content may be answered from `warehouse` now, without waiting.
+///
+/// # Returns
+/// * `Ok(true)`          - No apply is owed.
+/// * `Ok(false)`         - One is owed, which a discharge may end.
+/// * `Err(HandlerError)` - A `503`: the warehouse is drained, or the last apply stopped on damage.
+fn applies_settled(warehouse: &WarehouseHandle) -> Result<bool, HandlerError> {
+    if warehouse.draining.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(draining_refusal());
+    }
+
+    if !warehouse.applies_closed() {
+        return Ok(true);
+    }
+
+    if let Some(damage) = warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
+        return Err(damage_refusal(damage));
+    }
+
+    Ok(false)
 }
 
 /// The `503` of a content request while an apply is owed ([`await_applies`]).
@@ -4755,7 +4996,7 @@ fn applying_refusal() -> HandlerError {
 /// Kick off a background bundle rebuild when the accepted-lift counter reaches the
 /// configured threshold. At most one rebuild runs per warehouse at a time; the bundle
 /// is written atomically, so serving continues undisturbed throughout.
-fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
+fn maybe_rebuild_bundle(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
     use std::sync::atomic::Ordering;
 
     let Some(threshold) = state.rebuild_after_lifts else {
@@ -4771,20 +5012,24 @@ fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
     rebuild_bundle(state, warehouse, false);
 }
 
-/// Kick off a background bundle rebuild, when rebuilds are configured and none runs for this
-/// warehouse already. With `again` (a redaction was just applied, and the bundle withdrawn), a
-/// rebuild already running is followed by another once it ends: it began before the redaction, so
-/// it publishes nothing (see `bundle_utils::build_bundle`).
-fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool) {
+/// Ask for a background bundle rebuild, when rebuilds are configured. With `again` (a redaction
+/// was just applied, and the bundle withdrawn), a rebuild already running is followed by another
+/// once it ends: it began before the redaction, so it publishes nothing (see
+/// `bundle_utils::build_bundle`). Without it (a lift past the threshold), a rebuild running already
+/// serves the ask.
+///
+/// Each build holds one of the server's rebuild slots ([`AppState::rebuilds`]) until it ends, so
+/// at most [`REBUILD_SLOTS`] builds run at once across every warehouse served. A build gets its
+/// slot only through the warehouse's one waiter ([`queue_rebuild`]), which queues in arrival order
+/// with the other warehouses' waiters and holds no reference to the warehouse while it waits, so
+/// it never holds a drain open ([`drain`]). The slots are apart from the Heavy cap
+/// ([`AppState::heavy`]): a build can run for minutes, and one holding a Heavy permit would refuse
+/// costly requests for that long, every one of them at a cap of 1.
+fn rebuild_bundle(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, again: bool) {
     use std::sync::atomic::Ordering;
 
     if state.rebuild_after_lifts.is_none() {
         return;
-    }
-
-    // Asked for before the running rebuild is looked at, so that rebuild, ending, sees it.
-    if again {
-        warehouse.rebuild_again.store(true, Ordering::SeqCst);
     }
 
     // A rebuild would hold the drain open; the redaction run that drains asks again after.
@@ -4793,50 +5038,104 @@ fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool
         return;
     }
 
-    if warehouse.bundling.swap(true, Ordering::SeqCst) {
+    if !again && warehouse.bundling.load(Ordering::SeqCst) {
         return;
     }
 
-    // This rebuild starts after whatever asked for another, so it serves that ask.
-    warehouse.rebuild_again.store(false, Ordering::SeqCst);
-    warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
+    // Asked for before the waiter is looked at, so a waiter granted after it sees it.
+    warehouse.rebuild_again.store(true, Ordering::SeqCst);
+    queue_rebuild(state, &warehouse);
+}
+
+/// Start `warehouse`'s rebuild waiter, unless one waits already: a task that waits for a rebuild
+/// slot holding only a weak reference to the warehouse, then takes the handle back under the
+/// registry mutex ([`still_served`]) and runs one build with that permit ([`run_rebuild`]). A
+/// handle no longer served, or being drained, gets no build: a drain's redaction run serves the
+/// ask after it ([`finish_round`]), and a handle let go takes its ask with it.
+fn queue_rebuild(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>) {
+    use std::sync::atomic::Ordering;
+
+    if warehouse.rebuild_queued.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let queued = Arc::clone(&warehouse.rebuild_queued);
+    let weak = Arc::downgrade(warehouse);
+    let state = Arc::clone(state);
 
     tokio::spawn(async move {
-        loop {
-            let worker = Arc::clone(&warehouse);
-
-            let result = tokio::task::spawn_blocking(move || {
-                let _scope = StorageRootScope::enter(&worker.root);
-
-                bundle_utils::build_bundle()
-            }).await;
-
-            match result {
-                Ok(Ok(stats)) => tracing::info!(
-                    objects = stats.objects,
-                    deltas = stats.deltas,
-                    signatures = stats.signatures,
-                    "rebuilt the bundle"
-                ),
-                Ok(Err(error)) => tracing::error!(error, "the bundle rebuild failed"),
-                Err(error) => tracing::error!(%error, "the bundle rebuild task failed"),
+        let permit = match Arc::clone(&state.rebuilds).acquire_owned().await {
+            Ok(held) => held,
+            Err(closed) => {
+                queued.store(false, Ordering::SeqCst);
+                tracing::error!(%closed, "a bundle rebuild could not wait for a rebuild slot");
+                return;
             }
+        };
 
-            warehouse.bundling.store(false, Ordering::SeqCst);
+        // Cleared before the ask is read, so an ask stored after this starts another waiter.
+        queued.store(false, Ordering::SeqCst);
 
-            // A drain began while this one ran: the ask stays for the redaction run to serve after.
-            if warehouse.draining.load(Ordering::SeqCst) {
-                break;
-            }
+        let Served::Handle(warehouse) = still_served(&state, &weak, true) else {
+            return;
+        };
 
-            // Another was asked for while this one ran, and no other rebuild has started since.
-            if !warehouse.rebuild_again.swap(false, Ordering::SeqCst) || warehouse.bundling.swap(true, Ordering::SeqCst) {
-                break;
-            }
-
-            warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
+        // A build runs already; it looks for this ask when it ends.
+        if warehouse.bundling.swap(true, Ordering::SeqCst) {
+            return;
         }
+
+        run_rebuild(&state, warehouse, permit).await;
     });
+}
+
+/// Run one build of `warehouse`'s bundle with `permit`, when one is still asked for, then give
+/// the rebuild up ([`finish_rebuild`]). The caller set `bundling`.
+async fn run_rebuild(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, permit: tokio::sync::OwnedSemaphorePermit) {
+    use std::sync::atomic::Ordering;
+
+    // This build starts after whatever asked for it, so it serves that ask.
+    if warehouse.rebuild_again.swap(false, Ordering::SeqCst) {
+        warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
+
+        let worker = Arc::clone(&warehouse);
+        // The slot moves into the build, so it stays taken until the build ends.
+        let result = tokio::task::spawn_blocking(move || {
+            let _slot = permit;
+            let _scope = StorageRootScope::enter(&worker.root);
+            bundle_build_test_checkpoint(&worker.root);
+
+            bundle_utils::build_bundle()
+        }).await;
+
+        match result {
+            Ok(Ok(stats)) => tracing::info!(
+                objects = stats.objects,
+                deltas = stats.deltas,
+                signatures = stats.signatures,
+                "rebuilt the bundle"
+            ),
+            Ok(Err(error)) => tracing::error!(error, "the bundle rebuild failed"),
+            Err(error) => tracing::error!(%error, "the bundle rebuild task failed"),
+        }
+    } else {
+        drop(permit);
+    }
+
+    finish_rebuild(state, &warehouse);
+}
+
+/// Give `warehouse`'s rebuild up (`bundling`), and queue another for an ask that came while it
+/// ran: a waiter granted meanwhile found `bundling` set and left that ask to this rebuild. A drain
+/// begun meanwhile leaves it to the redaction run that drains, which asks again after.
+fn finish_rebuild(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>) {
+    use std::sync::atomic::Ordering;
+
+    warehouse.bundling.store(false, Ordering::SeqCst);
+
+    if warehouse.rebuild_again.load(Ordering::SeqCst) && !warehouse.draining.load(Ordering::SeqCst) {
+        queue_rebuild(state, warehouse);
+    }
 }
 
 /// `POST /v1/resolve` — operator identifiers → display names (DESIGN.html §8.12).
@@ -5249,6 +5548,25 @@ fn bundle_open_test_checkpoint(root: &std::path::Path) {
 #[cfg(not(test))]
 fn bundle_open_test_checkpoint(_root: &std::path::Path) {}
 
+/// Test seam: a bundle build of the armed warehouse root runs the armed closure once, on the
+/// build's blocking thread before it builds, so a test can see what the build holds while it runs.
+/// Keyed by root so tests rebuilding concurrently never meet.
+#[cfg(test)]
+static BUNDLE_BUILD_TEST_SEAMS: Mutex<BTreeMap<PathBuf, Box<dyn FnOnce() + Send>>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn bundle_build_test_checkpoint(root: &std::path::Path) {
+    let armed = BUNDLE_BUILD_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).remove(root);
+
+    if let Some(run) = armed {
+        run();
+    }
+}
+
+#[cfg(not(test))]
+fn bundle_build_test_checkpoint(_root: &std::path::Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5477,6 +5795,9 @@ mod tests {
             ),
             authentication_cache: Mutex::new(HashMap::new()),
             authentication_cache_ttl: std::time::Duration::from_secs(60),
+            heavy: Arc::new(tokio::sync::Semaphore::new(heavy_capacity(None).unwrap())),
+            rebuilds: Arc::new(tokio::sync::Semaphore::new(REBUILD_SLOTS)),
+            heavy_wait: HEAVY_WAIT,
             open: true,
         }
     }
@@ -9820,15 +10141,18 @@ mod tests {
     }
 
     /// A ref write whose client hangs up while it is under way still discharges the apply it owed
-    /// once it lands, so content is served again without waiting for another write.
+    /// once it lands, so content is served again without waiting for another write. Its Heavy
+    /// permit stays taken until that work ends, not until the request is dropped.
     ///
-    /// Revert: settle the write in the request's own future → the dropped request never applies,
-    /// and the apply stays owed → red.
+    /// Reverts: settle the write in the request's own future → the dropped request never applies,
+    /// and the apply stays owed → red. Keep the permit in the request's future rather than in the
+    /// spawned task → the hang-up frees it while the write is parked → red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_write_whose_client_hangs_up_still_discharges_its_apply() {
         let (root, _scope) = trust_warehouse("post-ref-hung-up");
         let head = store_bare_parcel("hung-up");
-        let state = Arc::new(single_mode_state(root.clone()));
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(root.clone(), &heavy, HEAVY_WAIT);
         let handle = resolve_handle(&state, &PathParams::new()).unwrap();
 
         let (_seam, reached, gate) = park_first_write(&root, "hung-up");
@@ -9836,17 +10160,20 @@ mod tests {
         reached.recv_timeout(std::time::Duration::from_secs(5)).expect("the push must park at its write");
         push.abort();
         assert!(push.await.unwrap_err().is_cancelled());
+        assert_eq!(heavy.available_permits(), 0, "the hung-up write keeps its permit while it runs");
         gate.send(()).unwrap();
 
         let mut open = false;
         for _ in 0..250 {
-            if forklift_core::util::pallet_utils::get_pallet_head("hung-up").unwrap().is_some() && !handle.applies_closed() {
+            if forklift_core::util::pallet_utils::get_pallet_head("hung-up").unwrap().is_some() && !handle.applies_closed()
+                && heavy.available_permits() == 1
+            {
                 open = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(open, "the write landed and its apply was discharged");
+        assert!(open, "the write landed, its apply was discharged, and its permit came back");
 
         drop((handle, state));
         let _ = forklift_core::util::file_utils::remove_dir_all(&root);
@@ -10989,6 +11316,7 @@ mod tests {
             events_hook: None,
             resolution_hook: None,
             authentication_cache_secs: None,
+            max_heavy_requests: None,
             open: false,
         }
     }
@@ -11329,5 +11657,646 @@ mod tests {
         assert!(error.contains("authentication_cache_secs"), "{}", error);
         assert!(error.contains("ceiling"), "{}", error);
         assert!(!error.contains("No authentication is configured"), "{}", error);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The cap on Heavy requests (acquire_heavy)
+    // ---------------------------------------------------------------------------------
+
+    /// How long a Heavy request waits for a permit in these tests: short, so a refusal is quick.
+    const HEAVY_TEST_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// A single-mode state on `root` whose Heavy cap is `heavy`, waiting `wait` for a permit.
+    fn heavy_capped_state(root: PathBuf, heavy: &Arc<tokio::sync::Semaphore>, wait: std::time::Duration) -> Arc<AppState> {
+        Arc::new(AppState { heavy: Arc::clone(heavy), heavy_wait: wait, ..single_mode_state(root) })
+    }
+
+    /// The four Heavy routes, asked through their handlers.
+    #[derive(Clone, Copy, Debug)]
+    enum HeavyRoute {
+        RefUpdate,
+        RefDelete,
+        Trust,
+        Batch,
+    }
+
+    /// A served warehouse whose bay stands on "main", with pallet "side" at a head of its own, and
+    /// a parcel stored for a push: what every [`HeavyRoute`] needs to change something.
+    struct HeavyFixture {
+        root: PathBuf,
+        _scope: StorageRootScope,
+        side: String,
+        pushed: String,
+    }
+
+    impl HeavyFixture {
+        fn new(route: HeavyRoute) -> Self {
+            let (root, scope) = trust_warehouse(&format!("heavy-cap-{route:?}"));
+
+            // A first trust anchor with an empty boundary is refused over pallets outside it, so
+            // the trust case keeps its warehouse bare.
+            let (side, pushed) = match route {
+                HeavyRoute::Trust => (String::new(), String::new()),
+                _ => {
+                    let main = store_bare_parcel("main");
+                    let side = store_bare_parcel("side");
+                    pallet_utils::update_pallet_head("main", None, &main, &RefPreconditions::NONE).unwrap();
+                    pallet_utils::update_pallet_head("side", None, &side, &RefPreconditions::NONE).unwrap();
+                    pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main))).unwrap();
+                    assert!(forklift_core::util::tombstone_utils::mark_served(false).unwrap());
+
+                    (side, store_bare_parcel("pushed"))
+                }
+            };
+
+            HeavyFixture { root, _scope: scope, side, pushed }
+        }
+
+        async fn send(&self, route: HeavyRoute, state: &Arc<AppState>) -> Response {
+            let state = State(Arc::clone(state));
+
+            match route {
+                HeavyRoute::RefUpdate => post_ref_update(
+                    state, Extension(Principal::Open), Path(ref_update_params("pushed")),
+                    Json(RefUpdateRequest { old_head: None, new_head: self.pushed.clone(), tombstone: None }),
+                ).await.into_response(),
+                HeavyRoute::RefDelete => delete_ref(
+                    state, Extension(Principal::Open), Path(ref_update_params("side")),
+                    Query(RefDeleteRequest { old_head: self.side.clone() }),
+                ).await.into_response(),
+                HeavyRoute::Trust => put_trust(
+                    state, Extension(Principal::Open), Path(PathParams::new()), Json(first_anchor(Vec::new())),
+                ).await.into_response(),
+                HeavyRoute::Batch => post_objects_batch(
+                    state, Path(PathParams::new()), Json(MissingObjectsRequest { hashes: vec![self.pushed.clone()] }),
+                ).await,
+            }
+        }
+
+        /// Whether the change `route` makes is in place.
+        fn changed(&self, route: HeavyRoute) -> bool {
+            match route {
+                HeavyRoute::RefUpdate => pallet_utils::get_pallet_head("pushed").unwrap() == Some(self.pushed.clone()),
+                HeavyRoute::RefDelete => pallet_utils::get_pallet_head("side").unwrap().is_none(),
+                HeavyRoute::Trust => office_utils::read_trust_anchor().unwrap().is_some(),
+                // A fetch changes nothing; its answer is checked by status alone.
+                HeavyRoute::Batch => false,
+            }
+        }
+    }
+
+    /// At capacity, each Heavy route waits its bounded wait and is refused with a `503` that
+    /// carries `Retry-After`, before it changes anything or counts a ref write. With the permit
+    /// free again, the same request goes through, so the refusal is the cap's and not the fixture's.
+    ///
+    /// Reverts: drop `acquire_heavy` from a handler → that route's request lands (or answers 200)
+    /// at capacity → red. Count the ref write before `acquire_heavy` → `ref_writes_started` moves
+    /// on the refusal → red.
+    #[tokio::test]
+    async fn a_heavy_request_at_capacity_is_refused_for_now_and_changes_nothing() {
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let cases = [
+            (HeavyRoute::RefUpdate, StatusCode::OK),
+            (HeavyRoute::RefDelete, StatusCode::OK),
+            (HeavyRoute::Trust, StatusCode::CREATED),
+            (HeavyRoute::Batch, StatusCode::OK),
+        ];
+
+        for (route, served) in cases {
+            let fixture = HeavyFixture::new(route);
+            let state = heavy_capped_state(fixture.root.clone(), &heavy, HEAVY_TEST_WAIT);
+            let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+            let started = handle.ref_writes_started.load(Ordering::SeqCst);
+
+            let held = Arc::clone(&heavy).try_acquire_owned().unwrap();
+            let refused = fixture.send(route, &state).await;
+
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{route:?} at capacity");
+            assert_eq!(refused.headers().get(axum::http::header::RETRY_AFTER).map(|value| value.to_str().unwrap()),
+                Some("10"), "{route:?}: a refusal for now says when to try again");
+            let body = body_text(refused).await;
+            assert!(body.contains("The server is at capacity for costly requests. Try again shortly."), "{route:?}: {body}");
+            assert!(!fixture.changed(route), "{route:?}: the refused request changed nothing");
+            assert_eq!(handle.ref_writes_started.load(Ordering::SeqCst), started, "{route:?}: no ref write was counted");
+
+            drop(held);
+            let answered = fixture.send(route, &state).await;
+            assert_eq!(answered.status(), served, "{route:?} with a permit free");
+            assert!(fixture.changed(route) || matches!(route, HeavyRoute::Batch), "{route:?}: the admitted request made its change");
+            assert_eq!(heavy.available_permits(), 1, "{route:?}: the permit came back");
+
+            drop((handle, state));
+            let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+        }
+    }
+
+    /// A request that waited for a permit while its warehouse started draining is answered as
+    /// drained once it is granted one, and changes nothing.
+    ///
+    /// Revert: drop the draining re-check from `acquire_heavy` → the push lands → red.
+    #[tokio::test]
+    async fn a_heavy_request_granted_while_its_warehouse_drains_is_refused_as_drained() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let held = Arc::clone(&heavy).try_acquire_owned().unwrap();
+
+        let push = tokio::spawn({
+            let state = Arc::clone(&state);
+            let pushed = fixture.pushed.clone();
+            async move {
+                post_ref_update(
+                    State(state), Extension(Principal::Open), Path(ref_update_params("pushed")),
+                    Json(RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None }),
+                ).await.into_response()
+            }
+        });
+
+        // The request holds the warehouse once it has resolved it; on this one-thread runtime it
+        // then runs until it waits for the permit.
+        while Arc::strong_count(&handle) < 3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        handle.draining.store(true, Ordering::SeqCst);
+        drop(held);
+        let response = push.await.unwrap();
+        handle.draining.store(false, Ordering::SeqCst);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_text(response).await;
+        assert!(body.contains("briefly unavailable while content redacted or withheld from it is deleted"), "{body}");
+        assert!(!fixture.changed(HeavyRoute::RefUpdate), "the push did not land");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// A request waiting for a permit on a warehouse that starts draining is refused at once, with
+    /// the permit still taken, so it does not hold the drain open for the rest of its wait.
+    ///
+    /// Revert: wait for the permit without listening for the drain's wake → the request waits
+    /// until a permit is free → the bounded join times out → red.
+    #[tokio::test]
+    async fn a_heavy_request_waiting_when_its_warehouse_drains_is_refused_at_once() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let held = Arc::clone(&heavy).try_acquire_owned().unwrap();
+
+        let push = tokio::spawn({
+            let state = Arc::clone(&state);
+            let pushed = fixture.pushed.clone();
+            async move {
+                post_ref_update(
+                    State(state), Extension(Principal::Open), Path(ref_update_params("pushed")),
+                    Json(RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None }),
+                ).await.into_response()
+            }
+        });
+
+        while Arc::strong_count(&handle) < 3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        // What `drain` does to the warehouse's waiters.
+        handle.draining.store(true, Ordering::SeqCst);
+        handle.applies_wake.notify_waiters();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), push).await
+            .expect("the waiting request is refused without waiting for a permit").unwrap();
+        handle.draining.store(false, Ordering::SeqCst);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_text(response).await;
+        assert!(body.contains("briefly unavailable while content redacted or withheld from it is deleted"), "{body}");
+        assert!(!fixture.changed(HeavyRoute::RefUpdate), "the push did not land");
+        assert_eq!(heavy.available_permits(), 0, "the permit is still the holder's");
+
+        drop((held, handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// A batch fetch that waited for its permit while a ref write came to owe an apply is refused
+    /// for now once it is granted one: it answers no content while an apply is owed, though it
+    /// found none owed before it waited.
+    ///
+    /// Revert: drop the batch's check after its permit → it answers `200` → red.
+    #[tokio::test]
+    async fn a_batch_granted_while_an_apply_is_owed_is_refused_for_now() {
+        let fixture = HeavyFixture::new(HeavyRoute::Batch);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        assert!(!handle.applies_closed(), "no apply is owed before the batch waits");
+        let held = Arc::clone(&heavy).try_acquire_owned().unwrap();
+
+        let batch = tokio::spawn({
+            let state = Arc::clone(&state);
+            let pushed = fixture.pushed.clone();
+            async move {
+                post_objects_batch(State(state), Path(PathParams::new()), Json(MissingObjectsRequest { hashes: vec![pushed] })).await
+            }
+        });
+
+        while Arc::strong_count(&handle) < 3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        // A ref write's apply owed, as `owe_apply` counts it.
+        handle.applies_owed.fetch_add(1, Ordering::SeqCst);
+        drop(held);
+        let response = batch.await.unwrap();
+        handle.applies_discharged.fetch_max(handle.applies_owed.load(Ordering::SeqCst), Ordering::SeqCst);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_text(response).await;
+        assert!(body.contains("unavailable while it settles which content redacted from it is no longer served"), "{body}");
+        assert_eq!(heavy.available_permits(), 1, "the refused batch gave its permit back");
+
+        // The same batch with nothing owed answers.
+        let answered = fixture.send(HeavyRoute::Batch, &state).await;
+        assert_eq!(answered.status(), StatusCode::OK);
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// A single-mode state on `root` that rebuilds its bundle after `lifts` lifts, whose Heavy cap
+    /// is `heavy` and whose rebuild slots are `slots`.
+    fn rebuilding_state(
+        root: PathBuf,
+        heavy: &Arc<tokio::sync::Semaphore>,
+        slots: &Arc<tokio::sync::Semaphore>,
+        lifts: u32,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            heavy: Arc::clone(heavy),
+            rebuilds: Arc::clone(slots),
+            heavy_wait: HEAVY_TEST_WAIT,
+            rebuild_after_lifts: Some(lifts),
+            ..single_mode_state(root)
+        })
+    }
+
+    /// Wait, bounded, until `done` holds.
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Whether `handle` has no rebuild running, waiting or asked for.
+    fn rebuilds_settled(handle: &WarehouseHandle) -> bool {
+        !handle.bundling.load(Ordering::SeqCst)
+            && !handle.rebuild_queued.load(Ordering::SeqCst)
+            && !handle.rebuild_again.load(Ordering::SeqCst)
+    }
+
+    /// With every rebuild slot taken, a lift past `rebuild_after_lifts` starts no build: its
+    /// rebuild waits for a slot holding no reference to the warehouse, so a drain completes
+    /// meanwhile. It waits in arrival order: a waiter queued after it (another warehouse's) gets
+    /// the slot only after this build has started.
+    ///
+    /// Reverts: take a slot only when one is free → the rebuild never starts → red. Hold the
+    /// warehouse while waiting → the drain times out → red.
+    #[tokio::test]
+    async fn a_rebuild_at_capacity_waits_its_turn_without_holding_the_warehouse() {
+        let root = scratch_dir("rebuild-at-capacity");
+        mark_warehouse(&root);
+        let (heavy, slots) = (Arc::new(tokio::sync::Semaphore::new(4)), Arc::new(tokio::sync::Semaphore::new(1)));
+        let state = rebuilding_state(root.clone(), &heavy, &slots, 2);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let held = Arc::clone(&slots).try_acquire_owned().unwrap();
+
+        maybe_rebuild_bundle(&state, Arc::clone(&handle));
+        maybe_rebuild_bundle(&state, Arc::clone(&handle));
+        // The waiter's task runs and queues for the slot.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!handle.bundling.load(Ordering::SeqCst), "no build started at capacity");
+        assert!(handle.rebuild_queued.load(Ordering::SeqCst), "the rebuild waits for a slot");
+        assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 2, "the lift count is kept");
+        assert!(drain(&state, &handle, std::time::Duration::from_secs(2)).await, "a drain completes");
+        undrain(&state, &handle);
+
+        let later = Arc::clone(&slots).acquire_owned();
+        tokio::pin!(later);
+        assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut later).await.is_err(), "the later waiter queues");
+        drop(held);
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(30), &mut later).await
+            .expect("the later waiter gets the slot after the build").unwrap();
+
+        assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 0, "the build started before the later waiter");
+        eventually("the rebuild settles", || rebuilds_settled(&handle)).await;
+        drop(granted);
+        assert_eq!(slots.available_permits(), 1, "the build gave its slot back");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// At a Heavy cap of 1, a lift past `rebuild_after_lifts` asks for its rebuild while it holds
+    /// the only Heavy permit itself, and the rebuild runs: it needs a rebuild slot, not that permit.
+    /// End to end only; the build's use of the rebuild slots and not the Heavy cap is pinned by
+    /// `an_ask_met_by_a_running_build_is_queued_when_that_build_ends`.
+    #[tokio::test]
+    async fn a_lift_with_the_only_permit_still_gets_its_rebuild() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let (heavy, slots) = (Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(tokio::sync::Semaphore::new(1)));
+        let state = rebuilding_state(fixture.root.clone(), &heavy, &slots, 1);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+
+        let response = fixture.send(HeavyRoute::RefUpdate, &state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        eventually("the lift's rebuild ran", || {
+            handle.lifts_since_bundle.load(Ordering::SeqCst) == 0 && rebuilds_settled(&handle)
+        }).await;
+        assert_eq!(slots.available_permits(), 1, "the build gave its slot back");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// A rebuild asked again while a build runs gets a build of its own once the build ends, and
+    /// waits for its slot behind a waiter queued before it (another warehouse's), holding no
+    /// reference to the warehouse, so a drain completes meanwhile.
+    ///
+    /// Reverts: hold the warehouse while waiting → the waiter keeps the warehouse → red. Take a
+    /// slot only when one is free → no build starts → red.
+    #[tokio::test]
+    async fn a_rebuild_asked_again_waits_its_turn_without_holding_the_warehouse() {
+        let root = scratch_dir("rebuild-again-at-capacity");
+        mark_warehouse(&root);
+        let (heavy, slots) = (Arc::new(tokio::sync::Semaphore::new(4)), Arc::new(tokio::sync::Semaphore::new(1)));
+        let state = rebuilding_state(root.clone(), &heavy, &slots, 1000);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let held = Arc::clone(&slots).try_acquire_owned().unwrap();
+
+        rebuild_bundle(&state, Arc::clone(&handle), false);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let other = Arc::clone(&slots).acquire_owned();
+        tokio::pin!(other);
+        assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut other).await.is_err(), "the other waiter queues");
+        drop(held);
+
+        // The first build has started; asked again now, its build waits behind the other waiter,
+        // whether or not the first build has ended by then.
+        eventually("the first build started", || handle.lifts_since_bundle.load(Ordering::SeqCst) == 0
+            && !handle.rebuild_again.load(Ordering::SeqCst)).await;
+        handle.lifts_since_bundle.store(7, Ordering::SeqCst);
+        rebuild_bundle(&state, Arc::clone(&handle), true);
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(30), &mut other).await
+            .expect("the other waiter gets the slot after the first build").unwrap();
+
+        eventually("the first build let the warehouse go", || {
+            !handle.bundling.load(Ordering::SeqCst) && Arc::strong_count(&handle) == 2
+        }).await;
+        assert!(handle.rebuild_queued.load(Ordering::SeqCst), "the second rebuild waits for a slot");
+        assert!(drain(&state, &handle, std::time::Duration::from_secs(2)).await,
+            "a drain completes while the other waiter holds the slot");
+        undrain(&state, &handle);
+
+        drop(granted);
+        eventually("the second build ran", || {
+            handle.lifts_since_bundle.load(Ordering::SeqCst) == 0 && rebuilds_settled(&handle)
+        }).await;
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// A waiter granted while a build runs leaves its ask to that build, and the build's end
+    /// queues it, so the ask gets a build of its own. That build holds its rebuild slot while it
+    /// runs, and no Heavy permit: nothing else contends for either here, so a build that gave its
+    /// slot back would see it free, and one that took a Heavy permit would see one fewer. The Heavy
+    /// cap (3) separates from the slot count (1).
+    ///
+    /// Reverts: drop the re-check after a rebuild ends → the ask stays with no waiter and no
+    /// build → red. Give the slot back before the build → red. Take the slot from the Heavy cap
+    /// → red.
+    #[tokio::test]
+    async fn an_ask_met_by_a_running_build_is_queued_when_that_build_ends() {
+        let root = scratch_dir("rebuild-ask-during-build");
+        mark_warehouse(&root);
+        let (heavy, slots) = (Arc::new(tokio::sync::Semaphore::new(3)), Arc::new(tokio::sync::Semaphore::new(1)));
+        let state = rebuilding_state(root.clone(), &heavy, &slots, 1000);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+
+        // A build runs, and has served the ask it started for.
+        handle.bundling.store(true, Ordering::SeqCst);
+        handle.lifts_since_bundle.store(7, Ordering::SeqCst);
+        rebuild_bundle(&state, Arc::clone(&handle), true);
+        eventually("the waiter was granted and stepped aside", || {
+            !handle.rebuild_queued.load(Ordering::SeqCst) && slots.available_permits() == 1
+        }).await;
+        assert!(handle.rebuild_again.load(Ordering::SeqCst), "the ask is left to the running build");
+        assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 7, "and no build served it");
+
+        let free_during_build = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (heavy, slots, seen) = (Arc::clone(&heavy), Arc::clone(&slots), Arc::clone(&free_during_build));
+            BUNDLE_BUILD_TEST_SEAMS.lock().unwrap().insert(root.clone(), Box::new(move || {
+                *seen.lock().unwrap() = Some((slots.available_permits(), heavy.available_permits()));
+            }));
+        }
+
+        // That build ends.
+        finish_rebuild(&state, &handle);
+        eventually("the ask got a build of its own", || {
+            handle.lifts_since_bundle.load(Ordering::SeqCst) == 0 && rebuilds_settled(&handle)
+        }).await;
+        let (free_slots, free_heavy) = free_during_build.lock().unwrap().expect("the build ran");
+        assert_eq!(free_slots, 0, "the build holds its slot while it runs");
+        assert_eq!(free_heavy, 3, "the build holds no Heavy permit");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// Every function in non-test source that names `acquire_heavy`, by the function it is in.
+    /// With them, every such function that calls `.spawn` on a binding named `permit`.
+    #[derive(Default)]
+    struct HeavyCallers {
+        within: Vec<String>,
+        found: BTreeSet<String>,
+        spawning: BTreeSet<String>,
+    }
+
+    impl HeavyCallers {
+        fn record(&mut self) {
+            self.found.insert(self.within.last().cloned().unwrap_or_else(|| "<item>".to_string()));
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for HeavyCallers {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path.path.segments.last().is_some_and(|segment| segment.ident == "acquire_heavy") {
+                self.record();
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "spawn"
+                && matches!(&*call.receiver, syn::Expr::Path(path) if path.path.is_ident("permit"))
+            {
+                self.spawning.insert(self.within.last().cloned().unwrap_or_else(|| "<item>".to_string()));
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone())).iter().any(|word| word == "acquire_heavy") {
+                self.record();
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    /// Each `ROUTES` literal's handler, by its verb and path as the source spells them: the
+    /// function `on(method, …)` is given, or `<closure>` for an inline one.
+    fn route_handlers(file: &syn::File) -> BTreeMap<(String, String), String> {
+        let routes = file.items.iter()
+            .find_map(|item| match item {
+                syn::Item::Const(constant) if constant.ident == "ROUTES" => Some(constant),
+                _ => None,
+            })
+            .expect("server.rs declares ROUTES");
+        let syn::Expr::Reference(reference) = &*routes.expr else { panic!("ROUTES is not a slice literal") };
+        let syn::Expr::Array(array) = &*reference.expr else { panic!("ROUTES is not an array literal") };
+        let last_name = |path: &syn::ExprPath| path.path.segments.last().unwrap().ident.to_string();
+
+        array.elems.iter().map(|element| {
+            let syn::Expr::Struct(entry) = element else { panic!("a ROUTES entry that is not a struct literal") };
+            let field = |name: &str| &entry.fields.iter()
+                .find(|field| matches!(&field.member, syn::Member::Named(ident) if ident == name))
+                .unwrap_or_else(|| panic!("a ROUTES entry with no {name}"))
+                .expr;
+
+            let syn::Expr::Path(verb) = field("verb") else { panic!("a verb that is not a path") };
+            let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(path), .. }) = field("path") else { panic!("a path that is not a string") };
+            let syn::Expr::Closure(closure) = field("handler") else { panic!("a handler that is not a closure") };
+            let syn::Expr::Call(call) = &*closure.body else { panic!("a handler closure that is not a call") };
+            let handler = match call.args.last() {
+                Some(syn::Expr::Path(handler)) => last_name(handler),
+                _ => "<closure>".to_string(),
+            };
+
+            ((last_name(verb), path.value()), handler)
+        }).collect()
+    }
+
+    /// The cost class each route declares matches its handler: a route is `Heavy` exactly when its
+    /// handler calls `acquire_heavy`, and nothing but a Heavy route's handler calls it. Each of them
+    /// also hands a binding named `permit` to `.spawn`, the one use [`HeavyPermit`] has, so its
+    /// work runs with the permit inside. The scan reads server.rs alone: `acquire_heavy` is private
+    /// to it, so no other file can call it. It checks that the calls are there, not where they sit
+    /// or that the spawned permit is the one acquired; the capacity, drain and hang-up tests do.
+    ///
+    /// Reverts: mark `delete_ref` Light → red; drop `acquire_heavy` from a Heavy handler → red;
+    /// call it from a Light one → red; run a Heavy handler's work with `tokio::spawn`, keeping the
+    /// permit in the request → red.
+    #[test]
+    fn a_route_is_heavy_exactly_when_its_handler_calls_acquire_heavy() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let file = syn::parse_file(&source).unwrap();
+        let handlers = route_handlers(&file);
+        assert_eq!(handlers.len(), ROUTES.len(), "every ROUTES entry read from the source once");
+
+        let mut callers = HeavyCallers::default();
+        syn::visit::Visit::visit_file(&mut callers, &file);
+
+        let heavy: BTreeSet<String> = ROUTES.iter()
+            .filter(|entry| entry.cost == Cost::Heavy)
+            .map(|entry| handlers[&(format!("{:?}", entry.verb), entry.path.to_string())].clone())
+            .collect();
+
+        assert_eq!(heavy, callers.found, "Heavy routes' handlers (left), functions calling acquire_heavy (right)");
+        assert_eq!(callers.found, callers.spawning, "functions calling acquire_heavy (left), functions spawning on `permit` (right)");
+
+        // A literal, not read from ROUTES: making a route Heavy or Light is an edit here too.
+        let expected: BTreeSet<String> = ["delete_ref", "post_objects_batch", "post_ref_update", "put_trust"]
+            .map(str::to_string).into();
+        assert_eq!(heavy, expected, "the Heavy routes");
+    }
+
+    /// `serve`'s capacity: a set value is used as given; zero, and more than the semaphore can
+    /// hold, are refused naming the flag and the key; unset is the host's parallelism, or 4 on a
+    /// host that reports none. The host's 7 and the limit's 9 separate from the fallback 4 and from
+    /// every set value here, so no arm passes on another's value.
+    ///
+    /// Reverts: accept zero → no error → red; default to a constant → `Ok(4)` for the host's 7 →
+    /// red; drop the semaphore bound → `Ok(10)` → red; read the host in place of the given
+    /// parallelism → `heavy_capacity`'s wiring is the last assertion.
+    #[test]
+    fn the_heavy_capacity_is_the_setting_or_the_hosts_parallelism() {
+        assert_eq!(heavy_capacity_when(Some(3), Some(7), 9), Ok(3));
+        assert_eq!(heavy_capacity_when(Some(9), Some(7), 9), Ok(9));
+        assert_eq!(heavy_capacity_when(None, Some(7), 9), Ok(7));
+        assert_eq!(heavy_capacity_when(None, None, 9), Ok(4));
+
+        let error = heavy_capacity_when(Some(0), Some(7), 9).unwrap_err();
+        assert!(error.starts_with("--max-heavy-requests (\"max_heavy_requests\" in the config file) is 0, \
+            which would refuse every ref update"), "{error}");
+
+        let error = heavy_capacity_when(Some(10), Some(7), 9).unwrap_err();
+        assert_eq!(error, "--max-heavy-requests (\"max_heavy_requests\" in the config file) is 10, more than \
+            this server can count; the most it accepts is 9.");
+
+        // On this host: its own parallelism, read where `serve` reads it.
+        let parallelism = std::thread::available_parallelism().map(usize::from).ok();
+        assert_eq!(heavy_capacity(None), Ok(parallelism.unwrap_or(4)));
+    }
+
+    /// Reached through a `ServeOptions` built directly, not only through `main.rs`'s readers.
+    ///
+    /// Revert: drop the `heavy_capacity` call from `serve` → the zero passes and the root is
+    /// resolved instead → red.
+    #[tokio::test]
+    async fn serve_refuses_a_max_heavy_requests_of_zero() {
+        let options = ServeOptions { max_heavy_requests: Some(0), open: true, ..bare_serve_options() };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.starts_with("--max-heavy-requests (\"max_heavy_requests\" in the config file) is 0"), "{error}");
     }
 }
