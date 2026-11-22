@@ -15633,12 +15633,12 @@ fn an_older_journal_is_refused_by_its_version() {
 
     let path = warehouse.root.join(".forklift/journal.json");
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("\"version\":4"), "{}", text);
-    std::fs::write(&path, text.replace("\"version\":4", "\"version\":3")).unwrap();
+    assert!(text.contains("\"version\":5"), "{}", text);
+    std::fs::write(&path, text.replace("\"version\":5", "\"version\":4")).unwrap();
 
     let refused = warehouse.run(&["undo"]);
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("has format version 3"), "{:?}", refused);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("has format version 4"), "{:?}", refused);
 }
 
 #[test]
