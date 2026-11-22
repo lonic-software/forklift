@@ -200,10 +200,10 @@ pub struct JournalEntry {
     /// [`check_undoable`]), and `restore_refs` rolls back only the refs still sitting here.
     pub after: Snapshot,
 
-    /// Whether an undo of this entry has started: the mark that tells a bay an interrupted undo
-    /// left apart from one that only looks like it. False when the entry is pushed. The pop that
-    /// finishes the undo removes it with the entry, and a merge abort or abandon clears it before
-    /// it changes anything (see [`pop_latest_left_in_progress_if`]).
+    /// Whether an undo of this entry has started, kept so that a retried undo can tell a bay its
+    /// interrupted run left from one that only looks like it. False when the entry is pushed.
+    /// The pop that finishes an undo removes it with the entry, and a merge abort or abandon
+    /// clears it before it changes anything (see [`pop_latest_left_in_progress_if`]).
     pub undo_started: bool,
 }
 
@@ -768,12 +768,14 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// `undo`. Kept, the entry would refuse every later undo: the bay no longer holds the consolidation
 /// its after records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
 /// and its undo depends on no bay state. Any other entry is kept, so a rerun of an interrupted
-/// abort, whose entry is already gone, removes nothing more; it only loses an undo's mark (see
+/// abort, whose entry is already gone, removes nothing more. A kept entry loses an undo's mark,
+/// which on such a rerun leaves an older interrupted undo refused (see
 /// [`pop_latest_left_in_progress_if`]).
 ///
 /// # Returns
 /// * `Ok(true)`    - The entry was removed.
-/// * `Ok(false)`   - No such entry is the latest, or the journal is empty.
+/// * `Ok(false)`   - No such entry is the latest, or the journal is empty; a kept entry's undo
+///                   mark may have been cleared.
 /// * `Err(String)` - If the journal or the bay's state could not be read, or the journal rewritten.
 pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
     pop_latest_left_in_progress_if(|entry| {
@@ -792,12 +794,13 @@ pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
 /// since the record may be damaged: the latest entry other than a pallet delete is removed when it
 /// left a consolidation or pick in progress and the bay still stands where it left it, on the same
 /// pallet and base. Whichever merge that entry recorded, none is in progress once the abort is
-/// through, so kept, it would refuse every later undo. Any other entry is kept, losing only an
+/// through, so kept, it would refuse every later undo. Any other entry is kept, and loses an
 /// undo's mark (see [`pop_latest_left_in_progress_if`]).
 ///
 /// # Returns
 /// * `Ok(true)`    - The entry was removed.
-/// * `Ok(false)`   - No such entry is the latest, or the journal is empty.
+/// * `Ok(false)`   - No such entry is the latest, or the journal is empty; a kept entry's undo
+///                   mark may have been cleared.
 /// * `Err(String)` - If the journal or the bay's position could not be read, or the journal rewritten.
 pub fn pop_if_it_left_in_progress_unread() -> Result<bool, String> {
     pop_latest_left_in_progress_if(|entry| {
@@ -809,29 +812,42 @@ pub fn pop_if_it_left_in_progress_unread() -> Result<bool, String> {
 /// Remove the latest entry other than a pallet delete when it [left a merge in
 /// progress](left_in_progress) and `still_there` holds for it.
 ///
-/// First, when that entry carries an undo's [`undo_started`](JournalEntry::undo_started) mark,
-/// rewrite it unmarked. Merge abort and abandon call this before they change anything, so an abort
-/// of the merge an interrupted undo wrote back leaves no mark that a later undo could take for its
-/// own unfinished run and resume, writing the aborted merge back. A failed rewrite fails the
-/// command with nothing changed.
+/// An entry it keeps loses an undo's [`undo_started`](JournalEntry::undo_started) mark, in the
+/// same single journal write. Merge abort and abandon call this before they change anything, so an
+/// abort of the merge an interrupted undo wrote back leaves no mark that a later undo could take
+/// for its own unfinished run and resume, writing the aborted merge back. A failed read or check
+/// fails the command with the journal as it was.
+///
+/// The mark is cleared on whichever entry is latest. A rerun of an abort interrupted after its pop
+/// therefore finds an older entry there, and clears that entry's mark too: an undo interrupted
+/// before that merge started is then refused as an unmarked one, which is the refusal it met
+/// before the mark existed. That takes two faults, and a combination of faults keeps today's
+/// refusal.
+///
+/// # Returns
+/// * `Ok(true)`    - The entry was removed.
+/// * `Ok(false)`   - It was kept; its mark, if it had one, was cleared.
+/// * `Err(String)` - If the journal could not be read or rewritten, or `still_there` failed.
 fn pop_latest_left_in_progress_if(still_there: impl FnOnce(&JournalEntry) -> Result<bool, String>) -> Result<bool, String> {
     let mut entries = read()?;
     let Some(index) = entries.iter().rposition(|entry| entry.op != DELETE_OP) else {
         return Ok(false);
     };
 
-    if entries[index].undo_started {
-        entries[index].undo_started = false;
-        write(&entries)?;
-    }
+    // Judged before anything is written, so a check that fails leaves the journal, mark
+    // included, as it was. One write then removes the entry, or clears its mark.
+    let popped = left_in_progress(&entries[index]) && still_there(&entries[index])?;
 
-    if !left_in_progress(&entries[index]) || !still_there(&entries[index])? {
+    if popped {
+        entries.remove(index);
+    } else if entries[index].undo_started {
+        entries[index].undo_started = false;
+    } else {
         return Ok(false);
     }
 
-    entries.remove(index);
     write(&entries)?;
-    Ok(true)
+    Ok(popped)
 }
 
 /// Whether `entry`'s operation started the consolidation or pick its after snapshot holds: one it
@@ -1823,6 +1839,22 @@ mod tests {
                 "{}", what
             );
         }
+
+        // A marked entry that left the merge is still removed, mark and all.
+        let mut started = entry("pick", "main", &hash('a'), &hash('a'));
+        started.after.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('a'), our_pallet: "main".to_string(), description: None });
+        started.undo_started = true;
+        write(&[older.clone(), started]).unwrap();
+        assert!(pop_if_it_left_in_progress_unread().unwrap(), "the entry that left the pick is removed");
+        assert_eq!(read().unwrap(), [older.clone()]);
+
+        // A check that fails leaves the journal as it was, the mark included.
+        let mut started_marked = latest.clone();
+        started_marked.after.cherry_pick = Some(PickInProgress { source: hash('c'), our_head: hash('a'), our_pallet: "main".to_string(), description: None });
+        write(&[older.clone(), started_marked.clone()]).unwrap();
+        let failed = pop_latest_left_in_progress_if(|_| Err("unreadable".to_string()));
+        assert_eq!(failed, Err("unreadable".to_string()));
+        assert_eq!(read().unwrap(), [older, started_marked], "a failed check writes nothing");
     }
 
     #[test]

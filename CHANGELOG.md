@@ -113,10 +113,6 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
-- **The undo journal moves to version 5.** Each entry now records whether an undo of it has
-  started, and `abort` (with or without `--keep-files`) clears that record. **Breaking:** a journal written
-  before this change is refused as an older version's. Remove it to start a fresh journal, which
-  loses the undo history from before the upgrade.
 - **While a durability taint stands, a refused write leaves the file as it was.** A write of a
   single file on its own, such as a pallet's ref, that a standing taint refuses is now refused before it
   replaces anything, where before it was written and then reported as refused. `heal`'s own
@@ -215,7 +211,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   as the full scope. Such a record now refuses as damaged. A full scope is no longer the empty
   file, so an empty scope file refuses too. **Breaking:** these records written before this
   change refuse as an older version's, so clone or make the warehouse again. The undo journal
-  moves to version 4 with them, and an older one is refused, so undo history from before the
+  moves to version 5 with them, and an older one is refused, so undo history from before the
   upgrade is lost.
 - **A server's withheld record, tombstone list and served mark carry a digest.** Damage that still
   parsed, such as a flipped digit in a hash, was read as true: a takedown was served again under
