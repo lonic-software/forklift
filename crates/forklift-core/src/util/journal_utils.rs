@@ -1082,7 +1082,8 @@ fn current_pallet_moved(pallet: &str, op: &str) -> String {
 /// an undo started ([`JournalEntry::undo_started`]), in one journal write; a retry that finds the
 /// mark already set writes none. A failure there refuses with nothing changed. Every bay a stopped
 /// undo leaves from then on is one [`check_undoable`] passes for the marked entry, and a retry
-/// resumes it.
+/// resumes it. A failed run that wrote the mark withdraws it when the bay and every journaled ref
+/// still read as the operation left them, so a refused undo leaves the journal as it was.
 ///
 /// The bay's position goes back first, to the base `entry.before` records — the tree the bay held
 /// before the operation, never a fresh read of the ref. Then the current pallet's ref: if it moved
@@ -1106,9 +1107,20 @@ fn current_pallet_moved(pallet: &str, op: &str) -> String {
 /// * `store_access` - The command's shared store-access hold, which an un-restore of the current
 ///                    pallet is judged under (see [`un_restore_current`]).
 pub fn restore_refs(entry: &JournalEntry, store_access: &StoreAccessLock) -> Result<(), String> {
-    let current = &entry.after.current_pallet;
-
     mark_undo_started(entry)?;
+
+    let restored = restore_marked(entry, store_access);
+
+    if restored.is_err() && !entry.undo_started {
+        withdraw_mark_if_unchanged(entry);
+    }
+
+    restored
+}
+
+/// The writes of [`restore_refs`] once its entry is marked.
+fn restore_marked(entry: &JournalEntry, store_access: &StoreAccessLock) -> Result<(), String> {
+    let current = &entry.after.current_pallet;
 
     pallet_utils::write_position(&pallet_utils::BayPosition::new(
         &entry.before.current_pallet, entry.before.current_head().cloned(),
@@ -1190,6 +1202,39 @@ fn mark_undo_started(entry: &JournalEntry) -> Result<(), String> {
     }
 
     write(&entries)
+}
+
+/// After a failed [`restore_refs`] that marked `entry`, unmark it again when the attempt is seen
+/// to have changed nothing: the bay reads as `entry.after`'s and every ref the entry journals
+/// still holds the head the operation left. A refused undo, such as one a pending move of the
+/// origin stops at its first put-back, then leaves the warehouse as it was. Otherwise, or when a
+/// read or the journal write fails, the mark stays, which only lets a retry resume.
+fn withdraw_mark_if_unchanged(entry: &JournalEntry) {
+    let unchanged = || -> Result<bool, String> {
+        if BayState::read()? != entry.after.bay_state() {
+            return Ok(false);
+        }
+        for (wire, head) in &entry.after.heads {
+            let reference = PalletRef::parse(wire)?;
+            if pallet_utils::get_pallet_head_in(reference.namespace, &reference.name)? != *head {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+
+    if !matches!(unchanged(), Ok(true)) {
+        return;
+    }
+
+    let Ok(mut entries) = read() else { return };
+    let mut marked = entry.clone();
+    marked.undo_started = true;
+
+    if let Some(latest) = entries.last_mut().filter(|latest| **latest == marked) {
+        latest.undo_started = false;
+        let _ = write(&entries);
+    }
 }
 
 /// Put back the refs `entry`'s operation wrote, the current pallet's first: see [`restore_refs`].
@@ -2710,12 +2755,16 @@ mod tests {
             return;
         }
 
+        let journal = std::fs::read(path()).unwrap();
         let restored = restore_refs(&entry, &held());
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(restored.is_err(), "the \"@kv\" write must fail");
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('2')),
             "the current pallet must be back where the operation left it");
+        // Everything reads as the operation left it, so the mark the attempt wrote is withdrawn.
+        // Revert: keep it → the journal holds the entry marked.
+        assert!(std::fs::read(path()).unwrap() == journal, "the journal is as it was before the attempt");
         check_undoable(&entry).expect("a retried undo must still pass the gate");
     }
 
