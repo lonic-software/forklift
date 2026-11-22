@@ -1102,8 +1102,8 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
     let current = &entry.after.current_pallet;
 
     // What the current pallet's head was judged against when its put-back read it, should it have
-    // to be moved back there. Read before the first put-back, and its own failure reported only
-    // then, so it refuses no undo that needs no un-restore.
+    // to be moved back there. Read before the first put-back; one that fails refuses nothing, and
+    // leaves an un-restore to the ordinary checked write.
     let basis = pallet_utils::PutBackBasis::read();
 
     for wire in put_back_order(entry) {
@@ -1160,21 +1160,21 @@ fn put_back_order(entry: &JournalEntry) -> impl Iterator<Item = &String> {
 /// error to report. Other refs restored before the failure stay restored: a retried undo finds
 /// them moved off the operation's heads and leaves them alone.
 ///
-/// A compensating write ([`pallet_utils::compensating_head_write`]), judged against `basis`: a
-/// taint the failed write left standing does not refuse it, so the bay is left where a retried
-/// undo passes its check once `forklift heal` has cleared that taint.
+/// A compensating write ([`pallet_utils::compensating_head_write`]) while `basis` still judges the
+/// head it puts back: a taint the failed write left standing does not refuse it, so the bay is
+/// left where a retried undo passes its check once `forklift heal` has cleared that taint. Once
+/// `basis` no longer does, it is the ordinary checked write.
 fn un_restore_current(entry: &JournalEntry, basis: &Result<pallet_utils::PutBackBasis, String>, error: String) -> String {
     let current = &entry.after.current_pallet;
     let (Some(pre_head), Some(post_head)) = (entry.before.head(current), entry.after.head(current)) else {
         return error;
     };
 
-    let written = match basis {
-        Ok(basis) => pallet_utils::compensating_head_write(current, pre_head, post_head, basis),
-        Err(read) => Err(RefUpdateError::Failed(read.clone())),
-    };
+    if pre_head == post_head {
+        return error;
+    }
 
-    let e = match written {
+    let e = match pallet_utils::compensating_head_write(current, pre_head, post_head, basis) {
         Ok(()) | Err(RefUpdateError::Moved(_)) => return error,
         Err(e) => e.to_string(),
     };

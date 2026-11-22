@@ -849,8 +849,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   Now the current pallet is moved back where the operation left it, and the retry runs once
   `forklift heal` has cleared the taint. In a served or sparse warehouse that move still reads the
   pallet's history, and a read the taint refuses leaves the undo as before. If a redaction was
-  recorded or applied, or the fetch scope changed, while the undo ran, the current pallet is not
-  moved back, and the error says a retried undo will not pass its check.
+  recorded or applied, or the fetch scope changed, while the undo ran, the pallet is moved back by
+  an ordinary checked write, which the taint still refuses, and the error then says a retried
+  undo will not pass its check.
 - `heal` no longer refuses forever over a durability taint that records a lost metadata ref copy
   (`.forklift/meta-copy/<name>`), as a crash can leave one after a metadata pallet's first write.
   When the ref beside it is a file holding a parcel hash, that part of the taint is resolved, and
