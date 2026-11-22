@@ -1782,16 +1782,17 @@ fn write_trust_office(lock: &crate::util::lock_utils::RefLock,
 /// Put the trust file back to `previous` (`None`: remove it), under [`install_trust`]'s hold. The
 /// copy is left as it is: an install fails back only before its copy write
 /// ([`write_trust_install`]), so the copy is still the one the install found. A compensating
-/// write ([`file_utils::compensating`]): a taint the failed install left standing does not stop it.
+/// write ([`file_utils::write_file_compensating`]): a taint the failed install left standing does
+/// not stop it, and a failed folder sync records one.
 fn restore_trust_file(previous: Option<&[u8]>) -> Result<(), String> {
     let path = forklift_root().join(FILE_NAME_TRUST);
 
     match previous {
-        Some(previous) => file_utils::compensating(|| file_utils::write_file_atomically(&path, previous)),
+        Some(previous) => file_utils::write_file_compensating(&path, previous),
         None => {
             file_utils::remove_file(&path)
                 .map_err(|e| format!("Error while removing the trust file: {}", e))?;
-            file_utils::sync_dir(&forklift_root())
+            file_utils::sync_dir_again_or_taint(&forklift_root(), &[&path])
         }
     }
 }
@@ -3680,6 +3681,41 @@ pub(crate) mod tests {
 
         assert!(absent.contains("has no"),
             "an absent required array must still report absence: {}", absent);
+    }
+
+    /// A trust install that created the trust file fails back by removing it. A failed folder
+    /// sync after the removal records a taint, as any compensating write's does, so a power cut
+    /// that brings the removed anchor back leaves heal a record to start from.
+    /// Revert: sync the folder without recording a taint → no taint stands → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_trust_fail_back_removal_whose_folder_sync_fails_records_a_taint() {
+        use crate::globals::StorageRootScope;
+        use crate::util::taint_utils;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-office-utils-trust-removal-sync-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+
+        let path = forklift_root().join(FILE_NAME_TRUST);
+        std::fs::write(&path, b"the anchor the install created").unwrap();
+
+        let removed = {
+            let _rig = file_utils::SyncDirFaultGuard::failing_exactly(&forklift_root());
+            restore_trust_file(None)
+        };
+
+        assert!(removed.is_err(), "a failed folder sync is reported");
+        assert!(!path.exists(), "the removal landed");
+        assert!(taint_utils::read_taints(&forklift_root()).unwrap().standing(), "the failed sync is recorded");
+
+        taint_utils::test_clear_gate(&forklift_root());
+        let _ = file_utils::remove_dir_all(&dir);
     }
 
     /// `filter_map(|e| e.as_str())`, silently dropping a non-string entry instead of erroring —

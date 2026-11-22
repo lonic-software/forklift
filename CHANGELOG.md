@@ -822,15 +822,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 ### Fixed
 
 - When a write fails in a way that records a durability taint, the command now still puts back
-  what it had already changed. This covers three cases:
+  what it had already changed. This covers two cases:
   - a trust install whose office write failed puts back the previous trust anchor;
-  - a metadata pallet write whose ref write failed puts its copy back as it was;
-  - an `undo` that stops partway puts the current pallet and the bay's position back where the
-    operation left them, so running `undo` again still passes its check.
+  - a metadata pallet write whose ref write failed puts its copy back as it was.
 
-  Before, the taint left by the failure refused each of these put-backs. The trust anchor or the
-  copy was then left at the new value beside an unchanged office or ref, and the undo was left half
-  done. The taint still stands afterwards, and `heal` is still needed.
+  Before, the taint left by the failure refused each of these put-backs, and the trust anchor or
+  the copy was left at the new value beside an unchanged office or ref. The taint still stands
+  afterwards, and `heal` is still needed. A trust install that created the trust file and then
+  fails removes it again; if the folder sync after that removal fails, a taint is now recorded for
+  `heal` as well.
 - `heal` no longer refuses forever over a durability taint that records a lost metadata ref copy
   (`.forklift/meta-copy/<name>`), as a crash can leave one after a metadata pallet's first write.
   When the ref beside it is a file holding a parcel hash, that part of the taint is resolved, and

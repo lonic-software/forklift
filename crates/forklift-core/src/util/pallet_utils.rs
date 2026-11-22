@@ -2497,14 +2497,15 @@ fn write_copy_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// own prior head, and return the error to report. The restore is read back, since a write can
 /// land and still return an error; one that did not land leaves the copy at the new head, which
 /// passed every check of the write, and says so. A compensating write
-/// ([`file_utils::compensating`]): a taint the failed write left standing does not stop it.
+/// ([`file_utils::write_file_compensating`]): a taint the failed write left standing does not stop
+/// it, and a failed folder sync records one.
 fn restore_copy(path: &Path, prior: &MetaCopyState, error: String) -> String {
     let restored = match read_file_state(path) {
         Ok(state) if state == *prior => return error,
         _ => match prior {
-            MetaCopyState::Bytes(bytes) => file_utils::compensating(|| file_utils::write_file_atomically(path, bytes)),
+            MetaCopyState::Bytes(bytes) => file_utils::write_file_compensating(path, bytes),
             MetaCopyState::Absent => match file_utils::remove_file(path) {
-                Ok(()) => path.parent().map_or(Ok(()), |parent| file_utils::sync_dir_or_taint(parent, &[path])),
+                Ok(()) => path.parent().map_or(Ok(()), |parent| file_utils::sync_dir_again_or_taint(parent, &[path])),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e.to_string()),
             },
@@ -3226,19 +3227,20 @@ pub(crate) mod tests {
         /// The taint machinery activated, and the next write landing with an error: a taint is
         /// recorded while it is in flight, and cleared before it returns, so the writes after it
         /// run with no taint standing.
-        fn land_next_write_with_an_error() -> (std::sync::MutexGuard<'static, ()>, file_utils::PostRenameTaintSeam) {
+        fn land_next_write_with_an_error() -> (file_utils::PostRenameTaintSeam, std::sync::MutexGuard<'static, ()>) {
             let serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             taint_utils::activate();
-            (serial, file_utils::PostRenameTaintSeam::arm())
+            (file_utils::PostRenameTaintSeam::arm(), serial)
         }
 
         /// The taint machinery activated, and the write to `path` landing with an error that leaves
         /// a taint standing, as a failed folder sync does: every write after it runs under that
-        /// taint, until the guard drops.
-        fn land_next_write_leaving_a_taint(path: &Path) -> (std::sync::MutexGuard<'static, ()>, file_utils::PostRenameTaintSeam) {
+        /// taint, until the guard drops. The seam comes first in the pair, so a pair dropped whole
+        /// clears the taint before it releases the activation lock.
+        fn land_next_write_leaving_a_taint(path: &Path) -> (file_utils::PostRenameTaintSeam, std::sync::MutexGuard<'static, ()>) {
             let serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             taint_utils::activate();
-            (serial, file_utils::PostRenameTaintSeam::arm_standing_at(path))
+            (file_utils::PostRenameTaintSeam::arm_standing_at(path), serial)
         }
 
         /// A forward write over a standing ref writes the copy first, and a copy that cannot be
@@ -3262,11 +3264,11 @@ pub(crate) mod tests {
         /// its own prior state: its prior bytes, or its absence, never the ref's bytes. It does so
         /// too when the copy write's failure leaves a taint standing.
         /// Revert: drop the restore → every case red; restore to the ref's bytes → the absent and
-        /// older cases red; write the prior bytes back outside the compensating scope → the
-        /// standing cases red.
+        /// older cases red; write the prior bytes back as an ordinary write → the bytes standing
+        /// cases red.
         #[test]
         fn a_copy_that_landed_beside_a_ref_that_did_not_is_put_back_as_it_was() {
-            for case in ["same", "absent", "older", "same, taint standing", "older, taint standing"] {
+            for case in ["same", "absent", "older", "same, taint standing", "absent, taint standing", "older, taint standing"] {
                 let (_root, _scope) = scratch(&format!("meta-copy-restore-{}", case));
                 let (h0, h1, h2) = (stub_parcel("h0"), stub_parcel("h1"), stub_parcel("h2"));
                 write("tags", None, &h0).unwrap();
@@ -3274,7 +3276,7 @@ pub(crate) mod tests {
 
                 // Both parse, so the write takes the forward path over a standing ref.
                 match case {
-                    "absent" => file_utils::remove_file(get_meta_copy_path("tags")).unwrap(),
+                    "absent" | "absent, taint standing" => file_utils::remove_file(get_meta_copy_path("tags")).unwrap(),
                     "older" | "older, taint standing" => set_copy("tags", &h0),
                     _ => {}
                 }

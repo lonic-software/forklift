@@ -1045,9 +1045,8 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
             _ => false,
         };
 
-        // A compensating write: a taint the failed ref write left standing does not stop it.
         if keeps_operation {
-            file_utils::compensating(|| pallet_utils::write_position(&pallet_utils::BayPosition::new(current, operation_left.cloned())))
+            pallet_utils::write_position(&pallet_utils::BayPosition::new(current, operation_left.cloned()))
                 .map_err(|e| format!("{} {}", error, e))?;
         }
 
@@ -1149,21 +1148,13 @@ fn put_back_order(entry: &JournalEntry) -> impl Iterator<Item = &String> {
 /// from its restored head to the one the operation left (if it was restored), and return the
 /// error to report. Other refs restored before the failure stay restored: a retried undo finds
 /// them moved off the operation's heads and leaves them alone.
-///
-/// A compensating write ([`file_utils::compensating`]): a taint the failed ref write left standing
-/// does not stop it. That covers the fetch-ledger entry the head write records first, when the
-/// head leaves its restored parcel unreached, since the put-back cannot land without it.
 fn un_restore_current(entry: &JournalEntry, error: String) -> String {
     let current = &entry.after.current_pallet;
     let (Some(pre_head), Some(post_head)) = (entry.before.head(current), entry.after.head(current)) else {
         return error;
     };
 
-    let put_back = file_utils::compensating(|| pallet_utils::update_pallet_head_in(
-        PalletNamespace::User, current, Some(pre_head), post_head, &pallet_utils::RefPreconditions::NONE,
-    ));
-
-    let e = match put_back {
+    let e = match pallet_utils::update_pallet_head_in(PalletNamespace::User, current, Some(pre_head), post_head, &pallet_utils::RefPreconditions::NONE) {
         Ok(()) | Err(RefUpdateError::Moved(_)) => return error,
         Err(e) => e.to_string(),
     };
@@ -2495,38 +2486,6 @@ mod tests {
         assert!(restored.is_err(), "the \"@kv\" write must fail");
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('2')),
             "the current pallet must be back where the operation left it");
-        check_undoable(&entry).expect("a retried undo must still pass the gate");
-    }
-
-    // The put-back of the current pallet lands and returns an error that leaves a taint standing,
-    // as a failed folder sync does: the ref and the position still go back where the operation
-    // left them, so a retried undo passes the gate.
-    // Revert: move the ref back outside the compensating scope → it stays at the earlier head →
-    // red. Revert: write the position back outside the scope → it stays at the earlier base →
-    // red.
-    #[test]
-    fn an_undo_whose_ref_write_leaves_a_taint_still_puts_the_current_pallet_back() {
-        let _scratch = Scratch::new("restore-under-taint");
-
-        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", pallet_utils::get_pallet_head("main").unwrap())).unwrap();
-        advance("main", None, &hash('1')).unwrap();
-        let before = capture().unwrap();
-        advance("main", Some(&hash('1')), &hash('2')).unwrap();
-        push_if_changed("stack", before).unwrap();
-        let entry = peek().unwrap().unwrap();
-
-        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::util::taint_utils::activate();
-        let _seam = file_utils::PostRenameTaintSeam::arm_standing_at(&pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main"));
-
-        let restored = restore_refs(&entry).expect_err("the ref write returned an error");
-
-        assert!(crate::util::taint_utils::read_taints(&crate::globals::forklift_root()).unwrap().standing(), "the failure left a taint");
-        assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('2')),
-            "the current pallet must be back where the operation left it");
-        assert_eq!(pallet_utils::read_position().unwrap(), pallet_utils::BayPosition::new("main", Some(hash('2'))),
-            "the bay must be back on the operation's result");
-        assert!(!restored.contains("could not be put back"), "{}", restored);
         check_undoable(&entry).expect("a retried undo must still pass the gate");
     }
 

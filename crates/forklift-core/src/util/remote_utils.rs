@@ -9669,7 +9669,7 @@ mod tests {
     }
 
     // Revert: skip `restore_trust_file` → the new anchor stands beside the old office. Revert:
-    // write the anchor back outside the compensating scope → a taint standing after the trust
+    // write the anchor back as an ordinary write → a taint standing after the trust
     // write refuses it, and the new anchor stands → red.
     #[test]
     fn a_trust_install_whose_office_write_fails_puts_the_previous_anchor_back() {
@@ -9677,14 +9677,14 @@ mod tests {
             let fixture = Regenesis::new(&format!("office-refused-{}", taint_stands));
             office_utils::tests::OFFICE_WRITE_FAULT.with(|fault| fault.set(office_utils::tests::OfficeWriteFault::Refuse));
 
-            // A taint recorded after the trust write, as a failed folder sync records one.
+            // A taint recorded after the trust write, as a failed folder sync records one: the
+            // durable record and the in-memory gate.
             let _serial = taint_stands.then(|| {
                 let serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 crate::util::taint_utils::activate();
                 office_utils::tests::BETWEEN_TRUST_WRITES.with(|seam| seam.set(Some(Box::new(|| {
-                    let folder = crate::globals::forklift_root().join("taint");
-                    std::fs::create_dir_all(&folder).unwrap();
-                    std::fs::write(folder.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/left"])).unwrap();
+                    let trust = crate::globals::forklift_root().join(office_utils::FILE_NAME_TRUST);
+                    crate::util::taint_utils::record_taint(&[&trust]).unwrap();
                 }))));
                 serial
             });
@@ -9695,6 +9695,7 @@ mod tests {
             assert!(error.to_string().contains("injected office write refusal"), "{}", error);
             assert!(!error.to_string().contains("could not be put back"), "{}", error);
             assert_eq!(crate::util::taint_utils::read_taints(&crate::globals::forklift_root()).unwrap().standing(), taint_stands);
+            crate::util::taint_utils::test_clear_gate(&crate::globals::forklift_root());
         }
     }
 
