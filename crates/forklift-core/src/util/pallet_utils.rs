@@ -1698,6 +1698,113 @@ pub(crate) fn put_back_pallet_head_in(
     update_pallet_head_checked(namespace, name, Some(expected), new, &RefPreconditions::NONE, None, None, None, None, None, None, WriteOrder::Backward)
 }
 
+/// What an undo's put-backs were judged against, read once before the first of them: the
+/// `@redactions` head, the record of applied redactions and the fetch scope. A
+/// [`compensating_head_write`] reads them again under its hold and refuses when any differs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PutBackBasis {
+    redactions: Option<String>,
+    applied: crate::util::applied_redactions::AppliedSet,
+    scope: PathScope,
+}
+
+impl PutBackBasis {
+    /// Read the three as they stand now.
+    pub(crate) fn read() -> Result<PutBackBasis, String> {
+        Ok(PutBackBasis {
+            redactions: get_meta_pallet_head(crate::util::redaction_utils::REDACTIONS_PALLET_NAME)?,
+            applied: crate::util::applied_redactions::read_applied()?,
+            scope: crate::util::scope_utils::read_fetch_scope()?,
+        })
+    }
+}
+
+/// Move user pallet `name` from `expected` back to `new`, the head it held when an undo's
+/// put-back of it began, after a later step of that undo failed: undo's un-restore of the current
+/// pallet. A compensating write ([`file_utils::write_file_compensating`]), so a taint the failed
+/// put-back left standing does not refuse it.
+///
+/// It keeps the compare-and-set, the served warehouse's refusal of a backward move (judged again
+/// in the hold), the fetched-heads ledger record of a head left unreached, the folder refusal and
+/// the write log. It verifies no closure and walks no redaction: `new` stood at the ref, its
+/// closure complete at the fetch scope, when the put-back read it under the ref lock, and while
+/// undo holds its store access no deleter runs. In place of those checks, `basis` (read before
+/// the first put-back) is read again under the hold: a redaction recorded or applied since, or a
+/// fetch scope changed since, refuses the write, since `new` was judged against neither.
+///
+/// # Returns
+/// * `Ok(())`                        - The head was moved.
+/// * `Err(RefUpdateError::Moved)`    - The ref did not hold `expected`; nothing was written.
+/// * `Err(RefUpdateError::Backward)` - In this served warehouse, `new` does not descend from
+///                                     `expected`; nothing was written.
+/// * `Err(RefUpdateError::Failed)`   - `basis` no longer stands, the name or head is invalid, or
+///                                     the ref could not be locked, read or written (the write may
+///                                     still have landed: read the ref back to tell).
+pub(crate) fn compensating_head_write(name: &str,
+                                      expected: &str,
+                                      new: &str,
+                                      basis: &PutBackBasis) -> Result<(), RefUpdateError> {
+    let namespace = PalletNamespace::User;
+
+    validate_head_write(name, new)?;
+
+    let left = left_unreached(namespace, Some(expected), new)?;
+    let mut backward = served_backward(namespace, Some(expected), new)?;
+
+    loop {
+        let lock = crate::util::lock_utils::RefLock::acquire()?;
+
+        let found = require_head(namespace, name, Some(expected))?;
+
+        if served_move(Some(expected), new)? != backward.is_some() {
+            drop(lock);
+            backward = served_backward(namespace, Some(expected), new)?;
+            continue;
+        }
+
+        if backward == Some(true) {
+            return Err(RefUpdateError::Backward {
+                pallet: PalletRef { namespace, name: name.to_string() },
+                head: expected.to_string(),
+            });
+        }
+
+        // Every `@redactions` write, applied-record write and fetch-scope commit takes this lock,
+        // so a change either lands before these reads or after the write.
+        let now = PutBackBasis::read()?;
+        let changed = if now.redactions != basis.redactions {
+            Some("a redaction was recorded")
+        } else if now.applied != basis.applied {
+            Some("a redaction was applied")
+        } else if now.scope != basis.scope {
+            Some("the fetch scope changed")
+        } else {
+            None
+        };
+
+        if let Some(changed) = changed {
+            return Err(RefUpdateError::Failed(format!(
+                "Refusing to move pallet \"{}\" back to {}: {} while the undo ran, and that head \
+                was not checked against it. The pallet was not moved.",
+                name, &new[..new.len().min(12)], changed
+            )));
+        }
+
+        if let Some(old) = left {
+            crate::util::fetch_ledger::record_fetch(&lock, old, name)?;
+        }
+
+        let path = get_pallet_ref_path(namespace, name);
+        let written = write_ref_file_with(&path, name, format!("{}\n", new).as_bytes(), file_utils::write_file_compensating);
+
+        if written.is_ok() || get_pallet_head_in(namespace, name).ok().flatten().as_deref() == Some(new) {
+            log_write(PalletRef { namespace, name: name.to_string() }.to_wire(), found, Some(new.to_string()));
+        }
+
+        return Ok(written?);
+    }
+}
+
 /// Which way a head write moves its ref, which orders a meta ref's copy write against the ref
 /// write (see [`write_head_locked`]). Only undo's put-back is backward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2463,6 +2570,14 @@ fn write_head_locked(
 /// Write the ref file at `path` of pallet `name`, creating its folder. A folder standing where
 /// the ref file must go is refused before anything is written.
 fn write_ref_file(path: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    write_ref_file_with(path, name, bytes, file_utils::write_file_atomically)
+}
+
+/// [`write_ref_file`], writing the bytes with `write`.
+fn write_ref_file_with(path: &Path,
+                       name: &str,
+                       bytes: &[u8],
+                       write: fn(&Path, &[u8]) -> Result<(), String>) -> Result<(), String> {
     // A folder where the ref file must go (left by a nested name whose emptied folders could not
     // be removed) reads as an unborn pallet; writing over it is refused by name, never attempted.
     if path.is_dir() {
@@ -2477,7 +2592,7 @@ fn write_ref_file(path: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
         file_utils::create_folder_if_not_exists(parent)?;
     }
 
-    file_utils::write_file_atomically(path, bytes)
+    write(path, bytes)
 }
 
 /// Write a meta ref's copy at `path` with `bytes`, unless it already holds exactly them.
@@ -3131,6 +3246,57 @@ pub(crate) mod tests {
 
     fn hash(c: char) -> String {
         stub_parcel(&c.to_string())
+    }
+
+    /// An undo's un-restore ([`compensating_head_write`]) of "main" from 1 back to 2, after
+    /// `change` ran between the put-back's read of its basis and the write: it lands only when
+    /// nothing changed, and is refused, with "main" left at 1, when the ref moved, a redaction was
+    /// recorded or applied, or the fetch scope changed.
+    #[test]
+    fn a_compensating_head_write_lands_only_on_the_basis_its_put_back_read() {
+        let cases: [(&str, fn(), Option<&str>); 5] = [
+            ("nothing changed", || {}, None),
+            ("the ref moved", || {
+                update_pallet_head("main", Some(&hash('1')), &hash('3'), &RefPreconditions::NONE).unwrap();
+            }, Some("moved")),
+            ("a redaction recorded", || {
+                update_meta_pallet_head(crate::util::redaction_utils::REDACTIONS_PALLET_NAME, None, &hash('r'), &RefPreconditions::NONE).unwrap();
+            }, Some("a redaction was recorded while the undo ran")),
+            ("a redaction applied", || {
+                crate::util::applied_redactions::apply_for_test(&[&hash('x')]);
+            }, Some("a redaction was applied while the undo ran")),
+            ("the fetch scope widened", || {
+                crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src", "web"])).unwrap();
+            }, Some("the fetch scope changed while the undo ran")),
+        ];
+
+        for (label, change, refused) in cases {
+            let (_root, _scope) = scratch(&format!("compensating-head-{}", label.replace(' ', "-")));
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
+            crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
+            update_pallet_head("main", None, &hash('1'), &RefPreconditions::NONE).unwrap();
+
+            let basis = PutBackBasis::read().unwrap();
+            change();
+            let before = get_pallet_head("main").unwrap();
+            let written = compensating_head_write("main", &hash('1'), &hash('2'), &basis);
+
+            match refused {
+                None => {
+                    assert_eq!(written, Ok(()), "{}", label);
+                    assert_eq!(get_pallet_head("main").unwrap(), Some(hash('2')), "{}: the write must land", label);
+                }
+                Some("moved") => {
+                    assert!(matches!(written, Err(RefUpdateError::Moved(_))), "{}: {:?}", label, written);
+                    assert_eq!(get_pallet_head("main").unwrap(), Some(hash('3')), "{}: nothing may be written", label);
+                }
+                Some(text) => {
+                    let message = match &written { Err(RefUpdateError::Failed(message)) => message.clone(), other => panic!("{}: {:?}", label, other) };
+                    assert!(message.contains(text), "{}: {}", label, message);
+                    assert_eq!(get_pallet_head("main").unwrap(), before, "{}: nothing may be written", label);
+                }
+            }
+        }
     }
 
     /// Point a user pallet at `new` without verifying `new`'s closure: a warehouse whose history

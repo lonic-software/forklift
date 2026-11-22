@@ -1101,6 +1101,11 @@ pub fn restore_refs(entry: &JournalEntry) -> Result<(), String> {
 fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
     let current = &entry.after.current_pallet;
 
+    // What the current pallet's head was judged against when its put-back read it, should it have
+    // to be moved back there. Read before the first put-back, and its own failure reported only
+    // then, so it refuses no undo that needs no un-restore.
+    let basis = pallet_utils::PutBackBasis::read();
+
     for wire in put_back_order(entry) {
         let (Some(pre_head), Some(post_after)) = (entry.before.head(wire), entry.after.heads.get(wire)) else {
             continue;
@@ -1134,7 +1139,7 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
             // complete (no precondition is consumed, so nothing else refuses it): put the current
             // pallet back where the operation left it, so the bay still matches the entry and a
             // retried undo passes the gate again.
-            Err(e) => return Err(un_restore_current(entry, e.into())),
+            Err(e) => return Err(un_restore_current(entry, &basis, e.into())),
         }
     }
 
@@ -1154,13 +1159,22 @@ fn put_back_order(entry: &JournalEntry) -> impl Iterator<Item = &String> {
 /// from its restored head to the one the operation left (if it was restored), and return the
 /// error to report. Other refs restored before the failure stay restored: a retried undo finds
 /// them moved off the operation's heads and leaves them alone.
-fn un_restore_current(entry: &JournalEntry, error: String) -> String {
+///
+/// A compensating write ([`pallet_utils::compensating_head_write`]), judged against `basis`: a
+/// taint the failed write left standing does not refuse it, so the bay is left where a retried
+/// undo passes its check once `forklift heal` has cleared that taint.
+fn un_restore_current(entry: &JournalEntry, basis: &Result<pallet_utils::PutBackBasis, String>, error: String) -> String {
     let current = &entry.after.current_pallet;
     let (Some(pre_head), Some(post_head)) = (entry.before.head(current), entry.after.head(current)) else {
         return error;
     };
 
-    let e = match pallet_utils::update_pallet_head_in(PalletNamespace::User, current, Some(pre_head), post_head, &pallet_utils::RefPreconditions::NONE) {
+    let written = match basis {
+        Ok(basis) => pallet_utils::compensating_head_write(current, pre_head, post_head, basis),
+        Err(read) => Err(RefUpdateError::Failed(read.clone())),
+    };
+
+    let e = match written {
         Ok(()) | Err(RefUpdateError::Moved(_)) => return error,
         Err(e) => e.to_string(),
     };
@@ -2507,55 +2521,45 @@ mod tests {
         check_undoable(&entry).expect("a retried undo must still pass the gate");
     }
 
-    /// SPIKE FORK-574: a stack of "main" (1 → 2) and "side" (a → b), undone with the put-back of
-    /// `failing` landing with an error that leaves a taint standing.
-    fn spike_574(failing: &str) -> (Result<(), String>, Result<(), String>, Option<String>, pallet_utils::BayPosition, Result<(), String>) {
-        let _scratch = Scratch::new(&format!("spike-574-{}", failing));
-
-        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", pallet_utils::get_pallet_head("main").unwrap())).unwrap();
-        advance("main", None, &hash('1')).unwrap();
-        pallet_utils::update_pallet_head("side", None, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap();
-
-        let before = capture().unwrap();
-        advance("main", Some(&hash('1')), &hash('2')).unwrap();
-        pallet_utils::update_pallet_head("side", Some(&hash('a')), &hash('b'), &pallet_utils::RefPreconditions::NONE).unwrap();
-        push_if_changed("stack", before).unwrap();
-        let entry = peek().unwrap().unwrap();
-
-        let serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::util::taint_utils::activate();
-        let seam = file_utils::PostRenameTaintSeam::arm_standing_at(&pallet_utils::get_pallet_ref_path(PalletNamespace::User, failing));
-
-        let restored = restore_refs(&entry);
-        let gate_under_taint = check_undoable(&entry);
-        let main = pallet_utils::get_pallet_head("main").unwrap();
-        let position = pallet_utils::read_position().unwrap();
-
-        // The taint cleared, as heal would: the retry's gate again.
-        drop(seam);
-        let gate_after_heal = check_undoable(&entry);
-        drop(serial);
-
-        eprintln!("SPIKE {}: restored={:?}\n gate_under_taint={:?}\n main={:?} (1={}, 2={})\n position={:?}\n gate_after_heal={:?}",
-            failing, restored, gate_under_taint, main, &hash('1')[..12], &hash('2')[..12], position, gate_after_heal);
-
-        (restored, gate_under_taint, main, position, gate_after_heal)
-    }
-
+    /// A stack of "main" (1 → 2) and "side" (a → b), undone with the put-back of the current
+    /// pallet's own ref, then of a later one, landing with an error that leaves a taint standing:
+    /// the un-restore still moves "main" back where the operation left it, and once the taint is
+    /// cleared (as `forklift heal` clears it) the retried undo passes its check and lands.
     #[test]
-    fn spike_574_the_current_pallets_own_put_back_lands_with_a_taint() {
-        let (restored, _, main, _, gate_after_heal) = spike_574("main");
-        assert!(restored.is_err());
-        assert_eq!(main, Some(hash('1')), "SPIKE red half: the un-restore was refused, main stays put back");
-        assert!(gate_after_heal.is_err(), "SPIKE red half: the retry is refused even after heal");
-    }
+    fn an_undo_whose_put_back_leaves_a_taint_is_retried_once_the_taint_is_healed() {
+        for failing in ["main", "side"] {
+            let _scratch = Scratch::new(&format!("restore-under-own-taint-{}", failing));
 
-    #[test]
-    fn spike_574_a_later_ref_put_back_lands_with_a_taint() {
-        let (restored, _, main, _, gate_after_heal) = spike_574("side");
-        assert!(restored.is_err());
-        assert_eq!(main, Some(hash('1')), "SPIKE red half: the un-restore was refused, main stays put back");
-        assert!(gate_after_heal.is_err(), "SPIKE red half: the retry is refused even after heal");
+            pallet_utils::write_position(&pallet_utils::BayPosition::new("main", pallet_utils::get_pallet_head("main").unwrap())).unwrap();
+            advance("main", None, &hash('1')).unwrap();
+            pallet_utils::update_pallet_head("side", None, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap();
+
+            let before = capture().unwrap();
+            advance("main", Some(&hash('1')), &hash('2')).unwrap();
+            pallet_utils::update_pallet_head("side", Some(&hash('a')), &hash('b'), &pallet_utils::RefPreconditions::NONE).unwrap();
+            push_if_changed("stack", before).unwrap();
+            let entry = peek().unwrap().unwrap();
+
+            let serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::util::taint_utils::activate();
+            let seam = file_utils::PostRenameTaintSeam::arm_standing_at(&pallet_utils::get_pallet_ref_path(PalletNamespace::User, failing));
+
+            let restored = restore_refs(&entry);
+            let main = pallet_utils::get_pallet_head("main").unwrap();
+
+            // The taint cleared, as heal clears it.
+            drop(seam);
+            let gate = check_undoable(&entry);
+            let retried = gate.as_ref().ok().map(|()| restore_refs(&entry));
+            drop(serial);
+
+            assert!(restored.is_err(), "{}: the put-back must fail", failing);
+            assert_eq!(main, Some(hash('2')), "{}: the un-restore must put \"main\" back where the operation left it", failing);
+            assert_eq!(gate, Ok(()), "{}: once healed, a retried undo must pass the gate", failing);
+            assert_eq!(retried, Some(Ok(())), "{}: the retried undo must land", failing);
+            assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('1')), "{}: the retry must undo \"main\"", failing);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(hash('a')), "{}: the retry must undo \"side\"", failing);
+        }
     }
 
     #[test]

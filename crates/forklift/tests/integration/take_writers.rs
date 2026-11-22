@@ -39,6 +39,7 @@ const PRIMITIVES: &[&str] = &[
     "recreate_pallet_head",
     "write_head_locked",
     "repair_pallet_head",
+    "compensating_head_write",
 ];
 
 /// Every production writer: the file, the function holding the call, and why it is sound. A
