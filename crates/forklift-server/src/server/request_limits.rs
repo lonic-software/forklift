@@ -167,13 +167,14 @@ impl RequestLimits {
     }
 
     /// Give back the request [`Self::charge`] took from `principal`'s bucket of class `cost`, for a
-    /// request refused for now before it changed anything. A bucket is never refunded past full.
+    /// request refused for now before it changed anything. A bucket refunded past full is held to
+    /// its limit by the next charge's refill ([`refilled`]), like any other.
     pub(super) fn refund(&self, principal: &Principal, cost: Cost) {
         let Some(limit) = self.limit_of(cost) else { return };
         let mut buckets = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(bucket) = buckets.by_caller.get_mut(&(Caller::of(principal), cost)) {
-            bucket.tokens = (bucket.tokens + 1.0).min(f64::from(limit));
+            bucket.tokens += 1.0;
         }
     }
 }
@@ -325,7 +326,7 @@ mod tests {
 
     /// A refund gives back one request, and never fills a bucket past its limit.
     ///
-    /// Reverts: refund nothing → red on the first; refund without the cap → red on the second.
+    /// Reverts: refund nothing → red on the first; drop the cap in [`refilled`] → red on the second.
     #[test]
     fn a_refund_gives_back_one_request_up_to_full() {
         let limits = RequestLimits::new(Some(6), Some(6)).unwrap();

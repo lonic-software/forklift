@@ -6267,9 +6267,12 @@ mod tests {
     /// A request its handler refuses for now, a `503` with `Retry-After`, is refunded to its
     /// caller's bucket for the route's class: a drained warehouse answers every request so, and a
     /// caller with a budget of 4 a minute in each class sends 8 requests of each and is answered
-    /// `503` every time, never `429`.
+    /// `503` every time, never `429`. Any other answer is not refunded: once the warehouse is back,
+    /// its store answers each request with a damage `503` that carries no `Retry-After`, and the
+    /// fifth is a `429`.
     ///
-    /// Revert: drop the refund → the fifth request of each class is a `429` → red.
+    /// Reverts: drop the refund → the fifth drained request of each class is a `429` → red; refund
+    /// every `503`, or every answer → the fifth damage answer is not a `429` → red.
     #[tokio::test]
     async fn a_request_refused_for_now_is_refunded() {
         let handle = Arc::new(WarehouseHandle::new(scratch_dir("limits-refund")));
@@ -6278,7 +6281,7 @@ mod tests {
             operator_tokens: [("tok-alice".to_string(), "alice".to_string())].into_iter().collect(),
             open: false,
             limits: RequestLimits::new(Some(4), Some(4)).unwrap(),
-            ..base_state(ServeMode::Single(handle))
+            ..base_state(ServeMode::Single(Arc::clone(&handle)))
         });
         let addr = serve_router(state, 1 << 20).await;
 
@@ -6293,6 +6296,21 @@ mod tests {
                 let head = response_head(&mut stream).await;
                 assert!(head.starts_with("http/1.1 503 "), "{method} {path}, request {attempt}: {head}");
                 assert!(head.contains("\r\nretry-after: "), "{method} {path}, request {attempt}: {head}");
+            }
+        }
+
+        // The scratch warehouse has no bay position, which its store reads as damage.
+        handle.draining.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        for attempt in 1..=5 {
+            let mut stream = send_head(addr, "GET", "/v1/bundles/latest", Some("tok-alice"), 0).await;
+            let head = response_head(&mut stream).await;
+
+            if attempt <= 4 {
+                assert!(head.starts_with("http/1.1 503 "), "request {attempt}: {head}");
+                assert!(!head.contains("\r\nretry-after: "), "request {attempt}: {head}");
+            } else {
+                assert!(head.starts_with("http/1.1 429 "), "request {attempt}: {head}");
             }
         }
     }
