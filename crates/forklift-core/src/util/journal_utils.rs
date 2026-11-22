@@ -2582,6 +2582,56 @@ mod tests {
         }
     }
 
+    /// FORK-576 spike. An undo of the stack that completed a consolidation or a pick, whose merge
+    /// state write fails after every ref went back: the bay stands at the earlier position, the
+    /// pallet at the earlier head, the merge state still the operation's, and the journal still
+    /// holds the entry. And an undo of a plain stack that landed and lost its pop ("none"): the
+    /// same bay, which the retry gate cannot tell apart.
+    #[test]
+    fn an_undo_whose_merge_state_write_fails_after_its_put_backs_is_refused_on_retry() {
+        for kind in ["consolidation", "pick", "none"] {
+            let _scratch = Scratch::new(&format!("restore-state-write-fails-{}", kind));
+
+            advance("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &hash('2')).unwrap();
+            pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('2')))).unwrap();
+
+            let mut completed = entry("stack", "main", &hash('1'), &hash('2'));
+            let copy = match kind {
+                "consolidation" => {
+                    completed.before.consolidation = Some(consolidating(&hash('c'), "side"));
+                    merge_utils::FILE_NAME_CONSOLIDATION_COPY
+                },
+                "none" => "",
+                _ => {
+                    completed.before.cherry_pick = Some(PickInProgress {
+                        source: hash('p'), our_head: hash('1'), our_pallet: "main".to_string(), description: None,
+                    });
+                    cherry_pick_utils::FILE_NAME_CHERRY_PICK_COPY
+                },
+            };
+            check_undoable(&completed).expect("the bay is where the stack left it");
+
+            // The state's copy, written first, cannot be written: a folder with something in it
+            // stands at its path.
+            let blocker = bay_root().join(copy);
+            if !copy.is_empty() {
+                std::fs::create_dir_all(blocker.join("occupied")).unwrap();
+            }
+            let undone = restore_refs(&completed, &held());
+            if !copy.is_empty() {
+                file_utils::remove_dir_all(&blocker).unwrap();
+            }
+
+            assert_eq!(undone.is_err(), !copy.is_empty(), "{}: only a blocked state write fails", kind);
+            assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(hash('1')), "{}: the ref went back", kind);
+            assert_eq!(pallet_utils::read_position().unwrap().base, Some(hash('1')), "{}: the position went back", kind);
+
+            // The defect: the retry reads the undo's own put-back as another writer's move. This
+            // assertion inverts with the fix.
+            assert_eq!(check_undoable(&completed), Err(current_pallet_moved("main", "stack")), "{}", kind);
+        }
+    }
+
     #[test]
     fn capture_refuses_a_consolidation_without_its_skeleton() {
         let _scratch = Scratch::new("capture-no-skeleton");
