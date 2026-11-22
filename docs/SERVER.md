@@ -197,11 +197,12 @@ tokens file with an `[operators]` table of plaintext tokens, is refused by name,
 token.
 
 A refusal of the tokens file, of `FORKLIFT_OPERATOR_TOKENS`, or of the config file's syntax, keys
-or value types and ranges names the file (or the variable), the key from the server's own
-vocabulary and the line of the fault. It never quotes a key, table name, value or parser message
-found there, since any of them may be a token or a hook secret put in the wrong place: an
-unrecognized key is named by its table and line only. Not yet covered: a refusal at startup of a
-value that names a place, such as `root`, `addr`, `tokens` or a hook's URL, quotes that value.
+or value types and ranges names the file (or the variable) and, where it can, the key from the
+server's own vocabulary or the line of the fault. It never quotes a key, table name, value or
+parser message found there, since any of them may be a token or a hook secret put in the wrong
+place: an unrecognized key is named by its table and line only. Not yet covered: a refusal at
+startup of a value that names a place, such as `root`, `addr`, `tokens` or a hook's URL, quotes
+that value, and a hook request's failure quotes the hook's URL.
 
 ## Per-operator tokens (FORK-10)
 

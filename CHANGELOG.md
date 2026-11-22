@@ -143,7 +143,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   lowercase hex digest; compute one with `printf '%s' "$TOKEN" | shasum -a 256`. An operator token
   bound twice, or also set as the static token, is refused at startup too. A refusal of a malformed
   tokens file, `FORKLIFT_OPERATOR_TOKENS`, or the config file's syntax, keys and value types now
-  names the line of the fault and no longer quotes the key, value or parser message found there,
+  no longer quotes the key, value or parser message found there,
   so a token or hook secret written in the wrong place there does not reach the log. An
   unrecognized config key is named by its table and line.
 
