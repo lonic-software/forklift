@@ -1818,8 +1818,9 @@ fn restore_trust_file(previous: Option<&[u8]>) -> Result<(), String> {
         None => {
             file_utils::remove_file(&path)
                 .map_err(|e| format!("Error while removing the trust file: {}", e))?;
-            // A bare sync, unlike a meta copy's removal: a taint naming a trust file that is gone
-            // is one heal cannot classify, so recording it would gate every command for good.
+            // A bare sync, unlike a meta copy's removal: heal cannot classify a taint naming a
+            // trust file that is gone, so this arm adds none. A taint the forward write's own sync
+            // recorded can still name the file this removes; that state is FORK-573's.
             file_utils::sync_dir(&forklift_root())
         }
     }

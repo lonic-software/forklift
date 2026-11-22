@@ -830,7 +830,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   the copy was left at the new value beside an unchanged office or ref. The taint still stands
   afterwards, and `heal` is still needed. When putting the trust anchor back lands but its folder
   sync fails, the install's error now says the previous anchor was put back, not that the new one
-  stands.
+  stands; when the install had created the trust file and its removal fails to sync, the error
+  says the file was removed again.
 - `heal` no longer refuses forever over a durability taint that records a lost metadata ref copy
   (`.forklift/meta-copy/<name>`), as a crash can leave one after a metadata pallet's first write.
   When the ref beside it is a file holding a parcel hash, that part of the taint is resolved, and
