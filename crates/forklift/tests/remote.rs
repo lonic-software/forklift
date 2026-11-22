@@ -4838,6 +4838,8 @@ struct HookServer {
     url: String,
     requests: std::sync::Arc<std::sync::Mutex<Vec<HookRequest>>>,
     admit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Deny `fetch` alone, with its own reason, while every other action is admitted.
+    refuse_fetch: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HookServer {
@@ -4846,6 +4848,8 @@ impl HookServer {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let admit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let refuse_fetch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refusing_fetch = std::sync::Arc::clone(&refuse_fetch);
 
         let recorded = std::sync::Arc::clone(&requests);
         let admitting = std::sync::Arc::clone(&admit);
@@ -4870,7 +4874,11 @@ impl HookServer {
                         }
                     }
                     "/admission" => {
-                        if admitting.load(std::sync::atomic::Ordering::SeqCst) {
+                        let fetch = String::from_utf8_lossy(&request.body).contains("\"action\":\"fetch\"");
+
+                        if fetch && refusing_fetch.load(std::sync::atomic::Ordering::SeqCst) {
+                            ("200 OK", r#"{"allow":false,"reason":"fetches are paused for this plan"}"#)
+                        } else if admitting.load(std::sync::atomic::Ordering::SeqCst) {
                             ("200 OK", r#"{"allow":true}"#)
                         } else {
                             ("200 OK", r#"{"allow":false,"reason":"the quota is exhausted"}"#)
@@ -4890,7 +4898,7 @@ impl HookServer {
             }
         });
 
-        HookServer { url, requests, admit }
+        HookServer { url, requests, admit, refuse_fetch }
     }
 
     fn recorded(&self) -> Vec<HookRequest> {
@@ -5156,8 +5164,9 @@ fn a_tail_naming_no_valid_pallet_never_reaches_the_admission_hook() {
 
 /// FORK-580: reads are put to the admission hook too. A clone is asked as `read` and `fetch`, the
 /// config file's `admission_cache_secs` reaches the server (at 0 every read is asked, where the
-/// default of 60 would answer the second from the cache), and a caller the hook suspends can no
-/// longer fetch, with the hook's reason in the client's error.
+/// default of 60 would answer the second from the cache), a policy that denies `fetch` alone
+/// still answers the handshake but fails the clone with its reason, and a caller the hook
+/// suspends outright can no longer clone either.
 #[test]
 fn reads_reach_the_admission_hook_and_a_suspended_caller_cannot_fetch() {
     let area = TestArea::new("hooks-reads");
@@ -5188,6 +5197,14 @@ fn reads_reach_the_admission_hook_and_a_suspended_caller_cannot_fetch() {
 
     assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "hook-token"]));
     assert!(asked("fetch") > 0, "a clone fetched nothing through the hook: {:?}", actions());
+
+    hooks.refuse_fetch.store(true, std::sync::atomic::Ordering::SeqCst);
+    let status = http_status(&server.url, "GET", "/v1/warehouse", Some("hook-token"));
+    assert!(status.starts_with("HTTP/1.1 200"), "a policy denying fetch alone refused the handshake: {}", status);
+    let paused = area.forklift(".", &["clone", &server.url, "p", "--token", "hook-token"]);
+    assert!(!paused.status.success(), "a clone whose fetches the admission hook denies must fail");
+    assert!(stderr(&paused).contains("fetches are paused for this plan"), "{}", stderr(&paused));
+    hooks.refuse_fetch.store(false, std::sync::atomic::Ordering::SeqCst);
 
     hooks.admit.store(false, std::sync::atomic::Ordering::SeqCst);
     let refused = area.forklift(".", &["clone", &server.url, "c", "--token", "hook-token"]);

@@ -1485,8 +1485,10 @@ async fn admit_in_layer(state: &AppState,
         return Ok(());
     }
 
+    // A path that does not decode is the caller's: answered with the rejection's own status and
+    // text, as the handler's extractor would answer it when no hook is configured.
     let Path(params) = request.extract_parts::<Path<PathParams>>().await
-        .map_err(|rejection| server_fault(format!("Error while reading the path parameters: {}", rejection)))?;
+        .map_err(|rejection| (rejection.status(), rejection.body_text()))?;
 
     if let Some(id) = params.get("warehouse") {
         validate_warehouse_id(id)?;
@@ -2436,6 +2438,9 @@ async fn ask_admission(state: &AppState,
         }
     }
 
+    // An allow is dated from when the question was sent, not when the answer came: a caller the
+    // hook suspends meanwhile is then admitted from the cache for no longer than the TTL.
+    let asked_at = std::time::Instant::now();
     let response = post_hook(state, hook, "admission", &request).await
         .map_err(|reason| {
             tracing::warn!(reason, "the admission hook is unreachable; failing closed");
@@ -2473,7 +2478,7 @@ async fn ask_admission(state: &AppState,
 
     if cached {
         if let Ok(mut cache) = state.admission_cache.lock() {
-            cache.store(request, state.admission_cache_ttl);
+            cache.store(request, asked_at, state.admission_cache_ttl);
         }
     }
 
@@ -2516,8 +2521,8 @@ impl AdmissionCache {
         self.allowed.get(request).is_some_and(|at| at.elapsed() < ttl)
     }
 
-    /// Record an allow the hook just gave, when it fits the budget.
-    fn store(&mut self, request: AdmissionHookRequest, ttl: std::time::Duration) {
+    /// Record an allow the hook gave to a question sent at `asked_at`, when it fits the budget.
+    fn store(&mut self, request: AdmissionHookRequest, asked_at: std::time::Instant, ttl: std::time::Duration) {
         let charge = AdmissionCache::charge(&request);
 
         if self.allowed.remove(&request).is_some() {
@@ -2538,7 +2543,7 @@ impl AdmissionCache {
 
         if self.charged + charge <= self.budget {
             self.charged += charge;
-            self.allowed.insert(request, std::time::Instant::now());
+            self.allowed.insert(request, asked_at);
         }
     }
 }
@@ -7578,20 +7583,23 @@ mod tests {
     struct SwitchedHook {
         url: String,
         allow: Arc<std::sync::atomic::AtomicBool>,
+        delay_ms: Arc<std::sync::atomic::AtomicU64>,
         received: Arc<Mutex<Vec<serde_json::Value>>>,
     }
 
     impl SwitchedHook {
         async fn start(allow: bool) -> SwitchedHook {
             let allow = Arc::new(std::sync::atomic::AtomicBool::new(allow));
+            let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let received = Arc::new(Mutex::new(Vec::new()));
-            let (allowing, recording) = (Arc::clone(&allow), Arc::clone(&received));
+            let (allowing, delaying, recording) = (Arc::clone(&allow), Arc::clone(&delay_ms), Arc::clone(&received));
 
             let app = Router::new().route("/hook", post(move |bytes: Bytes| {
-                let (allowing, recording) = (Arc::clone(&allowing), Arc::clone(&recording));
+                let (allowing, delaying, recording) = (Arc::clone(&allowing), Arc::clone(&delaying), Arc::clone(&recording));
 
                 async move {
                     recording.lock().unwrap().push(serde_json::from_slice(&bytes).unwrap());
+                    tokio::time::sleep(std::time::Duration::from_millis(delaying.load(Ordering::SeqCst))).await;
 
                     if allowing.load(Ordering::SeqCst) {
                         r#"{"allow":true}"#.into_response()
@@ -7604,7 +7612,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-            SwitchedHook { url: format!("http://{addr}/hook"), allow, received }
+            SwitchedHook { url: format!("http://{addr}/hook"), allow, delay_ms, received }
         }
 
         fn endpoint(&self) -> Option<HookEndpoint> {
@@ -7713,7 +7721,8 @@ mod tests {
             (ServeMode::Multi { base: multi }, vec![("GET", "/warehouses/-flag/v1/warehouse"),
                                                     ("GET", "/warehouses/Acme/v1/objects/x1")]),
             (ServeMode::Single(Arc::new(WarehouseHandle::new(single))), vec![("POST", "/v1/holds/..%2Fmain"),
-                                                                             ("POST", "/v1/holds/feature/X")]),
+                                                                             ("POST", "/v1/holds/feature/X"),
+                                                                             ("GET", "/v1/objects/%FF")]),
         ];
 
         for (mode, requests) in cases {
@@ -7732,7 +7741,10 @@ mod tests {
                     .body("{}")
                     .send().await.unwrap();
 
-                assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{method} {path}");
+                // A path that does not decode is the extractor's 400, as without a hook; an
+                // invalid id or name is the handlers' 422.
+                let expected = if path.ends_with("%FF") { StatusCode::BAD_REQUEST } else { StatusCode::UNPROCESSABLE_ENTITY };
+                assert_eq!(response.status(), expected, "{method} {path}");
             }
         }
 
@@ -7770,6 +7782,29 @@ mod tests {
         hook.allow.store(true, Ordering::SeqCst);
         ask_admission(&state, other(), true).await.unwrap();
         assert_eq!(hook.asked(), 4, "the read after the denial was not asked");
+    }
+
+    /// An allow is dated from when the hook was asked, not from when it answered: with a hook
+    /// taking 700 ms to answer and a TTL of 1 s, a read 500 ms after the answer is past the TTL
+    /// and is asked again.
+    ///
+    /// Revert: date the allow when it is stored → the read is answered from the cache → red.
+    #[tokio::test]
+    async fn an_allow_is_dated_from_when_the_hook_was_asked() {
+        let hook = SwitchedHook::start(true).await;
+        hook.delay_ms.store(700, Ordering::SeqCst);
+        let state = AppState {
+            admission_hook: hook.endpoint(),
+            admission_cache_ttl: std::time::Duration::from_secs(1),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+        let read = || admission("fetch", Some("w1"), Some("bob"), None);
+
+        ask_admission(&state, read(), true).await.unwrap();
+        hook.delay_ms.store(0, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        ask_admission(&state, read(), true).await.unwrap();
+        assert_eq!(hook.asked(), 2, "an allow was dated from its answer, not its question");
     }
 
     /// I4. The cache is keyed by every field the hook is told: requests that differ only in the
@@ -12939,11 +12974,18 @@ mod tests {
     struct AdmissionCallers {
         within: Vec<String>,
         found: BTreeSet<(String, String)>,
+        /// Every function calling (or naming in a macro) `ask_admission` or `admit_in_layer`, with
+        /// the one it calls: the two other ways to reach the hook.
+        askers: BTreeSet<(String, String)>,
     }
 
     impl AdmissionCallers {
+        fn here(&self) -> String {
+            self.within.last().cloned().unwrap_or_else(|| "<item>".to_string())
+        }
+
         fn record(&mut self, action: String) {
-            let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
+            let within = self.here();
             self.found.insert((within, action));
         }
     }
@@ -12987,12 +13029,27 @@ mod tests {
                 };
                 self.record(action);
             }
+            if let syn::Expr::Path(path) = &*call.func {
+                if let Some(callee) = path.path.segments.last().map(|segment| segment.ident.to_string())
+                    .filter(|callee| callee == "ask_admission" || callee == "admit_in_layer")
+                {
+                    let within = self.here();
+                    self.askers.insert((within, callee));
+                }
+            }
             syn::visit::visit_expr_call(self, call);
         }
 
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-            if identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone())).iter().any(|word| word == "check_admission") {
+            let words = identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone()));
+            if words.iter().any(|word| word == "check_admission") {
                 self.record("<macro>".to_string());
+            }
+            for callee in ["ask_admission", "admit_in_layer"] {
+                if words.iter().any(|word| word == callee) {
+                    let within = self.here();
+                    self.askers.insert((within, format!("{callee} <macro>")));
+                }
             }
             syn::visit::visit_macro(self, mac);
         }
@@ -13005,7 +13062,8 @@ mod tests {
     /// alone: `check_admission` is private to it.
     ///
     /// Reverts: flip holds' `pallet_tail` → red; mark an `InHandler` route `Unadmitted` → red;
-    /// pass another action from a handler, or call `check_admission` from a read handler → red.
+    /// pass another action from a handler, or call `check_admission` from a read handler → red;
+    /// a handler asking through `ask_admission` itself → red.
     #[test]
     fn a_route_is_admitted_as_its_entry_says() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
@@ -13034,6 +13092,14 @@ mod tests {
             })
             .collect();
         assert_eq!(in_handler, callers.found, "InHandler routes' handlers and actions (left), check_admission calls (right)");
+
+        // The hook is reached only through those two doors: the layer through `admit_in_layer`,
+        // called by `authenticate` alone, and a handler through `check_admission`, which never
+        // caches. A handler calling `ask_admission` itself could cache a write.
+        let askers: BTreeSet<(String, String)> = [
+            ("authenticate", "admit_in_layer"), ("admit_in_layer", "ask_admission"), ("check_admission", "ask_admission"),
+        ].into_iter().map(|(within, callee)| (within.to_string(), callee.to_string())).collect();
+        assert_eq!(callers.askers, askers, "the callers of ask_admission and admit_in_layer");
 
         // A literal, not read from ROUTES: changing how a route is admitted is an edit here too.
         let admissions: BTreeMap<String, Admission> = ROUTES.iter()
