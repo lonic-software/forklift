@@ -33,6 +33,7 @@ const PRIMITIVES: &[&str] = &[
     "adopt_pallet_head",
     "update_pallet_head_in",
     "put_back_pallet_head_in",
+    "compensating_head_write",
     "update_pallet_head_verified",
     "update_pallet_head_locked",
     "write_head_or_roll_back",
