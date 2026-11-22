@@ -66,7 +66,8 @@ already zstd streams (bundles, batches) are marked `identity` and never re-wrapp
 and is a refusal for now, sent before the request changed anything. The warehouse may be drained
 while content redacted or withheld from it is deleted (below), settling which redacted content it no
 longer serves (below), under maintenance, or not yet servable, or a hook it depends on may be
-unreachable. The request can be sent again after the wait.
+unreachable, or the server may be at capacity for costly requests (ref updates, pallet deletions,
+trust installs and batch fetches). The request can be sent again after the wait.
 
 One `503` from forklift-server has no `Retry-After`: damage only the server's operator can repair.
 It is refused, nothing changed, and waiting does not end it. `code` names the damage, `message`

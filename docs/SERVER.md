@@ -168,6 +168,8 @@ tokens = "/etc/forklift/tokens.toml"  # per-operator tokens (below)
 max_body_mb = 4096               # refuse larger request bodies (default: 64 MiB, the largest
                                   # legitimate object after chunking — never unlimited)
 rebuild_after_lifts = 20         # rebuild the bundle in the background (default: never)
+max_heavy_requests = 8           # costly requests run at once (default: the host's available
+                                  # parallelism; zero is refused) — see "TLS and hardening"
 open = false                     # explicit opt-out of authentication (default: false — see
                                   # "Authentication" above; a config with none of token, tokens,
                                   # or an authentication hook, and this unset, refuses to start)
@@ -482,12 +484,27 @@ forklift.example.com {
 ```
 
 Request timeouts, connection limits and rate limiting also belong to the proxy layer
-(nginx/caddy/haproxy do this better than any embedded knob). `max_body_mb` is the one
-limit the server enforces itself, because it gates disk-fill abuse behind verification.
-It applies to callers the server has admitted: authentication runs on the request's headers,
-and a refused caller's body is thrown away as it arrives, never held in memory, for at most 5
-seconds and 128 MiB per request. A body that runs past either bound has its connection closed;
-one that finishes inside them leaves the connection open, so rate limiting stays the proxy's job.
+(nginx/caddy/haproxy do this better than any embedded knob). The server enforces two limits
+itself.
+
+`max_body_mb` gates disk-fill abuse behind verification. It applies to callers the server has
+admitted: authentication runs on the request's headers, and a refused caller's body is thrown
+away as it arrives, never held in memory, for at most 5 seconds and 128 MiB per request. A body
+that runs past either bound has its connection closed; one that finishes inside them leaves the
+connection open, so rate limiting stays the proxy's job.
+
+`max_heavy_requests` caps how many costly requests run at once, across every warehouse the
+process serves: ref updates (`POST /v1/pallets/{name}`), pallet deletions
+(`DELETE /v1/pallets/{name}`), trust installs (`PUT /v1/trust`) and batch fetches
+(`POST /v1/objects/batch`). Each of these can walk a whole history or build a bundle before it
+answers. A request that finds the cap full waits up to 5 seconds, in arrival order, and is then
+refused with a `503` carrying `Retry-After`, before it has changed anything; the client waits it
+out and sends it again. The default is the host's available parallelism (4 when the host does not
+report one). It is uncalibrated: no benchmark of these routes exists yet, so size it to your
+host if lifts or fetches queue; each refusal is logged as a warning. The cap counts requests,
+not callers or warehouses, so a burst on one warehouse can refuse requests on another: per-caller
+budgets and a cap on reads are not part of it, and background work (bundle rebuilds and redaction
+runs, at most one of each per warehouse) runs outside it.
 
 **The single-writer rule:** exactly one serving process per warehouse root; a second server
 on the same root is refused at startup, since the serve lock it needs is held. Do not point two
