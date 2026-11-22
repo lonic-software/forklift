@@ -1,6 +1,7 @@
 use serde::Serialize;
 use forklift_core::error::sanitize;
 use forklift_core::util::journal_utils;
+use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::{object_utils, pallet_utils};
 use crate::commands::merge_abort::{self, MergeKind};
 use crate::commands::shift;
@@ -32,14 +33,16 @@ use crate::output::{self, CommandOutput};
 /// as it found it, so a retried `undo` sees the same entry rather than skipping straight past it.
 ///
 /// # Arguments
-/// * `as_name` - For `undo --as`: the name to bring a deleted pallet back under. Refused unless the
-///               last entry is a delete.
+/// * `as_name`      - For `undo --as`: the name to bring a deleted pallet back under. Refused
+///                    unless the last entry is a delete.
+/// * `store_access` - The command's shared store-access hold, which the put-back of the refs
+///                    judges an un-restore under (`journal_utils::restore_refs`).
 ///
 /// # Returns
 /// * `Ok(())`      - If an operation was undone.
 /// * `Err(String)` - If there is nothing to undo, the journal cannot be read, the bay has moved
 ///                   past the last entry, or the reversal failed.
-pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
+pub async fn handle_command(as_name: Option<&str>, store_access: &StoreAccessLock) -> Result<(), String> {
     let Some(entry) = journal_utils::peek()? else {
         return Err(
             "There is nothing to undo: the undo journal is empty. Only stack, consolidate, \
@@ -144,7 +147,7 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
         _ => String::new(),
     };
 
-    journal_utils::restore_refs(&entry)?;
+    journal_utils::restore_refs(&entry, store_access)?;
     journal_utils::pop()?;
 
     let head = pallet_utils::read_position()?.base.unwrap_or_default();
@@ -310,7 +313,7 @@ mod tests {
             pallet_utils::update_pallet_head("zeta", Some(&on), &moved_to, &pallet_utils::RefPreconditions::NONE).unwrap();
         }))));
 
-        let error = test_support::block_on(handle_command(None)).expect_err("the undo must be refused");
+        let error = test_support::block_on(handle_command(None, &StoreAccessLock::shared(|| {}).unwrap())).expect_err("the undo must be refused");
         assert!(error.contains("has moved since"), "{}", error);
 
         assert_eq!(pallet_utils::get_pallet_head("zeta").unwrap(), Some(three), "the other bay's head must stand");
@@ -334,7 +337,7 @@ mod tests {
         let entry = journal_utils::delete_entry("side", &freed).unwrap();
         pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "side", &freed, &none, Some(&entry)).unwrap();
 
-        let error = test_support::block_on(handle_command(None)).expect_err("the undo must refuse");
+        let error = test_support::block_on(handle_command(None, &StoreAccessLock::shared(|| {}).unwrap())).expect_err("the undo must refuse");
         assert!(error.contains("is no longer complete in this warehouse"), "{}", error);
         assert!(error.contains("forklift lower side"), "{}", error);
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None, "nothing was created");
@@ -362,7 +365,7 @@ mod tests {
         pallet_utils::remove_pallet_head_in(pallet_utils::PalletNamespace::User, "side", &side, &none, Some(&entry)).unwrap();
         assert_eq!(forklift_core::util::tombstone_utils::tombstone_heads().unwrap(), vec![side.clone()]);
 
-        test_support::block_on(handle_command(None)).expect("the undo restores the pallet");
+        test_support::block_on(handle_command(None, &StoreAccessLock::shared(|| {}).unwrap())).expect("the undo restores the pallet");
 
         assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(side));
         assert!(forklift_core::util::tombstone_utils::read_tombstones().unwrap().is_empty(), "the tombstone is cleared");
