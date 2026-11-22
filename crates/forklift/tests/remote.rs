@@ -4995,6 +4995,11 @@ fn assert_signed(request: &HookRequest, secret: &str) {
 
 /// Start a server whose config wires all three hooks at the mock endpoint.
 fn start_hooked_server(area: &TestArea, hooks: &HookServer, secret: &str) -> Server {
+    start_hooked_server_with(area, hooks, secret, "")
+}
+
+/// [`start_hooked_server`], with `extra` appended to the `[hooks]` table.
+fn start_hooked_server_with(area: &TestArea, hooks: &HookServer, secret: &str, extra: &str) -> Server {
     let root = area.path("server-root");
     let root_str = root.to_str().unwrap().to_string();
 
@@ -5008,8 +5013,8 @@ fn start_hooked_server(area: &TestArea, hooks: &HookServer, secret: &str) -> Ser
         "root = '{}'\naddr = \"127.0.0.1:0\"\n\n[hooks]\n\
         authentication_url = \"{}/auth\"\nauthentication_secret = \"{}\"\n\
         admission_url = \"{}/admission\"\nadmission_secret = \"{}\"\n\
-        events_url = \"{}/events\"\nevents_secret = \"{}\"\n",
-        root_str, hooks.url, secret, hooks.url, secret, hooks.url, secret
+        events_url = \"{}/events\"\nevents_secret = \"{}\"\n{}",
+        root_str, hooks.url, secret, hooks.url, secret, hooks.url, secret, extra
     ));
 
     Server::spawn(vec![
@@ -5121,6 +5126,11 @@ fn a_tail_naming_no_valid_pallet_never_reaches_the_admission_hook() {
     assert!(updates.len() == 1 && updates[0].contains("\"pallet\":\"feature/x\""), "{:?}", updates);
     let deletes = admitted("ref_delete");
     assert!(deletes.len() == 1 && deletes[0].contains("\"pallet\":\"feature/x\""), "{:?}", deletes);
+    let (status, body) = http_send_json_as(&server.url, "POST", "/v1/holds/feature/x",
+        &format!("{{\"candidates\":[\"{}\"]}}", hash), token);
+    assert!(!status.starts_with("HTTP/1.1 404"), "{} / {}", status, body);
+    let held = |pallet: &str| admitted("read").into_iter().filter(|body| body.contains(pallet)).count();
+    assert_eq!(held("\"pallet\":\"feature/x\""), 1, "{:?}", admitted("read"));
 
     for tail in ["feature/..", "..%2Fmain", "feature/./x", "feature/X", "feature//x", "feature/x/", "/main"] {
         let (status, body) =
@@ -5134,6 +5144,7 @@ fn a_tail_naming_no_valid_pallet_never_reaches_the_admission_hook() {
     }
     assert_eq!(admitted("ref_update").len(), 1, "a refused name was put to the hook: {:?}", admitted("ref_update"));
     assert_eq!(admitted("ref_delete").len(), 1, "a refused name was put to the hook: {:?}", admitted("ref_delete"));
+    assert_eq!(held("\"pallet\""), 1, "a refused name was put to the hook: {:?}", admitted("read"));
 
     for (method, path) in [("POST", "/v1/pallets/"), ("POST", "/v1/holds/")] {
         let (status, body) = http_send_json_as(&server.url, method, path, &update, token);
@@ -5141,6 +5152,47 @@ fn a_tail_naming_no_valid_pallet_never_reaches_the_admission_hook() {
     }
     let status = http_status(&server.url, "DELETE", &format!("/v1/pallets/?old_head={}", hash), token);
     assert!(status.starts_with("HTTP/1.1 404"), "{}", status);
+}
+
+/// FORK-580: reads are put to the admission hook too. A clone is asked as `read` and `fetch`, the
+/// config file's `admission_cache_secs` reaches the server (at 0 every read is asked, where the
+/// default of 60 would answer the second from the cache), and a caller the hook suspends can no
+/// longer fetch, with the hook's reason in the client's error.
+#[test]
+fn reads_reach_the_admission_hook_and_a_suspended_caller_cannot_fetch() {
+    let area = TestArea::new("hooks-reads");
+    let hooks = HookServer::start();
+    let server = start_hooked_server_with(&area, &hooks, "a shared hook secret", "admission_cache_secs = 0\n");
+
+    prepare_warehouse(&area, "a", &server.url);
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "hook-token"]));
+    area.write_file("a/readme.txt", "hello reads\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a parcel to fetch"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let actions = || -> Vec<String> {
+        hooks.recorded().into_iter()
+            .filter(|request| request.path == "/admission")
+            .map(|request| String::from_utf8_lossy(&request.body).to_string())
+            .collect()
+    };
+    let asked = |action: &str| actions().iter().filter(|body| body.contains(&format!("\"action\":\"{}\"", action))).count();
+
+    let reads = asked("read");
+    for _ in 0..2 {
+        let status = http_status(&server.url, "GET", "/v1/warehouse", Some("hook-token"));
+        assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+    }
+    assert_eq!(asked("read"), reads + 2, "admission_cache_secs = 0 did not reach the server: {:?}", actions());
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "hook-token"]));
+    assert!(asked("fetch") > 0, "a clone fetched nothing through the hook: {:?}", actions());
+
+    hooks.admit.store(false, std::sync::atomic::Ordering::SeqCst);
+    let refused = area.forklift(".", &["clone", &server.url, "c", "--token", "hook-token"]);
+    assert!(!refused.status.success(), "a clone the admission hook denies must fail");
+    assert!(stderr(&refused).contains("quota is exhausted"), "{}", stderr(&refused));
 }
 
 #[test]

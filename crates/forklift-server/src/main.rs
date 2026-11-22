@@ -390,6 +390,7 @@ fn serve_options(root: Option<String>,
         events_hook: file.events_hook,
         resolution_hook: file.resolution_hook,
         authentication_cache_secs: file.authentication_cache_secs,
+        admission_cache_secs: file.admission_cache_secs,
         max_heavy_requests: max_heavy_requests.or(file.max_heavy_requests),
         light_requests_per_minute: limits.light_requests_per_minute.or(file.light_requests_per_minute),
         heavy_requests_per_minute: limits.heavy_requests_per_minute.or(file.heavy_requests_per_minute),
@@ -422,6 +423,7 @@ fn serve_options(root: Option<String>,
 /// resolution_url = "…"
 /// resolution_secret = "…"
 /// authentication_cache_secs = 60
+/// admission_cache_secs = 60
 /// ```
 #[derive(Default)]
 struct ConfigFile {
@@ -458,6 +460,7 @@ struct ConfigFile {
     events_hook: Option<server::HookEndpoint>,
     resolution_hook: Option<server::HookEndpoint>,
     authentication_cache_secs: Option<u64>,
+    admission_cache_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for ConfigFile {
@@ -479,6 +482,7 @@ impl std::fmt::Debug for ConfigFile {
             .field("events_hook", &self.events_hook)
             .field("resolution_hook", &self.resolution_hook)
             .field("authentication_cache_secs", &self.authentication_cache_secs)
+            .field("admission_cache_secs", &self.admission_cache_secs)
             .finish()
     }
 }
@@ -548,7 +552,7 @@ fn optional_non_negative_integer(item: Option<&toml_edit::Item>, path: &str, key
 /// specifically: this field, alone among the three this module casts to an unsigned type, needs
 /// a magnitude check in addition to the sign check (a value can be non-negative and still be
 /// nonsensical — `i64::MAX` seconds is the "never re-checked again" hole with the sign flip
-/// removed). The ceiling itself is [`server::MAX_AUTHENTICATION_CACHE_SECS`], not a local copy
+/// removed). The ceiling itself is [`server::MAX_HOOK_CACHE_SECS`], not a local copy
 /// (PR #124 round 5, F4): `server::serve` re-enforces the identical bound at the `ServeOptions`
 /// boundary, and a config-file-specific error message here is the reason this function still
 /// exists rather than every caller going straight through `server`'s check — see that
@@ -557,11 +561,27 @@ fn bounded_authentication_cache_secs(
     item: Option<&toml_edit::Item>, path: &str, key: &str
 ) -> Result<Option<u64>, String> {
     match optional_non_negative_integer(item, path, key)? {
-        Some(v) if v > server::MAX_AUTHENTICATION_CACHE_SECS as i64 => Err(format!(
+        Some(v) if v > server::MAX_HOOK_CACHE_SECS as i64 => Err(format!(
             "The config file \"{}\" has a \"{}\" entry of {} seconds, which is over the \
             {}-second (24h) ceiling: a revoked credential must not be able to outlive its \
             revocation by more than about a day.",
-            path, key, v, server::MAX_AUTHENTICATION_CACHE_SECS
+            path, key, v, server::MAX_HOOK_CACHE_SECS
+        )),
+        other => Ok(other.map(|v| v as u64)),
+    }
+}
+
+/// [`bounded_authentication_cache_secs`]'s sibling for `admission_cache_secs`, under the same
+/// ceiling: it bounds how long a suspended caller keeps being admitted new reads.
+fn bounded_admission_cache_secs(
+    item: Option<&toml_edit::Item>, path: &str, key: &str
+) -> Result<Option<u64>, String> {
+    match optional_non_negative_integer(item, path, key)? {
+        Some(v) if v > server::MAX_HOOK_CACHE_SECS as i64 => Err(format!(
+            "The config file \"{}\" has a \"{}\" entry of {} seconds, which is over the \
+            {}-second (24h) ceiling: a suspended caller must not keep being admitted for more \
+            than about a day.",
+            path, key, v, server::MAX_HOOK_CACHE_SECS
         )),
         other => Ok(other.map(|v| v as u64)),
     }
@@ -630,17 +650,17 @@ const CONFIG_TOP_LEVEL_KEYS: [&str; 12] = [
 ];
 
 /// The keys `parse_config` understands inside `[hooks]` — four independent `{name}_url` /
-/// `{name}_secret` pairs (`docs/format/HOOK_PROTOCOL.md`) plus the one shared cache setting.
+/// `{name}_secret` pairs (`docs/format/HOOK_PROTOCOL.md`) plus the two cache settings.
 /// Same role as [`CONFIG_TOP_LEVEL_KEYS`]: a typo'd `autentication_url` is a startup error, not
 /// a silently-never-configured hook (the second fail-open path this fix closes — with no other
 /// auth configured, a hook that silently failed to parse used to leave `check_auth` reading
 /// "nothing is configured" and serving every request as `Principal::Open`).
-const HOOKS_KEYS: [&str; 9] = [
+const HOOKS_KEYS: [&str; 10] = [
     "authentication_url", "authentication_secret",
     "admission_url", "admission_secret",
     "events_url", "events_secret",
     "resolution_url", "resolution_secret",
-    "authentication_cache_secs",
+    "authentication_cache_secs", "admission_cache_secs",
 ];
 
 /// Refuse a key that is not in `known` — the mechanism behind [`CONFIG_TOP_LEVEL_KEYS`] and
@@ -736,6 +756,13 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         )?,
     };
 
+    let admission_cache_secs = match hooks {
+        None => None,
+        Some(table) => bounded_admission_cache_secs(
+            table.get("admission_cache_secs"), path, "hooks.admission_cache_secs"
+        )?,
+    };
+
     Ok(ConfigFile {
         root: optional_string(doc.get("root"), path, "root")?,
         warehouses: optional_string(doc.get("warehouses"), path, "warehouses")?,
@@ -772,6 +799,7 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         events_hook: hook_of("events")?,
         resolution_hook: hook_of("resolution")?,
         authentication_cache_secs,
+        admission_cache_secs,
     })
 }
 
@@ -1319,7 +1347,7 @@ mod tests {
             &format!(
                 "[hooks]\nauthentication_url = \"https://x\"\nauthentication_secret = \"s\"\n\
                 authentication_cache_secs = {}\n",
-                server::MAX_AUTHENTICATION_CACHE_SECS + 1
+                server::MAX_HOOK_CACHE_SECS + 1
             )
         );
         let error = parse_config(path.to_str().unwrap()).unwrap_err();
@@ -1339,14 +1367,44 @@ mod tests {
             &format!(
                 "[hooks]\nauthentication_url = \"https://x\"\nauthentication_secret = \"s\"\n\
                 authentication_cache_secs = {}\n",
-                server::MAX_AUTHENTICATION_CACHE_SECS
+                server::MAX_HOOK_CACHE_SECS
             )
         );
         let file = parse_config(path.to_str().unwrap()).unwrap();
 
-        assert_eq!(file.authentication_cache_secs, Some(server::MAX_AUTHENTICATION_CACHE_SECS));
+        assert_eq!(file.authentication_cache_secs, Some(server::MAX_HOOK_CACHE_SECS));
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
+    }
+
+    /// I9. `admission_cache_secs` is read like `authentication_cache_secs`: a string, a negative
+    /// value or one over the 24-hour ceiling is a startup error naming the key; zero (the cache
+    /// off) and the ceiling itself are accepted.
+    #[test]
+    fn admission_cache_secs_is_bounded_like_authentication_cache_secs() {
+        for (value, refusal) in [("\"60\"", "not an integer"), ("-1", "negative"), ("86401", "ceiling")] {
+            let path = scratch_config(
+                "admission-cache-secs-refused",
+                &format!("[hooks]\nadmission_url = \"https://x\"\nadmission_secret = \"s\"\nadmission_cache_secs = {value}\n")
+            );
+            let error = parse_config(path.to_str().unwrap()).unwrap_err();
+
+            assert!(error.contains("hooks.admission_cache_secs"), "{value}: {error}");
+            assert!(error.contains(refusal), "{value}: {error}");
+            let _ = forklift_core::util::file_utils::remove_file(&path);
+        }
+
+        for (value, read) in [("0", 0), ("86400", 86_400)] {
+            let path = scratch_config(
+                "admission-cache-secs-accepted",
+                &format!("[hooks]\nadmission_url = \"https://x\"\nadmission_secret = \"s\"\nadmission_cache_secs = {value}\n")
+            );
+            let file = parse_config(path.to_str().unwrap()).unwrap();
+
+            assert_eq!(file.admission_cache_secs, Some(read), "{value}");
+            assert_eq!(file.authentication_cache_secs, None, "{value}");
+            let _ = forklift_core::util::file_utils::remove_file(&path);
+        }
     }
 
     /// The same negative-wraps-to-huge-unsigned hole, applied to `max_body_mb` (`as u64`) while

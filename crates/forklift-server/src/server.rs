@@ -21,7 +21,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{on, MethodFilter, MethodRouter};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json, RequestExt, Router};
 use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};
 use forklift_core::model::hooks::{
     AdmissionHookRequest, AdmissionHookResponse, AuthenticationHookRequest,
@@ -655,6 +655,11 @@ struct AppState {
     authentication_cache: Mutex<HashMap<String, (String, std::time::Instant)>>,
     authentication_cache_ttl: std::time::Duration,
 
+    /// The admission hook's allows for reads and fetches ([`AdmissionCache`]). A newly suspended
+    /// caller is admitted new reads for at most the TTL; zero turns the cache off.
+    admission_cache: Mutex<AdmissionCache>,
+    admission_cache_ttl: std::time::Duration,
+
     /// The permits of Heavy requests in flight ([`acquire_heavy`]): one cap per serving process,
     /// shared by every warehouse it serves. Sized by [`heavy_capacity`].
     heavy: Arc<tokio::sync::Semaphore>,
@@ -764,8 +769,8 @@ pub struct ServeOptions {
     /// `authentication` hook: credential → operator identifier (hot, fail closed).
     pub authentication_hook: Option<HookEndpoint>,
 
-    /// `admission` hook: soft policy gate on uploads/ref updates/creation (hot,
-    /// fail closed).
+    /// `admission` hook: soft policy gate on writes, reads and fetches (hot, fail closed). Every
+    /// authenticated route but `PUT /trust` is put to it.
     pub admission_hook: Option<HookEndpoint>,
 
     /// `event` hook: lift/trust/revocation webhooks (cold, retried).
@@ -777,6 +782,10 @@ pub struct ServeOptions {
 
     /// How long a positive authentication-hook answer is cached (seconds; default 60).
     pub authentication_cache_secs: Option<u64>,
+
+    /// How long the admission hook's allow for a read or fetch is cached (seconds; default 60,
+    /// 0 = never cached). Writes are never cached.
+    pub admission_cache_secs: Option<u64>,
 
     /// How many costly requests (ref updates, pallet deletions, trust installs, batch fetches)
     /// run at once; `None` = the host's available parallelism. Zero is refused. See
@@ -889,8 +898,9 @@ fn body_limit_bytes(max_body_mb: Option<u64>) -> Result<usize, String> {
     }
 }
 
-/// The ceiling on `authentication_cache_secs`: how long a revoked credential can keep
-/// authenticating after the hook stops vouching for it (`docs/format/HOOK_PROTOCOL.md`: "a
+/// The ceiling on `authentication_cache_secs` and `admission_cache_secs`, each a latency budget:
+/// how long a revoked credential can keep authenticating after the hook stops vouching for it,
+/// and how long a suspended caller can keep being admitted new reads (`docs/format/HOOK_PROTOCOL.md`: "a
 /// revoked credential outlives its revocation by at most the TTL") — it is a revocation-latency
 /// budget, not a general-purpose cache knob, and its documented default is 60 seconds. One day
 /// is three orders of magnitude past that default — room for any legitimate "reduce hook
@@ -902,7 +912,7 @@ fn body_limit_bytes(max_body_mb: Option<u64>) -> Result<usize, String> {
 /// share (PR #124 round 5, F4): `main.rs::bounded_authentication_cache_secs` re-exports this
 /// same value into its own, config-file-specific error message rather than keeping a second
 /// copy of the number.
-pub const MAX_AUTHENTICATION_CACHE_SECS: u64 = 24 * 60 * 60;
+pub const MAX_HOOK_CACHE_SECS: u64 = 24 * 60 * 60;
 
 /// [`body_limit_bytes`]'s sibling for `authentication_cache_secs`: enforced here, at the
 /// `ServeOptions` boundary, not only in `main.rs::bounded_authentication_cache_secs` (the TOML
@@ -918,11 +928,25 @@ pub const MAX_AUTHENTICATION_CACHE_SECS: u64 = 24 * 60 * 60;
 /// re-checked again" hole `main.rs`'s sign and magnitude checks close for the config-file path.
 fn authentication_cache_ttl(secs: Option<u64>) -> Result<std::time::Duration, String> {
     match secs {
-        Some(v) if v > MAX_AUTHENTICATION_CACHE_SECS => Err(format!(
+        Some(v) if v > MAX_HOOK_CACHE_SECS => Err(format!(
             "\"authentication_cache_secs\" is {} seconds, which is over the {}-second (24h) \
             ceiling: a revoked credential must not be able to outlive its revocation by more \
             than about a day.",
-            v, MAX_AUTHENTICATION_CACHE_SECS
+            v, MAX_HOOK_CACHE_SECS
+        )),
+        _ => Ok(std::time::Duration::from_secs(secs.unwrap_or(60))),
+    }
+}
+
+/// [`authentication_cache_ttl`]'s sibling for `admission_cache_secs`, enforced at the same
+/// boundary for the same reason: a `ServeOptions` built directly must not get past the ceiling
+/// the config file is held to.
+fn admission_cache_ttl(secs: Option<u64>) -> Result<std::time::Duration, String> {
+    match secs {
+        Some(v) if v > MAX_HOOK_CACHE_SECS => Err(format!(
+            "\"admission_cache_secs\" is {} seconds, which is over the {}-second (24h) ceiling: a \
+            suspended caller must not keep being admitted for more than about a day.",
+            v, MAX_HOOK_CACHE_SECS
         )),
         _ => Ok(std::time::Duration::from_secs(secs.unwrap_or(60))),
     }
@@ -982,6 +1006,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // than trusting `main.rs::bounded_authentication_cache_secs` (the TOML reader) to be the
     // only path into this value — see `authentication_cache_ttl`'s own doc for why.
     let authentication_cache_ttl = authentication_cache_ttl(options.authentication_cache_secs)?;
+    let admission_cache_ttl = admission_cache_ttl(options.admission_cache_secs)?;
     let heavy_capacity = heavy_capacity(options.max_heavy_requests)?;
     let limits = RequestLimits::new(options.light_requests_per_minute, options.heavy_requests_per_minute)?;
 
@@ -1132,6 +1157,8 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         http,
         authentication_cache: Mutex::new(HashMap::new()),
         authentication_cache_ttl,
+        admission_cache: Mutex::new(AdmissionCache::new(ADMISSION_CACHE_BYTES)),
+        admission_cache_ttl,
         heavy: Arc::new(tokio::sync::Semaphore::new(heavy_capacity)),
         rebuilds: Arc::new(tokio::sync::Semaphore::new(REBUILD_SLOTS)),
         heavy_wait: HEAVY_WAIT,
@@ -1250,6 +1277,34 @@ enum Cost {
     Heavy,
 }
 
+/// How a route is put to the admission hook ([`check_admission`]). Each [`ROUTES`] entry states
+/// one, so no route is added without that decision; a test holds the handlers to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// A question about the warehouse that hands out no stored content, asked as `read` by the
+    /// authentication layer ([`admit_in_layer`]). `pallet_tail`: the path ends in a pallet name,
+    /// which the layer parses and sends as the request's `pallet`.
+    Read { pallet_tail: bool },
+    /// A request for stored content, asked as `fetch` by the authentication layer.
+    Fetch { pallet_tail: bool },
+    /// The handler asks, with this action, once it has parsed what the hook is told.
+    InHandler(&'static str),
+    /// Never put to the admission hook.
+    Unadmitted,
+}
+
+impl Admission {
+    /// The action the authentication layer asks the hook, and whether the path ends in a pallet
+    /// name; `None` for a route the layer does not admit.
+    fn in_layer(self) -> Option<(&'static str, bool)> {
+        match self {
+            Admission::Read { pallet_tail } => Some(("read", pallet_tail)),
+            Admission::Fetch { pallet_tail } => Some(("fetch", pallet_tail)),
+            Admission::InHandler(_) | Admission::Unadmitted => None,
+        }
+    }
+}
+
 /// One method on one path the server answers. [`ROUTES`] holds every one of them.
 struct RouteEntry {
     verb: Verb,
@@ -1261,6 +1316,7 @@ struct RouteEntry {
     /// under the Heavy cap is the handler's own call to [`acquire_heavy`], which a test holds to
     /// this field.
     cost: Cost,
+    admission: Admission,
     /// Builds the entry's method router from the entry's own method, so an entry cannot answer a
     /// method it does not name.
     handler: fn(MethodFilter) -> MethodRouter<Arc<AppState>>,
@@ -1276,40 +1332,57 @@ const MULTI_PROTOCOL_PREFIX: &str = "/warehouses/{warehouse}/v1";
 /// answers.
 const ROUTES: &[RouteEntry] = &[
     RouteEntry { verb: Verb::Get, path: "/warehouse", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, get_warehouse) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::Read { pallet_tail: false }, handler: |method| on(method, get_warehouse) },
     RouteEntry { verb: Verb::Post, path: "/objects/missing", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, post_missing) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::Read { pallet_tail: false }, handler: |method| on(method, post_missing) },
     RouteEntry { verb: Verb::Post, path: "/objects/upload-targets", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, post_upload_targets) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::Read { pallet_tail: false }, handler: |method| on(method, post_upload_targets) },
     RouteEntry { verb: Verb::Post, path: "/objects/batch", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Heavy, handler: |method| on(method, post_objects_batch) },
+        access: Access::Authenticated, cost: Cost::Heavy,
+        admission: Admission::Fetch { pallet_tail: false }, handler: |method| on(method, post_objects_batch) },
     RouteEntry { verb: Verb::Get, path: "/objects/{hash}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, get_object) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::Fetch { pallet_tail: false }, handler: |method| on(method, get_object) },
     RouteEntry { verb: Verb::Put, path: "/objects/{hash}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, put_object) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::InHandler("upload"), handler: |method| on(method, put_object) },
     RouteEntry { verb: Verb::Put, path: "/withheld/{hash}/recipe", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, put_withheld_recipe) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::InHandler("upload"), handler: |method| on(method, put_withheld_recipe) },
     RouteEntry { verb: Verb::Get, path: "/signatures/{hash}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, get_signature) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::Fetch { pallet_tail: false }, handler: |method| on(method, get_signature) },
     RouteEntry { verb: Verb::Put, path: "/signatures/{hash}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, put_signature) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::InHandler("upload"), handler: |method| on(method, put_signature) },
     RouteEntry { verb: Verb::Put, path: "/trust", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Heavy, handler: |method| on(method, put_trust) },
+        access: Access::Authenticated, cost: Cost::Heavy,
+        admission: Admission::Unadmitted, handler: |method| on(method, put_trust) },
     RouteEntry { verb: Verb::Post, path: "/pallets/{*name}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Heavy, handler: |method| on(method, post_ref_update) },
+        access: Access::Authenticated, cost: Cost::Heavy,
+        admission: Admission::InHandler("ref_update"), handler: |method| on(method, post_ref_update) },
     RouteEntry { verb: Verb::Delete, path: "/pallets/{*name}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Heavy, handler: |method| on(method, delete_ref) },
+        access: Access::Authenticated, cost: Cost::Heavy,
+        admission: Admission::InHandler("ref_delete"), handler: |method| on(method, delete_ref) },
     RouteEntry { verb: Verb::Post, path: "/holds/{*name}", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, post_holds) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::Read { pallet_tail: true }, handler: |method| on(method, post_holds) },
     RouteEntry { verb: Verb::Post, path: "/resolve", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, post_resolve) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::Read { pallet_tail: false }, handler: |method| on(method, post_resolve) },
     RouteEntry { verb: Verb::Get, path: "/bundles/latest", mount: Mount::Protocol, modes: Modes::Both,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, get_bundle) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::Fetch { pallet_tail: false }, handler: |method| on(method, get_bundle) },
     RouteEntry { verb: Verb::Put, path: "/warehouses/{warehouse}", mount: Mount::Root, modes: Modes::Multi,
-        access: Access::Authenticated, cost: Cost::Light, handler: |method| on(method, put_warehouse) },
+        access: Access::Authenticated, cost: Cost::Light,
+        admission: Admission::InHandler("warehouse_create"), handler: |method| on(method, put_warehouse) },
     // Liveness only: unauthenticated and warehouse-free on purpose.
     RouteEntry { verb: Verb::Get, path: "/healthz", mount: Mount::Root, modes: Modes::Both,
-        access: Access::Public, cost: Cost::Light, handler: |method| on(method, || async { "ok" }) },
+        access: Access::Public, cost: Cost::Light, admission: Admission::Unadmitted,
+        handler: |method| on(method, || async { "ok" }) },
 ];
 
 /// Register every [`ROUTES`] entry for one mount and serving mode. An authenticated entry carries
@@ -1324,7 +1397,9 @@ fn register(state: &Arc<AppState>, mount: Mount, multi: bool) -> Router<Arc<AppS
         let mut answer = (entry.handler)(entry.verb.filter());
 
         if entry.access == Access::Authenticated {
-            answer = answer.route_layer(middleware::from_fn_with_state((Arc::clone(state), entry.cost), authenticate));
+            answer = answer.route_layer(middleware::from_fn_with_state(
+                (Arc::clone(state), entry.cost, entry.admission), authenticate
+            ));
         }
 
         // axum merges a second method router on a path it already holds into the first.
@@ -1360,8 +1435,10 @@ fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
 /// The authentication layer: refuse the request from its headers alone, or pass it on with its
 /// [`Principal`] in the request extensions. A caller whose bucket for the route's cost class is
 /// empty ([`RequestLimits`]) is refused here too, with a `429`, before its body is read. A request
-/// admitted is charged whatever its handler then answers. See [`router`].
-async fn authenticate(State((state, cost)): State<(Arc<AppState>, Cost)>,
+/// admitted is charged whatever its handler then answers. A read or fetch route is then put to
+/// the admission hook ([`admit_in_layer`]), its refusal also answered before the body is read.
+/// See [`router`].
+async fn authenticate(State((state, cost, admission)): State<(Arc<AppState>, Cost, Admission)>,
                       mut request: Request,
                       next: Next) -> Response {
     let principal = match check_auth(&state, request.headers()).await {
@@ -1383,8 +1460,47 @@ async fn authenticate(State((state, cost)): State<(Arc<AppState>, Cost)>,
         return refuse_unread(request, throttled_response(throttled.retry_after_secs));
     }
 
+    if let Some((action, pallet_tail)) = admission.in_layer() {
+        if let Err(error) = admit_in_layer(&state, &mut request, &principal, action, pallet_tail).await {
+            return refuse_unread(request, error_response(error));
+        }
+    }
+
     request.extensions_mut().insert(principal);
     next.run(request).await
+}
+
+/// Put a read or fetch to the admission hook, from the route's path parameters alone. What the
+/// hook is told is checked first with the handlers' own pure checks, the warehouse id and, for a
+/// route ending in a pallet name, the name, so the hook only ever sees a valid id and reference;
+/// a failure is a `422` and the hook is not asked. The warehouse is not resolved here: resolving
+/// takes a registry reference and may touch the disk, so a well-formed id naming no warehouse is
+/// asked about, and a denied caller reads `403` where the handler would have answered `404`.
+async fn admit_in_layer(state: &AppState,
+                        request: &mut Request,
+                        principal: &Principal,
+                        action: &'static str,
+                        pallet_tail: bool) -> Result<(), HandlerError> {
+    if state.admission_hook.is_none() {
+        return Ok(());
+    }
+
+    let Path(params) = request.extract_parts::<Path<PathParams>>().await
+        .map_err(|rejection| server_fault(format!("Error while reading the path parameters: {}", rejection)))?;
+
+    if let Some(id) = params.get("warehouse") {
+        validate_warehouse_id(id)?;
+    }
+
+    let pallet = if pallet_tail {
+        let name = param(&params, "name")?;
+        pallet_utils::PalletRef::parse(&name).map_err(unprocessable)?;
+        Some(name)
+    } else {
+        None
+    };
+
+    ask_admission(state, admission_request(&params, principal, action, pallet.as_deref()), true).await
 }
 
 /// Answer `request` with `refusal` without reading its body first: a body still arriving is read
@@ -2271,19 +2387,24 @@ async fn post_hook<T: serde::Serialize>(state: &AppState,
         .map_err(|e| format!("The {} hook at \"{}\" failed: {}", kind, hook.url, e))
 }
 
-/// Ask the admission hook whether a request may proceed (soft policy: quotas, plan
-/// limits, suspensions). Fail closed on hook failure; a denial carries the hook's
-/// reason. No hook configured = everything admitted (the default server).
+/// Ask the admission hook whether a write may proceed (soft policy: quotas, plan limits,
+/// suspensions), from the handler that makes it. Every write is asked, never answered from the
+/// cache. Reads and fetches are asked by the authentication layer instead ([`admit_in_layer`]).
 async fn check_admission(state: &AppState,
                          params: &PathParams,
                          principal: &Principal,
                          action: &str,
                          pallet: Option<&str>) -> Result<(), HandlerError> {
-    let Some(hook) = &state.admission_hook else {
-        return Ok(());
-    };
+    ask_admission(state, admission_request(params, principal, action, pallet), false).await
+}
 
-    let request = AdmissionHookRequest {
+/// What the admission hook is told: the action, the warehouse id the path names, the operator
+/// a [`Principal::Operator`] is, and the pallet.
+fn admission_request(params: &PathParams,
+                     principal: &Principal,
+                     action: &str,
+                     pallet: Option<&str>) -> AdmissionHookRequest {
+    AdmissionHookRequest {
         action: action.to_string(),
         warehouse: params.get("warehouse").cloned(),
         operator: match principal {
@@ -2291,7 +2412,29 @@ async fn check_admission(state: &AppState,
             _ => None,
         },
         pallet: pallet.map(|name| name.to_string()),
+    }
+}
+
+/// Put `request` to the admission hook. Fail closed on hook failure (`503`); a denial is a `403`
+/// carrying the hook's reason. No hook configured = everything admitted (the default server).
+/// With `cached`, an allow the hook gave for an equal request within the TTL is reused, and a
+/// new allow is stored ([`AdmissionCache`]); a denial or a failure is never stored.
+async fn ask_admission(state: &AppState,
+                       request: AdmissionHookRequest,
+                       cached: bool) -> Result<(), HandlerError> {
+    let Some(hook) = &state.admission_hook else {
+        return Ok(());
     };
+
+    let cached = cached && !state.admission_cache_ttl.is_zero();
+
+    if cached {
+        if let Ok(cache) = state.admission_cache.lock() {
+            if cache.allows(&request, state.admission_cache_ttl) {
+                return Ok(());
+            }
+        }
+    }
 
     let response = post_hook(state, hook, "admission", &request).await
         .map_err(|reason| {
@@ -2321,13 +2464,82 @@ async fn check_admission(state: &AppState,
         )
     })?;
 
-    if verdict.allow {
-        Ok(())
-    } else {
-        Err((
+    if !verdict.allow {
+        return Err((
             StatusCode::FORBIDDEN,
             verdict.reason.unwrap_or("The request was refused by the server's admission policy.".to_string())
-        ))
+        ));
+    }
+
+    if cached {
+        if let Ok(mut cache) = state.admission_cache.lock() {
+            cache.store(request, state.admission_cache_ttl);
+        }
+    }
+
+    Ok(())
+}
+
+/// The memory [`AdmissionCache`] may use in production: at most 16,384 entries, whatever their size.
+const ADMISSION_CACHE_BYTES: usize = 4 << 20;
+
+/// What each [`AdmissionCache`] entry is charged on top of its key's string bytes: the map
+/// entry, the key's four string headers and the time it was stored.
+const ADMISSION_CACHE_ENTRY_BYTES: usize = 256;
+
+/// The admission hook's allows for reads and fetches ([`ask_admission`]), keyed by the whole
+/// request the hook was sent, with the time each was given. Bounded by a byte budget, so neither
+/// the number of names a caller sends nor their length grows it: each entry is charged its key's
+/// string bytes plus [`ADMISSION_CACHE_ENTRY_BYTES`]. Expired entries are dropped, and their
+/// charge returned, only when a new entry would not fit; one that still does not fit is not
+/// stored, and the request it answered is admitted all the same.
+struct AdmissionCache {
+    allowed: HashMap<AdmissionHookRequest, std::time::Instant>,
+    charged: usize,
+    budget: usize,
+}
+
+impl AdmissionCache {
+    fn new(budget: usize) -> AdmissionCache {
+        AdmissionCache { allowed: HashMap::new(), charged: 0, budget }
+    }
+
+    fn charge(request: &AdmissionHookRequest) -> usize {
+        let text = |field: &Option<String>| field.as_ref().map_or(0, String::len);
+
+        request.action.len() + text(&request.warehouse) + text(&request.operator) + text(&request.pallet)
+            + ADMISSION_CACHE_ENTRY_BYTES
+    }
+
+    /// Whether the hook allowed an equal request less than `ttl` ago.
+    fn allows(&self, request: &AdmissionHookRequest, ttl: std::time::Duration) -> bool {
+        self.allowed.get(request).is_some_and(|at| at.elapsed() < ttl)
+    }
+
+    /// Record an allow the hook just gave, when it fits the budget.
+    fn store(&mut self, request: AdmissionHookRequest, ttl: std::time::Duration) {
+        let charge = AdmissionCache::charge(&request);
+
+        if self.allowed.remove(&request).is_some() {
+            self.charged -= charge;
+        }
+
+        if self.charged + charge > self.budget {
+            let mut returned = 0;
+            self.allowed.retain(|key, at| {
+                let live = at.elapsed() < ttl;
+                if !live {
+                    returned += AdmissionCache::charge(key);
+                }
+                live
+            });
+            self.charged -= returned;
+        }
+
+        if self.charged + charge <= self.budget {
+            self.charged += charge;
+            self.allowed.insert(request, std::time::Instant::now());
+        }
     }
 }
 
@@ -3024,8 +3236,8 @@ static HOLDS_WALKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(M
 
 /// `POST /v1/holds/{name}` — which of these parcels does the pallet still hold, its head
 /// or one of the head's ancestors? A bounded walk ([`merge_utils::holds`]): a candidate it
-/// could not settle is answered `unknown`, never `not_held`. Reading history is what fetching
-/// already allows, so nothing past authentication is asked. A pallet deleted here is walked from
+/// could not settle is answered `unknown`, never `not_held`. The admission hook is asked it as a
+/// `read` naming the pallet, by the authentication layer. A pallet deleted here is walked from
 /// the head its tombstone holds, which stays stored and served like a live ref's.
 async fn post_holds(State(state): State<Arc<AppState>>,
                     Path(params): Path<PathParams>,
@@ -5851,6 +6063,8 @@ mod tests {
             ),
             authentication_cache: Mutex::new(HashMap::new()),
             authentication_cache_ttl: std::time::Duration::from_secs(60),
+            admission_cache: Mutex::new(AdmissionCache::new(ADMISSION_CACHE_BYTES)),
+            admission_cache_ttl: std::time::Duration::from_secs(60),
             heavy: Arc::new(tokio::sync::Semaphore::new(heavy_capacity(None).unwrap())),
             rebuilds: Arc::new(tokio::sync::Semaphore::new(REBUILD_SLOTS)),
             heavy_wait: HEAVY_WAIT,
@@ -7353,6 +7567,300 @@ mod tests {
         assert_eq!(value["warehouse"], "tenant-a");
         assert_eq!(value["operator"], "bob");
         assert_eq!(value["pallet"], "main");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Read admission: the authentication layer and the allow cache
+    // ---------------------------------------------------------------------------------
+
+    /// An admission hook whose answer the test switches: allow while `allow` holds, else a denial
+    /// with the reason "reads are suspended". Every request body it receives is recorded, in order.
+    struct SwitchedHook {
+        url: String,
+        allow: Arc<std::sync::atomic::AtomicBool>,
+        received: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl SwitchedHook {
+        async fn start(allow: bool) -> SwitchedHook {
+            let allow = Arc::new(std::sync::atomic::AtomicBool::new(allow));
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let (allowing, recording) = (Arc::clone(&allow), Arc::clone(&received));
+
+            let app = Router::new().route("/hook", post(move |bytes: Bytes| {
+                let (allowing, recording) = (Arc::clone(&allowing), Arc::clone(&recording));
+
+                async move {
+                    recording.lock().unwrap().push(serde_json::from_slice(&bytes).unwrap());
+
+                    if allowing.load(Ordering::SeqCst) {
+                        r#"{"allow":true}"#.into_response()
+                    } else {
+                        r#"{"allow":false,"reason":"reads are suspended"}"#.into_response()
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            SwitchedHook { url: format!("http://{addr}/hook"), allow, received }
+        }
+
+        fn endpoint(&self) -> Option<HookEndpoint> {
+            Some(HookEndpoint { url: self.url.clone(), secret: "s".to_string() })
+        }
+
+        fn asked(&self) -> usize {
+            self.received.lock().unwrap().len()
+        }
+
+        fn last(&self) -> serde_json::Value {
+            self.received.lock().unwrap().last().cloned().expect("the hook was asked")
+        }
+    }
+
+    /// An admission request as the hook sees it, for the cache tests.
+    fn admission(action: &str, warehouse: Option<&str>, operator: Option<&str>, pallet: Option<&str>) -> AdmissionHookRequest {
+        AdmissionHookRequest {
+            action: action.to_string(),
+            warehouse: warehouse.map(str::to_string),
+            operator: operator.map(str::to_string),
+            pallet: pallet.map(str::to_string),
+        }
+    }
+
+    /// I1. Every route the table admits in the layer, in both serving modes, is refused `403` with
+    /// the hook's reason when the hook denies, and the hook was told that route's action, the
+    /// warehouse the path names and, for a route ending in a pallet name, that name. The routes
+    /// are read from `ROUTES`, so a new read route is covered the day it is listed.
+    ///
+    /// Reverts: the layer skipping one class (`Fetch` or `Read`) → that class's routes reach their
+    /// handler instead → red; the hook told the wrong action or no pallet → red.
+    #[tokio::test]
+    async fn every_read_and_fetch_route_is_refused_by_a_denying_admission_hook() {
+        let hook = SwitchedHook::start(false).await;
+        let single = scratch_dir("read-admission-single");
+        let multi = scratch_dir("read-admission-multi");
+        let cases = [
+            (ServeMode::Single(Arc::new(WarehouseHandle::new(single))), false),
+            (ServeMode::Multi { base: multi }, true),
+        ];
+        let client = reqwest::Client::new();
+        let mut refused = BTreeSet::new();
+
+        for (mode, is_multi) in cases {
+            let state = Arc::new(AppState {
+                token: Some("the-token".to_string()),
+                open: false,
+                admission_hook: hook.endpoint(),
+                ..base_state(mode)
+            });
+            let addr = serve_router(state, 1 << 20).await;
+
+            for (entry, path) in registered_routes(is_multi) {
+                let Some((action, pallet_tail)) = entry.admission.in_layer() else { continue };
+                let asked = hook.asked();
+                let method = reqwest::Method::from_bytes(verb_name(entry.verb).as_bytes()).unwrap();
+                let response = client.request(method, format!("http://{addr}{path}"))
+                    .bearer_auth("the-token")
+                    .header("content-type", "application/json")
+                    .body("{}")
+                    .send().await.unwrap();
+                let status = response.status();
+                let body = response.text().await.unwrap();
+
+                assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+                assert!(body.contains("reads are suspended"), "{path}: {body}");
+                assert_eq!(hook.asked(), asked + 1, "{path}: the hook asked once");
+
+                let told = hook.last();
+                assert_eq!(told["action"], action, "{path}");
+                assert_eq!(told["warehouse"], if is_multi { serde_json::json!("w1") } else { serde_json::Value::Null }, "{path}");
+                assert_eq!(told["pallet"], if pallet_tail { serde_json::json!("a/b") } else { serde_json::Value::Null }, "{path}");
+                refused.insert((is_multi, format!("{} {}", verb_name(entry.verb), entry.path)));
+            }
+        }
+
+        // A literal, not read from ROUTES: the routes this test must have reached, in each mode.
+        let expected: BTreeSet<(bool, String)> = [
+            "GET /warehouse", "POST /objects/missing", "POST /objects/upload-targets", "POST /objects/batch",
+            "GET /objects/{hash}", "GET /signatures/{hash}", "POST /holds/{*name}", "POST /resolve",
+            "GET /bundles/latest",
+        ].into_iter().flat_map(|route| [(false, route.to_string()), (true, route.to_string())]).collect();
+        assert_eq!(refused, expected);
+    }
+
+    /// I7. The layer checks what the hook would be told before asking: a warehouse id that is no
+    /// valid id, and a holds tail that is no valid pallet name, are answered `422` and the hook is
+    /// never asked. The control in [`every_read_and_fetch_route_is_refused_by_a_denying_admission_hook`]
+    /// shows the same hook asked for valid ones.
+    ///
+    /// Reverts: drop the layer's warehouse-id check, or its pallet-name parse → the denying hook
+    /// is asked and answers `403` → red.
+    #[tokio::test]
+    async fn the_layer_never_asks_the_admission_hook_about_an_invalid_id_or_name() {
+        let hook = SwitchedHook::start(false).await;
+        let client = reqwest::Client::new();
+        let multi = scratch_dir("read-admission-invalid-multi");
+        let single = scratch_dir("read-admission-invalid-single");
+        let cases = [
+            (ServeMode::Multi { base: multi }, vec![("GET", "/warehouses/-flag/v1/warehouse"),
+                                                    ("GET", "/warehouses/Acme/v1/objects/x1")]),
+            (ServeMode::Single(Arc::new(WarehouseHandle::new(single))), vec![("POST", "/v1/holds/..%2Fmain"),
+                                                                             ("POST", "/v1/holds/feature/X")]),
+        ];
+
+        for (mode, requests) in cases {
+            let state = Arc::new(AppState {
+                token: Some("the-token".to_string()),
+                open: false,
+                admission_hook: hook.endpoint(),
+                ..base_state(mode)
+            });
+            let addr = serve_router(state, 1 << 20).await;
+
+            for (method, path) in requests {
+                let response = client.request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("http://{addr}{path}"))
+                    .bearer_auth("the-token")
+                    .header("content-type", "application/json")
+                    .body("{}")
+                    .send().await.unwrap();
+
+                assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{method} {path}");
+            }
+        }
+
+        assert_eq!(hook.asked(), 0, "an invalid id or name was put to the hook");
+    }
+
+    /// I2 and I3. An allow for a read is reused within the TTL and asked again after it; a denial
+    /// is never reused, so a caller the hook lets back in is admitted on its next read.
+    ///
+    /// Reverts: never expire → the third read is not asked → red; never cache → the second read
+    /// is asked → red; cache a denial → the read after the hook flips is still refused → red.
+    #[tokio::test]
+    async fn a_read_allow_is_cached_for_the_ttl_and_a_denial_never_is() {
+        let hook = SwitchedHook::start(true).await;
+        let state = AppState {
+            admission_hook: hook.endpoint(),
+            admission_cache_ttl: std::time::Duration::from_secs(1),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+        let read = || admission("fetch", Some("w1"), Some("bob"), None);
+
+        ask_admission(&state, read(), true).await.unwrap();
+        ask_admission(&state, read(), true).await.unwrap();
+        assert_eq!(hook.asked(), 1, "the second read within the TTL was asked");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        ask_admission(&state, read(), true).await.unwrap();
+        assert_eq!(hook.asked(), 2, "a read past the TTL was not asked");
+
+        let other = || admission("fetch", Some("w2"), Some("bob"), None);
+        hook.allow.store(false, Ordering::SeqCst);
+        let error = ask_admission(&state, other(), true).await.unwrap_err();
+        assert_eq!(error, (StatusCode::FORBIDDEN, "reads are suspended".to_string()));
+
+        hook.allow.store(true, Ordering::SeqCst);
+        ask_admission(&state, other(), true).await.unwrap();
+        assert_eq!(hook.asked(), 4, "the read after the denial was not asked");
+    }
+
+    /// I4. The cache is keyed by every field the hook is told: requests that differ only in the
+    /// action, only in the warehouse, only in the operator or only in the pallet each reach it.
+    ///
+    /// Reverts: drop any one field from the cache's comparison → the request differing only in it
+    /// is answered from the cache → red.
+    #[tokio::test]
+    async fn requests_differing_in_any_one_field_each_reach_the_admission_hook() {
+        let hook = SwitchedHook::start(true).await;
+        let state = AppState { admission_hook: hook.endpoint(), ..single_mode_state(PathBuf::from("/unused")) };
+        let requests = [
+            admission("read", Some("w1"), Some("bob"), Some("main")),
+            admission("fetch", Some("w1"), Some("bob"), Some("main")),
+            admission("read", Some("w2"), Some("bob"), Some("main")),
+            admission("read", Some("w1"), Some("eve"), Some("main")),
+            admission("read", Some("w1"), Some("bob"), Some("dev")),
+        ];
+
+        for request in &requests {
+            ask_admission(&state, request.clone(), true).await.unwrap();
+        }
+        assert_eq!(hook.asked(), requests.len(), "a request differing in one field was answered from the cache");
+
+        // The domain was not empty: each of them, asked again, is now cached.
+        for request in &requests {
+            ask_admission(&state, request.clone(), true).await.unwrap();
+        }
+        assert_eq!(hook.asked(), requests.len());
+    }
+
+    /// I5. A write is asked every time: two equal uploads through [`check_admission`] both reach
+    /// the hook. Revert: cache writes → the second is answered from the cache → red.
+    #[tokio::test]
+    async fn equal_uploads_each_reach_the_admission_hook() {
+        let hook = SwitchedHook::start(true).await;
+        let state = AppState { admission_hook: hook.endpoint(), ..single_mode_state(PathBuf::from("/unused")) };
+        let mut params = PathParams::new();
+        params.insert("warehouse".to_string(), "w1".to_string());
+        let bob = Principal::Operator("bob".to_string());
+
+        check_admission(&state, &params, &bob, "upload", None).await.unwrap();
+        check_admission(&state, &params, &bob, "upload", None).await.unwrap();
+        assert_eq!(hook.asked(), 2);
+        assert_eq!(hook.last()["action"], "upload");
+    }
+
+    /// I6. The cache keeps to its byte budget: with room for one entry, a second is admitted but
+    /// not stored and the first stays cached; once the first has expired, its charge comes back
+    /// and the next entry is stored. The budget is injected; each entry is charged its key's
+    /// string bytes plus 256.
+    ///
+    /// Reverts: store past the budget → the second read is answered from the cache → red; never
+    /// return an expired entry's charge → the read after expiry is never stored → red.
+    #[tokio::test]
+    async fn the_admission_cache_keeps_to_its_byte_budget() {
+        let hook = SwitchedHook::start(true).await;
+        let first = admission("read", Some("w1"), None, None);
+        let second = admission("read", Some("w2"), None, None);
+        // "read" + "w1": 6 bytes, plus 256.
+        assert_eq!(AdmissionCache::charge(&first), 262);
+        let state = AppState {
+            admission_hook: hook.endpoint(),
+            admission_cache: Mutex::new(AdmissionCache::new(262 + 100)),
+            admission_cache_ttl: std::time::Duration::from_secs(1),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        ask_admission(&state, first.clone(), true).await.unwrap();
+        ask_admission(&state, second.clone(), true).await.unwrap();
+        ask_admission(&state, second.clone(), true).await.unwrap();
+        assert_eq!(hook.asked(), 3, "an entry past the budget was stored");
+        ask_admission(&state, first.clone(), true).await.unwrap();
+        assert_eq!(hook.asked(), 3, "the entry that fit was dropped");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        ask_admission(&state, second.clone(), true).await.unwrap();
+        ask_admission(&state, second.clone(), true).await.unwrap();
+        assert_eq!(hook.asked(), 4, "the expired entry's charge was never returned");
+        assert_eq!(state.admission_cache.lock().unwrap().charged, 262);
+    }
+
+    /// The cache is off at a zero TTL: every read is asked, and nothing is stored.
+    #[tokio::test]
+    async fn a_zero_admission_cache_ttl_asks_every_read() {
+        let hook = SwitchedHook::start(true).await;
+        let state = AppState {
+            admission_hook: hook.endpoint(),
+            admission_cache_ttl: std::time::Duration::ZERO,
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        ask_admission(&state, admission("read", None, None, None), true).await.unwrap();
+        ask_admission(&state, admission("read", None, None, None), true).await.unwrap();
+        assert_eq!(hook.asked(), 2);
+        assert_eq!(state.admission_cache.lock().unwrap().charged, 0);
     }
 
     // ---------------------------------------------------------------------------------
@@ -11523,6 +12031,7 @@ mod tests {
             events_hook: None,
             resolution_hook: None,
             authentication_cache_secs: None,
+            admission_cache_secs: None,
             max_heavy_requests: None,
             light_requests_per_minute: None,
             heavy_requests_per_minute: None,
@@ -11835,14 +12344,14 @@ mod tests {
     #[test]
     fn authentication_cache_ttl_accepts_the_ceiling() {
         assert_eq!(
-            authentication_cache_ttl(Some(MAX_AUTHENTICATION_CACHE_SECS)).unwrap(),
-            std::time::Duration::from_secs(MAX_AUTHENTICATION_CACHE_SECS)
+            authentication_cache_ttl(Some(MAX_HOOK_CACHE_SECS)).unwrap(),
+            std::time::Duration::from_secs(MAX_HOOK_CACHE_SECS)
         );
     }
 
     #[test]
     fn authentication_cache_ttl_refuses_a_value_over_the_ceiling() {
-        let error = authentication_cache_ttl(Some(MAX_AUTHENTICATION_CACHE_SECS + 1)).unwrap_err();
+        let error = authentication_cache_ttl(Some(MAX_HOOK_CACHE_SECS + 1)).unwrap_err();
         assert!(error.contains("authentication_cache_secs"), "{}", error);
         assert!(error.contains("ceiling"), "{}", error);
     }
@@ -11858,7 +12367,7 @@ mod tests {
     #[tokio::test]
     async fn serve_refuses_an_authentication_cache_secs_over_the_ceiling() {
         let options = ServeOptions {
-            authentication_cache_secs: Some(MAX_AUTHENTICATION_CACHE_SECS + 1),
+            authentication_cache_secs: Some(MAX_HOOK_CACHE_SECS + 1),
             ..bare_serve_options()
         };
         let error = serve(options).await.unwrap_err();
@@ -11866,6 +12375,22 @@ mod tests {
         assert!(error.contains("authentication_cache_secs"), "{}", error);
         assert!(error.contains("ceiling"), "{}", error);
         assert!(!error.contains("No authentication is configured"), "{}", error);
+    }
+
+    /// `admission_cache_secs` is bounded at the `ServeOptions` boundary as well as in the config
+    /// file: its default is 60 seconds, the ceiling is accepted, and `serve` refuses a value past
+    /// it whatever built the options.
+    #[tokio::test]
+    async fn admission_cache_secs_is_bounded_at_the_serve_options_boundary() {
+        assert_eq!(admission_cache_ttl(None).unwrap(), std::time::Duration::from_secs(60));
+        assert_eq!(admission_cache_ttl(Some(7)).unwrap(), std::time::Duration::from_secs(7));
+        assert_eq!(admission_cache_ttl(Some(86_400)).unwrap(), std::time::Duration::from_secs(86_400));
+
+        let options = ServeOptions { admission_cache_secs: Some(86_401), ..bare_serve_options() };
+        let error = serve(options).await.unwrap_err();
+
+        assert!(error.contains("admission_cache_secs"), "{}", error);
+        assert!(error.contains("ceiling"), "{}", error);
     }
 
     // ---------------------------------------------------------------------------------
@@ -12400,6 +12925,137 @@ mod tests {
             }
             syn::visit::visit_macro(self, mac);
         }
+    }
+
+    /// Every call to `check_admission` in non-test source, as the function it is in and the action
+    /// it passes: the string literal, or `<expr>` for anything else. A mention inside a macro is
+    /// recorded with the action `<macro>`, so a call hidden there is never missed.
+    #[derive(Default)]
+    struct AdmissionCallers {
+        within: Vec<String>,
+        found: BTreeSet<(String, String)>,
+    }
+
+    impl AdmissionCallers {
+        fn record(&mut self, action: String) {
+            let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
+            self.found.insert((within, action));
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for AdmissionCallers {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|segment| segment.ident == "check_admission"))
+            {
+                let action = match call.args.iter().nth(3) {
+                    Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(action), .. })) => action.value(),
+                    _ => "<expr>".to_string(),
+                };
+                self.record(action);
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone())).iter().any(|word| word == "check_admission") {
+                self.record("<macro>".to_string());
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    /// I8. Each route's admission matches its shape and its handler: a public route is never
+    /// admitted; a route the layer admits is authenticated, and ends in a pallet name exactly when
+    /// its entry says so; and the handlers calling `check_admission`, with the action each passes,
+    /// are exactly the `InHandler` routes' handlers with their actions. The scan reads server.rs
+    /// alone: `check_admission` is private to it.
+    ///
+    /// Reverts: flip holds' `pallet_tail` → red; mark an `InHandler` route `Unadmitted` → red;
+    /// pass another action from a handler, or call `check_admission` from a read handler → red.
+    #[test]
+    fn a_route_is_admitted_as_its_entry_says() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let file = syn::parse_file(&source).unwrap();
+        let handlers = route_handlers(&file);
+        let handler = |entry: &RouteEntry| handlers[&(format!("{:?}", entry.verb), entry.path.to_string())].clone();
+
+        for entry in ROUTES {
+            if entry.access == Access::Public {
+                assert_eq!(entry.admission, Admission::Unadmitted, "public {}", entry.path);
+            }
+
+            if let Some((_, pallet_tail)) = entry.admission.in_layer() {
+                assert_eq!(entry.access, Access::Authenticated, "{}", entry.path);
+                assert_eq!(pallet_tail, entry.path.ends_with("/{*name}"), "{} {:?}", entry.path, entry.admission);
+            }
+        }
+
+        let mut callers = AdmissionCallers::default();
+        syn::visit::Visit::visit_file(&mut callers, &file);
+
+        let in_handler: BTreeSet<(String, String)> = ROUTES.iter()
+            .filter_map(|entry| match entry.admission {
+                Admission::InHandler(action) => Some((handler(entry), action.to_string())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(in_handler, callers.found, "InHandler routes' handlers and actions (left), check_admission calls (right)");
+
+        // A literal, not read from ROUTES: changing how a route is admitted is an edit here too.
+        let admissions: BTreeMap<String, Admission> = ROUTES.iter()
+            .map(|entry| (format!("{} {}", verb_name(entry.verb), entry.path), entry.admission))
+            .collect();
+        let read = Admission::Read { pallet_tail: false };
+        let fetch = Admission::Fetch { pallet_tail: false };
+        let expected: BTreeMap<String, Admission> = [
+            ("GET /warehouse", read),
+            ("POST /objects/missing", read),
+            ("POST /objects/upload-targets", read),
+            ("POST /objects/batch", fetch),
+            ("GET /objects/{hash}", fetch),
+            ("PUT /objects/{hash}", Admission::InHandler("upload")),
+            ("PUT /withheld/{hash}/recipe", Admission::InHandler("upload")),
+            ("GET /signatures/{hash}", fetch),
+            ("PUT /signatures/{hash}", Admission::InHandler("upload")),
+            ("PUT /trust", Admission::Unadmitted),
+            ("POST /pallets/{*name}", Admission::InHandler("ref_update")),
+            ("DELETE /pallets/{*name}", Admission::InHandler("ref_delete")),
+            ("POST /holds/{*name}", Admission::Read { pallet_tail: true }),
+            ("POST /resolve", read),
+            ("GET /bundles/latest", fetch),
+            ("PUT /warehouses/{warehouse}", Admission::InHandler("warehouse_create")),
+            ("GET /healthz", Admission::Unadmitted),
+        ].into_iter().map(|(route, admission)| (route.to_string(), admission)).collect();
+        assert_eq!(admissions, expected);
     }
 
     /// Each `ROUTES` literal's handler, by its verb and path as the source spells them: the
