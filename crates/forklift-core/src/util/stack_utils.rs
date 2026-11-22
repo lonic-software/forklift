@@ -5,8 +5,9 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::util::{
-    cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils,
-    object_utils, office_utils, operation_utils, pallet_utils, scope_utils, sign_utils, tree_utils,
+    cherry_pick_utils, config_utils, file_utils, inventory_utils, journal_utils, load_guard_utils,
+    merge_utils, object_utils, office_utils, operation_utils, pallet_utils, scope_utils, sign_utils,
+    tree_utils,
 };
 use crate::util::audit_utils::{self, VerifiedOffice};
 use crate::util::office_utils::TrustAnchor;
@@ -458,8 +459,12 @@ pub async fn stack_parcel(description: Option<String>,
         if consolidation.is_none() && head_parcel.tree_hash == root_tree.hash {
             // For a cherry-pick, an unchanged tree means the pick is empty (the head
             // already has the change): clear the pick and say so, rather than recording
-            // an empty parcel.
+            // an empty parcel. Clearing it abandons the pick as an abort does, so the journal is
+            // settled the same way first: the conflicted pick's own entry comes off, and a
+            // standing undo mark is cleared, so that a later undo does not take the bay without
+            // the pick for its own interrupted run and write the pick back.
             if cherry_pick.is_some() {
+                journal_utils::pop_if_it_left_in_progress()?;
                 cherry_pick_utils::clear_state()?;
 
                 return Err(StackError::Other(
