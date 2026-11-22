@@ -20,10 +20,6 @@ tokio = { workspace = true }
 subtle = { workspace = true }
 percent-encoding = { workspace = true }
 
-# SHA-256 for bearer tokens: the function holds only token digests (`FORKLIFT_TOKEN_SHA256`,
-# `FORKLIFT_OPERATOR_TOKENS`), the format `shasum -a 256` and terraform's `sha256()` produce.
-# Pinned to the version already in the lockfile (via the AWS SDK), so nothing new is pulled in.
-sha2 = "0.10.9"
 
 # The HTTP edge speaks the lightweight `http` crate (already in the tree via the AWS SDK), not
 # `lambda_http`, so the pure router `entrypoint::handle` is testable without any Lambda runtime
@@ -91,6 +87,10 @@ name = "forklift-aws-withhold"
 path = "src/bin/withhold.rs"
 
 [dev-dependencies]
+# Test-only: a token's digest computed the way a deployer does, independently of the code under
+# test (`forklift_core::util::token_utils`).
+sha2 = { workspace = true }
+
 # Following a `307` to a presigned S3 URL by hand in the LocalStack-gated end-to-end test —
 # the workspace's existing (ring-based) client, added only for tests.
 reqwest = { workspace = true }

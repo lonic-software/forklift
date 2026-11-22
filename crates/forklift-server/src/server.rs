@@ -42,6 +42,7 @@ use forklift_core::util::pallet_utils::{
     AnchorPrecondition, BoundaryScope, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError,
 };
 use forklift_core::util::lock_utils::{self, BaseServeLock, FormatLease, ServeLock, StoreAccessLock};
+use forklift_core::util::token_utils::{Bearer, Credentials, TokenDigest};
 use forklift_core::util::{
     applied_redactions, audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
     object_utils, office_utils, origin_utils, pack_utils, pallet_utils, progress_utils, redaction_deleter, redaction_utils, scope_utils,
@@ -49,7 +50,6 @@ use forklift_core::util::{
 };
 use forklift_core::util::applied_redactions::AppliedSet;
 use forklift_core::util::withholding::{self, WithheldSet};
-use subtle::ConstantTimeEq;
 
 mod request_limits;
 
@@ -622,13 +622,11 @@ fn let_go(handle: Arc<WarehouseHandle>) {
 struct AppState {
     mode: ServeMode,
 
-    /// The static bearer token (full access), when configured.
-    token: Option<String>,
-
-    /// Per-operator bearer tokens: token → office identifier. What the
-    /// operator may do derives from their role in the target warehouse's office —
-    /// the tracked, signed metadata — not from the token itself.
-    operator_tokens: HashMap<String, String>,
+    /// The bearer tokens accepted locally: the static token (full access) and per-operator
+    /// tokens bound to office identifiers, as digests. What an operator may do derives from
+    /// their role in the target warehouse's office (the tracked, signed metadata), not from the
+    /// token itself.
+    credentials: Credentials,
 
     /// Rebuild a warehouse's bundle after this many accepted lifts (`None` = never;
     /// `forklift-server bundle` stays the manual path).
@@ -732,31 +730,11 @@ pub struct ServeOptions {
     /// The address to bind (port 0 picks a free port).
     pub addr: String,
 
-    /// The static bearer token (full access), if any. Already normalized by the time it
-    /// reaches here when built through `main.rs::serve` (`main.rs::merge_static_token`
-    /// filters an empty-or-whitespace-only string out of *each* of the flag and config-file
-    /// sources before deciding precedence between them — filtering only the already-merged
-    /// value, as `serve` below alone used to, cannot recover a real value that precedence already
-    /// discarded in favor of a blank one from the other source). `serve` below still filters
-    /// again — this struct is `pub`, so any other constructor (a test, a future embedder) gets
-    /// the same "a blank string is not a credential" guarantee regardless of whether it
-    /// normalized its own sources first. Blank means empty *or* whitespace-only (PR #124 round 3,
-    /// F1) — the same rule `parse_operator_tokens` and `authenticate_via_hook` apply to their own
-    /// credential/identity fields, so every blank check in this module agrees on what blank
-    /// means.
-    pub token: Option<String>,
+    /// The static bearer token's digest (full access), if any.
+    pub token_sha256: Option<TokenDigest>,
 
-    /// The path of the per-operator token file, if any.
+    /// The path of the per-operator token digest file, if any ([`parse_operator_tokens`]).
     pub tokens: Option<String>,
-
-    /// Whether either of `token`'s two raw sources (the `--token` flag, the config file's
-    /// `token` key) was present but blank (empty or whitespace-only) — i.e. whether `token`
-    /// above is `None` *because* a blank credential was supplied, as opposed to nothing being
-    /// supplied at all. Computed by `main.rs::merge_static_token`, alongside the normalization
-    /// above; used only by `serve`'s startup refusal, to name that case as "a blank
-    /// --token/token" rather than the misdiagnosing "no --token/token" (PR #124 round 2, F2).
-    /// Never consulted for authentication itself.
-    pub blank_token_supplied: bool,
 
     /// Refuse request bodies over this size (MiB); `None` = the default cap
     /// (`object_utils::MAX_OBJECT_BYTES`, currently 64 MiB) applies — never unlimited. See
@@ -975,36 +953,19 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     let open_file_limit = lock_utils::raise_open_file_limit();
 
     // Kept past the `match` below (which consumes `options.tokens`) so the startup refusal can
-    // name the empty-`[operators]`-table case distinctly from "no --tokens/tokens file at all":
-    // an operator who passed `--tokens ops.toml` and got an empty map back (the file parsed, its
-    // `[operators]` table just has no entries) should not be told to look for a flag they already
-    // passed.
+    // tell a tokens file with no entries from no tokens file at all.
     let tokens_supplied = options.tokens.is_some();
 
     let operator_tokens = match options.tokens {
         Some(path) => parse_operator_tokens(&path)?,
-        None => HashMap::new(),
+        None => Vec::new(),
     };
 
-    // Defense-in-depth, not the primary enforcement point (see `ServeOptions::token`'s doc): a
-    // blank (empty or whitespace-only) string is not a credential — without this,
-    // `strip_bearer_prefix("Bearer ")` yields `Some("")`, `tokens_match("", "")` is `true`, and a
-    // request carrying the literal header `Authorization: Bearer ` (no credential after the
-    // scheme) would authenticate as `Principal::Static` with full privileges; a whitespace-only
-    // token has the identical problem one level removed (PR #124 round 3, F1) — either no client
-    // can ever present it at all, or, on a transport this crate makes no assumption about
-    // trimming, a guessable all-whitespace value can. `main.rs::merge_static_token` already
-    // normalizes both of the token's raw sources individually before this ever runs (PR #124
-    // round 2, F1: filtering only here, after the flag and the config file were already merged by
-    // precedence, could not recover a real token that precedence had already discarded in favor
-    // of a blank one from the other source) — this line stays so `ServeOptions`, which is `pub`,
-    // gives the same guarantee to any other constructor of it. Mirrors
-    // `forklift-aws-lambda::entrypoint::TokenDigest::of_token`'s identical blank check.
-    let token = options.token.filter(|value| !value.trim().is_empty());
+    let credentials = Credentials::new(options.token_sha256, operator_tokens)
+        .map_err(|e| format!("The configured bearer tokens are invalid: {}.", e))?;
 
-    // PR #124 round 5, F4: re-enforced here, beside the blank-token filter just above, rather
-    // than trusting `main.rs::bounded_authentication_cache_secs` (the TOML reader) to be the
-    // only path into this value — see `authentication_cache_ttl`'s own doc for why.
+    // Re-enforced here rather than trusting `main.rs::bounded_authentication_cache_secs` (the
+    // TOML reader) to be the only path into this value: see `authentication_cache_ttl`'s doc.
     let authentication_cache_ttl = authentication_cache_ttl(options.authentication_cache_secs)?;
     let admission_cache_ttl = admission_cache_ttl(options.admission_cache_secs)?;
     let heavy_capacity = heavy_capacity(options.max_heavy_requests)?;
@@ -1017,40 +978,21 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // never a server that quietly serves the world unauthenticated (the fail-open finding this
     // check exists to close: a hand-edited `token = 12345` used to parse as "no token" and,
     // with nothing else configured, serve every request openly with no warning at all).
-    let auth_configured =
-        token.is_some() || !operator_tokens.is_empty() || options.authentication_hook.is_some();
+    let auth_configured = !credentials.is_empty() || options.authentication_hook.is_some();
 
     if !auth_configured && !options.open {
-        // F2 of PR #124 round 2: an operator who passed `--token ""` (or `token = ""`) must be
-        // told that specifically — "no --token/token" sends them looking for a flag they
-        // already passed, the same misdiagnosis this fixed for the empty-`[operators]`-table
-        // case below. "Blank" covers both an empty string and a whitespace-only one (PR #124
-        // round 4, F1): round 3 widened `blank_token_supplied` to catch `--token "   "` but left
-        // this clause hardcoded to "an empty ... (an empty string is not a credential)", so a
-        // whitespace-only token was told it was literally empty — a wrong diagnosis pinned by a
-        // passing test until this round. Reachable here only when the merge in
-        // `main.rs::merge_static_token`
-        // discarded a blank value from *and never found a real token in* either source: a real
-        // token from the other source would have made `auth_configured` true above, and this
-        // whole branch would never run.
-        let token_clause = if options.blank_token_supplied {
-            "a blank --token/token (an empty or whitespace-only string is not a credential)"
-        } else {
-            "no --token/token"
-        };
-
         let tokens_clause = if tokens_supplied {
-            "a --tokens/tokens file whose [operators] table defines no entries"
+            "a --tokens/tokens file whose [operators_sha256] table defines no entries"
         } else {
             "no --tokens/tokens file"
         };
 
         return Err(format!(
-            "No authentication is configured: {}, {}, and no authentication \
-            hook. Refusing to start serving requests unauthenticated by accident — set one \
-            of those, or pass --open (or `open = true` in the config file) to explicitly run \
-            this server with no authentication at all.",
-            token_clause, tokens_clause
+            "No authentication is configured: no --token-sha256/token_sha256, {}, and no \
+            authentication hook. Refusing to start serving requests unauthenticated by accident \
+            — set one of those, or pass --open (or `open = true` in the config file) to \
+            explicitly run this server with no authentication at all.",
+            tokens_clause
         ));
     }
 
@@ -1146,8 +1088,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
     let state = Arc::new(AppState {
         mode,
-        token,
-        operator_tokens,
+        credentials,
         rebuild_after_lifts: options.rebuild_after_lifts,
         warehouses: Mutex::new(WarehouseRegistry::new(live_warehouse_cap(open_file_limit))),
         authentication_hook: options.authentication_hook,
@@ -1611,72 +1552,60 @@ async fn shutdown_signal() {
     }
 }
 
-/// Parse the operator-token file: a TOML `[operators]` table of `"<token>" =
-/// "<office identifier>"` entries. Tokens are transport secrets and live only here,
-/// server-side — never in the tracked office metadata.
-fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> {
+/// Parse the operator-token file: a TOML `[operators_sha256]` table of `"<SHA-256 of the
+/// token>" = "<office identifier>"` entries, in file order. The tokens are transport secrets;
+/// only their digests live here, server-side, and never in the tracked office metadata.
+/// [`Credentials::new`] refuses a blank identifier and a digest bound twice.
+///
+/// An `[operators]` table, the plaintext form this file had before, is refused by name rather
+/// than ignored, and so is any other table: a token in the wrong place is never read as no
+/// token. A malformed key is refused without echoing it, since it may be a plaintext token.
+fn parse_operator_tokens(path: &str) -> Result<Vec<(TokenDigest, String)>, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Error while reading the token file \"{}\": {}", path, e))?;
 
     let doc: toml_edit::DocumentMut = content.parse()
         .map_err(|e| format!("The token file \"{}\" is not valid TOML: {}", path, e))?;
 
-    let Some(operators) = doc.get("operators").and_then(|item| item.as_table()) else {
+    if doc.contains_key("operators") {
         return Err(format!(
-            "The token file \"{}\" has no [operators] table (\"<token>\" = \"<identifier>\").",
+            "The token file \"{}\" has an [operators] table of plaintext tokens, but \
+            forklift-server holds no plaintext credential: move each entry to an \
+            [operators_sha256] table, keyed by the token's SHA-256 digest (64 lowercase hex \
+            characters).",
+            path
+        ));
+    }
+
+    if let Some((key, _)) = doc.as_table().iter().find(|(key, _)| *key != "operators_sha256") {
+        return Err(format!(
+            "The token file \"{}\" has an unrecognized key \"{}\"; it holds only an \
+            [operators_sha256] table.",
+            path, key
+        ));
+    }
+
+    let Some(operators) = doc.get("operators_sha256").and_then(|item| item.as_table()) else {
+        return Err(format!(
+            "The token file \"{}\" has no [operators_sha256] table (\"<SHA-256 of the token>\" = \
+            \"<identifier>\").",
             path
         ));
     };
 
-    let mut tokens = HashMap::new();
+    let mut tokens = Vec::new();
 
-    for (token, identifier) in operators.iter() {
+    for (digest, identifier) in operators.iter() {
+        let digest = TokenDigest::parse_hex(digest)
+            .map_err(|e| format!("The token file \"{}\" has an invalid key: {}.", path, e))?;
+
+        // An identifier is kept untrimmed: `authority_utils::office_user_of` matches it by exact
+        // equality against the office roster, so a trimmed one could never match again.
         let identifier = identifier.as_str().ok_or(format!(
-            "The token file \"{}\" maps a token to a non-string value.", path
+            "The token file \"{}\" maps a token digest to a non-string value.", path
         ))?;
 
-        // A blank (empty or whitespace-only) string is not a credential (the same hole as
-        // `--token ""`/`--token "   "`, see `serve`): a request carrying the literal header
-        // `Authorization: Bearer ` (no credential after the scheme) would otherwise match an
-        // empty-key entry via `state.operator_tokens.get("")` and authenticate as `identifier`
-        // with no credential presented at all — and a whitespace-only key has the identical
-        // problem one level removed (PR #124 round 3, F1): a client on a transport that trims
-        // trailing whitespace off header values could never present it (the entry is permanently
-        // dead, silently locking "identifier" out), while on one that does not it is a
-        // trivially-guessable credential. This is a presence check only, not a normalization: a
-        // real, non-blank token key is still matched byte-for-byte, verbatim, via
-        // `state.operator_tokens.get(token)` — nothing here trims it.
-        if token.trim().is_empty() {
-            return Err(format!(
-                "The token file \"{}\" maps an empty or whitespace-only token to \"{}\": that is \
-                not a credential — remove that entry.",
-                path, identifier
-            ));
-        }
-
-        // F4 of PR #124 round 2: an identity is not a credential — nothing compares it
-        // byte-exactly against a configured value the way a token is compared, it is *recorded*
-        // (into `Principal::Operator`, then admission/event payloads, `post_resolve`'s `caller`)
-        // as a legitimate-looking actor. Blank is rejected on both sides now (PR #124 round 3, F1
-        // unified the rule the token check above used to lack); what still differs between them
-        // is normalization, not presence — a token's real, non-blank value is compared byte-exact
-        // and never trimmed (above), and an identity's real, non-blank value is *also* never
-        // trimmed: `authority_utils::office_user_of` matches it by exact equality against the
-        // tracked office roster, so trimming a legitimately whitespace-padded identifier here
-        // would be the reason it can never match again (see
-        // `a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed` below).
-        // Deliberately does not echo `token` into the message — unlike the blank-token case
-        // above, `token` here is a real, live credential, and printing it would leak it into the
-        // server's own startup-failure output and logs.
-        if identifier.trim().is_empty() {
-            return Err(format!(
-                "The token file \"{}\" maps a token to a blank identifier: an identity must not \
-                be empty or whitespace-only — remove that entry.",
-                path
-            ));
-        }
-
-        tokens.insert(token.to_string(), identifier.to_string());
+        tokens.push((digest, identifier.to_string()));
     }
 
     Ok(tokens)
@@ -2202,19 +2131,11 @@ fn office_lift_refusal(error: audit_utils::OfficeChainError, held_head: Option<&
     }
 }
 
-/// Compare two bearer tokens without leaking which byte differs first: a naive `==` on `str`
-/// short-circuits at the first mismatch, which is exactly the timing side channel a bearer
-/// check must not have. The slice lengths are still compared up front (`subtle`'s own
-/// short-circuit) — a token's length is not the secret, only its bytes are.
-fn tokens_match(provided: &str, expected: &str) -> bool {
-    bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
-}
-
 /// Strip the `Bearer` auth-scheme token case-insensitively (RFC 7235 §2.1: `auth-scheme` is a
 /// `token`, and the scheme name itself is case-insensitive — `bearer`, `Bearer`, `BEARER` all
 /// name the same scheme), leaving the credentials (the token after the scheme and its one
-/// separating space) untouched: still compared case-sensitively, in constant time, by
-/// [`tokens_match`]. Only the 7-byte scheme prefix is matched loosely; a non-`Bearer` scheme
+/// separating space) untouched: still matched case-sensitively, by
+/// [`Credentials::match_bearer`]. Only the 7-byte scheme prefix is matched loosely; a non-`Bearer` scheme
 /// (`Basic …`) still fails to match at all.
 fn strip_bearer_prefix(value: &str) -> Option<&str> {
     const SCHEME_LEN: usize = "bearer ".len();
@@ -2249,46 +2170,30 @@ async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
         "A valid bearer token is required.".to_string()
     );
 
-    if state.token.is_none()
-        && state.operator_tokens.is_empty()
-        && state.authentication_hook.is_none() {
+    if state.credentials.is_empty() && state.authentication_hook.is_none() {
         return if state.open { Ok(Principal::Open) } else { Err(unauthorized()) };
     }
 
-    // A blank (empty or whitespace-only) credential is not a credential: `Authorization: Bearer `
-    // (no bytes after the scheme, so `strip_bearer_prefix` yields `Some("")`) must never match
-    // anything — not the static token, not an operator-tokens entry, not the hook — and neither
-    // must an all-whitespace one (PR #124 round 3, F1): this checkpoint cannot assume any given
-    // transport trims trailing whitespace off header values before this code ever sees it (axum
-    // also serves h2c, where HPACK does not), so a client presenting `Bearer    ` must be refused
-    // the same way as a client presenting `Bearer `. `serve`'s options filter
-    // (`options.token.filter(|v| !v.trim().is_empty())`) and `parse_operator_tokens`'s blank-key
-    // rejection already keep a blank string out of `state.token`/`state.operator_tokens` in the
-    // first place; this is the belt-and-braces guard at the one checkpoint every
-    // principal-granting comparison goes through, so a future change that reintroduces a blank
-    // credential upstream (a new construction path for `AppState`, a relaxed parser) still cannot
-    // authenticate a blank-credential request. This filters presence only, not the value: a real,
-    // non-blank credential is still compared byte-for-byte, verbatim, by `tokens_match` — nothing
-    // here trims it.
+    // A blank (empty or whitespace-only) credential is not a credential, and is never put to
+    // the hook. This checkpoint cannot assume a transport trims trailing whitespace off header
+    // values (axum also serves h2c, where HPACK does not), so `Bearer    ` is refused like
+    // `Bearer `. [`Credentials::match_bearer`] refuses one too; this guard also covers the hook.
     let provided = headers.get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(strip_bearer_prefix)
         .filter(|token| !token.trim().is_empty());
 
-    match provided {
-        Some(token) if state.token.as_deref().is_some_and(|expected| tokens_match(token, expected)) =>
-            Ok(Principal::Static),
-        Some(token) => {
-            if let Some(identifier) = state.operator_tokens.get(token) {
-                return Ok(Principal::Operator(identifier.clone()));
-            }
+    let Some(token) = provided else {
+        return Err(unauthorized());
+    };
 
-            match &state.authentication_hook {
-                Some(hook) => authenticate_via_hook(state, hook, token).await,
-                None => Err(unauthorized()),
-            }
-        }
-        None => Err(unauthorized()),
+    match state.credentials.match_bearer(token) {
+        Some(Bearer::Static) => Ok(Principal::Static),
+        Some(Bearer::Operator(identifier)) => Ok(Principal::Operator(identifier.to_string())),
+        None => match &state.authentication_hook {
+            Some(hook) => authenticate_via_hook(state, hook, token).await,
+            None => Err(unauthorized()),
+        },
     }
 }
 
@@ -6041,6 +5946,16 @@ mod tests {
     // Shared test plumbing
     // ---------------------------------------------------------------------------------
 
+    /// Credentials accepting a static `token` and `(token, identifier)` operator tokens, built
+    /// from the tokens themselves.
+    fn credentials(static_token: Option<&str>, operators: &[(&str, &str)]) -> Credentials {
+        Credentials::new(
+            static_token.map(|token| TokenDigest::of_token(token).unwrap()),
+            operators.iter().map(|(token, identifier)| (TokenDigest::of_token(token).unwrap(), identifier.to_string())).collect(),
+        )
+        .unwrap()
+    }
+
     /// A fresh `AppState` for a given serving mode, with no auth/hooks configured (tests
     /// override individual fields with struct-update syntax). `http` is built through
     /// [`build_hook_client`] — the same function [`serve`] uses — rather than a bare
@@ -6054,8 +5969,7 @@ mod tests {
     fn base_state(mode: ServeMode) -> AppState {
         AppState {
             mode,
-            token: None,
-            operator_tokens: HashMap::new(),
+            credentials: Credentials::default(),
             rebuild_after_lifts: None,
             warehouses: Mutex::new(WarehouseRegistry::new(MAX_LIVE_WAREHOUSES)),
             authentication_hook: None,
@@ -6256,7 +6170,7 @@ mod tests {
     }
 
     fn token_state(mode: ServeMode) -> Arc<AppState> {
-        Arc::new(AppState { token: Some("the-token".to_string()), open: false, ..base_state(mode) })
+        Arc::new(AppState { credentials: credentials(Some("the-token"), &[]), open: false, ..base_state(mode) })
     }
 
     fn verb_name(verb: Verb) -> &'static str {
@@ -6401,12 +6315,13 @@ mod tests {
         let state_for = |mode: ServeMode| {
             // alice and bob, and one fresh caller for each request that must be admitted, since
             // every admitted request spends from its caller's bucket.
-            let operator_tokens = [("tok-alice".to_string(), "alice".to_string()), ("tok-bob".to_string(), "bob".to_string())]
+            let operators = [("tok-alice".to_string(), "alice".to_string()), ("tok-bob".to_string(), "bob".to_string())]
                 .into_iter()
                 .chain((0..64).map(|index| (format!("tok-{index}"), format!("fresh-{index}"))))
+                .map(|(token, identifier)| (TokenDigest::of_token(&token).unwrap(), identifier))
                 .collect();
             Arc::new(AppState {
-                operator_tokens,
+                credentials: Credentials::new(None, operators).unwrap(),
                 open: false,
                 limits: RequestLimits::new(Some(6), Some(4)).unwrap(),
                 ..base_state(mode)
@@ -6484,7 +6399,7 @@ mod tests {
         let handle = Arc::new(WarehouseHandle::new(scratch_dir("limits-refused-for-now")));
         handle.draining.store(true, std::sync::atomic::Ordering::SeqCst);
         let state = Arc::new(AppState {
-            operator_tokens: [("tok-alice".to_string(), "alice".to_string())].into_iter().collect(),
+            credentials: credentials(None, &[("tok-alice", "alice")]),
             open: false,
             limits: RequestLimits::new(Some(4), Some(4)).unwrap(),
             ..base_state(ServeMode::Single(handle))
@@ -7115,7 +7030,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_static_token_authenticates_as_static() {
-        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let state = AppState { credentials: credentials(Some("secret"), &[]), ..single_mode_state(PathBuf::from("/unused")) };
         let principal = check_auth(&state, &headers_with_bearer("secret")).await.unwrap();
         assert!(principal == Principal::Static);
     }
@@ -7127,57 +7042,35 @@ mod tests {
     /// other test here, since they all use tokens of different lengths.
     #[tokio::test]
     async fn an_equal_length_near_miss_token_is_unauthorized() {
-        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let state = AppState { credentials: credentials(Some("secret"), &[]), ..single_mode_state(PathBuf::from("/unused")) };
         let error = check_auth(&state, &headers_with_bearer("secrft")).await.err().unwrap();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
-    /// Belt-and-braces for the empty-credential fail-open finding: even if `state.token` were
-    /// somehow `Some("")` — `serve`'s options filter is meant to make this unreachable in
-    /// practice, but this pins the deeper guard directly, in case a future construction path for
-    /// `AppState` reintroduces it — a request presenting the literal header
-    /// `Authorization: Bearer ` (empty credential, no bytes after the scheme) must still be
-    /// refused, not authenticate as `Principal::Static` via `tokens_match("", "")`.
+    /// A blank bearer (empty, or whitespace-only: the h2c/HPACK case, where no transport trims
+    /// it first) is refused locally and never put to the authentication hook. The hook here is
+    /// unreachable, so a blank bearer that reached it would read `503`, not `401`; a real
+    /// unknown token is the positive control that the hook is asked at all.
     #[tokio::test]
-    async fn an_empty_bearer_credential_never_authenticates_even_against_an_empty_static_token() {
+    async fn a_blank_bearer_is_unauthorized_and_never_reaches_the_authentication_hook() {
         let state = AppState {
-            token: Some(String::new()),
+            credentials: credentials(Some("secret"), &[]),
+            authentication_hook: Some(HookEndpoint { url: "http://127.0.0.1:9/".to_string(), secret: "s".to_string() }),
             ..single_mode_state(PathBuf::from("/unused"))
         };
-        let error = check_auth(&state, &headers_with_bearer("")).await.err().unwrap();
-        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
-    }
 
-    /// The whitespace-only sibling (PR #124 round 3, F1): even if `state.token` were somehow
-    /// `Some("   ")` — again, upstream filtering is meant to make this unreachable in practice —
-    /// a request presenting an all-whitespace bearer credential must still be refused, not
-    /// authenticate via `tokens_match("   ", "   ")`. This is the h2c/HPACK case the finding
-    /// raised directly: this belt-and-braces guard does not assume any transport trims trailing
-    /// whitespace off header values before `check_auth` ever sees them.
-    #[tokio::test]
-    async fn a_whitespace_only_bearer_credential_never_authenticates_even_against_a_whitespace_only_static_token() {
-        let state = AppState {
-            token: Some("   ".to_string()),
-            ..single_mode_state(PathBuf::from("/unused"))
-        };
-        let error = check_auth(&state, &headers_with_bearer("   ")).await.err().unwrap();
-        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
-    }
+        for blank in ["", "   "] {
+            let error = check_auth(&state, &headers_with_bearer(blank)).await.err().unwrap();
+            assert_eq!(error.0, StatusCode::UNAUTHORIZED, "{:?}", blank);
+        }
 
-    #[test]
-    fn tokens_match_requires_an_exact_byte_for_byte_match() {
-        assert!(tokens_match("secret", "secret"));
-        assert!(!tokens_match("secret", "secrft"), "a same-length near-miss must refuse");
-        assert!(!tokens_match("secret", "secre"), "a shorter guess must refuse");
-        assert!(!tokens_match("secret", "secrets"), "a longer guess must refuse");
-        assert!(tokens_match("", ""));
+        let asked = check_auth(&state, &headers_with_bearer("unknown")).await.err().unwrap();
+        assert_eq!(asked.0, StatusCode::SERVICE_UNAVAILABLE, "an unknown token is put to the hook");
     }
 
     #[tokio::test]
     async fn a_known_operator_token_authenticates_as_that_operator() {
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-bob".to_string(), "bob".to_string());
-        let state = AppState { operator_tokens, ..single_mode_state(PathBuf::from("/unused")) };
+        let state = AppState { credentials: credentials(None, &[("tok-bob", "bob")]), ..single_mode_state(PathBuf::from("/unused")) };
 
         let principal = check_auth(&state, &headers_with_bearer("tok-bob")).await.unwrap();
         assert!(principal == Principal::Operator("bob".to_string()));
@@ -7185,21 +7078,21 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_token_with_no_hook_is_unauthorized() {
-        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let state = AppState { credentials: credentials(Some("secret"), &[]), ..single_mode_state(PathBuf::from("/unused")) };
         let error = check_auth(&state, &headers_with_bearer("guess")).await.err().unwrap();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn a_missing_authorization_header_is_unauthorized_when_auth_is_configured() {
-        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let state = AppState { credentials: credentials(Some("secret"), &[]), ..single_mode_state(PathBuf::from("/unused")) };
         let error = check_auth(&state, &HeaderMap::new()).await.err().unwrap();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn a_non_bearer_scheme_is_unauthorized() {
-        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let state = AppState { credentials: credentials(Some("secret"), &[]), ..single_mode_state(PathBuf::from("/unused")) };
         let error = check_auth(&state, &headers_with_raw("Basic secret")).await.err().unwrap();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
@@ -7209,7 +7102,7 @@ mod tests {
     /// same-length, wrong-case token must still refuse.
     #[tokio::test]
     async fn the_bearer_scheme_is_accepted_case_insensitively_but_the_token_stays_case_sensitive() {
-        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let state = AppState { credentials: credentials(Some("secret"), &[]), ..single_mode_state(PathBuf::from("/unused")) };
 
         for scheme in ["bearer", "Bearer", "BEARER", "BeArEr"] {
             let principal = check_auth(&state, &headers_with_raw(&format!("{scheme} secret")))
@@ -7660,7 +7553,7 @@ mod tests {
 
         for (mode, is_multi) in cases {
             let state = Arc::new(AppState {
-                token: Some("the-token".to_string()),
+                credentials: credentials(Some("the-token"), &[]),
                 open: false,
                 admission_hook: hook.endpoint(),
                 ..base_state(mode)
@@ -7727,7 +7620,7 @@ mod tests {
 
         for (mode, requests) in cases {
             let state = Arc::new(AppState {
-                token: Some("the-token".to_string()),
+                credentials: credentials(Some("the-token"), &[]),
                 open: false,
                 admission_hook: hook.endpoint(),
                 ..base_state(mode)
@@ -7926,180 +7819,56 @@ mod tests {
         assert!(validate_warehouse_id(&"a".repeat(100)).is_ok(), "exactly 100 is fine");
     }
 
-    #[test]
-    fn parses_a_valid_operator_token_file() {
-        let dir = scratch_dir("tokens-ok");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\"tok-a\" = \"alice\"\n\"tok-b\" = \"bob\"\n").unwrap();
-
-        let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
-        assert_eq!(tokens.get("tok-a"), Some(&"alice".to_string()));
-        assert_eq!(tokens.get("tok-b"), Some(&"bob".to_string()));
-
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
+    /// A token's digest, spelled as a deployer computes it: independently of [`TokenDigest`].
+    fn hex_digest(token: &str) -> String {
+        forklift_core::util::sign_utils::to_hex(&<sha2::Sha256 as sha2::Digest>::digest(token.as_bytes()))
     }
 
+    /// The tokens file is an `[operators_sha256]` table of digest → identifier, read in file
+    /// order with identifiers untrimmed. Everything else is refused: the plaintext `[operators]`
+    /// table by name, any other key, a missing table, a key that is not a digest (never echoed,
+    /// since it may be a plaintext token), the empty string's digest, and a non-string value.
     #[test]
-    fn rejects_a_missing_token_file() {
-        let path = std::env::temp_dir().join("forklift-server-test-tokens-does-not-exist.toml");
-        let _ = forklift_core::util::file_utils::remove_file(&path);
-        assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
-    }
-
-    #[test]
-    fn rejects_a_token_file_that_is_not_valid_toml() {
-        let dir = scratch_dir("tokens-bad-toml");
+    fn the_operator_token_file_holds_only_digests_and_refuses_everything_else() {
+        let dir = scratch_dir("tokens-file");
         let path = dir.join("tokens.toml");
-        std::fs::write(&path, "not [ valid toml").unwrap();
+        let parse = |content: &str| {
+            std::fs::write(&path, content).unwrap();
+            parse_operator_tokens(path.to_str().unwrap())
+        };
+        let alice = hex_digest("tok-a");
+        let bob = hex_digest("tok-b");
 
-        assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
+        let tokens = parse(&format!("[operators_sha256]\n\"{alice}\" = \"alice\"\n\"{bob}\" = \" bob \"\n")).unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                (TokenDigest::of_token("tok-a").unwrap(), "alice".to_string()),
+                (TokenDigest::of_token("tok-b").unwrap(), " bob ".to_string()),
+            ],
+            "every entry, in order, its identifier untrimmed"
+        );
 
-    #[test]
-    fn rejects_a_token_file_with_no_operators_table() {
-        let dir = scratch_dir("tokens-no-table");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "not_operators = 1\n").unwrap();
-
-        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
-        assert!(error.contains("[operators]"), "{}", error);
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn rejects_a_token_mapped_to_a_non_string_value() {
-        let dir = scratch_dir("tokens-non-string");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\"tok-a\" = 42\n").unwrap();
-
-        assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
-
-    /// The operator-tokens counterpart of the empty-`--token` fail-open finding: an empty
-    /// string key is not a credential. Left unrejected, `state.operator_tokens.get("")` would
-    /// match a request carrying the literal header `Authorization: Bearer ` (empty credential),
-    /// authenticating it as whatever identifier the empty key maps to.
-    #[test]
-    fn rejects_a_token_file_with_an_empty_token_key() {
-        let dir = scratch_dir("tokens-empty-key");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\"\" = \"alice\"\n\"tok-b\" = \"bob\"\n").unwrap();
-
-        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
-        assert!(error.contains("empty"), "{}", error);
-        assert!(error.contains("alice"), "{}", error);
+        for (content, expected, why) in [
+            ("[operators]\n\"tok-a\" = \"alice\"\n".to_string(), "has an [operators] table of plaintext tokens", "the plaintext table"),
+            (format!("[operators_sha256]\n\"{alice}\" = \"alice\"\n[operators]\n"), "[operators] table", "the plaintext table beside the digests"),
+            (format!("extra = 1\n[operators_sha256]\n\"{alice}\" = \"alice\"\n"), "unrecognized key \"extra\"", "another key"),
+            ("".to_string(), "has no [operators_sha256] table", "no table"),
+            ("operators_sha256 = 1\n".to_string(), "has no [operators_sha256] table", "not a table"),
+            ("[operators_sha256]\n\"tok-a\" = \"alice\"\n".to_string(), "invalid key: a token digest must be 64 lowercase hex", "a plaintext key"),
+            (format!("[operators_sha256]\n\"{}\" = \"alice\"\n", hex_digest("")), "must not be the SHA-256 of the empty string", "the empty string's digest"),
+            (format!("[operators_sha256]\n\"{alice}\" = 42\n"), "maps a token digest to a non-string value", "a non-string value"),
+            ("not [ valid toml".to_string(), "is not valid TOML", "invalid TOML"),
+        ] {
+            let error = parse(&content).unwrap_err();
+            assert!(error.contains(expected), "{}: {}", why, error);
+            assert!(!error.contains("tok-a"), "{}: the refusal must not echo a token: {}", why, error);
+        }
 
         let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
 
-    /// The round-3 sibling (F1): a whitespace-only token key is exactly as much "not a
-    /// credential" as an empty one, for the identical reason `merge_static_token`'s static token
-    /// now checks whitespace too — either no client can ever present it (over a transport that
-    /// trims trailing whitespace off header values, silently locking "alice" out forever), or one
-    /// can present a trivially-guessable all-whitespace credential.
-    #[test]
-    fn rejects_a_token_file_with_a_whitespace_only_token_key() {
-        let dir = scratch_dir("tokens-whitespace-key");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\"   \" = \"alice\"\n\"tok-b\" = \"bob\"\n").unwrap();
-
-        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
-        assert!(error.contains("whitespace"), "{}", error);
-        assert!(error.contains("alice"), "{}", error);
-
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
-
-    /// F4 of PR #124 round 2: `"tok-a" = ""` used to parse fine — only the token (key) side was
-    /// checked for emptiness, never the identifier (value). An empty identifier is not merely
-    /// unenrolled (which the office lookup already 403s): it flows into admission/event payloads
-    /// and `post_resolve`'s `caller` as a legitimate-looking actor.
-    #[test]
-    fn rejects_a_token_mapped_to_a_blank_identifier() {
-        let dir = scratch_dir("tokens-blank-identifier");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\"tok-a\" = \"\"\n\"tok-b\" = \"bob\"\n").unwrap();
-
-        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
-        assert!(error.contains("blank"), "{}", error);
-
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
-
-    /// Whitespace-only is exactly as much "not an identity" as empty — the same blank rule
-    /// `rejects_a_token_file_with_a_whitespace_only_token_key` now applies to the token (key)
-    /// side too (PR #124 round 3, F1 unified them); what still differs is normalization, not
-    /// presence — see `a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed`
-    /// below for the half of the identity rule this test does not cover.
-    #[test]
-    fn rejects_a_token_mapped_to_a_whitespace_only_identifier() {
-        let dir = scratch_dir("tokens-whitespace-identifier");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\"tok-a\" = \"   \"\n").unwrap();
-
-        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
-        assert!(error.contains("blank"), "{}", error);
-
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
-
-    /// F6 of PR #124 round 3: the matching control `authenticate_via_hook`'s own identity rule
-    /// already has
-    /// (`a_hook_answer_with_incidental_whitespace_around_a_real_identifier_still_authenticates`),
-    /// missing here until now. Without it, a future edit changing `identifier.to_string()` to
-    /// `identifier.trim().to_string()` above would silently break exact-equality matching against
-    /// the tracked office roster (the office lookup) for every legitimately whitespace-padded
-    /// identifier, with no test in this file catching it: the two rejection tests above only
-    /// exercise *entirely*-blank identifiers, never one with real content plus incidental
-    /// surrounding whitespace.
-    #[test]
-    fn a_token_file_identifier_with_incidental_whitespace_is_stored_untrimmed() {
-        let dir = scratch_dir("tokens-identifier-whitespace-preserved");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\"tok-a\" = \" bob \"\n").unwrap();
-
-        let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
-        assert_eq!(tokens.get("tok-a").map(String::as_str), Some(" bob "));
-
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
-
-    /// PR #124 round 4, F5: the symmetric control for the *key* side of the same claim — the
-    /// comment above (`"a real, non-blank token key is still matched byte-for-byte, verbatim …
-    /// nothing here trims it"`) has never had a test pinning it, only the two rejection tests
-    /// above (which exercise *entirely*-blank keys). Without this, a future
-    /// `token.trim().to_string()` edit at the `tokens.insert(...)` call below would silently make
-    /// every whitespace-padded operator token permanently unauthenticatable — `check_auth` looks
-    /// up the presented, untrimmed header value via `state.operator_tokens.get(token)`, so a
-    /// stored, trimmed key can never match again — with no test in this file catching it.
-    #[test]
-    fn a_token_file_key_with_incidental_whitespace_is_stored_untrimmed() {
-        let dir = scratch_dir("tokens-key-whitespace-preserved");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\" tok a \" = \"bob\"\n").unwrap();
-
-        let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
-        assert_eq!(tokens.get(" tok a ").map(String::as_str), Some("bob"));
-
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
-    }
-
-    /// The blank-identifier error must never echo the token — unlike the empty-*token* error
-    /// above (safe to echo, since the token there is itself empty), the token in this scenario
-    /// is a real, live credential, and printing it would leak it into the server's own
-    /// startup-failure output and logs.
-    #[test]
-    fn a_blank_identifier_error_never_echoes_the_token() {
-        let dir = scratch_dir("tokens-blank-identifier-no-leak");
-        let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n\"super-secret-token\" = \"\"\n").unwrap();
-
-        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
-        assert!(!error.contains("super-secret-token"), "{}", error);
-
-        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
+        let missing = parse_operator_tokens(dir.join("missing.toml").to_str().unwrap()).unwrap_err();
+        assert!(missing.contains("Error while reading the token file"), "{}", missing);
     }
 
     // ---------------------------------------------------------------------------------
@@ -12061,9 +11830,8 @@ mod tests {
             root: Some("/does/not/exist/and/does/not/matter".to_string()),
             warehouses: None,
             addr: "127.0.0.1:0".to_string(),
-            token: None,
+            token_sha256: None,
             tokens: None,
-            blank_token_supplied: false,
             max_body_mb: None,
             rebuild_after_lifts: None,
             authentication_hook: None,
@@ -12090,10 +11858,7 @@ mod tests {
 
         assert!(error.contains("No authentication is configured"), "{}", error);
         assert!(error.contains("--open"), "{}", error);
-        // Locks the "absent" phrasing distinctly from the "blank" phrasing
-        // `serve_with_an_empty_token_does_not_pass_the_auth_gate` pins below (F2 of PR #124
-        // round 2) — no token was supplied at all here, blank or otherwise.
-        assert!(error.contains("no --token/token"), "{}", error);
+        assert!(error.contains("no --token-sha256/token_sha256, no --tokens/tokens file"), "{}", error);
     }
 
     /// The explicit opt-in must still work: `open: true` with nothing else configured must
@@ -12114,66 +11879,45 @@ mod tests {
     /// looks at all three auth sources (token, operator tokens, hook), not just `open`.
     #[tokio::test]
     async fn serve_with_a_token_passes_the_auth_gate_even_without_open() {
-        let options = ServeOptions { token: Some("secret".to_string()), ..bare_serve_options() };
+        let options = ServeOptions { token_sha256: Some(TokenDigest::of_token("secret").unwrap()), ..bare_serve_options() };
         let error = serve(options).await.unwrap_err();
 
         assert!(!error.contains("No authentication is configured"), "{}", error);
         assert!(error.contains("Error while resolving"), "{}", error);
     }
 
-    /// The fail-open finding: `--token ""` (or `token = ""` in the config file) must not count
-    /// as a configured token. Before the fix, `options.token.is_some()` was `true` for
-    /// `Some("")`, so this bypassed the gate entirely and the server would have started fully
-    /// open to any request carrying `Authorization: Bearer ` (empty credential).
-    ///
-    /// `blank_token_supplied: true` here mirrors what `main.rs::merge_static_token` would have
-    /// computed for this scenario — this test constructs `ServeOptions` directly, bypassing
-    /// that merge, so it sets the signal by hand. F2 of PR #124 round 2: the refusal must name
-    /// this case as "a blank --token/token", not the misdiagnosing "no --token/token" (which
-    /// `serve_refuses_to_start_with_no_auth_and_no_open` pins for the genuinely-absent case).
+    /// The assembled credentials are refused at startup, before anything is bound, when the
+    /// static token's digest is also an operator's: that operator would match as the static
+    /// token, an administrator.
     #[tokio::test]
-    async fn serve_with_an_empty_token_does_not_pass_the_auth_gate() {
+    async fn serve_refuses_an_operator_token_that_is_also_the_static_token() {
+        let dir = scratch_dir("serve-static-operator");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, format!("[operators_sha256]\n\"{}\" = \"alice\"\n", hex_digest("shared"))).unwrap();
+
         let options = ServeOptions {
-            token: Some(String::new()),
-            blank_token_supplied: true,
+            token_sha256: Some(TokenDigest::of_token("shared").unwrap()),
+            tokens: Some(path.to_str().unwrap().to_string()),
             ..bare_serve_options()
         };
         let error = serve(options).await.unwrap_err();
 
-        assert!(error.contains("No authentication is configured"), "{}", error);
-        assert!(error.contains("a blank --token/token"), "{}", error);
-        assert!(!error.contains("no --token/token"), "{}", error);
+        assert!(
+            error.contains("The configured bearer tokens are invalid: an operator token's digest is also the shared bearer's."),
+            "{}", error
+        );
+
+        let _ = forklift_core::util::file_utils::remove_dir_all(&dir);
     }
 
-    /// The whitespace-only sibling (PR #124 round 3, F1): `--token "   "` must be treated exactly
-    /// like `--token ""` at this gate too — `blank_token_supplied` is set the same way
-    /// `main.rs::merge_static_token` would set it for this scenario. PR #124 round 4, F1: this
-    /// test used to assert the same "an empty --token/token" wording as the empty-string case
-    /// above, which was true of the code (a single hardcoded clause covered both) but not of the
-    /// scenario — an operator who set `token = "   "` was told their token was an empty string.
-    /// Now asserts the corrected, case-covering wording instead of pinning that misdiagnosis.
-    #[tokio::test]
-    async fn serve_with_a_whitespace_only_token_does_not_pass_the_auth_gate() {
-        let options = ServeOptions {
-            token: Some("   ".to_string()),
-            blank_token_supplied: true,
-            ..bare_serve_options()
-        };
-        let error = serve(options).await.unwrap_err();
-
-        assert!(error.contains("No authentication is configured"), "{}", error);
-        assert!(error.contains("a blank --token/token"), "{}", error);
-        assert!(!error.contains("no --token/token"), "{}", error);
-    }
-
-    /// The empty-`[operators]`-table case must be named distinctly from "no --tokens/tokens
+    /// The empty-`[operators_sha256]`-table case must be named distinctly from "no --tokens/tokens
     /// file" (F4): the operator did pass `--tokens`, the file just defines no entries. Telling
     /// them to pass a flag they already passed sends them looking in the wrong place.
     #[tokio::test]
     async fn serve_with_an_empty_tokens_file_names_that_case_distinctly() {
         let dir = scratch_dir("serve-empty-tokens-file");
         let path = dir.join("tokens.toml");
-        std::fs::write(&path, "[operators]\n").unwrap();
+        std::fs::write(&path, "[operators_sha256]\n").unwrap();
 
         let options = ServeOptions {
             tokens: Some(path.to_str().unwrap().to_string()),

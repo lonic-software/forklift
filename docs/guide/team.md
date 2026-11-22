@@ -61,14 +61,15 @@ $ forklift-server prepare --root server
 Prepared warehouse at "server".
 ```
 
-Write the token file. Each line maps a secret token to the identifier of the person who holds it.
-Use long random tokens in practice, and keep the file private: anyone with a token can reach the
-server as that person.
+Write the token file. Each line maps a secret token to the identifier of the person who holds it,
+but the server is never given the token itself: each line names the token by its SHA-256 digest,
+which `printf '%s' ada-secret | shasum -a 256` prints. Use long random tokens in practice, such as
+`openssl rand -hex 32`, and hand each person their own.
 
 ```console
-$ echo '[operators]' > tokens.toml
-$ echo '"ada-secret" = "ada@example.com"' >> tokens.toml
-$ echo '"bob-secret" = "bob@example.com"' >> tokens.toml
+$ echo '[operators_sha256]' > tokens.toml
+$ echo '"cb3ac4f9f4ba2da6f063a94debb6009ec2ee2abcf28f90cd97fdb92fdc44d736" = "ada@example.com"' >> tokens.toml
+$ echo '"9f03ef1533a68d2f506f81ef463c1183a82a6bd40e45613f36e6fe1889cf1b99" = "bob@example.com"' >> tokens.toml
 ```
 
 The server reads this file only when it starts. Write a line for everyone you are about to invite

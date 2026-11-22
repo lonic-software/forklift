@@ -40,13 +40,9 @@
 //! [`Scratch::shared`](crate::scratch::Scratch::shared) — both must key on the same warehouse
 //! id).
 
-use std::collections::HashMap;
-
 use http::{header, Method, Request, Response, StatusCode};
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 
 use forklift_core::model::remote::{
     CommitLiftRequest, ErrorResponse, HoldsRequest, HoldsResponse, MissingObjectsRequest,
@@ -56,9 +52,8 @@ use forklift_core::model::remote::{
     LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY,
 };
 use forklift_core::util::authority_utils::Principal;
-use forklift_core::util::object_utils::is_object_hash;
 use forklift_core::util::pallet_utils::{validate_pallet_name, DEFAULT_PALLET_NAME};
-use forklift_core::util::sign_utils;
+use forklift_core::util::token_utils::{Bearer, Credentials, TokenDigest};
 use forklift_core::util::warehouse_utils;
 
 use crate::aws::AwsConfig;
@@ -142,103 +137,6 @@ fn require_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<Stri
     }
 }
 
-/// The SHA-256 digest of a bearer token: the only form in which this head holds a credential.
-///
-/// A Lambda's environment is part of the function's configuration, readable by whoever may read
-/// that configuration, so the function never holds a plaintext token to compare against. A
-/// deployer computes the digest with any common tool (`shasum -a 256`, `openssl dgst -sha256`,
-/// terraform's `sha256()`); tokens are high-entropy, so an unsalted digest gives nothing away.
-///
-/// Neither constructor yields the digest of the empty string: a configuration holding it would
-/// admit a request with a blank bearer, were [`authenticate`] ever to hash one.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TokenDigest([u8; 32]);
-
-impl TokenDigest {
-    /// Parse a configured digest: exactly 64 lowercase hex characters, never the digest of the
-    /// empty string.
-    pub fn parse_hex(hex: &str) -> Result<TokenDigest, String> {
-        // An object hash's spelling is exactly a SHA-256 digest's: 64 lowercase hex characters.
-        let malformed = || "a token digest must be 64 lowercase hex characters (a SHA-256 digest)".to_string();
-
-        if !is_object_hash(hex) {
-            return Err(malformed());
-        }
-
-        let bytes = sign_utils::from_hex(hex).map_err(|()| malformed())?;
-        let digest = TokenDigest(bytes.try_into().map_err(|_| malformed())?);
-        if digest == TokenDigest::hash("") {
-            return Err("a token digest must not be the SHA-256 of the empty string".to_string());
-        }
-
-        Ok(digest)
-    }
-
-    /// The digest of a token, refused for an empty or whitespace-only token: the same rule
-    /// [`authenticate`] applies to a presented bearer, and `forklift-server` to its own static
-    /// token.
-    pub fn of_token(token: &str) -> Result<TokenDigest, String> {
-        if token.trim().is_empty() {
-            return Err("a bearer token must not be empty or whitespace-only".to_string());
-        }
-
-        Ok(TokenDigest::hash(token))
-    }
-
-    fn hash(token: &str) -> TokenDigest {
-        TokenDigest(Sha256::digest(token.as_bytes()).into())
-    }
-}
-
-impl std::fmt::Debug for TokenDigest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TokenDigest(<redacted>)")
-    }
-}
-
-/// The credentials a deployment accepts: the shared bearer, per-operator tokens, or both — never
-/// neither, which is what [`Credentials::new`] refuses.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Credentials {
-    /// The shared bearer's digest. Its holder is [`Principal::Static`]: the deployment's own
-    /// administrator credential, full access under every office rule.
-    static_token: Option<TokenDigest>,
-
-    /// Per-operator token digests, each bound to an office identifier. Identifiers are kept
-    /// untrimmed: the office rules match them by exact equality against the roster.
-    operators: HashMap<TokenDigest, String>,
-}
-
-impl Credentials {
-    /// Assemble the accepted credentials. Refused when there are none at all, when an
-    /// identifier is blank, and when one digest is bound twice — among the operators, or as both
-    /// the shared bearer and an operator, where the shared bearer's match would silently make
-    /// that operator an administrator.
-    pub fn new(static_token: Option<TokenDigest>,
-               operators: Vec<(TokenDigest, String)>) -> Result<Credentials, String> {
-        if static_token.is_none() && operators.is_empty() {
-            return Err("no credential is configured".to_string());
-        }
-
-        let mut bound = HashMap::new();
-        for (digest, identifier) in operators {
-            if identifier.trim().is_empty() {
-                return Err("an operator token is bound to a blank identifier".to_string());
-            }
-
-            if static_token == Some(digest) {
-                return Err("an operator token's digest is also the shared bearer's".to_string());
-            }
-
-            if bound.insert(digest, identifier).is_some() {
-                return Err("one operator token digest is bound more than once".to_string());
-            }
-        }
-
-        Ok(Credentials { static_token, operators: bound })
-    }
-}
-
 /// The transport-authentication configuration, resolved once at cold start ([`auth_from_env`])
 /// and threaded into every request by [`handle`]. `Debug` is hand-written so a digest or an
 /// identifier never reaches a log line.
@@ -264,8 +162,8 @@ impl std::fmt::Debug for AuthConfig {
         match self {
             AuthConfig::Credentials(credentials) => f
                 .debug_struct("Credentials")
-                .field("static_token", &credentials.static_token.is_some())
-                .field("operators", &credentials.operators.len())
+                .field("static_token", &credentials.has_static())
+                .field("operators", &credentials.operator_count())
                 .finish(),
             AuthConfig::Open => write!(f, "Open"),
             AuthConfig::Closed => write!(f, "Closed"),
@@ -291,7 +189,7 @@ pub fn auth_from_env() -> Result<AuthConfig, String> {
 /// every warehouse id read-only for good. Checked at cold start, beside the two readers.
 pub fn check_auth_fits_routing(auth: &AuthConfig, routing: &Routing) -> Result<(), String> {
     match (auth, routing) {
-        (AuthConfig::Credentials(credentials), Routing::Multi) if credentials.static_token.is_none() => Err(
+        (AuthConfig::Credentials(credentials), Routing::Multi) if !credentials.has_static() => Err(
             "Multi-warehouse routing (no FORKLIFT_WAREHOUSE_ID) needs FORKLIFT_TOKEN_SHA256: only the \
             shared bearer sets a warehouse up, so operator tokens alone could never write anywhere."
                 .to_string(),
@@ -402,10 +300,9 @@ fn unauthorized() -> HeadError {
 
 /// The transport-authentication seam: who is calling. [`AuthConfig::Open`] passes everything as
 /// [`Principal::Open`]; [`AuthConfig::Closed`] refuses everything. With credentials configured,
-/// a blank bearer is refused before anything is hashed; otherwise the bearer's digest is
-/// matched against the shared bearer's in constant time first ([`Principal::Static`]), then
-/// looked up among the operator tokens ([`Principal::Operator`]), the same order
-/// `forklift-server` resolves its tokens in. A lookup leaks timing only about the digest.
+/// the bearer is matched by [`Credentials::match_bearer`]: the shared bearer is
+/// [`Principal::Static`], an operator token is [`Principal::Operator`], the same order
+/// `forklift-server` resolves its tokens in, and a blank bearer matches nothing.
 ///
 /// What the principal may do is not decided here. The office authority rules
 /// (`forklift_core::util::authority_utils`) decide it at each mutating [`Head`] method, against
@@ -423,19 +320,11 @@ fn authenticate<B>(auth: &AuthConfig, request: &Request<B>) -> HeadResult<Princi
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(strip_bearer_prefix)
-        .filter(|token| !token.trim().is_empty())
         .ok_or_else(unauthorized)?;
 
-    let digest = TokenDigest::hash(provided);
-
-    if let Some(expected) = &credentials.static_token {
-        if bool::from(digest.0.ct_eq(&expected.0)) {
-            return Ok(Principal::Static);
-        }
-    }
-
-    match credentials.operators.get(&digest) {
-        Some(identifier) => Ok(Principal::Operator(identifier.clone())),
+    match credentials.match_bearer(provided) {
+        Some(Bearer::Static) => Ok(Principal::Static),
+        Some(Bearer::Operator(identifier)) => Ok(Principal::Operator(identifier.to_string())),
         None => Err(unauthorized()),
     }
 }
@@ -1100,6 +989,8 @@ fn names_unreadable_object(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use forklift_core::util::sign_utils;
     use forklift_core::util::scope_utils;
 
     /// FORK-449: an `object_unreadable` refusal, framed at the start or wrapped inside another
@@ -1262,7 +1153,7 @@ mod tests {
 
     /// The SHA-256 of `token`, as a deployer writes it into the environment.
     fn hex_digest(token: &str) -> String {
-        sign_utils::to_hex(&Sha256::digest(token.as_bytes()))
+        sign_utils::to_hex(&<sha2::Sha256 as sha2::Digest>::digest(token.as_bytes()))
     }
 
     /// A variable source holding exactly `vars`.
@@ -1286,29 +1177,6 @@ mod tests {
         AuthConfig::Credentials(
             Credentials::new(static_token.map(|token| TokenDigest::of_token(token).unwrap()), operators).unwrap(),
         )
-    }
-
-    /// A configured digest is 64 lowercase hex characters, and never the digest of the empty
-    /// string: a configuration holding that would admit a blank bearer.
-    #[test]
-    fn a_token_digest_is_64_lowercase_hex_and_never_the_empty_strings() {
-        assert_eq!(TokenDigest::parse_hex(&hex_digest("secret")).unwrap(), TokenDigest::of_token("secret").unwrap());
-
-        assert!(TokenDigest::parse_hex(&hex_digest("")).is_err(), "the empty string's digest");
-        assert!(TokenDigest::parse_hex(&hex_digest("secret").to_uppercase()).is_err(), "uppercase");
-        assert!(TokenDigest::parse_hex(&hex_digest("secret")[1..]).is_err(), "63 characters");
-        assert!(TokenDigest::parse_hex(&format!("{}0", hex_digest("secret"))).is_err(), "65 characters");
-        assert!(TokenDigest::parse_hex(&format!("g{}", &hex_digest("secret")[1..])).is_err(), "a non-hex digit");
-        assert!(TokenDigest::parse_hex("").is_err(), "empty");
-        assert!(TokenDigest::parse_hex("secret").is_err(), "a plaintext token");
-
-        assert!(TokenDigest::of_token("").is_err(), "an empty token");
-        assert!(TokenDigest::of_token("   ").is_err(), "a whitespace-only token");
-        assert_eq!(
-            TokenDigest::of_token(" has spaces ").unwrap(),
-            TokenDigest::parse_hex(&hex_digest(" has spaces ")).unwrap(),
-            "a real token is hashed untrimmed"
-        );
     }
 
     /// The cold-start matrix: a credential configured closes the head to everything else; no
@@ -1477,23 +1345,6 @@ mod tests {
 
         let operators_only = operator_auth(None, &[("ada-token", "ada@example")]);
         assert!(authenticate(&operators_only, &request_with_bearer("secret")).is_err(), "no shared bearer");
-    }
-
-    /// A blank bearer is refused before anything is hashed, so no configured digest can ever
-    /// match one — not even a digest of that very blank string, which [`TokenDigest`]'s
-    /// constructors refuse but which is built here directly to show the check does not lean on
-    /// them.
-    #[test]
-    fn authenticate_refuses_a_blank_bearer_before_hashing_it() {
-        for blank in ["", "   "] {
-            let auth = AuthConfig::Credentials(Credentials {
-                static_token: Some(TokenDigest::hash(blank)),
-                operators: [(TokenDigest::hash(blank), "ada@example".to_string())].into_iter().collect(),
-            });
-
-            let error = authenticate(&auth, &request_with_bearer(blank)).unwrap_err();
-            assert_eq!(error.status, crate::error::Status::Unauthorized, "{:?}", blank);
-        }
     }
 
     /// RFC 7235 §2.1: `auth-scheme` is case-insensitive, so `bearer`/`BEARER`/mixed-case must

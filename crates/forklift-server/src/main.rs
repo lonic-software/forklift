@@ -11,6 +11,8 @@
 
 use clap::{Parser, Subcommand};
 
+use forklift_core::util::token_utils::TokenDigest;
+
 mod server;
 
 #[derive(Parser)]
@@ -41,11 +43,13 @@ enum Command {
         #[arg(long)]
         addr: Option<String>,
 
-        /// Require this bearer token on every request (also gates warehouse creation)
-        #[arg(long)]
-        token: Option<String>,
+        /// Require a bearer token whose SHA-256 digest is this, 64 lowercase hex characters
+        /// (also gates warehouse creation; the server never holds the token itself)
+        #[arg(long = "token-sha256", value_name = "HEX")]
+        token_sha256: Option<String>,
 
-        /// A TOML file of per-operator tokens: [operators] "<token>" = "<identifier>"
+        /// A TOML file of per-operator token digests:
+        /// [operators_sha256] "<SHA-256 of the token>" = "<identifier>"
         #[arg(long)]
         tokens: Option<String>,
 
@@ -77,7 +81,7 @@ enum Command {
         heavy_requests_per_minute: Option<u32>,
 
         /// Serve with no authentication at all: the explicit opt-out. Without this (and
-        /// without --token/--tokens/a configured authentication hook), the server refuses
+        /// without --token-sha256/--tokens/a configured authentication hook), the server refuses
         /// to start rather than infer "open" from an empty auth config.
         #[arg(long)]
         open: bool,
@@ -261,10 +265,10 @@ async fn async_main() {
 
     let result = match cli.command {
         Command::Serve {
-            root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests,
+            root, warehouses, addr, token_sha256, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests,
             light_requests_per_minute, heavy_requests_per_minute, open, config,
         } => serve(
-            root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests,
+            root, warehouses, addr, token_sha256, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests,
             RequestLimitFlags { light_requests_per_minute, heavy_requests_per_minute }, open, config,
         ).await,
         Command::Prepare { root } => prepare(&root),
@@ -286,54 +290,12 @@ async fn async_main() {
     }
 }
 
-/// The static token as it enters the program: two independent sources (the `--token` flag, the
-/// config file's `token` key), each normalized individually — an empty *or whitespace-only*
-/// string is not a credential (`server::check_auth`'s doc, `server::ServeOptions::token`'s doc)
-/// — *before* precedence between them is decided, rather than after the two are already merged
-/// into one `Option<String>`.
-///
-/// That ordering is the actual fix, not a stylistic preference: `Option::or` only sees "was a
-/// value supplied at all", so `Some("")` (a blank `--token`) counts as supplied and wins over a
-/// real `Some("admin-secret")` from the config file — filtering *after* that merge, as the
-/// single call site this replaces used to, can no longer recover the real value the merge
-/// already discarded. Filtering each source first means a blank flag falls through to a real
-/// config-file token exactly the way an *absent* flag already does.
-///
-/// Whitespace-only, not just empty (PR #124 round 3, F1): round 2 checked `is_empty()` here
-/// while the identity rule added in the same round (`parse_operator_tokens`,
-/// `authenticate_via_hook`) checked `trim().is_empty()`, on the argument that a token is only
-/// ever compared byte-exact so a whitespace-only one presents no *comparison* hole the way an
-/// untrimmed identity does. That argument answers a different question than the one this
-/// function asks: not "should a real token's bytes be trimmed before comparing" (no — a token's
-/// bytes are never trimmed, before or after this fix), but "does a whitespace-only value count as
-/// a configured credential at all". It does not — a `--token "   "` either can never be
-/// presented by a client at all on a transport that trims trailing whitespace off header values
-/// (a silent lockout dressed up as a configured server), or, on a transport this crate makes no
-/// assumption about *not* trimming, is presentable as a guessable, effectively-public credential.
-/// Either way the server must refuse to start believing it has a real token, exactly as it
-/// already refuses to for an empty one.
-///
-/// Returns the merged, already-normalized token, plus whether either raw source was
-/// present-but-blank — carried only so `serve`'s startup refusal can name that case correctly
-/// (F2 of PR #124 round 2: "no --token/token" is a misdiagnosis when a blank one was in fact
-/// passed). It plays no role in authentication itself: by the time this returns, a blank
-/// value from either source has already been discarded from the merged token.
-fn merge_static_token(flag: Option<String>, file: Option<String>) -> (Option<String>, bool) {
-    let is_blank = |value: &Option<String>| value.as_deref().is_some_and(|v| v.trim().is_empty());
-    let flag_was_blank = is_blank(&flag);
-    let file_was_blank = is_blank(&file);
-
-    let non_blank = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
-
-    (non_blank(flag).or(non_blank(file)), flag_was_blank || file_was_blank)
-}
-
 /// Merge the flags with the config file (flags win) and serve.
 #[allow(clippy::too_many_arguments)]
 async fn serve(root: Option<String>,
                warehouses: Option<String>,
                addr: Option<String>,
-               token: Option<String>,
+               token_sha256: Option<String>,
                tokens: Option<String>,
                max_body_mb: Option<u64>,
                rebuild_after_lifts: Option<u32>,
@@ -342,8 +304,8 @@ async fn serve(root: Option<String>,
                open: bool,
                config: Option<String>) -> Result<(), String> {
     let options = serve_options(
-        root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, limits, open,
-        config,
+        root, warehouses, addr, token_sha256, tokens, max_body_mb, rebuild_after_lifts, max_heavy_requests, limits,
+        open, config,
     )?;
 
     server::serve(options).await
@@ -362,7 +324,7 @@ struct RequestLimitFlags {
 fn serve_options(root: Option<String>,
                warehouses: Option<String>,
                addr: Option<String>,
-               token: Option<String>,
+               token_sha256: Option<String>,
                tokens: Option<String>,
                max_body_mb: Option<u64>,
                rebuild_after_lifts: Option<u32>,
@@ -375,13 +337,18 @@ fn serve_options(root: Option<String>,
         None => ConfigFile::default(),
     };
 
-    let (token, blank_token_supplied) = merge_static_token(token, file.token);
+    // The flag wins, but a malformed digest is refused from either source: neither is ever
+    // passed over unread.
+    let flag_digest = token_sha256
+        .map(|hex| TokenDigest::parse_hex(&hex))
+        .transpose()
+        .map_err(|e| format!("The --token-sha256 value is invalid: {}.", e))?;
 
     let options = server::ServeOptions {
         root: root.or(file.root),
         warehouses: warehouses.or(file.warehouses),
         addr: addr.or(file.addr).unwrap_or("127.0.0.1:9418".to_string()),
-        token,
+        token_sha256: flag_digest.or(file.token_sha256),
         tokens: tokens.or(file.tokens),
         max_body_mb: max_body_mb.or(file.max_body_mb),
         rebuild_after_lifts: rebuild_after_lifts.or(file.rebuild_after_lifts),
@@ -400,7 +367,6 @@ fn serve_options(root: Option<String>,
         // "a flag can supply a value", never "a flag can unset one") — remove it from the
         // file to close that hole.
         open: open || file.open.unwrap_or(false),
-        blank_token_supplied,
     };
 
     Ok(options)
@@ -431,14 +397,8 @@ struct ConfigFile {
     warehouses: Option<String>,
     addr: Option<String>,
 
-    /// The static bearer token, verbatim from the config file — the primary credential this
-    /// head has (worth more than a hook's MAC key: it grants full access, including warehouse
-    /// creation). `Debug` is hand-written below specifically so this field redacts: see
-    /// `server::HookEndpoint`'s own hand-written `Debug` for the identical rationale (a future
-    /// `tracing::debug!(?file)`, a panic message) — it applies verbatim here, and doubly so
-    /// since every `parse_config(...).unwrap_err()` in this module's own tests would otherwise
-    /// dump a real token straight into CI output the moment a test fixture used one.
-    token: Option<String>,
+    /// The static bearer token's digest (`token_sha256`). Its `Debug` prints no digest.
+    token_sha256: Option<TokenDigest>,
 
     tokens: Option<String>,
     max_body_mb: Option<u64>,
@@ -469,7 +429,7 @@ impl std::fmt::Debug for ConfigFile {
             .field("root", &self.root)
             .field("warehouses", &self.warehouses)
             .field("addr", &self.addr)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("token_sha256", &self.token_sha256)
             .field("tokens", &self.tokens)
             .field("max_body_mb", &self.max_body_mb)
             .field("rebuild_after_lifts", &self.rebuild_after_lifts)
@@ -645,7 +605,7 @@ fn optional_bool(item: Option<&toml_edit::Item>, path: &str, key: &str) -> Resul
 /// per-field readers cannot catch on their own, since the misspelled key is simply never looked
 /// up) is a startup error rather than a silently no-op setting.
 const CONFIG_TOP_LEVEL_KEYS: [&str; 12] = [
-    "root", "warehouses", "addr", "token", "tokens", "max_body_mb", "rebuild_after_lifts",
+    "root", "warehouses", "addr", "token_sha256", "tokens", "max_body_mb", "rebuild_after_lifts",
     "max_heavy_requests", "light_requests_per_minute", "heavy_requests_per_minute", "open", "hooks",
 ];
 
@@ -713,6 +673,17 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
     let doc: toml_edit::DocumentMut = content.parse()
         .map_err(|e| format!("The config file \"{}\" is not valid TOML: {}", path, e))?;
 
+    // A plaintext token is refused by name, so the message can say what replaced it. Its value
+    // is never echoed.
+    if doc.contains_key("token") {
+        return Err(format!(
+            "The config file \"{}\" sets \"token\", but forklift-server holds no plaintext \
+            credential: set token_sha256 to the token's SHA-256 digest (64 lowercase hex \
+            characters) and remove token.",
+            path
+        ));
+    }
+
     reject_unknown_keys(doc.as_table(), &CONFIG_TOP_LEVEL_KEYS, path, "the top-level config")?;
 
     let hooks = match doc.get("hooks") {
@@ -767,7 +738,10 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         root: optional_string(doc.get("root"), path, "root")?,
         warehouses: optional_string(doc.get("warehouses"), path, "warehouses")?,
         addr: optional_string(doc.get("addr"), path, "addr")?,
-        token: optional_string(doc.get("token"), path, "token")?,
+        token_sha256: optional_string(doc.get("token_sha256"), path, "token_sha256")?
+            .map(|hex| TokenDigest::parse_hex(&hex))
+            .transpose()
+            .map_err(|e| format!("The config file \"{}\" has an invalid \"token_sha256\": {}.", path, e))?,
         tokens: optional_string(doc.get("tokens"), path, "tokens")?,
         // No ceiling wrapper needed here (unlike `rebuild_after_lifts` just below): the cast is
         // `as u64`, and `optional_non_negative_integer` has already rejected every negative
@@ -1037,7 +1011,7 @@ mod tests {
         assert_eq!(file.root, None);
         assert_eq!(file.warehouses, None);
         assert_eq!(file.addr, None);
-        assert_eq!(file.token, None);
+        assert_eq!(file.token_sha256, None);
         assert_eq!(file.tokens, None);
         assert_eq!(file.max_body_mb, None);
         assert_eq!(file.rebuild_after_lifts, None);
@@ -1059,7 +1033,7 @@ mod tests {
         let path = scratch_config("full", r#"
             root = "/srv/forklift/wh"
             addr = "127.0.0.1:9418"
-            token = "secret"
+            token_sha256 = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
             tokens = "/etc/forklift/tokens.toml"
             max_body_mb = 4096
             rebuild_after_lifts = 20
@@ -1083,7 +1057,7 @@ mod tests {
         let file = parse_config(path.to_str().unwrap()).unwrap();
 
         assert_eq!(file.root.as_deref(), Some("/srv/forklift/wh"));
-        assert_eq!(file.token.as_deref(), Some("secret"));
+        assert_eq!(file.token_sha256, Some(TokenDigest::of_token("secret").unwrap()));
         assert_eq!(file.max_body_mb, Some(4096));
         assert_eq!(file.rebuild_after_lifts, Some(20));
         assert_eq!(file.max_heavy_requests, Some(6));
@@ -1145,15 +1119,14 @@ mod tests {
     // parse_config: present-but-wrong-typed values error (Part 1 of the fix)
     // ---------------------------------------------------------------------------------
 
-    /// The exact reproduction from the fail-open finding: a hand-edited, unquoted
-    /// `token = 12345` must be a startup error naming the file and the key, never silently
-    /// parsed as "no token configured".
+    /// A hand-edited, unquoted `token_sha256 = 12345` must be a startup error naming the file
+    /// and the key, never silently parsed as "no token configured".
     #[test]
-    fn a_present_but_numeric_token_is_an_error_naming_the_key() {
-        let path = scratch_config("token-numeric", "token = 12345\n");
+    fn a_present_but_numeric_token_digest_is_an_error_naming_the_key() {
+        let path = scratch_config("token-numeric", "token_sha256 = 12345\n");
         let error = parse_config(path.to_str().unwrap()).unwrap_err();
 
-        assert!(error.contains("\"token\""), "{}", error);
+        assert!(error.contains("\"token_sha256\""), "{}", error);
         assert!(error.contains("not a string"), "{}", error);
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
@@ -1536,206 +1509,76 @@ mod tests {
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
-    // ---------------------------------------------------------------------------------
-    // merge_static_token (F1 of PR #124 round 2): normalize each source before merging
-    // ---------------------------------------------------------------------------------
-
-    /// The exact repro from the finding: a blank `--token` must not beat a real config-file
-    /// token. Before this fix, the merge was `token.or(file.token)` with the empty-string
-    /// filter applied only afterward — `Option::or` sees `Some("")` as "a value was supplied"
-    /// and picks it over `file.token`, so the real token was discarded and never recovered.
-    #[test]
-    fn a_blank_flag_token_falls_back_to_a_real_file_token() {
-        let (token, blank) = merge_static_token(Some(String::new()), Some("admin-secret".to_string()));
-        assert_eq!(token.as_deref(), Some("admin-secret"));
-        assert!(blank, "the flag source was blank, even though a real token resulted");
+    /// A token's digest, spelled as a deployer computes it: independently of [`TokenDigest`].
+    fn hex_digest(token: &str) -> String {
+        forklift_core::util::sign_utils::to_hex(&<sha2::Sha256 as sha2::Digest>::digest(token.as_bytes()))
     }
 
-    /// The symmetric case: a blank config-file token must not beat a real `--token` flag either
-    /// — normalization applies to both sources, not just the flag.
+    /// The static token's digest, from the flag or the config file: the flag wins, a malformed
+    /// digest from either source is refused even when the other is sound, and no refusal echoes
+    /// the value it refused, which may be a plaintext token put where its digest belongs.
     #[test]
-    fn a_blank_file_token_falls_back_to_a_real_flag_token() {
-        let (token, blank) = merge_static_token(Some("flag-secret".to_string()), Some(String::new()));
-        assert_eq!(token.as_deref(), Some("flag-secret"));
-        assert!(blank, "the file source was blank, even though a real token resulted");
+    fn the_static_token_digest_comes_from_the_flag_or_the_file_and_a_malformed_one_is_refused() {
+        let flag = hex_digest("flag-secret");
+        let file = hex_digest("file-secret");
+        let options = |flag: Option<&str>, file: Option<&str>| {
+            let config = file.map(|hex| scratch_config("token-digest", &format!("token_sha256 = \"{}\"\n", hex)));
+            let options = serve_options(
+                None, None, None, flag.map(str::to_string), None, None, None, None, RequestLimitFlags::default(), false,
+                config.as_ref().map(|path| path.to_str().unwrap().to_string()),
+            );
+            if let Some(path) = config {
+                let _ = forklift_core::util::file_utils::remove_file(&path);
+            }
+            options.map(|options| options.token_sha256)
+        };
+        let digest = |token: &str| Some(TokenDigest::of_token(token).unwrap());
+
+        assert_eq!(options(Some(&flag), Some(&file)).unwrap(), digest("flag-secret"), "the flag wins");
+        assert_eq!(options(None, Some(&file)).unwrap(), digest("file-secret"));
+        assert_eq!(options(Some(&flag), None).unwrap(), digest("flag-secret"));
+        assert_eq!(options(None, None).unwrap(), None);
+
+        for (flag_value, file_value, names) in [
+            (Some("plain-secret"), None, "--token-sha256"),
+            (Some(""), None, "--token-sha256"),
+            (Some("   "), Some(file.as_str()), "--token-sha256"),
+            (Some(flag.as_str()), Some("plain-secret"), "\"token_sha256\""),
+            (None, Some(hex_digest("").as_str()), "\"token_sha256\""),
+        ] {
+            let error = options(flag_value, file_value).unwrap_err();
+            assert!(error.contains(names), "{:?}/{:?}: {}", flag_value, file_value, error);
+            assert!(!error.contains("plain-secret"), "the refusal must not echo the value: {}", error);
+        }
     }
 
+    /// A config file still setting the plaintext `token` is refused, naming what replaced it,
+    /// and never echoing the token.
     #[test]
-    fn two_blank_sources_merge_to_no_token_and_report_blank() {
-        let (token, blank) = merge_static_token(Some(String::new()), Some(String::new()));
-        assert_eq!(token, None);
-        assert!(blank);
-    }
+    fn a_plaintext_token_key_is_refused_naming_token_sha256() {
+        let path = scratch_config("plaintext-token", "token = \"s3cr3t-value\"\n");
+        let error = parse_config(path.to_str().unwrap()).unwrap_err();
 
-    #[test]
-    fn two_absent_sources_merge_to_no_token_and_do_not_report_blank() {
-        let (token, blank) = merge_static_token(None, None);
-        assert_eq!(token, None);
-        assert!(!blank, "nothing was ever supplied, blank or otherwise");
-    }
-
-    #[test]
-    fn a_real_flag_token_wins_over_a_real_file_token() {
-        let (token, blank) = merge_static_token(
-            Some("flag-secret".to_string()), Some("file-secret".to_string())
-        );
-        assert_eq!(token.as_deref(), Some("flag-secret"), "the flag must still win between two real tokens");
-        assert!(!blank);
-    }
-
-    // ---------------------------------------------------------------------------------
-    // merge_static_token (F1 of PR #124 round 3): whitespace-only is blank too, not just empty
-    // ---------------------------------------------------------------------------------
-
-    /// The round-3 finding itself: a whitespace-only `--token` must not beat a real config-file
-    /// token, exactly like a literally-empty one already does not. Before this fix, only
-    /// `is_empty()` was checked here, so `Some("   ")` counted as "a value was supplied" and
-    /// still won over `file.token` — the identical bug `a_blank_flag_token_falls_back_to_a_real_file_token`
-    /// closes for the empty case, left open for whitespace.
-    #[test]
-    fn a_whitespace_only_flag_token_falls_back_to_a_real_file_token() {
-        let (token, blank) = merge_static_token(
-            Some("   ".to_string()), Some("admin-secret".to_string())
-        );
-        assert_eq!(token.as_deref(), Some("admin-secret"));
-        assert!(blank, "the flag source was whitespace-only, even though a real token resulted");
-    }
-
-    /// The symmetric case, for the config-file source.
-    #[test]
-    fn a_whitespace_only_file_token_falls_back_to_a_real_flag_token() {
-        let (token, blank) = merge_static_token(
-            Some("flag-secret".to_string()), Some("   ".to_string())
-        );
-        assert_eq!(token.as_deref(), Some("flag-secret"));
-        assert!(blank, "the file source was whitespace-only, even though a real token resulted");
-    }
-
-    #[test]
-    fn two_whitespace_only_sources_merge_to_no_token_and_report_blank() {
-        let (token, blank) = merge_static_token(Some("  ".to_string()), Some("\t".to_string()));
-        assert_eq!(token, None);
-        assert!(blank);
-    }
-
-    /// A real token is never trimmed, even though a whitespace-*only* one is treated as blank —
-    /// the fix is a presence check, not a normalization: incidental internal or edge whitespace
-    /// around real content must survive verbatim into the merged token (and, downstream, into
-    /// `tokens_match`'s byte-exact comparison).
-    #[test]
-    fn a_flag_token_with_incidental_whitespace_survives_untrimmed() {
-        let (token, blank) = merge_static_token(Some(" has spaces ".to_string()), None);
-        assert_eq!(token.as_deref(), Some(" has spaces "));
-        assert!(!blank, "this is a real, non-blank token");
-    }
-
-    // ---------------------------------------------------------------------------------
-    // serve: the F1/F2 precedence fix, observed end to end through the merged options
-    // ---------------------------------------------------------------------------------
-
-    /// The full-stack version of `a_blank_flag_token_falls_back_to_a_real_file_token`: with the
-    /// precedence bug, the real config-file token is discarded, no other auth source is
-    /// configured, and `server::serve`'s startup gate refuses with "No authentication is
-    /// configured". Fixed, the real token survives, the auth gate passes, and the function
-    /// fails downstream instead — at root resolution, since the configured root does not exist.
-    /// Distinguishing by which error comes back is the same technique `server.rs`'s own
-    /// `serve_with_open_true_passes_the_auth_gate` uses; fully starting the server is out of
-    /// scope for a fast unit test.
-    #[tokio::test]
-    async fn serve_falls_back_to_a_real_file_token_when_the_flag_token_is_blank() {
-        let path = scratch_config("blank-flag-real-file-token", "token = \"admin-secret\"\n");
-
-        let error = serve(
-            Some("/does/not/exist/and/does/not/matter".to_string()),
-            None,
-            None,
-            Some(String::new()),
-            None,
-            None,
-            None,
-            None,
-            RequestLimitFlags::default(),
-            false,
-            Some(path.to_str().unwrap().to_string()),
-        ).await.unwrap_err();
-
-        assert!(!error.contains("No authentication is configured"), "{}", error);
-        assert!(error.contains("Error while resolving"), "{}", error);
+        assert!(error.contains("sets \"token\""), "{}", error);
+        assert!(error.contains("set token_sha256 to the token's SHA-256 digest"), "{}", error);
+        assert!(!error.contains("s3cr3t-value"), "{}", error);
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }
 
-    /// The whitespace-only sibling of the test just above (PR #124 round 3, F1): a
-    /// `--token "   "` must fall back to a real config-file token exactly like `--token ""`
-    /// does — the whole point of round 3 being that round 2's fix only normalized emptiness.
-    #[tokio::test]
-    async fn serve_falls_back_to_a_real_file_token_when_the_flag_token_is_whitespace_only() {
-        let path = scratch_config("whitespace-flag-real-file-token", "token = \"admin-secret\"\n");
-
-        let error = serve(
-            Some("/does/not/exist/and/does/not/matter".to_string()),
-            None,
-            None,
-            Some("   ".to_string()),
-            None,
-            None,
-            None,
-            None,
-            RequestLimitFlags::default(),
-            false,
-            Some(path.to_str().unwrap().to_string()),
-        ).await.unwrap_err();
-
-        assert!(!error.contains("No authentication is configured"), "{}", error);
-        assert!(error.contains("Error while resolving"), "{}", error);
-
-        let _ = forklift_core::util::file_utils::remove_file(&path);
-    }
-
-    /// F2: when a blank `--token` is the *only* auth-flavored thing supplied (no real token
-    /// anywhere, nothing else configured), the startup refusal must name that case correctly —
-    /// "a blank --token/token", not "no --token/token", which sends an operator who passed the
-    /// flag looking for a flag they never passed at all.
-    #[tokio::test]
-    async fn serve_names_a_blank_flag_token_distinctly_from_no_token_at_all() {
-        let error = serve(
-            Some("/does/not/exist/and/does/not/matter".to_string()),
-            None,
-            None,
-            Some(String::new()),
-            None,
-            None,
-            None,
-            None,
-            RequestLimitFlags::default(),
-            false,
-            None,
-        ).await.unwrap_err();
-
-        assert!(error.contains("No authentication is configured"), "{}", error);
-        assert!(error.contains("a blank --token/token"), "{}", error);
-        assert!(!error.contains("no --token/token"), "{}", error);
-    }
-
-    // ---------------------------------------------------------------------------------
-    // ConfigFile::fmt (F3 of PR #124 round 2): the static token must never print
-    // ---------------------------------------------------------------------------------
-
-    /// The same class `HookEndpoint::fmt` closes (`server.rs`'s
-    /// `hook_endpoint_debug_never_prints_the_secret`), applied to the higher-value secret: the
-    /// static bearer token, which grants full access including warehouse creation, versus a
-    /// hook's MAC key which only signs requests. Checks both the value's absence and the field
-    /// name's presence, so a future edit cannot "fix" the struct literal without the test
-    /// noticing the field itself vanished too.
+    /// `Debug` of the parsed config prints no digest of the static token: the same rule as
+    /// `server.rs`'s `hook_endpoint_debug_never_prints_the_secret`, so a future
+    /// `tracing::debug!(?file)` or a panic message leaks nothing. The field's name still prints,
+    /// so the redaction cannot pass by the field vanishing.
     #[test]
-    fn config_file_debug_never_prints_the_token() {
-        let path = scratch_config("debug-redaction", "token = \"s3cr3t-value\"\n");
+    fn config_file_debug_never_prints_the_token_digest() {
+        let digest = hex_digest("s3cr3t-value");
+        let path = scratch_config("debug-redaction", &format!("token_sha256 = \"{}\"\n", digest));
         let file = parse_config(path.to_str().unwrap()).unwrap();
         let formatted = format!("{:?}", file);
 
-        assert!(!formatted.contains("s3cr3t-value"), "{}", formatted);
-        assert!(formatted.contains("token"), "{}", formatted);
-        assert!(formatted.contains("redacted"), "{}", formatted);
+        assert!(!formatted.contains(&digest), "{}", formatted);
+        assert!(formatted.contains("token_sha256: Some(TokenDigest(<redacted>))"), "{}", formatted);
 
         let _ = forklift_core::util::file_utils::remove_file(&path);
     }

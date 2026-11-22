@@ -21,13 +21,13 @@ serves every prepared warehouse under `/data`:
 ```sh
 docker build -t forklift-server .
 docker run -d -p 9418:9418 -v forklift-data:/data forklift-server \
-    serve --warehouses /data --addr 0.0.0.0:9418 --token <admin-secret>
+    serve --warehouses /data --addr 0.0.0.0:9418 --token-sha256 <SHA-256 of the admin secret>
 ```
 
 The image's baked-in default command is `serve --warehouses /data --addr 0.0.0.0:9418` — with
 no token, that command **refuses to start** (see "Authentication" below), so you always
 override it: as above to set a token, with `--open` for a throwaway/local container, or to
-serve a single warehouse (`serve --root /data/wh --token <secret>`). Create warehouses against
+serve a single warehouse (`serve --root /data/wh --token-sha256 <digest>`). Create warehouses against
 the running container with the admin token:
 
 ```sh
@@ -43,7 +43,7 @@ self-mutate" rule as a bare install.
 
 ```sh
 forklift-server prepare --root /srv/forklift/wh
-forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --token <secret>
+forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --token-sha256 <SHA-256 of the secret>
 ```
 
 Clients configure `forklift config set remote.url http://…` (plus `remote.token`), or just
@@ -91,7 +91,7 @@ again.
 ## Serving many warehouses
 
 ```sh
-forklift-server serve --warehouses /srv/forklift --token <admin-secret>
+forklift-server serve --warehouses /srv/forklift --token-sha256 <SHA-256 of the admin secret>
 ```
 
 Every prepared subdirectory is served at `/warehouses/<id>/v1/…`; the id simply travels
@@ -141,7 +141,8 @@ is fixed in the anchor, so the refusal names the pallet and its head.
 ## Authentication
 
 **Some authentication is required to start the server at all.** Configure at least one of a
-static `--token`/`token`, a `--tokens`/`tokens` operator-token file, or an `authentication` hook
+static `--token-sha256`/`token_sha256`, a `--tokens`/`tokens` operator-token file, or an
+`authentication` hook
 (below) — or the server refuses to start, naming the missing piece. This is not "auth defaults
 to a static token"; there is no default at all, on purpose.
 
@@ -163,7 +164,7 @@ Flags, or a TOML file (`--config server.toml`; flags override the file):
 ```toml
 root = "/srv/forklift/wh"        # or: warehouses = "/srv/forklift"
 addr = "127.0.0.1:9418"
-token = "<secret>"               # static token: full access, gates creation
+token_sha256 = "<64 hex>"        # the static token's SHA-256: full access, gates creation
 tokens = "/etc/forklift/tokens.toml"  # per-operator tokens (below)
 max_body_mb = 4096               # refuse larger request bodies (default: 64 MiB, the largest
                                   # legitimate object after chunking — never unlimited)
@@ -180,18 +181,32 @@ open = false                     # explicit opt-out of authentication (default: 
 ```
 
 Every key here is validated strictly: a key set to a value of the wrong type (e.g. an
-unquoted `token = 12345`) is a startup error naming the file and the key, never silently
+unquoted `token_sha256 = 12345`) is a startup error naming the file and the key, never silently
 treated as unset — and an unrecognized key name (a typo) is refused the same way.
+
+## Tokens are configured as digests
+
+The server never holds a bearer token itself, only its SHA-256 digest: 64 lowercase hex
+characters, such as `printf '%s' "$TOKEN" | shasum -a 256` prints. It hashes the token a request
+presents and compares digests, so a reader of the config file, the tokens file or the command
+line learns no credential. Tokens are high-entropy secrets (`openssl rand -hex 32`), so an
+unsalted digest gives nothing away. A value that is not a digest is refused at startup without
+being echoed, and so is the digest of the empty string. A config file still setting `token`, or a
+tokens file with an `[operators]` table of plaintext tokens, is refused by name, never read as no
+token.
 
 ## Per-operator tokens (FORK-10)
 
-The token file maps transport secrets to office identifiers — tokens are server-side
-only and never enter the tracked metadata:
+The token file maps transport secrets, by their digests, to office identifiers. Tokens never
+enter the tracked metadata:
 
 ```toml
-[operators]
-"<token>" = "mate@lonic.net"
+[operators_sha256]
+"<SHA-256 of the token>" = "mate@lonic.net"
 ```
+
+A digest bound twice, a blank identifier, and an operator token that is also the static token
+are refused at startup.
 
 A token authorizes transport, not authorship. It decides whose role the server applies to a
 request; it never decides who a parcel is attributed to, which is the parcel's signer in the office.

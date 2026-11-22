@@ -30,9 +30,11 @@ tower-http = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-subtle = { workspace = true }
 
 [dev-dependencies]
+# Test-only: a token's digest computed the way a deployer does, independently of the code under
+# test (`forklift_core::util::token_utils`).
+sha2 = { workspace = true }
 # Only for test-only parcel construction (FORK-95 falsifiers) — `ParcelAction`'s
 # timestamp is a `chrono::DateTime<Utc>`, and forklift-server has no production need
 # for the crate itself.
