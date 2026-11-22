@@ -3133,6 +3133,94 @@ pub(crate) mod tests {
         stub_parcel(&c.to_string())
     }
 
+    /// SPIKE (FORK-577 design, not to merge): under a standing taint, which of the ordinary checked
+    /// write's reads answer for a move 1 -> 2 whose new objects are loose. Asserted, not printed.
+    #[test]
+    fn spike_577_reads_under_a_standing_taint() {
+        use crate::util::warehouse_utils::WarehouseMode;
+        for mode in [WarehouseMode::Full, WarehouseMode::Sparse] {
+            for redacting in [false, true] {
+                let label = format!("{:?}-{}", mode, redacting);
+                let (_root, _scope) = scratch(&format!("spike-577-{}", label));
+                crate::util::warehouse_utils::mark_for_test(mode);
+                if mode == WarehouseMode::Sparse {
+                    crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
+                }
+                use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+                use crate::model::tree_item::TreeItem;
+                use crate::enums::dir_entry_type::DirEntryType;
+                let one = hash('1');
+                update_pallet_head("main", None, &one, &RefPreconditions::NONE).unwrap();
+                let mut blob = LooseObjectBuilder::build_blob(&crate::model::blob::Blob { content: format!("new {}", label).into_bytes() });
+                blob.store().unwrap();
+                let mut src = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+                src.add_child(TreeItem::new("a".to_string(), blob.hash.clone(), DirEntryType::Normal));
+                let mut src = LooseObjectBuilder::build_tree(&src);
+                src.store().unwrap();
+                let mut top = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+                top.add_child(TreeItem::new("src".to_string(), src.hash.clone(), DirEntryType::Tree));
+                // An out-of-scope subtree the store lacks, as a sparse warehouse holds it.
+                if mode == WarehouseMode::Sparse {
+                    top.add_child(TreeItem::new("lib".to_string(), hash('9'), DirEntryType::Tree));
+                }
+                let mut top = LooseObjectBuilder::build_tree(&top);
+                top.store().unwrap();
+                let mut parcel = LooseObjectBuilder::build_parcel(&crate::model::parcel::Parcel {
+                    tree_hash: top.hash.clone(), parents: vec![one.clone()], actions: Vec::new(), description: None,
+                });
+                parcel.store().unwrap();
+                let two = parcel.hash.clone();
+                if redacting {
+                    let redaction = crate::util::redaction_utils::Redaction {
+                        hash: hash('z'), reason: "leaked".to_string(), redacted_at: 0, chunks: None,
+                    };
+                    let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+                    crate::util::redaction_utils::record_redaction(&redaction, &crate::util::meta_tree::MetaWriter::Unsigned, &operator).unwrap();
+                }
+                // Before the taint: the ordinary verify answers.
+                let scope = crate::util::scope_utils::read_fetch_scope().unwrap();
+                assert!(verify_new_head("main", Some(&one), &two, &scope).is_ok(), "{}: untainted verify", label);
+
+                let serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                crate::util::taint_utils::activate();
+                let path = get_pallet_ref_path(PalletNamespace::User, "main");
+                crate::util::taint_utils::record_taint(&[&path]).unwrap();
+
+                let verify = verify_new_head("main", Some(&one), &two, &scope);
+                let walk = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&one), &two, None);
+                let left = left_unreached(PalletNamespace::User, Some(&one), &two);
+                let stands = crate::util::lock_utils::RefLock::acquire().map_err(|e| e.to_string()).and_then(|lock| walk.stands(&lock));
+                println!("SPIKE {} verify={:?} walk={:?} stands={:?} left={:?}", label,
+                    verify.as_ref().map(|t| t.is_some()), walk.outcome().map(|_| ()), stands, left);
+
+                assert!(verify.is_err(), "{}: verify_new_head must be refused under the taint: {:?}", label, verify.map(|t| t.is_some()));
+                assert!(left.is_ok(), "{}: left_unreached must answer: {:?}", label, left);
+                assert_eq!(stands, Ok(true), "{}: the walk must stand", label);
+                match (mode, redacting) {
+                    (WarehouseMode::Sparse, true) => assert!(
+                        matches!(walk.outcome(), Err(RefUpdateError::Failed(ref message)) if message.contains("taint")),
+                        "{}: the walk must be refused naming the taint: {:?}", label, walk.outcome().map(|_| ())),
+                    _ => assert!(walk.outcome().is_ok(), "{}: the walk must answer: {:?}", label, walk.outcome().map(|_| ())),
+                }
+                // Every other read of the checked write answers too: a write whose token skips the
+                // walk gets past every hold read and is refused only by the rename's taint re-check.
+                if !(mode == WarehouseMode::Sparse && redacting) {
+                    let token = VerifiedClosure::new(&two, scope.clone(), Some(&one));
+                    let written = update_pallet_head_verified(PalletNamespace::User, "main", Some(&one), &two, &RefPreconditions::NONE, &token, None);
+                    println!("SPIKE {} token-write={:?}", label, written);
+                    assert!(matches!(written, Err(RefUpdateError::Failed(ref message)) if message.contains("taint")), "{}: {:?}", label, written);
+                    assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(one.as_str()), "{}: nothing landed", label);
+                }
+
+                let root = crate::globals::forklift_root();
+                let state = crate::util::taint_utils::read_taints(&root).unwrap();
+                let _ = crate::util::taint_utils::test_remove_taint_files(&root, &state.files);
+                crate::util::taint_utils::test_clear_gate(&root);
+                drop(serial);
+            }
+        }
+    }
+
     /// Point a user pallet at `new` without verifying `new`'s closure: a warehouse whose history
     /// went missing after a ref write that found it complete, for a test of what reads and
     /// repairs do then.
