@@ -517,6 +517,25 @@ pub fn read_tolerated() -> Result<Tolerated, String> {
     Ok(Tolerated { sealed: read_sealed()?, ..read_removed()? })
 }
 
+/// Read the records a walk of a head's closure judges an absence by, as the warehouse's mode
+/// decides: [`read_tolerated`] where content may be absent, else [`read_removed`]. The one reader
+/// for every judge of a closure, so a put-back's basis tolerates what the walk it stands in for
+/// would.
+///
+/// # Arguments
+/// * `content_may_be_absent` - Whether this warehouse may lack content by design
+///                             ([`content_may_be_absent`](crate::util::scope_utils::content_may_be_absent)).
+///
+/// # Returns
+/// * `Ok(Tolerated)` - The sets.
+/// * `Err(String)`   - If any record cannot be read or parsed.
+pub fn read_tolerated_for(content_may_be_absent: bool) -> Result<Tolerated, String> {
+    match content_may_be_absent {
+        true => read_tolerated(),
+        false => read_removed(),
+    }
+}
+
 /// Read the applied redactions, the withheld content and the unavailable content, for a walk in a
 /// warehouse whose every other object must be present.
 ///
