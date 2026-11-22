@@ -2954,11 +2954,12 @@ mod tests {
         completed.undo_started = true;
         let completed = in_journal(&completed);
 
-        // Where the undo stopped: the position back, the pick not yet, and the pallet either put
-        // back or moved on by another bay since. The refusal claims only what holds in both.
-        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('1')))).unwrap();
-        for (state, head) in [("ref moved on", hash('3')), ("ref put back", hash('1'))] {
+        // Where the undo stopped: the position back, the pick not yet, and the pallet not yet put
+        // back, put back, or moved on by another bay since. The refusal claims only what holds in
+        // every one.
+        for (state, head) in [("ref not yet put back", hash('2')), ("ref put back", hash('1')), ("ref moved on", hash('3'))] {
             advance("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &head).unwrap();
+            pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('1')))).unwrap();
 
             let refused = check_undoable(&completed).unwrap_err();
             assert!(refused.contains("no longer holds that parcel") && refused.contains("is not resumed")
