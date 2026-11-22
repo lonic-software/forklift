@@ -7636,7 +7636,8 @@ mod tests {
     /// are read from `ROUTES`, so a new read route is covered the day it is listed.
     ///
     /// Reverts: the layer skipping one class (`Fetch` or `Read`) → that class's routes reach their
-    /// handler instead → red; the hook told the wrong action or no pallet → red.
+    /// handler instead → red; the hook told the wrong action or no pallet → red, against the
+    /// literal set at the end.
     #[tokio::test]
     async fn every_read_and_fetch_route_is_refused_by_a_denying_admission_hook() {
         let hook = SwitchedHook::start(false).await;
@@ -7659,7 +7660,7 @@ mod tests {
             let addr = serve_router(state, 1 << 20).await;
 
             for (entry, path) in registered_routes(is_multi) {
-                let Some((action, pallet_tail)) = entry.admission.in_layer() else { continue };
+                if entry.admission.in_layer().is_none() { continue }
                 let asked = hook.asked();
                 let method = reqwest::Method::from_bytes(verb_name(entry.verb).as_bytes()).unwrap();
                 let response = client.request(method, format!("http://{addr}{path}"))
@@ -7675,19 +7676,23 @@ mod tests {
                 assert_eq!(hook.asked(), asked + 1, "{path}: the hook asked once");
 
                 let told = hook.last();
-                assert_eq!(told["action"], action, "{path}");
                 assert_eq!(told["warehouse"], if is_multi { serde_json::json!("w1") } else { serde_json::Value::Null }, "{path}");
-                assert_eq!(told["pallet"], if pallet_tail { serde_json::json!("a/b") } else { serde_json::Value::Null }, "{path}");
-                refused.insert((is_multi, format!("{} {}", verb_name(entry.verb), entry.path)));
+                refused.insert((is_multi, format!("{} {}", verb_name(entry.verb), entry.path),
+                                told["action"].as_str().unwrap_or("").to_string(), told["pallet"].as_str().map(str::to_string)));
             }
         }
 
-        // A literal, not read from ROUTES: the routes this test must have reached, in each mode.
-        let expected: BTreeSet<(bool, String)> = [
-            "GET /warehouse", "POST /objects/missing", "POST /objects/upload-targets", "POST /objects/batch",
-            "GET /objects/{hash}", "GET /signatures/{hash}", "POST /holds/{*name}", "POST /resolve",
-            "GET /bundles/latest",
-        ].into_iter().flat_map(|route| [(false, route.to_string()), (true, route.to_string())]).collect();
+        // A literal, not read from ROUTES or the layer: the routes this test must have reached in
+        // each mode, with the action and pallet the hook must have been told for each.
+        let expected: BTreeSet<(bool, String, String, Option<String>)> = [
+            ("GET /warehouse", "read", None), ("POST /objects/missing", "read", None),
+            ("POST /objects/upload-targets", "read", None), ("POST /objects/batch", "fetch", None),
+            ("GET /objects/{hash}", "fetch", None), ("GET /signatures/{hash}", "fetch", None),
+            ("POST /holds/{*name}", "read", Some("a/b")), ("POST /resolve", "read", None),
+            ("GET /bundles/latest", "fetch", None),
+        ].into_iter().flat_map(|(route, action, pallet)| [false, true].map(|is_multi| {
+            (is_multi, route.to_string(), action.to_string(), pallet.map(str::to_string))
+        })).collect();
         assert_eq!(refused, expected);
     }
 
