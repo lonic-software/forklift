@@ -14,7 +14,7 @@ use crate::model::hooks::{
 
 /// The key-derivation context of the request MAC. Versioned with the protocol: a
 /// wire-format change re-keys every MAC, so mixed versions can never half-verify.
-const MAC_CONTEXT: &str = "forklift hook protocol 2026-07-05 request mac";
+const MAC_CONTEXT: &str = "forklift hook protocol 2026-11-22 request mac";
 
 /// How far a request's timestamp may lie from the receiver's clock before the
 /// request is refused as a replay (seconds, either direction).
@@ -91,6 +91,26 @@ mod tests {
         assert!(verify_hook_request("other", 1000, 1000, body, &mac).is_err());
         assert!(verify_hook_request("secret", 1001, 1001, body, &mac).is_err());
         assert!(verify_hook_request("secret", 1000, 1000, b"{}", &mac).is_err());
+    }
+
+    /// The protocol version a request carries, on its header and in its MAC key, read against
+    /// literals: a receiver written for another version refuses the request rather than parsing
+    /// a vocabulary it does not know.
+    #[test]
+    fn a_request_speaks_the_2026_11_22_protocol() {
+        let body = br#"{"action":"fetch"}"#;
+        let headers = hook_request_headers("admission", "secret", 1000, body);
+
+        assert_eq!(headers[1], (HEADER_HOOK_VERSION, "2026-11-22".to_string()));
+
+        let key = blake3::derive_key("forklift hook protocol 2026-11-22 request mac", b"secret");
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(b"1000\n");
+        hasher.update(body);
+        let expected = hasher.finalize().to_hex().to_string();
+
+        assert_eq!(headers[3], (HEADER_HOOK_SIGNATURE, expected.clone()));
+        assert!(verify_hook_request("secret", 1000, 1000, body, &expected).is_ok());
     }
 
     #[test]
