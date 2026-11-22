@@ -12,7 +12,7 @@ use forklift_core::util::reseal_utils::{self, ResealError};
 use forklift_core::util::warehouse_utils::{self, WarehouseMode};
 use forklift_core::util::applied_redactions::{self, RedactionState};
 use forklift_core::util::unavailable_heal::{self, RemoteError};
-use forklift_core::util::{config_utils, office_utils, origin_utils, pallet_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
+use forklift_core::util::{config_utils, file_utils, office_utils, origin_utils, pallet_utils, park_utils, recovery_utils, redaction_utils, sealed_utils, tree_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// The note of a re-apply of redactions that could not run, followed by why.
@@ -126,6 +126,12 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             twice.1
         ));
     }
+
+    // Heal writes while the taint it is resolving still stands: every repair it runs before the
+    // recovery, and the recovery's own. So the standing-taint re-check is exempted for the whole
+    // run, which this process runs alone. A taint is cleared only by what the recovery finds on
+    // disk, never by a write's Ok.
+    let _heal_writes = file_utils::SelfTripExemptionGuard::new();
 
     // Taken before anything is read: the choice may narrow the fetch scope, so no other process may
     // use the store until it is written.

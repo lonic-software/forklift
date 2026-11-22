@@ -3830,8 +3830,9 @@ async fn attempt_heal_driven_refetch(
     corrupt_hashes: &[String],
 ) -> HealRefetch {
     // Armed for the rest of this function — both passes below, and every `.await` inside them —
-    // so every store this refetch makes is exempt from `taint_recheck`'s standing-taint success
-    // re-check against the very taint this run is in the middle of healing (see
+    // so every store this refetch makes is exempt from `taint_recheck`'s standing-taint
+    // re-check against the very taint this run is in the middle of healing, whichever caller
+    // reached it; under `forklift heal` it nests inside the run's own arming (see
     // `SelfTripExemptionGuard`'s own doc comment for why this must be process-global and the
     // precondition it depends on). A zero-sized RAII guard held across `.await` points is fine
     // here — it is not a lock, so it does not threaten the future's `Send`-ness.
@@ -8264,17 +8265,10 @@ mod tests {
     /// Mutation: make `restage_object` special-case a ref-shaped path by restoring some stored
     /// snapshot of V0 instead of re-reading the live file → `head_after` comes back V0 → red.
     ///
-    /// **Surprise found while building this fixture, worth flagging on its own:**
-    /// `pallet_utils::update_pallet_head`'s own write (`write_file_atomically`) already refuses to
-    /// report success while ANY taint stands anywhere under the root — `file_utils::
-    /// taint_recheck` runs after this write's own rename *and* directory sync both succeed, and
-    /// unconditionally errors if `taint_utils::read_taints` finds anything recorded at all,
-    /// regardless of path. So the "advance to V1" call below returns `Err`, even though — because
-    /// that check runs strictly after the rename already landed — the ref file's bytes on disk
-    /// are already durably V1 by the time the error is returned. A real `stack`/`lift` driving
-    /// this same call would see (and presumably report) failure despite the head having actually
-    /// already moved; this test does not chase that quirk further, but does not paper over it by
-    /// pretending the call succeeds either.
+    /// The V1 write is made under the self-trip exemption: with the taint standing,
+    /// `write_file_atomically` refuses any other write before its rename, so an unexempted V1
+    /// write would never land and the test would restage V0 with nothing to revert. The
+    /// exemption stands for any writer the taint does not stop, such as heal's own.
     #[test]
     fn heal_restaging_a_tainted_pallet_ref_never_reverts_a_later_legitimate_head_move() {
         use crate::globals::StorageRootScope;
@@ -8306,21 +8300,19 @@ mod tests {
         // comment on why that already rules out a stored-snapshot mechanism.
         plant_complete_taint(&forklift, &["pallets/main"]);
 
-        // Bay B's forward progress: an ordinary head move to V1, through the exact same
-        // `write_file_atomically`-backed primitive any real pallet-advancing command uses —
-        // simulating a legitimate `stack`/`lift` elsewhere while this (unrelated-content) taint
-        // still stands. This call itself returns `Err` (see the "surprise" note above) — the
-        // rename to V1 lands first, and only the trailing, blanket taint-recheck then refuses —
-        // so the call is deliberately not `.unwrap()`-ed here; what matters for this test is the
-        // durable on-disk value it leaves behind, confirmed next.
-        let _ = pallet_utils::update_pallet_head(
-            "main",
-            pallet_utils::get_pallet_head("main").unwrap().as_deref(),
-            &v1,
-            &pallet_utils::RefPreconditions::NONE,
-        );
-        assert_eq!(pallet_utils::get_pallet_head("main").unwrap().unwrap(), v1,
-            "sanity: the rename to V1 must have physically landed despite the call's own Err");
+        // A head move to V1 after the taint, through the exact same `write_file_atomically`-backed
+        // primitive any real pallet-advancing command uses, made under the exemption (see this
+        // test's own doc comment) so it lands and reports Ok.
+        {
+            let _exempt = crate::util::file_utils::SelfTripExemptionGuard::new();
+            pallet_utils::update_pallet_head(
+                "main",
+                pallet_utils::get_pallet_head("main").unwrap().as_deref(),
+                &v1,
+                &pallet_utils::RefPreconditions::NONE,
+            ).expect("an exempted head move lands under the taint");
+        }
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap().unwrap(), v1, "sanity: the head moved to V1");
 
         let outcome = run_heal().expect("a present, readable, non-content-addressed path restages cleanly");
         assert!(outcome.was_tainted);

@@ -976,7 +976,10 @@ pub(crate) fn sync_dir_attempts() -> Vec<PathBuf> {
 ///   for the storage root that owns `final_paths`, so a caller only reports `Ok` once both the
 ///   sync and the re-check have passed (see [`taint_recheck`]). Every recorder that durably
 ///   records a reference off the back of this call (a pallet head, a parked-list entry) must
-///   write that reference only after this returns `Ok`.
+///   write that reference only after this returns `Ok`. This re-check comes after the effect, so
+///   its refusal is of something already visible; [`write_file_atomically`] also checks before
+///   its rename, so on that path this one refuses only a taint recorded while the write was in
+///   flight, or a taint state it cannot read.
 ///
 /// Both halves are no-ops beyond returning `sync_result` unchanged on failure, or always
 /// `Ok(())` on success — unless [`taint_utils::activate`] has been called in this process: both
@@ -1062,6 +1065,54 @@ impl Drop for TaintRecordFaultGuard {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Armed by [`PostRenameTaintSeam::arm`]: the next [`write_file_atomically`] on this thread
+    /// plants a taint file between its rename and its folder sync.
+    static POST_RENAME_TAINT_SEAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test-only stand-in for a taint recorded while a write is in flight. Armed, the next
+/// [`write_file_atomically`] on this thread (one-shot: the arming is spent by that call) plants a
+/// complete taint file under its storage root after the rename and before the folder sync, so
+/// the re-check after the sync refuses a write that has landed. The planted file is removed
+/// before that call returns (self-clearing), so no taint stands for the writes that follow. The
+/// planted taint is read only once activated, as every taint is. Dropping the guard disarms a
+/// seam no write spent.
+#[cfg(test)]
+pub(crate) struct PostRenameTaintSeam;
+
+#[cfg(test)]
+impl PostRenameTaintSeam {
+    pub(crate) fn arm() -> Self {
+        POST_RENAME_TAINT_SEAM.with(|seam| seam.set(true));
+        PostRenameTaintSeam
+    }
+}
+
+#[cfg(test)]
+impl Drop for PostRenameTaintSeam {
+    fn drop(&mut self) {
+        POST_RENAME_TAINT_SEAM.with(|seam| seam.set(false));
+    }
+}
+
+/// The armed seam's plant, spending the arming: the planted taint file's path, or `None` when the
+/// seam is not armed. A write whose path is under no storage root spends the arming and plants
+/// nothing, as no taint could be read for it.
+#[cfg(test)]
+fn plant_post_rename_taint(file_path: &Path) -> Option<PathBuf> {
+    if !POST_RENAME_TAINT_SEAM.with(|seam| seam.replace(false)) {
+        return None;
+    }
+    let root = taint_utils::resolve_root_for(&[file_path])?;
+    let folder = root.join("taint");
+    std::fs::create_dir_all(&folder).expect("the seam's taint folder is created");
+    let planted = folder.join(format!("taint-seam-{}", std::process::id()));
+    std::fs::write(&planted, taint_utils::taint_file_bytes(["objects/zz/seam"])).expect("the seam's taint file is written");
+    Some(planted)
+}
+
 /// What [`taint_after_sync_failure`] puts between the sync error and the taint write's own.
 const TAINT_UNRECORDED: &str = " (additionally, while recording a durability taint for the affected object(s): ";
 
@@ -1080,12 +1131,18 @@ pub fn is_taint_unrecorded(error: &str) -> bool {
 /// make safe.
 static SELF_TRIP_EXEMPTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The no-self-trip exemption for heal's own refetch writes (extending `heal_utils`'s own
-/// "no-self-trip rule", see that module's doc comment, to the second heal-owned write path that
-/// was never brought under it when it was added — `forklift heal`'s remote refetch, which stores
-/// through the ordinary [`write_file_atomically`]/[`sync_dir_or_taint`] path while the very taint
-/// it is trying to resolve is still standing). While at least one guard is held, [`taint_recheck`]
-/// returns `Ok(())` immediately instead of reading the durable taint files — see that function.
+/// The no-self-trip exemption for heal's own writes (extending `heal_utils`'s own "no-self-trip
+/// rule", see that module's doc comment, to the writes heal makes through the ordinary
+/// [`write_file_atomically`]/[`sync_dir_or_taint`] path while the very taint it is trying to
+/// resolve is still standing). While at least one guard is held, [`taint_recheck`] returns
+/// `Ok(())` immediately instead of reading the durable taint files — see that function.
+///
+/// Two sites arm it. `forklift heal`'s command handler holds one for its whole run, from the
+/// moment its arguments validate: heal repairs config, meta refs, records, positions and refs
+/// before its recovery, all while a taint may stand, and each of those writes would otherwise be
+/// refused before its rename. `recovery_utils::attempt_heal_driven_refetch` holds one around the
+/// remote refetch, so the refetch's exemption does not depend on which caller reached the
+/// recovery; inside a heal run it nests in the run's own, which the counter makes compose.
 ///
 /// Construct with [`SelfTripExemptionGuard::new`] and hold it for the guard's entire lifetime;
 /// `Drop` decrements the count automatically.
@@ -1111,12 +1168,13 @@ static SELF_TRIP_EXEMPTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::at
 /// mechanism this reasons about): the exemption is process-local and purely in-memory, while the
 /// taint itself stays on disk for the whole armed window — a sibling process's own `taint_recheck`
 /// call still reads the standing durable taint files exactly as before, so nothing about this
-/// guard changes what a *different* process observes. And within this process, heal never records
-/// a durable reference off the strength of an exempted store's `Ok`: heal's own recovery verdict
-/// — which hashes are reported resolved and dropped from the taint's remainder — comes from a
-/// separate, unconditional presence recheck run after the fetch attempt, never from the store
-/// call's own return value, so the exemption changes which objects land on disk but not how
-/// "recovered" is decided.
+/// guard changes what a *different* process observes. And within this process, nothing clears a
+/// taint off the strength of an exempted write's `Ok`: a taint file is removed only through
+/// `taint_utils::resolve_taints`, whose callers decide from the closure walk's remainder and the
+/// taint files left on disk — the hashes heal reports recovered come from a separate,
+/// unconditional presence recheck run after the fetch attempt — never from a store call's own
+/// return value. So the exemption changes what heal's writes report, and which later steps of the
+/// run go ahead, but not how "recovered" is decided.
 ///
 /// If a future long-lived process ever runs heal concurrently with another store-issuing
 /// operation in the same process (for example a multi-tenant server holding one warehouse's heal
@@ -1125,24 +1183,18 @@ static SELF_TRIP_EXEMPTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::at
 /// stores too. Before any such process shape ships, this exemption must be re-scoped from
 /// process-global to heal-invocation-scoped — e.g. a token threaded explicitly through the store
 /// calls one heal invocation makes, or a task-local propagated into the tasks it spawns — rather
-/// than a bare process-wide counter.
+/// than a bare process-wide counter. That token must reach every write the heal run makes before
+/// its recovery, not only the refetch's.
 ///
 /// If `audit` (the other chokepoint-exempt verb) ever grows a repair-fetch of its own, it must
 /// arm this same guard rather than invent a parallel exemption.
-pub(crate) struct SelfTripExemptionGuard;
+pub struct SelfTripExemptionGuard;
 
 impl SelfTripExemptionGuard {
-    /// Arm the exemption. Forward-looking tripwire, not present-tense enforcement: in the shipped
-    /// CLI this guard has exactly one call site, reached once per heal invocation, so nested or
-    /// concurrent arming cannot occur today and this assertion is dead code by construction. Its
-    /// value is catching the moment a second arming site is introduced — precisely the change that
-    /// would silently invalidate the single-writer-per-process precondition above. It catches only
-    /// nested/concurrent *arming*; it cannot catch, and does not attempt to catch, a non-heal
-    /// writer simply observing a nonzero counter from someone else's already-open guard (see this
-    /// type's own doc comment).
-    pub(crate) fn new() -> Self {
-        let previous_count = SELF_TRIP_EXEMPTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        debug_assert!(previous_count == 0, "SelfTripExemptionGuard armed while already armed");
+    /// Arm the exemption, nesting inside any guard already held: the exemption lasts until the
+    /// last guard drops.
+    pub fn new() -> Self {
+        SELF_TRIP_EXEMPTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         SelfTripExemptionGuard
     }
 }
@@ -1153,12 +1205,16 @@ impl Drop for SelfTripExemptionGuard {
     }
 }
 
-/// The durable-taint re-check on a directory sync's success path: refuse if a taint is already
-/// standing for the storage root that owns `final_paths` — closing the window between a failed
-/// sync elsewhere (this process's own earlier failure, or a sibling process's, since this reads
-/// the durable taint files rather than only the in-memory gate [`taint_utils::gate_check`]
-/// covers) and this call's own success. A recorder must not durably reference anything this call
-/// covered until it has returned `Ok`.
+/// The durable-taint re-check: refuse if a taint is standing for the storage root that owns
+/// `final_paths`. It reads the durable taint files rather than only the in-memory gate
+/// [`taint_utils::gate_check`] covers, so it sees this process's own earlier failure and a
+/// sibling process's alike. Two places call it:
+///
+/// - [`write_file_atomically`], before its rename: a taint already standing when the write begins
+///   refuses it with nothing visible, so a refused immediate write never lands.
+/// - [`sync_result_or_taint`], on a directory sync's success path: closing the window between a
+///   failed sync elsewhere and this call's own success, after the effect. A recorder must not
+///   durably reference anything that call covered until it has returned `Ok`.
 ///
 /// Skipped early, before any taint file is read, while a [`SelfTripExemptionGuard`] is armed
 /// anywhere in this process — see that type's doc comment for what makes this sound (and the
@@ -1371,13 +1427,14 @@ fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
 ///                   durability was proven — including the taint re-check below, if
 ///                   `taint_utils::activate` has been called in this process (see
 ///                   `sync_dir_or_taint`); an unactivated process sees no change here.
-/// * `Err(String)` - Either the write/rename itself failed (nothing is visible at `file_path`),
-///                   or the rename succeeded but the following directory sync failed — `file_path`
-///                   is then visible with its directory entry's durability unproven, and (once
-///                   activated) that fact is recorded as a taint; or the directory sync itself
-///                   succeeded but a taint was already standing for this root, in which case
-///                   `file_path`'s directory entry was never re-attempted and the caller must not
-///                   trust it as durable.
+/// * `Err(String)` - Either nothing landed: the temp write failed, the rename failed, or (once
+///                   activated) a taint was already standing for this root when the write began,
+///                   which refuses it before the rename, leaving `file_path` exactly as it was.
+///                   Or the write landed and is not proven durable: the rename succeeded but the
+///                   following directory sync failed (recorded as a taint, once activated), or the
+///                   sync held and the re-check after it found a taint recorded while the write
+///                   was in flight, or could not read the taint state. A caller that must know
+///                   which reads `file_path` back.
 pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
     let temporary_file_path = temp_path_for(file_path)?;
 
@@ -1397,19 +1454,39 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
 
     write_and_sync_file(&temporary_file_path, content)?;
 
+    // A taint already standing when the write begins refuses it before anything becomes
+    // visible: whether one stands is decided by taint files that predate this write, so the
+    // refusal need not wait for the effect. The temp file goes, and `file_path` keeps exactly
+    // what it held.
+    if let Err(refused) = taint_recheck(&[file_path]) {
+        let _ = std::fs::remove_file(&temporary_file_path);
+        return Err(refused);
+    }
+
     rename(&temporary_file_path, file_path).map_err(|e|
         format!("Error while moving file into place at \"{}\": {}", file_path.to_string_lossy(), e)
     )?;
 
+    #[cfg(test)]
+    let seam_taint = plant_post_rename_taint(file_path);
+
     // The rename is only durable once the directory entry recording the new name is on disk;
     // otherwise a power loss can undo it even though the file's bytes were already synced. A
-    // sync failure here taints `file_path`; a sync success is re-checked against any taint
-    // already standing for this root before this function may report `Ok` — see
-    // `sync_dir_or_taint`.
-    match file_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => sync_dir_or_taint(parent, &[file_path])?,
-        _ => (),
+    // sync failure here taints `file_path`. A sync success is re-checked once more, for a taint
+    // recorded while this write was in flight (by another writer in this process, or by a
+    // sibling process) — see `sync_dir_or_taint`. Either refusal comes after the rename: the
+    // write is visible, and not proven durable.
+    let synced = match file_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir_or_taint(parent, &[file_path]),
+        _ => Ok(()),
     };
+
+    #[cfg(test)]
+    if let Some(planted) = seam_taint {
+        std::fs::remove_file(&planted).expect("the seam's planted taint file is removed");
+    }
+
+    synced?;
 
     // Counted only once every step above — including the taint re-check — has actually
     // succeeded — see `BARRIER_COUNT`'s doc comment ("one per *completed* barrier"). A caller
@@ -8054,9 +8131,10 @@ mod tests {
 
     #[test]
     fn write_file_atomically_refuses_when_a_taint_is_already_standing_once_activated() {
-        // Same shape as the `WriteBatch` re-check test above, but for the immediate path — every
-        // fire site must inherit the same re-check, not just the batched one (see
-        // `sync_dir_or_taint`'s doc comment).
+        // The immediate path refuses a write a taint already standing would refuse, before its
+        // rename: the final path keeps its old bytes and no temp file is left behind.
+        // Revert: drop the check before the rename → the write lands (the re-check after the
+        // sync still refuses), the old bytes are gone → red.
         let _serial = lock_taint_activation();
         taint_utils::activate();
 
@@ -8067,16 +8145,90 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
+        let target = forklift.join("objects").join("ee").join("standing-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        write_file_atomically(&target, b"old bytes").unwrap();
+
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("ee").join("fresh-object");
+        let error = write_file_atomically(&target, b"new bytes").unwrap_err();
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
+        assert_eq!(std::fs::read(&target).unwrap(), b"old bytes", "a refused write leaves the final path as it was");
+        let left: Vec<_> = std::fs::read_dir(target.parent().unwrap()).unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("standing-object")], "no temp file is left");
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn write_file_atomically_refuses_a_taint_recorded_while_it_was_in_flight() {
+        // The re-check after the folder sync stays: a taint recorded between the rename and the
+        // sync (the seam plants one there) refuses the write, which has landed. The seam's taint
+        // is gone once the call returns, so the next write is not refused.
+        // Revert: sync the folder without the re-check after it (`sync_dir` plus
+        // `taint_after_sync_failure`) → the write reports Ok → red.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-taint-recheck-in-flight-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let target = forklift.join("objects").join("ef").join("in-flight-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        write_file_atomically(&target, b"old bytes").unwrap();
+
+        let _seam = PostRenameTaintSeam::arm();
+        let error = write_file_atomically(&target, b"new bytes").unwrap_err();
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new bytes", "the refused write has landed");
+
+        assert!(!taint_utils::read_taints(&forklift).unwrap().standing(), "the seam's taint is cleared");
+        write_file_atomically(&target, b"later bytes").expect("the seam fires once");
+        assert_eq!(std::fs::read(&target).unwrap(), b"later bytes");
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn self_trip_exemption_guards_nest() {
+        // A guard armed inside another keeps the exemption until the last one drops.
+        // Revert: put back the assertion that the counter was zero → the inner arming panics in a
+        // debug build → red; make `Drop` clear the counter → the write after the inner drop
+        // refuses → red.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-taint-exemption-nested-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let taint_dir = forklift.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
+
+        let target = forklift.join("objects").join("gh").join("nested-object");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
-        let error = write_file_atomically(&target, b"content").unwrap_err();
+        let outer = SelfTripExemptionGuard::new();
+        {
+            let _inner = SelfTripExemptionGuard::new();
+            write_file_atomically(&target, b"inner").expect("exempt under both guards");
+        }
+        write_file_atomically(&target, b"outer").expect("still exempt under the outer guard");
+        drop(outer);
+        let error = write_file_atomically(&target, b"after").unwrap_err();
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
-        assert!(target.exists(), "the write itself must have landed; only the re-check refuses");
+        assert_eq!(std::fs::read(&target).unwrap(), b"outer");
 
         remove_dir_all(&temp).ok();
     }

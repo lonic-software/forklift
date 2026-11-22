@@ -2656,6 +2656,18 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
             assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), side_bytes, "{}: the ref is left as it was", case);
         }
 
+        // Heal's own writes are not refused by the taint, but setting the ref at the head whose
+        // parcel is the lost one is: the parcel is not there to set it at. Nothing is written, and
+        // the taint stands.
+        if !lost {
+            let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
+            let write = area.run(&root, &["heal", "--ref", &format!("side={}", side)]);
+            assert_eq!(write.status.code(), Some(1), "{}: {}{}", case, text(&write.stdout), text(&write.stderr));
+            assert!(text(&write.stderr).contains(&format!("No object with hash \"{}\" exists.", side)), "{}: {}", case, text(&write.stderr));
+            assert!(std::fs::read_dir(&dir).unwrap().next().is_some(), "{}: the taint stands", case);
+            assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), side_bytes, "{}: the ref is left as it was", case);
+        }
+
         for (object, bytes) in &objects {
             std::fs::write(object, bytes).unwrap();
         }
@@ -2669,10 +2681,11 @@ fn a_damaged_user_ref_whose_unread_head_keeps_the_taint_is_given_a_way_out() {
 }
 
 /// A damaged user ref is removed only once nothing names a head for it; while something does, the
-/// refusal names the write that sets it. While a durability taint stands, neither that write nor
-/// the removal can complete, so the removal is refused naming the heal that resolves the taint
-/// first, whether or not something names a head. That heal either resolves it, rebuilding the ref
-/// at the head named, or says what keeps it standing: with nothing named, the unreadable ref.
+/// refusal names the write that sets it. While a durability taint stands, the removal is refused
+/// naming the heal that resolves the taint first, whether or not something names a head. That
+/// heal either resolves it, rebuilding the ref at the head named, or says what keeps it standing:
+/// with nothing named, the unreadable ref. The write that sets the ref completes under the taint,
+/// as heal's own writes are not refused by it, and heal goes on to its recovery.
 // The step rests on one choice, the taint standing or not, read as the writes' re-check reads it:
 // something recorded, or a file torn. The cases cross that read's three cells with named and not,
 // so each mutant of the choice goes red in one: the write named under a taint (recorded, torn);
@@ -2709,8 +2722,8 @@ fn remove_ref_under_a_standing_taint_names_heal_first() {
 
             let named_head = format!("Something still names a head for pallet \"side\": {} (", side);
             let set = "so its ref is not removed: set it with \"forklift heal --ref side=<parcel>\". Nothing was changed.";
-            let first = "A durability taint stands, so neither this removal nor \"forklift heal --ref\" can complete until \
-                it is resolved: run \"forklift heal\" first, which resolves it or says what keeps it standing. Nothing was changed.";
+            let first = "A durability taint stands, so this removal is refused until it is resolved: \
+                run \"forklift heal\" first, which resolves it or says what keeps it standing. Nothing was changed.";
             let removal = area.run(&root, &["heal", "--remove-ref", "side"]);
             let said = text(&removal.stderr);
             let removed = !named && taint == Taint::Clean;
@@ -2746,11 +2759,13 @@ fn remove_ref_under_a_standing_taint_names_heal_first() {
                     assert!(said.contains("The ref of pallet \"side\" is damaged. While it cannot be read, the durability taint's recovery"), "{}: {}", case, said);
                     assert!(standing(), "{}: the taint stands", case);
                     assert_eq!(std::fs::read(ref_path(&root, "side")).unwrap(), zeros, "{}: the ref is left as it was", case);
-                    // The write the old step named is refused while the taint stands. Whether it
-                    // lands before that refusal is not asserted here, so nothing follows it.
+                    // The write the old step named completes under the taint, and heal goes on to
+                    // its recovery: the ref now reaches what it names, and the vanished object the
+                    // taint records is reached by nothing, so the taint resolves.
                     let write = area.run(&root, &["heal", "--ref", &format!("side={}", side)]);
-                    assert!(!write.status.success(), "{}: {}", case, text(&write.stdout));
-                    assert!(text(&write.stderr).contains("existence cannot be trusted here until it is healed"), "{}: {}", case, text(&write.stderr));
+                    assert_eq!(write.status.code(), Some(0), "{}: {}{}", case, text(&write.stdout), text(&write.stderr));
+                    assert_eq!(head(&root, "side"), side, "{}", case);
+                    assert!(!standing(), "{}: the taint is resolved", case);
                 }
             }
         }

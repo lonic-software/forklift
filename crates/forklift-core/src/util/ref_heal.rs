@@ -431,9 +431,9 @@ struct Tainted {
     torn: bool,
     /// Whether the taint could not be read, which [`Tainted::read`] takes as torn.
     unread: bool,
-    /// Whether the taint stands ([`taint_utils::TaintState::standing`]), so a write's sync is
-    /// refused until it is resolved; true where it could not be read, as that sync's re-check
-    /// refuses then too.
+    /// Whether the taint stands ([`taint_utils::TaintState::standing`]), so a write outside heal
+    /// is refused until it is resolved; true where it could not be read, as the re-check refuses
+    /// then too.
     standing: bool,
 }
 
@@ -1074,7 +1074,8 @@ fn undurable(pallet: &str, head: &str, why: &str) -> String {
 
 /// The note for a rebuild of the ref of `pallet` (as it is written on the wire) at `head` that
 /// landed although its write reported `error`: a failure after the ref's rename (its folder not
-/// synced, a taint standing) leaves the ref written, and what the write reported stands beside it.
+/// synced, or a taint recorded while the write was in flight) leaves the ref written, and what the
+/// write reported stands beside it.
 fn landed_despite(pallet: &str, head: &str, error: &RefUpdateError) -> String {
     format!("The ref of pallet \"{}\" was rebuilt at {}, though its write reported: {}", pallet, head, error)
 }
@@ -1544,12 +1545,11 @@ fn admit_remove(pallet: &str, notes: &mut Vec<String>) -> Result<DamagedRef, Str
         ));
     }
 
-    // While a taint stands, the re-check on a write's sync refuses the removal's own write as it
-    // refuses --ref's, so neither completes, and either way the step is the heal that resolves
-    // the taint first; once it has, the removal is judged again.
+    // While a taint stands, the removal is refused up front, and the step is the heal that
+    // resolves the taint first; once it has, the removal is judged again.
     let taint = tainted.standing.then_some(
-        "A durability taint stands, so neither this removal nor \"forklift heal --ref\" can complete until it is \
-        resolved: run \"forklift heal\" first, which resolves it or says what keeps it standing."
+        "A durability taint stands, so this removal is refused until it is resolved: \
+        run \"forklift heal\" first, which resolves it or says what keeps it standing."
     );
 
     if !evidence.candidates.is_empty() || evidence.salvage_unknown.is_some() || !evidence.deleted_in.is_empty() {
