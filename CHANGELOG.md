@@ -841,8 +841,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `--keep-files`, clears the mark, so an undo after it never writes the aborted merge back, and so
   does a `stack` that finds a pick empty and clears it.
 - **After a `stack` finds a pick empty, `undo` can reach the operation before the pick.** Clearing
-  an empty pick now settles the undo journal as `abort` does: when the pick is the last journaled
-  operation, its entry comes off. Before, every `undo` after it refused, since the pick its entry
+  an empty pick now settles the undo journal as `abort` does: when nothing but pallet deletes was
+  journaled after the pick, its entry comes off. Before, every `undo` after it refused, since the pick its entry
   recorded was no longer in progress.
 - `heal` checks every pallet that `--ref` and `--remove-ref` name before it changes anything.
   Before, an invalid name, or `--ref` naming a metadata pallet (`@<name>`), was refused only after

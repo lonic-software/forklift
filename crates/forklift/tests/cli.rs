@@ -11631,10 +11631,13 @@ fn an_empty_pick_lets_undo_reach_past_the_pick() {
     let (warehouse, _) = warehouse_with_a_conflicted_pick("empty-pick-undo-past");
     let main_path = warehouse.root.join(".forklift/pallets/main");
     let main_head = std::fs::read_to_string(&main_path).unwrap();
+    let journal_path = warehouse.root.join(".forklift/journal.json");
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    assert!(journal.contains("\"op\":\"pick\""), "the conflicted pick is journaled: {}", journal);
 
     stack_an_empty_pick(&warehouse);
 
-    let journal = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
     assert!(!journal.contains("\"op\":\"pick\""), "the pick's entry is off the journal: {}", journal);
 
     let undone = json(&warehouse.run(&["--json", "undo"]));
