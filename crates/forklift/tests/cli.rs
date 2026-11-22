@@ -7417,19 +7417,30 @@ fn catching_up_is_not_journaled() {
     assert_eq!(std::fs::read_to_string(bay.join("f.txt")).unwrap(), "f v2 from A\n");
 }
 
+/// Mark a bay's latest journal entry as an undo started, as an undo writes it before its first
+/// change to the bay.
+fn mark_undo_started(warehouse: &TestWarehouse, bay: Option<&str>) {
+    let path = position_path(warehouse, bay).with_file_name("journal.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let at = text.rfind("\"undo_started\":false").expect("the journal has an unmarked entry");
+    std::fs::write(&path, format!("{}\"undo_started\":true{}", &text[..at], &text[at + "\"undo_started\":false".len()..])).unwrap();
+}
+
 /// T10's bay b: it stacked X→N (f changed) and then edited g without loading it, and an undo of
-/// that stack was cut short after writing the earlier position {main, X}. Returns X and N.
+/// that stack was cut short after marking the entry and writing the earlier position {main, X}.
+/// Returns X and N.
 fn half_undone_bay(name: &str) -> (TestWarehouse, std::path::PathBuf, String, String) {
     let (warehouse, bay) = two_bays_on_main(name);
     let x = pallet_head_hash(&warehouse, "main");
     let n = stack_at(&warehouse, &bay, "f.txt", "f from N\n", "B's N");
     std::fs::write(bay.join("g.txt"), "g edited\n").unwrap();
+    mark_undo_started(&warehouse, Some("b"));
     write_position(&warehouse, Some("b"), "main", &x);
 
     (warehouse, bay, x, n)
 }
 
-// T10 (i). Revert: the gate without its half-undone arm → the retry is refused at the gate.
+// T10 (i). Revert: the gate without its marked-resume arm → the retry is refused at the gate.
 #[test]
 fn a_half_applied_undo_resumes() {
     let (warehouse, bay, x, _) = half_undone_bay("half-undo-resume");
@@ -7440,7 +7451,7 @@ fn a_half_applied_undo_resumes() {
     assert_eq!(std::fs::read_to_string(bay.join("g.txt")).unwrap(), "g edited\n");
 }
 
-// T10 (ii). Another bay stacked N→M before the retry. Revert: the gate without its half-undone arm
+// T10 (ii). Another bay stacked N→M before the retry. Revert: the gate without its marked-resume arm
 // → refused at the gate with the position left at X.
 #[test]
 fn a_half_applied_undo_after_another_bay_stacked_on_its_result_keeps_that_result() {
@@ -15935,6 +15946,40 @@ fn undo_of_a_conflicted_consolidate_aborts_it_and_then_reaches_the_stack_before(
     let next = warehouse.run(&["undo"]);
     assert_success(&next);
     assert!(stdout(&next).contains("Undid stack") && stdout(&next).contains("(ours)"), "{}", stdout(&next));
+}
+
+/// T-e and T-f. An undo of the stack that completed a consolidation wrote the consolidation back
+/// and lost its pop, leaving the entry marked. An abort of that consolidation, with or without
+/// `--keep-files`, clears the mark, so a later undo is refused as for any bay the stack no longer
+/// matches. Revert: keep the mark through the abort → the undo resumes and writes the aborted
+/// consolidation back.
+#[test]
+fn an_abort_of_the_consolidation_a_stopped_undo_put_back_leaves_it_refused() {
+    for (name, abort) in [("abort-resumed-undo", &["abort", "--confirm"][..]), ("abandon-resumed-undo", &["abort", "--keep-files"][..])] {
+        let warehouse = a_conflicted_consolidation(name);
+        warehouse.write_file("f.txt", "resolved\n");
+        assert_success(&warehouse.run(&["load", "f.txt"]));
+        assert_success(&warehouse.run(&["stack", "-m", "resolved"]));
+
+        let journal = warehouse.root.join(".forklift/journal.json");
+        let consolidation = warehouse.root.join(".forklift/consolidation");
+        let stacked = std::fs::read_to_string(&journal).unwrap();
+        assert!(!consolidation.exists(), "{}: the stack completed the consolidation", name);
+
+        // The undo lands but its pop is lost: the journal is as the undo marked it.
+        assert_success(&warehouse.run(&["undo"]));
+        assert!(consolidation.exists(), "{}: the undo put the consolidation back", name);
+        std::fs::write(&journal, &stacked).unwrap();
+        mark_undo_started(&warehouse, None);
+
+        assert_success(&warehouse.run(abort));
+        assert!(!consolidation.exists(), "{}: the abort ended the consolidation", name);
+
+        let undone = warehouse.run(&["undo"]);
+        assert!(!undone.status.success(), "{}: {}", name, stdout(&undone));
+        assert!(stderr(&undone).contains("has moved since that operation"), "{}: {}", name, stderr(&undone));
+        assert!(!consolidation.exists(), "{}: the aborted consolidation is not written back", name);
+    }
 }
 
 #[test]

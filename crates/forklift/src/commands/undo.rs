@@ -29,8 +29,10 @@ use crate::output::{self, CommandOutput};
 /// delete changed no bay state, so nothing the bay did since stops its undo.
 ///
 /// The journal entry is only ever consumed (`journal_utils::pop`) once its undo has fully
-/// succeeded — `peek` looks at it first. A refused or failed undo must leave the journal exactly
-/// as it found it, so a retried `undo` sees the same entry rather than skipping straight past it.
+/// succeeded — `peek` looks at it first. A refused or failed undo keeps the entry, so a retried
+/// `undo` sees the same entry rather than skipping straight past it. A soft reset marks it as
+/// started before it changes the bay (`journal_utils::restore_refs`), and a retry of a marked
+/// entry resumes where the failed run stopped.
 ///
 /// # Arguments
 /// * `as_name`      - For `undo --as`: the name to bring a deleted pallet back under. Refused
