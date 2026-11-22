@@ -12,6 +12,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **`forklift-server` can limit how many requests each caller sends a minute.**
+  `--light-requests-per-minute` and `--heavy-requests-per-minute` (or `light_requests_per_minute` and
+  `heavy_requests_per_minute` in the config file) give each caller a budget per minute: an operator
+  token or hook identity is one caller, the static token is one, and an open server is one. Costly
+  requests (ref updates, pallet deletions, trust installs, batch fetches) and cheap ones have
+  separate budgets, and no caller's requests spend another's budget. A caller over its budget is
+  refused with a `429` and `Retry-After` before anything is read or changed, and the client waits it
+  out. Every admitted request counts, a `503` included. The limits bound how fast
+  each caller sends, not how many of its requests run at once. Both are unlimited unless set; a
+  limit is at least 4 a minute, and a cheap limit far below what a lift sends fails the lift.
 - **`forklift-server` caps how many costly requests run at once.** Ref updates, pallet deletions,
   trust installs and batch fetches, which can walk a whole history or build a bundle, now share a
   cap per serving process, set with `--max-heavy-requests` or `max_heavy_requests` (default: the
