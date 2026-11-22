@@ -2507,6 +2507,57 @@ mod tests {
         check_undoable(&entry).expect("a retried undo must still pass the gate");
     }
 
+    /// SPIKE FORK-574: a stack of "main" (1 → 2) and "side" (a → b), undone with the put-back of
+    /// `failing` landing with an error that leaves a taint standing.
+    fn spike_574(failing: &str) -> (Result<(), String>, Result<(), String>, Option<String>, pallet_utils::BayPosition, Result<(), String>) {
+        let _scratch = Scratch::new(&format!("spike-574-{}", failing));
+
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", pallet_utils::get_pallet_head("main").unwrap())).unwrap();
+        advance("main", None, &hash('1')).unwrap();
+        pallet_utils::update_pallet_head("side", None, &hash('a'), &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        let before = capture().unwrap();
+        advance("main", Some(&hash('1')), &hash('2')).unwrap();
+        pallet_utils::update_pallet_head("side", Some(&hash('a')), &hash('b'), &pallet_utils::RefPreconditions::NONE).unwrap();
+        push_if_changed("stack", before).unwrap();
+        let entry = peek().unwrap().unwrap();
+
+        let serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::activate();
+        let seam = file_utils::PostRenameTaintSeam::arm_standing_at(&pallet_utils::get_pallet_ref_path(PalletNamespace::User, failing));
+
+        let restored = restore_refs(&entry);
+        let gate_under_taint = check_undoable(&entry);
+        let main = pallet_utils::get_pallet_head("main").unwrap();
+        let position = pallet_utils::read_position().unwrap();
+
+        // The taint cleared, as heal would: the retry's gate again.
+        drop(seam);
+        let gate_after_heal = check_undoable(&entry);
+        drop(serial);
+
+        eprintln!("SPIKE {}: restored={:?}\n gate_under_taint={:?}\n main={:?} (1={}, 2={})\n position={:?}\n gate_after_heal={:?}",
+            failing, restored, gate_under_taint, main, &hash('1')[..12], &hash('2')[..12], position, gate_after_heal);
+
+        (restored, gate_under_taint, main, position, gate_after_heal)
+    }
+
+    #[test]
+    fn spike_574_the_current_pallets_own_put_back_lands_with_a_taint() {
+        let (restored, _, main, _, gate_after_heal) = spike_574("main");
+        assert!(restored.is_err());
+        assert_eq!(main, Some(hash('1')), "SPIKE red half: the un-restore was refused, main stays put back");
+        assert!(gate_after_heal.is_err(), "SPIKE red half: the retry is refused even after heal");
+    }
+
+    #[test]
+    fn spike_574_a_later_ref_put_back_lands_with_a_taint() {
+        let (restored, _, main, _, gate_after_heal) = spike_574("side");
+        assert!(restored.is_err());
+        assert_eq!(main, Some(hash('1')), "SPIKE red half: the un-restore was refused, main stays put back");
+        assert!(gate_after_heal.is_err(), "SPIKE red half: the retry is refused even after heal");
+    }
+
     #[test]
     fn capture_refuses_a_consolidation_without_its_skeleton() {
         let _scratch = Scratch::new("capture-no-skeleton");
