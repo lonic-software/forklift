@@ -170,7 +170,10 @@ impl RequestLimits {
     /// request refused for now before it changed anything. A bucket refunded past full is held to
     /// its limit by the next charge's refill ([`refilled`]), like any other.
     pub(super) fn refund(&self, principal: &Principal, cost: Cost) {
-        let Some(limit) = self.limit_of(cost) else { return };
+        if self.limit_of(cost).is_none() {
+            return;
+        }
+
         let mut buckets = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(bucket) = buckets.by_caller.get_mut(&(Caller::of(principal), cost)) {
