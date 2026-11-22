@@ -392,7 +392,8 @@ revocation by more than about a day.
   tombstone drop` frees it. From
   then on it refuses that content on every route with `410` (`content_redacted`), takes the
   latest bundle down (every bundle built after leaves the content out, and with
-  `rebuild_after_lifts` set the next one is built at once), and accepts lifts whose history names it
+  `rebuild_after_lifts` set the next one is built as soon as the server's rebuild slot is free),
+  and accepts lifts whose history names it
   without the content. The applied redactions are kept in `<root>/.forklift/redactions-applied`.
   No content is served while an apply may be owed: from just before a pallet update or deletion
   through the server until an apply after it has decided every redaction, and from startup until
@@ -503,8 +504,15 @@ out and sends it again. The default is the host's available parallelism (4 when 
 report one). It is uncalibrated: no benchmark of these routes exists yet, so size it to your
 host if lifts or fetches queue; each refusal is logged as a warning. The cap counts requests,
 not callers or warehouses, so a burst on one warehouse can refuse requests on another: per-caller
-budgets and a cap on reads are not part of it, and background work (bundle rebuilds and redaction
-runs, at most one of each per warehouse) runs outside it.
+budgets and a cap on reads are not part of it. Background bundle rebuilds (`rebuild_after_lifts`)
+are bounded apart from that cap: a serving process runs one build at a time, across every
+warehouse it serves, so a rebuild never refuses a request, and the most costly requests and builds
+running at once are the cap plus one build. A rebuild that finds a build running for another warehouse waits its
+turn in arrival order, holding nothing of the warehouse; once it runs, a redaction run that must
+drain the warehouse waits for it to end. Meanwhile clients get the bundle already built, or none if
+a redaction took it down, and fetch the rest object by object. With many warehouses rebuilding,
+each waits for the builds queued before it, a redaction's rebuild included. Redaction runs stay
+outside both bounds.
 
 **The single-writer rule:** exactly one serving process per warehouse root; a second server
 on the same root is refused at startup, since the serve lock it needs is held. Do not point two

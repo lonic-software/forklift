@@ -69,6 +69,10 @@ struct WarehouseHandle {
     /// so it publishes nothing.
     rebuild_again: std::sync::atomic::AtomicBool,
 
+    /// Whether this warehouse's rebuild waiter ([`queue_rebuild`]) waits for a rebuild slot. Shared
+    /// with the waiter, which holds no reference to the handle while it waits.
+    rebuild_queued: Arc<std::sync::atomic::AtomicBool>,
+
     /// Whether a redaction run's round must rebuild the bundle after its deletion: a ref write
     /// applied a redaction, withdrawing it. Read only by the round, never by a running rebuild, so
     /// the build waits for the drain rather than run beside it.
@@ -190,6 +194,7 @@ impl WarehouseHandle {
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
             rebuild_again: std::sync::atomic::AtomicBool::new(false),
+            rebuild_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rebuild_after_drain: std::sync::atomic::AtomicBool::new(false),
             _serve_lock: None,
             store_access: std::sync::Mutex::new(None),
@@ -650,6 +655,11 @@ struct AppState {
     /// shared by every warehouse it serves. Sized by [`heavy_capacity`].
     heavy: Arc<tokio::sync::Semaphore>,
 
+    /// The permits of background bundle builds ([`queue_rebuild`]): [`REBUILD_SLOTS`] per serving
+    /// process, shared by every warehouse it serves, apart from the Heavy cap so a build never
+    /// refuses a request.
+    rebuilds: Arc<tokio::sync::Semaphore>,
+
     /// How long a Heavy request waits for a permit: [`HEAVY_WAIT`] when served, shorter in tests.
     heavy_wait: std::time::Duration,
 
@@ -1106,6 +1116,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         authentication_cache: Mutex::new(HashMap::new()),
         authentication_cache_ttl,
         heavy: Arc::new(tokio::sync::Semaphore::new(heavy_capacity)),
+        rebuilds: Arc::new(tokio::sync::Semaphore::new(REBUILD_SLOTS)),
         heavy_wait: HEAVY_WAIT,
         open: options.open,
     });
@@ -4164,6 +4175,11 @@ const LAST_APPLY_RETRY: std::time::Duration = std::time::Duration::from_secs(300
 const APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const _: () = assert!(APPLY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
 
+/// How many background bundle builds a serving process runs at once, across every warehouse it
+/// serves, beside the requests the Heavy cap admits. Uncalibrated: a server whose warehouses'
+/// bundles go stale waiting their turn could use more.
+const REBUILD_SLOTS: usize = 1;
+
 /// How long a Heavy request ([`Cost::Heavy`]) waits for one of the server's
 /// [`AppState::heavy`] permits before it is refused with a `503` ([`acquire_heavy`]).
 /// Uncalibrated policy: no benchmark of the Heavy routes exists.
@@ -4549,7 +4565,7 @@ struct RoundOwes {
 }
 
 /// One round of a redaction run ([`run_redactions`]).
-async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> RoundOwes {
+async fn redaction_round(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>) -> RoundOwes {
     use std::sync::atomic::Ordering;
 
     // A rebuild a write's apply called for, after this round's drain. Taken first, so the flag
@@ -4595,10 +4611,13 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
 ///
 /// A write that applied nothing leaves the rebuild here, so a steady stream of them does not put
 /// it off.
-fn finish_round(state: &AppState, warehouse: &Arc<WarehouseHandle>, applied: bool, held_back: bool, owed: bool) {
+fn finish_round(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>, applied: bool, held_back: bool, owed: bool) {
     use std::sync::atomic::Ordering;
 
-    // A rebuild the drain held back (`rebuild_again`) is carried on as one an apply calls for is.
+    // An asked-for rebuild (`rebuild_again`) is carried on as one an apply calls for is: one the
+    // drain held back, or one whose waiter is still queued for a slot. A queued one may build
+    // before the round this leaves it to, which then builds once more; an extra build, never a
+    // lost one.
     let due = applied || held_back || warehouse.rebuild_again.load(Ordering::SeqCst);
 
     // Each leaves a round to follow: the write asks for a run after setting the flag, and a run
@@ -4977,7 +4996,7 @@ fn applying_refusal() -> HandlerError {
 /// Kick off a background bundle rebuild when the accepted-lift counter reaches the
 /// configured threshold. At most one rebuild runs per warehouse at a time; the bundle
 /// is written atomically, so serving continues undisturbed throughout.
-fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
+fn maybe_rebuild_bundle(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
     use std::sync::atomic::Ordering;
 
     let Some(threshold) = state.rebuild_after_lifts else {
@@ -4993,20 +5012,24 @@ fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
     rebuild_bundle(state, warehouse, false);
 }
 
-/// Kick off a background bundle rebuild, when rebuilds are configured and none runs for this
-/// warehouse already. With `again` (a redaction was just applied, and the bundle withdrawn), a
-/// rebuild already running is followed by another once it ends: it began before the redaction, so
-/// it publishes nothing (see `bundle_utils::build_bundle`).
-fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool) {
+/// Ask for a background bundle rebuild, when rebuilds are configured. With `again` (a redaction
+/// was just applied, and the bundle withdrawn), a rebuild already running is followed by another
+/// once it ends: it began before the redaction, so it publishes nothing (see
+/// `bundle_utils::build_bundle`). Without it (a lift past the threshold), a rebuild running already
+/// serves the ask.
+///
+/// Each build holds one of the server's rebuild slots ([`AppState::rebuilds`]) until it ends, so
+/// at most [`REBUILD_SLOTS`] builds run at once across every warehouse served. A build gets its
+/// slot only through the warehouse's one waiter ([`queue_rebuild`]), which queues in arrival order
+/// with the other warehouses' waiters and holds no reference to the warehouse while it waits, so
+/// it never holds a drain open ([`drain`]). The slots are apart from the Heavy cap
+/// ([`AppState::heavy`]): a build can run for minutes, and one holding a Heavy permit would refuse
+/// costly requests for that long, every one of them at a cap of 1.
+fn rebuild_bundle(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, again: bool) {
     use std::sync::atomic::Ordering;
 
     if state.rebuild_after_lifts.is_none() {
         return;
-    }
-
-    // Asked for before the running rebuild is looked at, so that rebuild, ending, sees it.
-    if again {
-        warehouse.rebuild_again.store(true, Ordering::SeqCst);
     }
 
     // A rebuild would hold the drain open; the redaction run that drains asks again after.
@@ -5015,50 +5038,104 @@ fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool
         return;
     }
 
-    if warehouse.bundling.swap(true, Ordering::SeqCst) {
+    if !again && warehouse.bundling.load(Ordering::SeqCst) {
         return;
     }
 
-    // This rebuild starts after whatever asked for another, so it serves that ask.
-    warehouse.rebuild_again.store(false, Ordering::SeqCst);
-    warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
+    // Asked for before the waiter is looked at, so a waiter granted after it sees it.
+    warehouse.rebuild_again.store(true, Ordering::SeqCst);
+    queue_rebuild(state, &warehouse);
+}
+
+/// Start `warehouse`'s rebuild waiter, unless one waits already: a task that waits for a rebuild
+/// slot holding only a weak reference to the warehouse, then takes the handle back under the
+/// registry mutex ([`still_served`]) and runs one build with that permit ([`run_rebuild`]). A
+/// handle no longer served, or being drained, gets no build: a drain's redaction run serves the
+/// ask after it ([`finish_round`]), and a handle let go takes its ask with it.
+fn queue_rebuild(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>) {
+    use std::sync::atomic::Ordering;
+
+    if warehouse.rebuild_queued.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let queued = Arc::clone(&warehouse.rebuild_queued);
+    let weak = Arc::downgrade(warehouse);
+    let state = Arc::clone(state);
 
     tokio::spawn(async move {
-        loop {
-            let worker = Arc::clone(&warehouse);
-
-            let result = tokio::task::spawn_blocking(move || {
-                let _scope = StorageRootScope::enter(&worker.root);
-
-                bundle_utils::build_bundle()
-            }).await;
-
-            match result {
-                Ok(Ok(stats)) => tracing::info!(
-                    objects = stats.objects,
-                    deltas = stats.deltas,
-                    signatures = stats.signatures,
-                    "rebuilt the bundle"
-                ),
-                Ok(Err(error)) => tracing::error!(error, "the bundle rebuild failed"),
-                Err(error) => tracing::error!(%error, "the bundle rebuild task failed"),
+        let permit = match Arc::clone(&state.rebuilds).acquire_owned().await {
+            Ok(held) => held,
+            Err(closed) => {
+                queued.store(false, Ordering::SeqCst);
+                tracing::error!(%closed, "a bundle rebuild could not wait for a rebuild slot");
+                return;
             }
+        };
 
-            warehouse.bundling.store(false, Ordering::SeqCst);
+        // Cleared before the ask is read, so an ask stored after this starts another waiter.
+        queued.store(false, Ordering::SeqCst);
 
-            // A drain began while this one ran: the ask stays for the redaction run to serve after.
-            if warehouse.draining.load(Ordering::SeqCst) {
-                break;
-            }
+        let Served::Handle(warehouse) = still_served(&state, &weak, true) else {
+            return;
+        };
 
-            // Another was asked for while this one ran, and no other rebuild has started since.
-            if !warehouse.rebuild_again.swap(false, Ordering::SeqCst) || warehouse.bundling.swap(true, Ordering::SeqCst) {
-                break;
-            }
-
-            warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
+        // A build runs already; it looks for this ask when it ends.
+        if warehouse.bundling.swap(true, Ordering::SeqCst) {
+            return;
         }
+
+        run_rebuild(&state, warehouse, permit).await;
     });
+}
+
+/// Run one build of `warehouse`'s bundle with `permit`, when one is still asked for, then give
+/// the rebuild up ([`finish_rebuild`]). The caller set `bundling`.
+async fn run_rebuild(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, permit: tokio::sync::OwnedSemaphorePermit) {
+    use std::sync::atomic::Ordering;
+
+    // This build starts after whatever asked for it, so it serves that ask.
+    if warehouse.rebuild_again.swap(false, Ordering::SeqCst) {
+        warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
+
+        let worker = Arc::clone(&warehouse);
+        // The slot moves into the build, so it stays taken until the build ends.
+        let result = tokio::task::spawn_blocking(move || {
+            let _slot = permit;
+            let _scope = StorageRootScope::enter(&worker.root);
+            bundle_build_test_checkpoint(&worker.root);
+
+            bundle_utils::build_bundle()
+        }).await;
+
+        match result {
+            Ok(Ok(stats)) => tracing::info!(
+                objects = stats.objects,
+                deltas = stats.deltas,
+                signatures = stats.signatures,
+                "rebuilt the bundle"
+            ),
+            Ok(Err(error)) => tracing::error!(error, "the bundle rebuild failed"),
+            Err(error) => tracing::error!(%error, "the bundle rebuild task failed"),
+        }
+    } else {
+        drop(permit);
+    }
+
+    finish_rebuild(state, &warehouse);
+}
+
+/// Give `warehouse`'s rebuild up (`bundling`), and queue another for an ask that came while it
+/// ran: a waiter granted meanwhile found `bundling` set and left that ask to this rebuild. A drain
+/// begun meanwhile leaves it to the redaction run that drains, which asks again after.
+fn finish_rebuild(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>) {
+    use std::sync::atomic::Ordering;
+
+    warehouse.bundling.store(false, Ordering::SeqCst);
+
+    if warehouse.rebuild_again.load(Ordering::SeqCst) && !warehouse.draining.load(Ordering::SeqCst) {
+        queue_rebuild(state, warehouse);
+    }
 }
 
 /// `POST /v1/resolve` — operator identifiers → display names (DESIGN.html §8.12).
@@ -5471,6 +5548,25 @@ fn bundle_open_test_checkpoint(root: &std::path::Path) {
 #[cfg(not(test))]
 fn bundle_open_test_checkpoint(_root: &std::path::Path) {}
 
+/// Test seam: a bundle build of the armed warehouse root runs the armed closure once, on the
+/// build's blocking thread before it builds, so a test can see what the build holds while it runs.
+/// Keyed by root so tests rebuilding concurrently never meet.
+#[cfg(test)]
+static BUNDLE_BUILD_TEST_SEAMS: Mutex<BTreeMap<PathBuf, Box<dyn FnOnce() + Send>>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn bundle_build_test_checkpoint(root: &std::path::Path) {
+    let armed = BUNDLE_BUILD_TEST_SEAMS.lock().unwrap_or_else(|e| e.into_inner()).remove(root);
+
+    if let Some(run) = armed {
+        run();
+    }
+}
+
+#[cfg(not(test))]
+fn bundle_build_test_checkpoint(_root: &std::path::Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5700,6 +5796,7 @@ mod tests {
             authentication_cache: Mutex::new(HashMap::new()),
             authentication_cache_ttl: std::time::Duration::from_secs(60),
             heavy: Arc::new(tokio::sync::Semaphore::new(heavy_capacity(None).unwrap())),
+            rebuilds: Arc::new(tokio::sync::Semaphore::new(REBUILD_SLOTS)),
             heavy_wait: HEAVY_WAIT,
             open: true,
         }
@@ -11827,6 +11924,205 @@ mod tests {
 
         drop((handle, state));
         let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// A single-mode state on `root` that rebuilds its bundle after `lifts` lifts, whose Heavy cap
+    /// is `heavy` and whose rebuild slots are `slots`.
+    fn rebuilding_state(
+        root: PathBuf,
+        heavy: &Arc<tokio::sync::Semaphore>,
+        slots: &Arc<tokio::sync::Semaphore>,
+        lifts: u32,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            heavy: Arc::clone(heavy),
+            rebuilds: Arc::clone(slots),
+            heavy_wait: HEAVY_TEST_WAIT,
+            rebuild_after_lifts: Some(lifts),
+            ..single_mode_state(root)
+        })
+    }
+
+    /// Wait, bounded, until `done` holds.
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Whether `handle` has no rebuild running, waiting or asked for.
+    fn rebuilds_settled(handle: &WarehouseHandle) -> bool {
+        !handle.bundling.load(Ordering::SeqCst)
+            && !handle.rebuild_queued.load(Ordering::SeqCst)
+            && !handle.rebuild_again.load(Ordering::SeqCst)
+    }
+
+    /// With every rebuild slot taken, a lift past `rebuild_after_lifts` starts no build: its
+    /// rebuild waits for a slot holding no reference to the warehouse, so a drain completes
+    /// meanwhile. It waits in arrival order: a waiter queued after it (another warehouse's) gets
+    /// the slot only after this build has started.
+    ///
+    /// Reverts: take a slot only when one is free → the rebuild never starts → red. Hold the
+    /// warehouse while waiting → the drain times out → red.
+    #[tokio::test]
+    async fn a_rebuild_at_capacity_waits_its_turn_without_holding_the_warehouse() {
+        let root = scratch_dir("rebuild-at-capacity");
+        mark_warehouse(&root);
+        let (heavy, slots) = (Arc::new(tokio::sync::Semaphore::new(4)), Arc::new(tokio::sync::Semaphore::new(1)));
+        let state = rebuilding_state(root.clone(), &heavy, &slots, 2);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let held = Arc::clone(&slots).try_acquire_owned().unwrap();
+
+        maybe_rebuild_bundle(&state, Arc::clone(&handle));
+        maybe_rebuild_bundle(&state, Arc::clone(&handle));
+        // The waiter's task runs and queues for the slot.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!handle.bundling.load(Ordering::SeqCst), "no build started at capacity");
+        assert!(handle.rebuild_queued.load(Ordering::SeqCst), "the rebuild waits for a slot");
+        assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 2, "the lift count is kept");
+        assert!(drain(&state, &handle, std::time::Duration::from_secs(2)).await, "a drain completes");
+        undrain(&state, &handle);
+
+        let later = Arc::clone(&slots).acquire_owned();
+        tokio::pin!(later);
+        assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut later).await.is_err(), "the later waiter queues");
+        drop(held);
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(30), &mut later).await
+            .expect("the later waiter gets the slot after the build").unwrap();
+
+        assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 0, "the build started before the later waiter");
+        eventually("the rebuild settles", || rebuilds_settled(&handle)).await;
+        drop(granted);
+        assert_eq!(slots.available_permits(), 1, "the build gave its slot back");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// At a Heavy cap of 1, a lift past `rebuild_after_lifts` asks for its rebuild while it holds
+    /// the only Heavy permit itself, and the rebuild runs: it needs a rebuild slot, not that permit.
+    /// End to end only; the build's use of the rebuild slots and not the Heavy cap is pinned by
+    /// `an_ask_met_by_a_running_build_is_queued_when_that_build_ends`.
+    #[tokio::test]
+    async fn a_lift_with_the_only_permit_still_gets_its_rebuild() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let (heavy, slots) = (Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(tokio::sync::Semaphore::new(1)));
+        let state = rebuilding_state(fixture.root.clone(), &heavy, &slots, 1);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+
+        let response = fixture.send(HeavyRoute::RefUpdate, &state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        eventually("the lift's rebuild ran", || {
+            handle.lifts_since_bundle.load(Ordering::SeqCst) == 0 && rebuilds_settled(&handle)
+        }).await;
+        assert_eq!(slots.available_permits(), 1, "the build gave its slot back");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// A rebuild asked again while a build runs gets a build of its own once the build ends, and
+    /// waits for its slot behind a waiter queued before it (another warehouse's), holding no
+    /// reference to the warehouse, so a drain completes meanwhile.
+    ///
+    /// Reverts: hold the warehouse while waiting → the waiter keeps the warehouse → red. Take a
+    /// slot only when one is free → no build starts → red.
+    #[tokio::test]
+    async fn a_rebuild_asked_again_waits_its_turn_without_holding_the_warehouse() {
+        let root = scratch_dir("rebuild-again-at-capacity");
+        mark_warehouse(&root);
+        let (heavy, slots) = (Arc::new(tokio::sync::Semaphore::new(4)), Arc::new(tokio::sync::Semaphore::new(1)));
+        let state = rebuilding_state(root.clone(), &heavy, &slots, 1000);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let held = Arc::clone(&slots).try_acquire_owned().unwrap();
+
+        rebuild_bundle(&state, Arc::clone(&handle), false);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let other = Arc::clone(&slots).acquire_owned();
+        tokio::pin!(other);
+        assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut other).await.is_err(), "the other waiter queues");
+        drop(held);
+
+        // The first build has started; asked again now, its build waits behind the other waiter,
+        // whether or not the first build has ended by then.
+        eventually("the first build started", || handle.lifts_since_bundle.load(Ordering::SeqCst) == 0
+            && !handle.rebuild_again.load(Ordering::SeqCst)).await;
+        handle.lifts_since_bundle.store(7, Ordering::SeqCst);
+        rebuild_bundle(&state, Arc::clone(&handle), true);
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(30), &mut other).await
+            .expect("the other waiter gets the slot after the first build").unwrap();
+
+        eventually("the first build let the warehouse go", || {
+            !handle.bundling.load(Ordering::SeqCst) && Arc::strong_count(&handle) == 2
+        }).await;
+        assert!(handle.rebuild_queued.load(Ordering::SeqCst), "the second rebuild waits for a slot");
+        assert!(drain(&state, &handle, std::time::Duration::from_secs(2)).await,
+            "a drain completes while the other waiter holds the slot");
+        undrain(&state, &handle);
+
+        drop(granted);
+        eventually("the second build ran", || {
+            handle.lifts_since_bundle.load(Ordering::SeqCst) == 0 && rebuilds_settled(&handle)
+        }).await;
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// A waiter granted while a build runs leaves its ask to that build, and the build's end
+    /// queues it, so the ask gets a build of its own. That build holds its rebuild slot while it
+    /// runs, and no Heavy permit: nothing else contends for either here, so a build that gave its
+    /// slot back would see it free, and one that took a Heavy permit would see one fewer. The Heavy
+    /// cap (3) separates from the slot count (1).
+    ///
+    /// Reverts: drop the re-check after a rebuild ends → the ask stays with no waiter and no
+    /// build → red. Give the slot back before the build → red. Take the slot from the Heavy cap
+    /// → red.
+    #[tokio::test]
+    async fn an_ask_met_by_a_running_build_is_queued_when_that_build_ends() {
+        let root = scratch_dir("rebuild-ask-during-build");
+        mark_warehouse(&root);
+        let (heavy, slots) = (Arc::new(tokio::sync::Semaphore::new(3)), Arc::new(tokio::sync::Semaphore::new(1)));
+        let state = rebuilding_state(root.clone(), &heavy, &slots, 1000);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+
+        // A build runs, and has served the ask it started for.
+        handle.bundling.store(true, Ordering::SeqCst);
+        handle.lifts_since_bundle.store(7, Ordering::SeqCst);
+        rebuild_bundle(&state, Arc::clone(&handle), true);
+        eventually("the waiter was granted and stepped aside", || {
+            !handle.rebuild_queued.load(Ordering::SeqCst) && slots.available_permits() == 1
+        }).await;
+        assert!(handle.rebuild_again.load(Ordering::SeqCst), "the ask is left to the running build");
+        assert_eq!(handle.lifts_since_bundle.load(Ordering::SeqCst), 7, "and no build served it");
+
+        let free_during_build = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (heavy, slots, seen) = (Arc::clone(&heavy), Arc::clone(&slots), Arc::clone(&free_during_build));
+            BUNDLE_BUILD_TEST_SEAMS.lock().unwrap().insert(root.clone(), Box::new(move || {
+                *seen.lock().unwrap() = Some((slots.available_permits(), heavy.available_permits()));
+            }));
+        }
+
+        // That build ends.
+        finish_rebuild(&state, &handle);
+        eventually("the ask got a build of its own", || {
+            handle.lifts_since_bundle.load(Ordering::SeqCst) == 0 && rebuilds_settled(&handle)
+        }).await;
+        let (free_slots, free_heavy) = free_during_build.lock().unwrap().expect("the build ran");
+        assert_eq!(free_slots, 0, "the build holds its slot while it runs");
+        assert_eq!(free_heavy, 3, "the build holds no Heavy permit");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// Every function in non-test source that names `acquire_heavy`, by the function it is in.
