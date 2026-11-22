@@ -1008,8 +1008,9 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(),
 /// re-check, so a sync that holds returns `Ok` whatever taint stands, or fails to read: the
 /// re-check refuses whenever a taint stands, so for a sync that held it would say only that a
 /// taint stands, never what the sync did. It also no longer refuses a taint a sibling process
-/// recorded since the write. Heal, the one caller, is the process resolving taints, and while
-/// it runs, [`SelfTripExemptionGuard`] skips that re-check anyway.
+/// recorded since the write. Its callers: heal, the process resolving taints, while
+/// [`SelfTripExemptionGuard`] skips that re-check anyway; and a compensating write or removal
+/// ([`write_file_compensating`]), which puts back what stood before its command.
 pub(crate) fn sync_dir_again_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(), String> {
     sync_dir(dir).map_err(|sync_error| taint_after_sync_failure(sync_error, final_paths))
 }
@@ -1080,9 +1081,22 @@ impl Drop for TaintRecordFaultGuard {
 
 #[cfg(test)]
 thread_local! {
-    /// Armed by [`PostRenameTaintSeam::arm`]: the next [`write_file_atomically`] on this thread
-    /// plants a taint file between its rename and its folder sync.
-    static POST_RENAME_TAINT_SEAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Armed by [`PostRenameTaintSeam`]: which [`write_file_atomically`] on this thread plants a
+    /// taint file between its rename and its folder sync, and whether it is left standing.
+    static POST_RENAME_TAINT_SEAM: std::cell::RefCell<Option<SeamArming>> = const { std::cell::RefCell::new(None) };
+
+    /// The storage root a standing seam recorded its taint under, cleared when its guard drops.
+    static STANDING_SEAM_TAINT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What an armed [`PostRenameTaintSeam`] waits for, and what its plant does afterwards.
+#[cfg(test)]
+struct SeamArming {
+    /// The final path of the write it fires on; `None`, the next write.
+    at: Option<PathBuf>,
+
+    /// Whether the planted taint outlives the write.
+    standing: bool,
 }
 
 /// A test-only stand-in for a taint recorded while a write is in flight. Armed, the next
@@ -1092,13 +1106,24 @@ thread_local! {
 /// before that call returns (self-clearing), so no taint stands for the writes that follow. The
 /// planted taint is read only once activated, as every taint is. Dropping the guard disarms a
 /// seam no write spent.
+///
+/// [`PostRenameTaintSeam::arm_standing_at`] arms it instead for the write to one path, and records
+/// its taint as a failed folder sync does ([`taint_utils::record_taint`], which also sets the
+/// in-memory gate), leaving it standing until the guard drops: the write fails as above, having
+/// landed, and everything after it runs under the taint that write's failure left. Dropping the
+/// guard removes the root's taint files and clears its gate.
 #[cfg(test)]
 pub(crate) struct PostRenameTaintSeam;
 
 #[cfg(test)]
 impl PostRenameTaintSeam {
     pub(crate) fn arm() -> Self {
-        POST_RENAME_TAINT_SEAM.with(|seam| seam.set(true));
+        POST_RENAME_TAINT_SEAM.with(|seam| seam.replace(Some(SeamArming { at: None, standing: false })));
+        PostRenameTaintSeam
+    }
+
+    pub(crate) fn arm_standing_at(path: &Path) -> Self {
+        POST_RENAME_TAINT_SEAM.with(|seam| seam.replace(Some(SeamArming { at: Some(path.to_path_buf()), standing: true })));
         PostRenameTaintSeam
     }
 }
@@ -1106,23 +1131,41 @@ impl PostRenameTaintSeam {
 #[cfg(test)]
 impl Drop for PostRenameTaintSeam {
     fn drop(&mut self) {
-        POST_RENAME_TAINT_SEAM.with(|seam| seam.set(false));
+        POST_RENAME_TAINT_SEAM.with(|seam| seam.replace(None));
+
+        if let Some(root) = STANDING_SEAM_TAINT.with(|standing| standing.replace(None)) {
+            if let Ok(state) = taint_utils::read_taints(&root) {
+                let _ = taint_utils::test_remove_taint_files(&root, &state.files);
+            }
+            taint_utils::test_clear_gate(&root);
+        }
     }
 }
 
-/// The armed seam's plant, spending the arming: the planted taint file's path, or `None` when the
-/// seam is not armed. A write whose path is under no storage root spends the arming and plants
-/// nothing, as no taint could be read for it.
+/// The armed seam's plant, spending the arming: the planted taint file's path when it is to be
+/// removed before the write returns, or `None` when the seam is not armed for this write or its
+/// taint is left standing. A write whose path is under no storage root spends the arming and
+/// plants nothing, as no taint could be read for it.
 #[cfg(test)]
 fn plant_post_rename_taint(file_path: &Path) -> Option<PathBuf> {
-    if !POST_RENAME_TAINT_SEAM.with(|seam| seam.replace(false)) {
+    let arming = POST_RENAME_TAINT_SEAM.with(|seam| {
+        let mut seam = seam.borrow_mut();
+        let fires = seam.as_ref().is_some_and(|arming| arming.at.as_deref().is_none_or(|at| at == file_path));
+        if fires { seam.take() } else { None }
+    })?;
+    let root = taint_utils::resolve_root_for(&[file_path])?;
+
+    if arming.standing {
+        taint_utils::record_taint(&[file_path]).expect("the standing seam's taint is recorded");
+        STANDING_SEAM_TAINT.with(|standing| standing.replace(Some(root)));
         return None;
     }
-    let root = taint_utils::resolve_root_for(&[file_path])?;
+
     let folder = root.join("taint");
     std::fs::create_dir_all(&folder).expect("the seam's taint folder is created");
     let planted = folder.join(format!("taint-seam-{}", std::process::id()));
     std::fs::write(&planted, taint_utils::taint_file_bytes(["objects/zz/seam"])).expect("the seam's taint file is written");
+
     Some(planted)
 }
 
@@ -1217,6 +1260,25 @@ impl Drop for SelfTripExemptionGuard {
     fn drop(&mut self) {
         SELF_TRIP_EXEMPTION_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// [`write_file_atomically`] for a compensating write: one that puts back what stood before the
+/// command, after an earlier step of the same command failed. It runs neither standing-taint
+/// re-check, before its rename or after its folder sync; a failed folder sync still records a
+/// taint and returns its error. So `Ok` means the write landed with its folder synced, and an
+/// `Err` means either nothing landed, or the write landed and a failed sync recorded a taint.
+///
+/// The forward write's own failure is what often records the taint, and the re-checks refuse
+/// whenever one stands, so they would refuse every rollback after such a failure, or land it and
+/// report it refused. What a compensating write puts back stood before the command, so it records
+/// nothing new for a taint to doubt; the caller reports the forward failure whatever the put-back
+/// returns, and the taint keeps the warehouse gated until heal.
+///
+/// It exempts this one write, not the writes a caller makes around it. Inside a bulk-store
+/// session, which is process-wide, the write is only staged, as any write is, and the session's
+/// finish re-checks it.
+pub(crate) fn write_file_compensating(file_path: &Path, content: &[u8]) -> Result<(), String> {
+    write_file_atomically_as(file_path, content, true)
 }
 
 /// The durable-taint re-check: refuse if a taint is standing for the storage root that owns
@@ -1451,10 +1513,17 @@ fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
 ///                   was in flight, or could not read the taint state. A caller that must know
 ///                   which reads `file_path` back.
 ///
+/// [`write_file_compensating`] runs neither re-check.
+///
 /// Inside a bulk-store session the write is only staged and returns `Ok`: its rename and its
 /// re-check run in `BulkStoreSession::finish`, which renames every staged file and then re-checks,
 /// so a taint standing there is reported after the files were replaced.
 pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
+    write_file_atomically_as(file_path, content, false)
+}
+
+/// [`write_file_atomically`], or with `compensating` [`write_file_compensating`].
+fn write_file_atomically_as(file_path: &Path, content: &[u8], compensating: bool) -> Result<(), String> {
     let temporary_file_path = temp_path_for(file_path)?;
 
     // While a bulk-store session is active, stage the write and hand its (temp, final) pair to
@@ -1476,8 +1545,9 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
     // A taint already standing when the write begins refuses it before anything becomes
     // visible: whether one stands is decided by taint files that predate this write, so the
     // refusal need not wait for the effect. The temp file goes, and `file_path` keeps exactly
-    // what it held.
-    if let Err(refused) = taint_recheck(&[file_path]) {
+    // what it held. A compensating write skips this re-check and the one after the folder sync
+    // (see `write_file_compensating`).
+    if let Err(refused) = if compensating { Ok(()) } else { taint_recheck(&[file_path]) } {
         let _ = remove_file(&temporary_file_path);
         return Err(refused);
     }
@@ -1496,6 +1566,7 @@ pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), Str
     // sibling process) — see `sync_dir_or_taint`. Either refusal comes after the rename: the
     // write is visible, and not proven durable.
     let synced = match file_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() && compensating => sync_dir_again_or_taint(parent, &[file_path]),
         Some(parent) if !parent.as_os_str().is_empty() => sync_dir_or_taint(parent, &[file_path]),
         _ => Ok(()),
     };
@@ -8212,6 +8283,79 @@ mod tests {
         assert!(!taint_utils::read_taints(&forklift).unwrap().standing(), "the seam's taint is cleared");
         write_file_atomically(&target, b"later bytes").expect("the seam fires once");
         assert_eq!(std::fs::read(&target).unwrap(), b"later bytes");
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn a_compensating_write_lands_under_a_standing_taint() {
+        // A compensating write puts back what stood before its command, so a taint standing
+        // refuses it neither before its rename nor after its folder sync. An ordinary write
+        // beside it is still refused.
+        // Revert: run the check before the rename for a compensating write → the put-back is
+        // refused and the old bytes stay → red. Revert: run the re-check after the sync for it →
+        // the put-back lands and reports Err → red. Revert: exempt every write → the ordinary
+        // write lands → red.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-compensating-write-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let target = forklift.join("objects").join("ed").join("compensated-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        write_file_atomically(&target, b"before the command").unwrap();
+        write_file_atomically(&target, b"the failed write").unwrap();
+
+        let taint_dir = forklift.join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(taint_dir.join("taint-99999-0"), taint_utils::taint_file_bytes(["objects/zz/left-by-the-failure"])).unwrap();
+
+        let put_back = write_file_compensating(&target, b"before the command");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"before the command", "the put-back landed");
+        assert_eq!(put_back, Ok(()), "a put-back that landed with its folder synced reports Ok");
+
+        let ordinary = write_file_atomically(&target, b"an ordinary write").expect_err("an ordinary write keeps the check");
+        assert!(ordinary.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", ordinary);
+        assert_eq!(std::fs::read(&target).unwrap(), b"before the command");
+
+        remove_dir_all(&temp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_compensating_write_whose_folder_sync_fails_records_a_taint() {
+        // Only the re-checks are skipped: a put-back whose folder sync fails has landed, and is
+        // reported and recorded as any write is.
+        // Revert: sync a compensating write's folder without recording a taint → no taint stands
+        // after the failure → red.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir()
+            .join(format!("forklift-compensating-sync-{}", std::process::id()));
+        let _ = remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        let forklift = forklift_root();
+
+        let target = forklift.join("objects").join("ec").join("compensated-object");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        write_file_atomically(&target, b"before the command").unwrap();
+
+        let failed = {
+            let _rig = SyncDirFaultGuard::failing_exactly(target.parent().unwrap());
+            write_file_compensating(&target, b"put back")
+        };
+
+        assert!(failed.is_err(), "a failed folder sync is reported");
+        assert_eq!(std::fs::read(&target).unwrap(), b"put back", "the put-back landed");
+        assert!(taint_utils::read_taints(&forklift).unwrap().standing(), "the failed sync is recorded");
 
         remove_dir_all(&temp).ok();
     }

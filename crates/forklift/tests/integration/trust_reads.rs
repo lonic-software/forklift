@@ -27,6 +27,9 @@ const BYTE_READS: &[(&str, &str)] = &[
     // a missing file as permission to sign.
     ("crates/forklift-core/src/util/office_utils.rs", "install_trust"),
     ("crates/forklift-core/src/util/office_utils.rs", "install_trust"),
+    // A failed put-back's message names what the trust file holds; the read decides wording only,
+    // and a missing file is what the removal of a file the install created leaves.
+    ("crates/forklift-core/src/util/office_utils.rs", "put_back_failed_message"),
     // The copy's mend compares the trust file to the anchor its caller holds, and the copy to it;
     // a missing trust file writes nothing.
     ("crates/forklift-core/src/util/office_utils.rs", "mend_trust_copy"),

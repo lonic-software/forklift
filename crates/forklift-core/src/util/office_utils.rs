@@ -1708,11 +1708,7 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
     if anchor_is_new && office_now.as_deref() == install.office {
         return match restore_trust_file(install.replaces) {
             Ok(()) => Err(error),
-            Err(e) => Err(RefUpdateError::Failed(format!(
-                "{} The previous trust anchor could not be put back either ({}): the trust anchor \
-                is the new one while the office is not.",
-                error, e
-            ))),
+            Err(e) => Err(RefUpdateError::Failed(put_back_failed_message(&error, &e, install.replaces, &bytes))),
         };
     }
 
@@ -1724,6 +1720,36 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         if anchor_is_new { "the new one" } else { "not the new one" },
         office_now.as_deref().unwrap_or("unborn")
     )))
+}
+
+/// What [`install_trust`] says when putting the trust file back returned an error. The error can
+/// come after the put-back landed (its folder sync failed), so the trust file is read back and
+/// the message names what stands.
+fn put_back_failed_message(error: &RefUpdateError, why: &str, previous: Option<&[u8]>, new: &[u8]) -> String {
+    match read_trust_file(FILE_NAME_TRUST) {
+        Ok(now) if now.as_deref() == previous => match previous {
+            Some(_) => format!(
+                "{} The previous trust anchor was put back, but it may not be on disk durably yet ({}).",
+                error, why
+            ),
+            None => format!(
+                "{} The trust file this install created was removed again, but the removal may not \
+                be on disk durably yet ({}).",
+                error, why
+            ),
+        },
+        Ok(Some(now)) if now == new => format!(
+            "{} The previous trust anchor could not be put back either ({}): the trust anchor is \
+            the new one while the office is not.",
+            error, why
+        ),
+        _ => format!(
+            "{} The previous trust anchor could not be put back either ({}), and the trust file \
+            holds neither the previous anchor nor the new one; run \"forklift audit\" to see \
+            whether it matches the office.",
+            error, why
+        ),
+    }
 }
 
 /// The writes of [`install_trust`], under its hold: the anchor, then the office, then the copy.
@@ -1781,15 +1807,20 @@ fn write_trust_office(lock: &crate::util::lock_utils::RefLock,
 
 /// Put the trust file back to `previous` (`None`: remove it), under [`install_trust`]'s hold. The
 /// copy is left as it is: an install fails back only before its copy write
-/// ([`write_trust_install`]), so the copy is still the one the install found.
+/// ([`write_trust_install`]), so the copy is still the one the install found. Putting a previous
+/// anchor back is a compensating write ([`file_utils::write_file_compensating`]): a taint the
+/// failed install left standing does not stop it, and a failed folder sync records one.
 fn restore_trust_file(previous: Option<&[u8]>) -> Result<(), String> {
     let path = forklift_root().join(FILE_NAME_TRUST);
 
     match previous {
-        Some(previous) => file_utils::write_file_atomically(&path, previous),
+        Some(previous) => file_utils::write_file_compensating(&path, previous),
         None => {
             file_utils::remove_file(&path)
                 .map_err(|e| format!("Error while removing the trust file: {}", e))?;
+            // A bare sync, unlike a meta copy's removal: heal cannot classify a taint naming a
+            // trust file that is gone, so this arm adds none. A taint the forward write's own sync
+            // recorded can still name the file this removes; that state is FORK-573's.
             file_utils::sync_dir(&forklift_root())
         }
     }
@@ -3679,6 +3710,48 @@ pub(crate) mod tests {
 
         assert!(absent.contains("has no"),
             "an absent required array must still report absence: {}", absent);
+    }
+
+    /// After putting the trust file back returned an error, the message names what the trust
+    /// file holds, read back: the error may come after the put-back landed. Revert: word every
+    /// case as "the trust anchor is the new one" → the first two rows red.
+    #[test]
+    fn a_failed_trust_put_back_is_worded_by_what_the_trust_file_holds() {
+        use crate::globals::StorageRootScope;
+
+        let dir = std::env::temp_dir()
+            .join(format!("forklift-office-utils-put-back-message-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&dir);
+        let path = forklift_root().join(FILE_NAME_TRUST);
+        let error = RefUpdateError::Failed("forward failure.".to_string());
+
+        let previous: &[u8] = b"the previous anchor";
+        let new: &[u8] = b"the new anchor";
+        let other: &[u8] = b"an anchor nobody wrote";
+
+        // (previous, what the trust file holds, the words the message must carry)
+        let cases: [(Option<&[u8]>, Option<&[u8]>, &str); 4] = [
+            (Some(previous), Some(previous), "The previous trust anchor was put back, but it may not be on disk durably yet (sync failed)"),
+            (None, None, "The trust file this install created was removed again, but the removal may not be on disk durably yet (sync failed)"),
+            (Some(previous), Some(new), "the trust anchor is the new one while the office is not"),
+            (Some(previous), Some(other), "holds neither the previous anchor nor the new one"),
+        ];
+
+        for (previous, holds, words) in cases {
+            match holds {
+                Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+                None => { let _ = file_utils::remove_file(&path); }
+            }
+
+            let message = put_back_failed_message(&error, "sync failed", previous, new);
+
+            assert!(message.starts_with("forward failure."), "{}", message);
+            assert!(message.contains(words), "{:?} holding {:?}: {}", previous, holds, message);
+        }
+
+        let _ = file_utils::remove_dir_all(&dir);
     }
 
     /// `filter_map(|e| e.as_str())`, silently dropping a non-string entry instead of erroring —

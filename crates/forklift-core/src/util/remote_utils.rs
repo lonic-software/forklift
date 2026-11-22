@@ -9668,16 +9668,64 @@ mod tests {
         assert_eq!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), Some(fixture.local_head.clone()));
     }
 
-    // Revert: skip `restore_trust_file` → the new anchor stands beside the old office.
+    // Revert: skip `restore_trust_file` → the new anchor stands beside the old office. Revert:
+    // write the anchor back as an ordinary write → a taint standing after the trust
+    // write refuses it, and the new anchor stands → red.
     #[test]
     fn a_trust_install_whose_office_write_fails_puts_the_previous_anchor_back() {
-        let fixture = Regenesis::new("office-refused");
+        for taint_stands in [false, true] {
+            let fixture = Regenesis::new(&format!("office-refused-{}", taint_stands));
+            office_utils::tests::OFFICE_WRITE_FAULT.with(|fault| fault.set(office_utils::tests::OfficeWriteFault::Refuse));
+
+            // A taint recorded after the trust write, as a failed folder sync records one: the
+            // durable record and the in-memory gate.
+            let _serial = taint_stands.then(|| {
+                let serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                crate::util::taint_utils::activate();
+                office_utils::tests::BETWEEN_TRUST_WRITES.with(|seam| seam.set(Some(Box::new(|| {
+                    let trust = crate::globals::forklift_root().join(office_utils::FILE_NAME_TRUST);
+                    crate::util::taint_utils::record_taint(&[&trust]).unwrap();
+                }))));
+                serial
+            });
+
+            let error = fixture.install().expect_err("a failed office write must fail the install");
+
+            fixture.assert_untouched();
+            assert!(error.to_string().contains("injected office write refusal"), "{}", error);
+            assert!(!error.to_string().contains("could not be put back"), "{}", error);
+            assert_eq!(crate::util::taint_utils::read_taints(&crate::globals::forklift_root()).unwrap().standing(), taint_stands);
+            crate::util::taint_utils::test_clear_gate(&crate::globals::forklift_root());
+        }
+    }
+
+    // A put-back that lands and then fails its folder sync is reported as put back, not as the
+    // new anchor standing. Revert: word every put-back error as "the trust anchor is the new one"
+    // → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_trust_put_back_whose_folder_sync_fails_says_the_previous_anchor_is_back() {
+        let fixture = Regenesis::new("put-back-sync-fails");
         office_utils::tests::OFFICE_WRITE_FAULT.with(|fault| fault.set(office_utils::tests::OfficeWriteFault::Refuse));
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::activate();
+
+        // Armed after the forward trust write, so only the put-back's folder sync fails.
+        let rig: std::rc::Rc<std::cell::RefCell<Option<file_utils::SyncDirFaultGuard>>> = Default::default();
+        let armed = rig.clone();
+        office_utils::tests::BETWEEN_TRUST_WRITES.with(|seam| seam.set(Some(Box::new(move || {
+            *armed.borrow_mut() = Some(file_utils::SyncDirFaultGuard::failing_exactly(&crate::globals::forklift_root()));
+        }))));
 
         let error = fixture.install().expect_err("a failed office write must fail the install");
+        drop(rig.borrow_mut().take());
 
         fixture.assert_untouched();
-        assert!(error.to_string().contains("injected office write refusal"), "{}", error);
+        let message = error.to_string();
+        assert!(message.contains("The previous trust anchor was put back, but it may not be on disk durably yet"), "{}", message);
+        assert!(!message.contains("is the new one"), "{}", message);
+        assert!(crate::util::taint_utils::read_taints(&crate::globals::forklift_root()).unwrap().standing(), "the failed sync is recorded");
+        crate::util::taint_utils::test_clear_gate(&crate::globals::forklift_root());
     }
 
     // Revert: restore on any office error without reading back → the old anchor beside the new
