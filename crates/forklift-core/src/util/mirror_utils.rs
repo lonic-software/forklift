@@ -66,30 +66,94 @@ pub fn write_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String
     file_utils::write_file_atomically(&mirror_roots_path(), &roots_bytes(roots))
 }
 
-/// Write the record as `roots` only when it does not already read as `roots`: a run whose steps
-/// already wrote what it holds rewrites nothing, so a taint recorded meanwhile, which refuses the
-/// ordinary write, does not fail the run. A write can land and still return an error, when its
-/// folder sync fails, so a failed write is read back, and the error is a sentence naming the
-/// record that says only what that read shows: the record holds `roots` but may not be durable
-/// yet, it could not be written, or whether it was is not known ([`failed_write`]).
-pub fn update_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String> {
-    if read_mirror_roots().ok().as_ref() == Some(roots) {
-        return Ok(());
-    }
-
-    let Err(failed) = write_mirror_roots(roots) else { return Ok(()) };
-    Err(failed_write(&failed, read_mirror_roots().map(|now| now == *roots)))
+/// What a write of the record did, as reading it back showed. A write can land and still fail,
+/// when its folder sync fails, so a failed write is read back, and each variant says only what
+/// that read shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootsWrite {
+    /// The record already read as wanted, so nothing was written.
+    AlreadyRead,
+    /// The write landed, with its folder synced.
+    Landed,
+    /// The write failed with this error, and the record reads as wanted: it may not be on disk
+    /// durably yet.
+    NotDurable(String),
+    /// The write failed with this error, and the record reads otherwise.
+    Failed(String),
+    /// The write failed with `failed`, and the record could not be read back (`unread`).
+    Unknown { failed: String, unread: String },
+    /// The record could not be read, so what to write could not be worked out, and nothing was.
+    /// Only a put-back of owed entries ([`put_back_owed_roots`]) ends this way.
+    Unread(String),
 }
 
-/// The sentence for a write of the record that failed with `failed`, from what reading it back
-/// showed: whether it holds what was written, or why it could not be read. It says only that, and
-/// nothing of what a later run will do: a taint that refused the write refuses the next one too,
-/// until it is healed.
-fn failed_write(failed: &str, read_back: Result<bool, String>) -> String {
-    match read_back {
-        Ok(true) => format!("The mirror record holds what this run wrote, but it may not be on disk durably yet ({}).", failed),
-        Ok(false) => format!("The mirror record could not be written: {}", failed),
-        Err(unread) => format!("Whether the mirror record was written is not known: {} It could not be read back: {}", failed, unread),
+impl RootsWrite {
+    /// The sentence for a run's last write of the record that failed, naming the record; `None`
+    /// when it did not fail. It says nothing of what a later run will do: a taint that refused the
+    /// write refuses the next one too, until it is healed. [`update_mirror_roots`] never ends as
+    /// `Unread`, so that arm says only why the record could not be read.
+    pub fn failure(&self) -> Option<String> {
+        match self {
+            RootsWrite::AlreadyRead | RootsWrite::Landed => None,
+            RootsWrite::NotDurable(failed) => Some(format!(
+                "The mirror record holds what this run wrote, but it may not be on disk durably yet ({}).", failed
+            )),
+            RootsWrite::Failed(failed) => Some(format!("The mirror record could not be written: {}", failed)),
+            RootsWrite::Unknown { failed, unread } => Some(format!(
+                "Whether the mirror record was written is not known: {} It could not be read back: {}", failed, unread
+            )),
+            RootsWrite::Unread(unread) => Some(unread.clone()),
+        }
+    }
+
+    /// Whether, after a write that went this way, the record holds the put-backs a takedown
+    /// refusal could not make, as far as reading it shows: when it does not, or reading it failed,
+    /// those put-backs are tried again ([`put_back_owed_roots`]).
+    pub fn holds_what_was_wanted(&self) -> bool {
+        match self {
+            RootsWrite::AlreadyRead | RootsWrite::Landed | RootsWrite::NotDurable(_) => true,
+            RootsWrite::Failed(_) | RootsWrite::Unknown { .. } | RootsWrite::Unread(_) => false,
+        }
+    }
+
+    /// The sentence for a put-back a takedown refusal could not make, when this is the write
+    /// that settled it.
+    pub fn put_back(&self) -> String {
+        match self {
+            RootsWrite::AlreadyRead => "The mirror record reads as put back.".to_string(),
+            RootsWrite::Landed => "The mirror record was put back.".to_string(),
+            RootsWrite::NotDurable(failed) => format!(
+                "The mirror record reads as put back, but it may not be on disk durably yet ({}).", failed
+            ),
+            RootsWrite::Failed(failed) => format!("The mirror record could not be put back: {}", failed),
+            RootsWrite::Unknown { failed, unread } => format!(
+                "Whether the mirror record was put back is not known: {} It could not be read back: {}", failed, unread
+            ),
+            RootsWrite::Unread(unread) => format!("Whether the mirror record was put back is not known: {}", unread),
+        }
+    }
+}
+
+/// Write the record as `roots` only when it does not already read as `roots`: a run whose steps
+/// already wrote what it holds rewrites nothing, so a taint recorded meanwhile, which refuses the
+/// ordinary write, does not fail the run.
+pub fn update_mirror_roots(roots: &BTreeMap<String, String>) -> RootsWrite {
+    if read_mirror_roots().ok().as_ref() == Some(roots) {
+        return RootsWrite::AlreadyRead;
+    }
+
+    match write_mirror_roots(roots) {
+        Ok(()) => RootsWrite::Landed,
+        Err(failed) => read_back(failed, roots),
+    }
+}
+
+/// What a write of `wanted` that failed with `failed` did, from reading the record back.
+fn read_back(failed: String, wanted: &BTreeMap<String, String>) -> RootsWrite {
+    match read_mirror_roots() {
+        Ok(now) if now == *wanted => RootsWrite::NotDurable(failed),
+        Ok(_) => RootsWrite::Failed(failed),
+        Err(unread) => RootsWrite::Unknown { failed, unread },
     }
 }
 
@@ -102,6 +166,37 @@ pub fn put_back_mirror_roots(error: String, before: &BTreeMap<String, String>) -
     file_utils::put_back_as_read(error, "mirror record", before, read_mirror_roots, |before| {
         file_utils::write_file_compensating(&mirror_roots_path(), &roots_bytes(before))
     })
+}
+
+/// Put back the entries of the pallets in `owed`, whose takedown refusal could not put the record
+/// back, to what `record` holds for each (or to no entry), and say what that did. It writes the
+/// record as it reads now with only those entries changed, through the compensating write
+/// ([`file_utils::write_file_compensating`]), which no standing taint refuses. That write's own
+/// precondition, that what it writes stood before the command, holds for the entries it changes:
+/// each goes back to what stood before its pallet's step. It does not hold for every other entry,
+/// which a later step of the same run may have written, even with the failed folder sync that
+/// recorded the taint: such an entry is written as it already reads, so nothing becomes visible
+/// that was not, and a gc root kept longer only keeps more history.
+pub fn put_back_owed_roots(record: &BTreeMap<String, String>, owed: &[String]) -> RootsWrite {
+    let now = match read_mirror_roots() {
+        Ok(now) => now,
+        Err(unread) => return RootsWrite::Unread(unread),
+    };
+    let mut wanted = now.clone();
+    for pallet in owed {
+        match record.get(pallet) {
+            Some(root) => wanted.insert(pallet.clone(), root.clone()),
+            None => wanted.remove(pallet),
+        };
+    }
+    if wanted == now {
+        return RootsWrite::AlreadyRead;
+    }
+
+    match file_utils::write_file_compensating(&mirror_roots_path(), &roots_bytes(&wanted)) {
+        Ok(()) => RootsWrite::Landed,
+        Err(failed) => read_back(failed, &wanted),
+    }
 }
 
 fn roots_bytes(roots: &BTreeMap<String, String>) -> Vec<u8> {
@@ -221,25 +316,102 @@ mod tests {
 
         // The run's last write leaves a record that already holds what it would write alone, and
         // still refuses one that would change it.
-        update_mirror_roots(&before).expect("an unchanged record is not rewritten");
-        let changed = update_mirror_roots(&stepped).expect_err("a changed record is still refused under the taint");
+        assert_eq!(update_mirror_roots(&before), RootsWrite::AlreadyRead, "an unchanged record is not rewritten");
+        let changed = update_mirror_roots(&stepped).failure().expect("a changed record is still refused under the taint");
         assert!(changed.starts_with("The mirror record could not be written: "), "got: {}", changed);
         assert!(changed.contains(crate::util::taint_utils::GATE_TAINT_MARKER), "got: {}", changed);
         assert_eq!(read_mirror_roots().unwrap(), before);
     }
 
-    /// Each read-back is said as it is, and nothing is promised of a later run.
+    /// An owed put-back lands under a standing taint that refuses the run's ordinary last write,
+    /// and changes only the owed entries: one owed pallet is put back to its prior root, another
+    /// with no prior root loses its entry, and an entry only the run's memory holds stays out.
+    /// Revert: write the owed entries through the ordinary write → refused under the taint, the
+    /// record keeps the stepped heads → red. Revert: write the whole record in memory → the entry
+    /// only memory holds lands → red.
     #[test]
-    fn a_failed_write_says_only_what_reading_the_record_back_shows() {
-        assert_eq!(
-            failed_write("Disk full.", Ok(true)),
-            "The mirror record holds what this run wrote, but it may not be on disk durably yet (Disk full.)."
-        );
-        assert_eq!(failed_write("Disk full.", Ok(false)), "The mirror record could not be written: Disk full.");
-        assert_eq!(
-            failed_write("Disk full.", Err("Unreadable.".to_string())),
-            "Whether the mirror record was written is not known: Disk full. It could not be read back: Unreadable."
-        );
+    fn an_owed_put_back_lands_under_a_taint_and_changes_only_the_owed_entries() {
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::activate();
+        let _scratch = Scratch::new("owed-put-back");
+
+        let on_disk = BTreeMap::from([
+            ("main".to_string(), "b2".repeat(32)),
+            ("feat".to_string(), "c3".repeat(32)),
+            ("new".to_string(), "d4".repeat(32)),
+        ]);
+        write_mirror_roots(&on_disk).unwrap();
+        // In memory: main put back to its prior root, new (no prior root) dropped, and an entry the
+        // record on disk does not hold.
+        let record = BTreeMap::from([
+            ("main".to_string(), "a1".repeat(32)),
+            ("feat".to_string(), "c3".repeat(32)),
+            ("memory".to_string(), "e5".repeat(32)),
+        ]);
+        let owed = ["main".to_string(), "new".to_string()];
+
+        let taint_dir = crate::globals::forklift_root().join("taint");
+        std::fs::create_dir_all(&taint_dir).unwrap();
+        std::fs::write(
+            taint_dir.join("taint-99999-0"),
+            crate::util::taint_utils::taint_file_bytes(["objects/zz/recorded-during-the-run"]),
+        ).unwrap();
+
+        assert_eq!(put_back_owed_roots(&record, &owed), RootsWrite::Landed);
+        assert_eq!(read_mirror_roots().unwrap(), BTreeMap::from([
+            ("main".to_string(), "a1".repeat(32)),
+            ("feat".to_string(), "c3".repeat(32)),
+        ]));
+
+        // Already put back: nothing rewritten.
+        assert_eq!(put_back_owed_roots(&record, &owed), RootsWrite::AlreadyRead);
+        // The run's ordinary last write is still refused.
+        assert!(matches!(update_mirror_roots(&record), RootsWrite::Failed(_)));
+    }
+
+    /// Every way a write of the record can go, with what each says as the run's last write, whether
+    /// it leaves an owed put-back to try again, and what it says as the write that settled one:
+    /// each read-back is said as it is, nothing is promised of a later run, and a write that
+    /// failed is never said as having put the record back durably.
+    /// Revert: say a landed-but-unsynced write as plainly put back, or skip the retry after an
+    /// unreadable read-back → red.
+    #[test]
+    fn each_write_of_the_record_says_only_what_reading_it_back_shows() {
+        let failed = || "Disk full.".to_string();
+        let cases: [(RootsWrite, Option<&str>, bool, &str); 6] = [
+            (RootsWrite::AlreadyRead, None, true, "The mirror record reads as put back."),
+            (RootsWrite::Landed, None, true, "The mirror record was put back."),
+            (
+                RootsWrite::NotDurable(failed()),
+                Some("The mirror record holds what this run wrote, but it may not be on disk durably yet (Disk full.)."),
+                true,
+                "The mirror record reads as put back, but it may not be on disk durably yet (Disk full.).",
+            ),
+            (
+                RootsWrite::Failed(failed()),
+                Some("The mirror record could not be written: Disk full."),
+                false,
+                "The mirror record could not be put back: Disk full.",
+            ),
+            (
+                RootsWrite::Unknown { failed: failed(), unread: "Unreadable.".to_string() },
+                Some("Whether the mirror record was written is not known: Disk full. It could not be read back: Unreadable."),
+                false,
+                "Whether the mirror record was put back is not known: Disk full. It could not be read back: Unreadable.",
+            ),
+            (
+                RootsWrite::Unread("Unreadable.".to_string()),
+                Some("Unreadable."),
+                false,
+                "Whether the mirror record was put back is not known: Unreadable.",
+            ),
+        ];
+
+        for (write, failure, holds, put_back) in cases {
+            assert_eq!(write.failure().as_deref(), failure, "{:?}", write);
+            assert_eq!(write.holds_what_was_wanted(), holds, "{:?}", write);
+            assert_eq!(write.put_back(), put_back, "{:?}", write);
+        }
     }
 
     /// Anything this build does not understand is refused, naming the record and the way out,
