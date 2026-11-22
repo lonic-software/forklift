@@ -6303,7 +6303,7 @@ mod tests {
         handle.draining.store(false, std::sync::atomic::Ordering::SeqCst);
 
         for attempt in 1..=5 {
-            let mut stream = send_head(addr, "GET", "/v1/bundles/latest", Some("tok-alice"), 0).await;
+            let mut stream = send_head(addr, "GET", "/v1/warehouse", Some("tok-alice"), 0).await;
             let head = response_head(&mut stream).await;
 
             if attempt <= 4 {
