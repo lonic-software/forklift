@@ -2,9 +2,12 @@
 //! spending its budget never spends another's, and costly requests never spend the budget of cheap
 //! ones. The authentication layer ([`super::authenticate`]) charges each request once its
 //! principal is known and before its body is read; an empty bucket is a `429` with `Retry-After`.
-//! A request its handler then refuses for now (a `503` with `Retry-After`, sent before anything
-//! changed) is refunded, so a caller's budget is spent by what it sent and not by other callers'
-//! load. The limits bound how fast a caller sends, not how many of its requests run at once.
+//! A charged request is never given back, whatever it is then answered: a token buys one admitted
+//! attempt, so a `503` (the costly-request cap full, a drained warehouse) spends budget like any
+//! other answer. A refund for such a refusal was tried and removed: some are answered only after a
+//! wait the caller can queue up (the cap's, an owed apply's), so refunding them would let a caller
+//! hold any number of those waits at no cost. The limits bound how fast a caller sends, not
+//! how many of its requests run at once.
 //!
 //! A class with no limit configured is never charged. The buckets are kept per serving process,
 //! across every warehouse it serves: a principal is the server's identity for its caller, not one
@@ -165,21 +168,6 @@ impl RequestLimits {
 
         Err(Throttled { retry_after_secs, log })
     }
-
-    /// Give back the request [`Self::charge`] took from `principal`'s bucket of class `cost`, for a
-    /// request refused for now before it changed anything. A bucket refunded past full is held to
-    /// its limit by the next charge's refill ([`refilled`]), like any other.
-    pub(super) fn refund(&self, principal: &Principal, cost: Cost) {
-        if self.limit_of(cost).is_none() {
-            return;
-        }
-
-        let mut buckets = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(bucket) = buckets.by_caller.get_mut(&(Caller::of(principal), cost)) {
-            bucket.tokens += 1.0;
-        }
-    }
 }
 
 /// `bucket`'s tokens at `now`, refilled at `limit` a minute up to `limit`.
@@ -325,25 +313,5 @@ mod tests {
             admitted(&limits, &alice, Cost::Light, 60, start + Duration::from_secs(10)), 8,
             "ten seconds at one a second, less the two already admitted"
         );
-    }
-
-    /// A refund gives back one request, and never fills a bucket past its limit.
-    ///
-    /// Reverts: refund nothing → red on the first; drop the cap in [`refilled`] → red on the second.
-    #[test]
-    fn a_refund_gives_back_one_request_up_to_full() {
-        let limits = RequestLimits::new(Some(6), Some(6)).unwrap();
-        let start = Instant::now();
-        let alice = operator("alice");
-
-        assert_eq!(admitted(&limits, &alice, Cost::Heavy, 6, start), 6);
-        limits.refund(&alice, Cost::Heavy);
-        assert_eq!(admitted(&limits, &alice, Cost::Heavy, 6, start), 1, "the refunded request");
-
-        let bob = operator("bob");
-        assert_eq!(admitted(&limits, &bob, Cost::Heavy, 1, start), 1);
-        limits.refund(&bob, Cost::Heavy);
-        limits.refund(&bob, Cost::Heavy);
-        assert_eq!(admitted(&limits, &bob, Cost::Heavy, 10, start), 6, "full is the limit, not more");
     }
 }

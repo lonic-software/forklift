@@ -19,7 +19,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   requests (ref updates, pallet deletions, trust installs, batch fetches) and cheap ones have
   separate budgets, and no caller's requests spend another's budget. A caller over its budget is
   refused with a `429` and `Retry-After` before anything is read or changed, and the client waits it
-  out. A request the server refuses for now with a `503` is not counted. The limits bound how fast
+  out. Every admitted request counts, a `503` included. The limits bound how fast
   each caller sends, not how many of its requests run at once. Both are unlimited unless set; a
   limit is at least 4 a minute, and a cheap limit far below what a lift sends fails the lift.
 - **`forklift-server` caps how many costly requests run at once.** Ref updates, pallet deletions,

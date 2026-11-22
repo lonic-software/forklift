@@ -530,11 +530,13 @@ class is the four routes `max_heavy_requests` caps; every other authenticated ro
 request or changed; the client waits it out and sends the request again, for up to 30 seconds. A
 budget holds a minute of requests and refills continuously, so a caller may send a minute's worth
 at once. One caller spending its budget never spends another's, and costly requests never spend
-the cheap budget. A request refused for now with a `503` and `Retry-After` (the costly-request cap
-was full, or the warehouse was briefly unavailable) is given back to its caller's budget, so other
-callers' load does not spend it. The limits bound how fast a caller sends, not how many of its
-requests run at once: a caller within its costly limit can still hold every `max_heavy_requests`
-slot for a while. The budgets are kept per serving process, across every warehouse it serves, and
+the cheap budget. A request is charged once its caller is known, whatever it is then answered: a
+`503` (the costly-request cap was full, or the warehouse was briefly unavailable) spends budget
+like any other answer, so while the server is busy a request the client sends again every 10
+seconds spends 6 a minute, and a caller with many requests waiting at once can run out of budget
+and be refused with a `429` before the busy spell ends. The limits bound how fast a caller sends,
+not how many of its requests run at once: a caller within its costly limit can still hold every
+`max_heavy_requests` slot while its budget lasts. The budgets are kept per serving process, across every warehouse it serves, and
 start full when the process starts. A limit is at least 4 a minute, since below it even one refused
 request is told to wait longer than its client waits; that floor does not make a low limit safe
 for a client sending many requests at once (below). Each class is unlimited unless set, and so is a caller that
