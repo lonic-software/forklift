@@ -66,6 +66,16 @@ pub fn write_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String
     file_utils::write_file_atomically(&mirror_roots_path(), &roots_bytes(roots))
 }
 
+/// Write the record as `roots` only when it does not already read as `roots`: a run whose steps
+/// already wrote what it holds rewrites nothing, so a taint recorded meanwhile, which refuses the
+/// ordinary write, does not replace what the run reports.
+pub fn update_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String> {
+    if read_mirror_roots().ok().as_ref() == Some(roots) {
+        return Ok(());
+    }
+    write_mirror_roots(roots)
+}
+
 /// Put the record back to `before`, what it held before a mirror step that then failed with
 /// `error`, and return `error` with what happened to the record appended
 /// ([`file_utils::put_back_as_read`]). The write is a compensating one
@@ -188,6 +198,16 @@ mod tests {
 
         assert_eq!(read_mirror_roots().unwrap(), before, "the record is put back");
         assert_eq!(reported, "The step was refused. The mirror record was put back.");
+
+        // A record that already reads as `before` is left alone and goes unmentioned.
+        assert_eq!(put_back_mirror_roots("Refused again.".to_string(), &before), "Refused again.");
+
+        // The run's last write leaves a record that already holds what it would write alone, and
+        // still refuses one that would change it.
+        update_mirror_roots(&before).expect("an unchanged record is not rewritten");
+        let changed = update_mirror_roots(&stepped).expect_err("a changed record is still refused under the taint");
+        assert!(changed.contains(crate::util::taint_utils::GATE_TAINT_MARKER), "got: {}", changed);
+        assert_eq!(read_mirror_roots().unwrap(), before);
     }
 
     /// Anything this build does not understand is refused, naming the record and the way out,

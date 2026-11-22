@@ -132,7 +132,7 @@ pub fn pending_add(path: &Path, key: &str) -> Option<Vec<u8>> {
 pub fn add(path: &Path, key: &str) -> Result<(), String> {
     match pending_add(path, key) {
         None => Ok(()),
-        Some(bytes) => write_bytes(path, &bytes),
+        Some(bytes) => write_bytes(path, &bytes, false),
     }
 }
 
@@ -186,14 +186,15 @@ pub fn remove_covered_by(path: &Path, by: &str) -> BTreeSet<String> {
     removed
 }
 
-/// Put the set recorded at `path` back to `set`, read from it earlier, best-effort as
-/// [`remove_covered_by`] is: for a caller that recorded a key and then established that nothing
-/// it covers was touched.
+/// Put the set recorded at `path` back to `set`, best-effort as [`remove_covered_by`] is: for a
+/// caller that recorded a key and then established that nothing it covers was touched. `set` must
+/// be what [`read`] returned for `path` before the caller's command wrote it, never a set the
+/// caller computed.
 ///
 /// A non-empty `set` is written back as a compensating write
-/// ([`file_utils::write_file_compensating`]): it puts back what stood before the caller's
-/// command, so a taint standing for the storage root does not refuse it, whoever recorded that
-/// taint. An empty one removes the file, as [`clear`] does.
+/// ([`file_utils::write_file_compensating`]), so a taint standing for the storage root does not
+/// refuse it, whoever recorded that taint: those bytes stood on disk before the command. An empty
+/// one removes the file, as [`clear`] does.
 pub fn restore(path: &Path, set: &BTreeSet<String>) {
     let _ = write_set_or_clear(path, set, true);
 }
@@ -217,17 +218,18 @@ fn write_set_or_clear(path: &Path, set: &BTreeSet<String>, compensating: bool) -
         return Ok(());
     }
 
-    ensure_parent_folder(path)?;
-    if compensating {
-        file_utils::write_file_compensating(path, &serialize(set))
-    } else {
-        file_utils::write_file_atomically(path, &serialize(set))
-    }
+    write_bytes(path, &serialize(set), compensating)
 }
 
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Write `bytes` to `path`, creating its folder first: with `compensating`, through
+/// [`file_utils::write_file_compensating`], else [`file_utils::write_file_atomically`].
+fn write_bytes(path: &Path, bytes: &[u8], compensating: bool) -> Result<(), String> {
     ensure_parent_folder(path)?;
-    file_utils::write_file_atomically(path, bytes)
+    if compensating {
+        file_utils::write_file_compensating(path, bytes)
+    } else {
+        file_utils::write_file_atomically(path, bytes)
+    }
 }
 
 fn ensure_parent_folder(path: &Path) -> Result<(), String> {
