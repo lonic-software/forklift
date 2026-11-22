@@ -822,9 +822,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 ### Fixed
 
 - When a write fails in a way that records a durability taint, the command now still puts back
-  what it had already changed. This covers two cases:
+  what it had already changed. This covers three cases:
   - a trust install whose office write failed puts back the previous trust anchor;
-  - a metadata pallet write whose ref write failed puts its copy back as it was.
+  - a metadata pallet write whose ref write failed puts its copy back as it was;
+  - a pallet removal that failed puts back the undo journal and the tombstone list.
 
   Before, the taint left by the failure refused each of these put-backs, and the trust anchor or
   the copy was left at the new value beside an unchanged office or ref. The taint still stands
@@ -832,6 +833,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   sync fails, the install's error now says the previous anchor was put back, not that the new one
   stands; when the install had created the trust file and its removal fails to sync, the error
   says the file was removed again.
+
+  A pallet removal whose own journal or tombstone write failed after landing now puts that record
+  back too. Before, the undo journal kept an entry deleting the pallet although the pallet was
+  still there, and the tombstone list kept the pallet's tombstone. When a put-back itself fails,
+  the error now says whether the record was put back but may not be durable yet, or could not be
+  put back.
 - `heal` no longer refuses forever over a durability taint that records a lost metadata ref copy
   (`.forklift/meta-copy/<name>`), as a crash can leave one after a metadata pallet's first write.
   When the ref beside it is a file holding a parcel hash, that part of the taint is resolved, and
