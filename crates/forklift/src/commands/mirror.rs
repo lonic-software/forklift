@@ -279,14 +279,11 @@ fn put_back_on_takedown(
         None => record.remove(pallet),
     };
 
-    let written = put_back(record);
-    if !written.holds_what_was_wanted() {
-        return (refused, true);
+    match put_back(record) {
+        RootsWrite::AlreadyRead => (refused, false),
+        written @ (RootsWrite::Landed | RootsWrite::NotDurable(_)) => (format!("{} {}", refused, written.put_back()), false),
+        RootsWrite::Failed(_) | RootsWrite::Unknown { .. } | RootsWrite::Unread(_) => (refused, true),
     }
-    if written == RootsWrite::AlreadyRead {
-        return (refused, false);
-    }
-    (format!("{} {}", refused, written.put_back()), false)
 }
 
 /// The key the remote's handshake lists `@tags` under.
@@ -1477,9 +1474,9 @@ mod tests {
         assert_eq!(outcomes[1].message.as_deref(), Some("Other."));
     }
 
-    /// The takedown refusal's put-back is owed exactly when the record does not read back as put
-    /// back: then the refusal is reported as it was, for the retry to complete; otherwise it
-    /// carries what the put-back said. Either way the record in memory is the one put back.
+    /// The takedown refusal's put-back is owed exactly when its write's outcome leaves the record
+    /// not holding the put-back: then the refusal is reported as it was, for the retry to
+    /// complete; otherwise it carries that write's sentence. Either way the record in memory is the one put back.
     /// Revert: owe the put-back when it read back as landed (or not when it did not) → red.
     #[test]
     fn a_takedown_put_back_is_owed_when_the_record_does_not_read_back_as_put_back() {
