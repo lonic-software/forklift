@@ -247,7 +247,7 @@ pub fn judged_loose_entry(folder: &Path, file_name: &str) -> Result<Option<(Stri
 }
 
 /// Every byte of `text` is `0-9` or `a-f`.
-fn is_lowercase_hex(text: &str) -> bool {
+pub(crate) fn is_lowercase_hex(text: &str) -> bool {
     text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -988,6 +988,7 @@ pub(crate) fn sync_dir_attempts() -> Vec<PathBuf> {
 /// through) gate themselves on activation, so an unactivated process sees no behavior change
 /// from this routine's existence at all.
 fn sync_result_or_taint(sync_result: Result<(), String>, final_paths: &[&Path]) -> Result<(), String> {
+    taint_utils::assert_declared(final_paths);
     match sync_result {
         Ok(()) => taint_recheck(final_paths),
         Err(sync_error) => Err(taint_after_sync_failure(sync_error, final_paths)),
@@ -1012,6 +1013,7 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(),
 /// [`SelfTripExemptionGuard`] skips that re-check anyway; and a compensating write or removal
 /// ([`write_file_compensating`]), which puts back what stood before its command.
 pub(crate) fn sync_dir_again_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(), String> {
+    taint_utils::assert_declared(final_paths);
     sync_dir(dir).map_err(|sync_error| taint_after_sync_failure(sync_error, final_paths))
 }
 
@@ -1022,6 +1024,8 @@ pub(crate) fn sync_dir_again_or_taint(dir: &Path, final_paths: &[&Path]) -> Resu
 /// [`taint_utils::activate`] has been called in this process — see
 /// [`taint_utils::record_taint`]'s own doc comment.
 fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String {
+    taint_utils::assert_declared(final_paths);
+
     #[cfg(test)]
     if TAINT_RECORD_FAULT.with(|fault| fault.get()) && TAINT_RECORD_FAULTS_LEFT.with(|left| match left.get() {
         None => true,
@@ -1936,6 +1940,12 @@ impl BulkStoreSession {
 /// crash-safety-critical ordering instead of risking it drifting between two copies — including
 /// the rename-failure fix below, which now applies to both callers identically.
 fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    // Ahead of every fsync gate: with fsync off, no path of this batch reaches the taint funnel's
+    // own checks.
+    if cfg!(debug_assertions) {
+        taint_utils::assert_declared(&pending.iter().map(|(_, final_path)| final_path.as_path()).collect::<Vec<_>>());
+    }
+
     if fsync_enabled() {
         for (temp, _) in pending {
             fsync_data(temp)?;
@@ -9224,5 +9234,213 @@ mod tests {
             drop(scope);
             let _ = remove_dir_all(&root);
         }
+    }
+
+    /// A storage root holding an empty `.forklift/undeclared` folder, entered on this thread.
+    fn undeclared_shape_fixture(name: &str) -> (crate::globals::StorageRootScope, PathBuf) {
+        let root = std::env::temp_dir().join(format!("forklift-file-utils-{}-{}", name, std::process::id()));
+        let _ = remove_dir_all(&root);
+        let folder = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join("undeclared");
+        std::fs::create_dir_all(&folder).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&root);
+        (scope, crate::globals::forklift_root().join("undeclared"))
+    }
+
+    /// A path under the root whose shape the taint registry does not declare, written through
+    /// the single-file write, is refused at the funnel's entry in a debug build, though its sync
+    /// holds and this process never activated the taint machinery.
+    /// Revert: drop the check at `sync_result_or_taint`'s entry → no panic → red.
+    #[test]
+    #[should_panic(expected = "names \"undeclared/record\", a path whose shape no entry of TAINT_SHAPES declares")]
+    fn the_funnel_refuses_an_undeclared_path_in_a_debug_build() {
+        let (_scope, folder) = undeclared_shape_fixture("undeclared-funnel");
+
+        let _ = write_file_atomically(&folder.join("record"), b"content");
+    }
+
+    /// The same for a batch, with fsync off, where no path of the batch reaches the funnel.
+    /// Revert: drop the check at `run_write_barrier`'s first line → no panic → red.
+    #[test]
+    #[should_panic(expected = "names \"undeclared/batched\", a path whose shape no entry of TAINT_SHAPES declares")]
+    fn the_batch_write_refuses_an_undeclared_path_with_fsync_off() {
+        assert!(!fsync_enabled(), "sanity: this crate's unit tests run with fsync off");
+        let (_scope, folder) = undeclared_shape_fixture("undeclared-batch");
+        let temp = folder.join("batched.tmp");
+        std::fs::write(&temp, b"content").unwrap();
+
+        let _ = run_write_barrier(&[(temp, folder.join("batched"))]);
+    }
+
+    /// The functions that put a path into a taint record, or check one on its way in: the record
+    /// writer, heal's unchecked remainder writer, and the funnel whose entries
+    /// `taint_utils::assert_declared` guards.
+    const TAINT_FAMILY: [&str; 6] = [
+        "record_taint", "resolve_taints", "taint_after_sync_failure", "sync_result_or_taint", "sync_dir_or_taint",
+        "sync_dir_again_or_taint",
+    ];
+
+    /// Every mention of a [`TAINT_FAMILY`] function in non-test source, as (file under `crates/`,
+    /// the function it is in, the function named). A call, the function taken as a value, and a
+    /// name anywhere in a macro's tokens all count; an item under `#[cfg(test)]` is skipped whole.
+    #[derive(Default)]
+    struct TaintCallers {
+        file: String,
+        within: Vec<String>,
+        found: Vec<(String, String, String)>,
+    }
+
+    fn is_test_only(attributes: &[syn::Attribute]) -> bool {
+        attributes.iter().any(|attribute| {
+            attribute.path().is_ident("cfg")
+                && attribute.parse_args::<syn::Meta>().is_ok_and(|meta| meta.path().is_ident("test"))
+        })
+    }
+
+    impl TaintCallers {
+        fn note(&mut self, name: &str) {
+            if TAINT_FAMILY.contains(&name) {
+                let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
+                self.found.push((self.file.clone(), within, name.to_string()));
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for TaintCallers {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if let Some(last) = path.path.segments.last() {
+                self.note(&last.ident.to_string());
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            fn walk(mut cursor: syn::buffer::Cursor, words: &mut Vec<String>) {
+                while !cursor.eof() {
+                    if let Some((ident, next)) = cursor.ident() {
+                        words.push(ident.to_string());
+                        cursor = next;
+                    } else if let Some((inside, _, _, next)) = cursor.any_group() {
+                        walk(inside, words);
+                        cursor = next;
+                    } else if let Some((_, next)) = cursor.token_tree() {
+                        cursor = next;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let mut words = Vec::new();
+            walk(syn::buffer::TokenBuffer::new2(mac.tokens.clone()).begin(), &mut words);
+            for word in words {
+                self.note(&word);
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    fn rust_files_under(folder: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files_under(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The census of the taint family's callers: every non-test caller, in every crate's `src/`,
+    /// of the record writer, heal's remainder writer and the funnel, as a literal multiset. A new
+    /// direct caller of `record_taint` or `resolve_taints`, or a new way into the funnel that
+    /// passes by its checked entries, turns it red. It sees what a source scan names, not what is
+    /// reachable: a call through a function pointer stored elsewhere is outside it, and so is test
+    /// code, which may call any of them.
+    /// Revert: add a `record_taint` call to a non-test function under any crate's `src/` → red;
+    /// add a `resolve_taints` call outside heal's five sites → red.
+    #[test]
+    fn the_taint_family_has_exactly_its_census_of_callers() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(crates).unwrap() {
+            let source = entry.unwrap().path().join("src");
+            if source.is_dir() {
+                rust_files_under(&source, &mut files);
+            }
+        }
+        files.sort();
+        assert!(files.iter().any(|file| file.ends_with("forklift-server/src/server.rs")),
+            "sanity: the scan reads every crate, not only this one: {:?}", files.len());
+
+        let mut callers = TaintCallers::default();
+        for file in &files {
+            callers.file = file.strip_prefix(crates).unwrap().components()
+                .map(|component| component.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+            let source = std::fs::read_to_string(file).unwrap();
+            let parsed = syn::parse_file(&source).unwrap_or_else(|e| panic!("parse {}: {}", file.display(), e));
+            syn::visit::Visit::visit_file(&mut callers, &parsed);
+        }
+        let mut found = callers.found;
+        found.sort();
+
+        let mut expected: Vec<(String, String, String)> = [
+            // The one writer of a new record, from the end of a failed folder sync only.
+            ("forklift-core/src/util/file_utils.rs", "taint_after_sync_failure", "record_taint"),
+            // Heal's remainder writer, unchecked, from heal's five sites only.
+            ("forklift-core/src/util/heal_utils.rs", "heal_if_tainted", "resolve_taints"),
+            ("forklift-core/src/util/heal_utils.rs", "heal_object_paths", "resolve_taints"),
+            ("forklift-core/src/util/recovery_utils.rs", "run_pass", "resolve_taints"),
+            ("forklift-core/src/util/recovery_utils.rs", "resolve_the_rest", "resolve_taints"),
+            ("forklift-core/src/util/recovery_utils.rs", "rescan_torn_taint", "resolve_taints"),
+            // The funnel's three checked entries, and the batch write.
+            ("forklift-core/src/util/file_utils.rs", "sync_result_or_taint", "taint_after_sync_failure"),
+            ("forklift-core/src/util/file_utils.rs", "sync_dir_again_or_taint", "taint_after_sync_failure"),
+            ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "taint_after_sync_failure"),
+            ("forklift-core/src/util/file_utils.rs", "sync_dir_or_taint", "sync_result_or_taint"),
+            ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "sync_result_or_taint"),
+            // The funnel's callers.
+            ("forklift-core/src/util/bundle_utils.rs", "write_latest", "sync_dir_or_taint"),
+            ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_again_or_taint"),
+            ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_or_taint"),
+            ("forklift-core/src/util/object_utils.rs", "store_object", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "write_pack", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "write_pack_index", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "write_signature_table", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "replace_pack", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pallet_utils.rs", "remove_pallet_ref", "sync_dir_again_or_taint"),
+            ("forklift-core/src/util/pallet_utils.rs", "delete_pallet_ref", "sync_dir_or_taint"),
+            ("forklift-core/src/util/ref_heal.rs", "write_ref_back", "sync_dir_again_or_taint"),
+        ].into_iter().map(|(file, within, name)| (file.to_string(), within.to_string(), name.to_string())).collect();
+        expected.sort();
+
+        assert_eq!(found, expected);
     }
 }

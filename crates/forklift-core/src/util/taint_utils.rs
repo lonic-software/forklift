@@ -230,6 +230,178 @@ pub(crate) fn resolve_root_for(final_paths: &[&Path]) -> Option<PathBuf> {
     final_paths.iter().all(|path| path.strip_prefix(&root).is_ok()).then_some(root)
 }
 
+/// What heal does with a vanished path of a declared [`TaintShape`]: the class
+/// `recovery_utils::classify_vanished` hands its dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VanishedDisposition {
+    Loose,
+    Signature,
+    PackData,
+    PackIndex,
+    SignatureTable,
+    Shard,
+    Ref,
+    MetaCopy,
+}
+
+/// One kind of root-relative path a taint record may name.
+pub(crate) struct TaintShape {
+    /// What the path is, as heal's remainder line names it.
+    pub(crate) description: &'static str,
+    /// `None` for a shape heal has no recovery for: a vanished path of it stays in the remainder.
+    pub(crate) disposition: Option<VanishedDisposition>,
+    pattern: &'static [Part],
+}
+
+/// One component, or a run of components, of a [`TaintShape`]'s pattern.
+enum Part {
+    /// Exactly this name.
+    Is(&'static str),
+    /// Any one name.
+    Name,
+    /// One or more names.
+    Names,
+    /// A loose object's fan-out folder: `OBJECT_HASH_FOLDER_PATH_CHARACTERS` lowercase hex.
+    FanOut,
+    /// The rest of a loose object's hash: lowercase hex of any length.
+    Hex,
+    /// The rest of a loose object's hash, then the signature suffix.
+    HexSignature,
+    /// A non-empty stem with this extension.
+    Extension(&'static str),
+    /// One of the meta pallets' names.
+    MetaPalletName,
+}
+
+use Part::{Extension, FanOut, Hex, HexSignature, Is, MetaPalletName, Name, Names};
+use VanishedDisposition as Disposition;
+
+/// Every shape a taint record may name, in match order; the first match wins. The pallets/,
+/// removed-refs/, meta/ and meta-copy/ entries come first, so a ref or keepsake whose name looks
+/// like an object, a shard, a pack or a signature is matched as what it is. A shape missing here
+/// fails [`assert_declared`] in a debug build the first time a test writes it.
+static TAINT_SHAPES: &[TaintShape] = &[
+    TaintShape { description: "a pallet ref", disposition: Some(Disposition::Ref), pattern: &[Is("pallets"), Names] },
+    TaintShape { description: "a removed ref's keepsake", disposition: None, pattern: &[Is("removed-refs"), Names] },
+    TaintShape { description: "a meta pallet ref", disposition: None, pattern: &[Is("meta"), Name] },
+    TaintShape { description: "a meta pallet ref's copy", disposition: Some(Disposition::MetaCopy), pattern: &[Is("meta-copy"), MetaPalletName] },
+    TaintShape { description: "a copy of a ref that is no meta pallet's", disposition: None, pattern: &[Is("meta-copy"), Name] },
+
+    TaintShape { description: "a loose object", disposition: Some(Disposition::Loose), pattern: &[Is("objects"), FanOut, Hex] },
+    TaintShape { description: "a loose object's signature", disposition: Some(Disposition::Signature), pattern: &[Is("objects"), FanOut, HexSignature] },
+    TaintShape { description: "a pack", disposition: Some(Disposition::PackData), pattern: &[Is("objects"), Is("pack"), Extension("pack")] },
+    TaintShape { description: "a pack index", disposition: Some(Disposition::PackIndex), pattern: &[Is("objects"), Is("pack"), Extension("idx")] },
+    TaintShape { description: "a signature table", disposition: Some(Disposition::SignatureTable), pattern: &[Is("objects"), Is("pack"), Extension("sigs")] },
+    TaintShape { description: "a staged inventory shard", disposition: Some(Disposition::Shard), pattern: &[Is("inventory"), Names, Is("data")] },
+    TaintShape { description: "a bay's staged inventory shard", disposition: Some(Disposition::Shard), pattern: &[Is("bays"), Name, Is("inventory"), Names, Is("data")] },
+
+    TaintShape { description: "the incomplete-load marker", disposition: None, pattern: &[Is("inventory"), Is("incomplete-load")] },
+    TaintShape { description: "the checkout position", disposition: None, pattern: &[Is("position")] },
+    TaintShape { description: "the checkout position's copy", disposition: None, pattern: &[Is("position-copy")] },
+    TaintShape { description: "the checkout scope", disposition: None, pattern: &[Is("scope")] },
+    TaintShape { description: "the checkout scope's copy", disposition: None, pattern: &[Is("scope-copy")] },
+    TaintShape { description: "the consolidation state", disposition: None, pattern: &[Is("consolidation")] },
+    TaintShape { description: "the consolidation state's copy", disposition: None, pattern: &[Is("consolidation-copy")] },
+    TaintShape { description: "the consolidation skeleton", disposition: None, pattern: &[Is("consolidation-skeleton")] },
+    TaintShape { description: "the consolidation skeleton's copy", disposition: None, pattern: &[Is("consolidation-skeleton-copy")] },
+    TaintShape { description: "the journal", disposition: None, pattern: &[Is("journal.json")] },
+
+    TaintShape { description: "a bay's incomplete-load marker", disposition: None, pattern: &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")] },
+    TaintShape { description: "a bay's checkout position", disposition: None, pattern: &[Is("bays"), Name, Is("position")] },
+    TaintShape { description: "a bay's checkout position's copy", disposition: None, pattern: &[Is("bays"), Name, Is("position-copy")] },
+    TaintShape { description: "a bay's checkout scope", disposition: None, pattern: &[Is("bays"), Name, Is("scope")] },
+    TaintShape { description: "a bay's checkout scope's copy", disposition: None, pattern: &[Is("bays"), Name, Is("scope-copy")] },
+    TaintShape { description: "a bay's consolidation state", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation")] },
+    TaintShape { description: "a bay's consolidation state's copy", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation-copy")] },
+    TaintShape { description: "a bay's consolidation skeleton", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation-skeleton")] },
+    TaintShape { description: "a bay's consolidation skeleton's copy", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation-skeleton-copy")] },
+    TaintShape { description: "a bay's journal", disposition: None, pattern: &[Is("bays"), Name, Is("journal.json")] },
+    TaintShape { description: "a bay's path record", disposition: None, pattern: &[Is("bays"), Name, Is("path")] },
+
+    TaintShape { description: "the cherry-pick state", disposition: None, pattern: &[Is("cherry-pick")] },
+    TaintShape { description: "the cherry-pick state's copy", disposition: None, pattern: &[Is("cherry-pick-copy")] },
+    TaintShape { description: "the fetch scope", disposition: None, pattern: &[Is("config"), Is("fetch-scope")] },
+    TaintShape { description: "the fetch ledger", disposition: None, pattern: &[Is("fetched-heads")] },
+    TaintShape { description: "the held-heads record", disposition: None, pattern: &[Is("held-heads")] },
+    TaintShape { description: "the mirror roots record", disposition: None, pattern: &[Is("mirror-roots")] },
+    TaintShape { description: "the served record", disposition: None, pattern: &[Is("served")] },
+    TaintShape { description: "the tombstones record", disposition: None, pattern: &[Is("tombstones")] },
+    TaintShape { description: "the unvouched-heads record", disposition: None, pattern: &[Is("unvouched-heads")] },
+    TaintShape { description: "the trust anchor", disposition: None, pattern: &[Is("trust")] },
+    TaintShape { description: "the trust anchor's copy", disposition: None, pattern: &[Is("trust-copy")] },
+    TaintShape { description: "the latest bundle's name", disposition: None, pattern: &[Is("bundles"), Is("latest")] },
+];
+
+/// The declared shape of a root-relative path, or `None` for a path no entry of the registry
+/// matches. A path with any component other than a plain name (a root, a `.`, a `..`) matches
+/// none.
+pub(crate) fn taint_shape(relative: &Path) -> Option<&'static TaintShape> {
+    let mut names = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => names.push(name),
+            _ => return None,
+        }
+    }
+
+    TAINT_SHAPES.iter().find(|shape| pattern_matches(shape.pattern, &names))
+}
+
+fn pattern_matches(pattern: &[Part], names: &[&std::ffi::OsStr]) -> bool {
+    let Some((part, rest)) = pattern.split_first() else {
+        return names.is_empty();
+    };
+
+    if let Names = part {
+        return (1..=names.len()).any(|taken| pattern_matches(rest, &names[taken..]));
+    }
+
+    let Some((name, names)) = names.split_first() else {
+        return false;
+    };
+    let text = name.to_str();
+    let fits = match part {
+        Is(expected) => *name == std::ffi::OsStr::new(expected),
+        Name => true,
+        Names => unreachable!("handled above"),
+        FanOut => text.is_some_and(|text| text.len() == file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS
+            && file_utils::is_lowercase_hex(text)),
+        Hex => text.is_some_and(file_utils::is_lowercase_hex),
+        HexSignature => text.and_then(|text| text.strip_suffix(crate::util::sign_utils::FILE_SUFFIX_SIGNATURE))
+            .is_some_and(file_utils::is_lowercase_hex),
+        Extension(extension) => {
+            let name = Path::new(name);
+            name.extension() == Some(std::ffi::OsStr::new(extension))
+                && name.file_stem().is_some_and(|stem| !stem.is_empty())
+        }
+        MetaPalletName => crate::util::meta_tree::META_PALLET_NAMES.iter().any(|known| *name == std::ffi::OsStr::new(known)),
+    };
+
+    fits && pattern_matches(rest, names)
+}
+
+/// In a debug build, refuse a batch of final paths that a taint could record and whose shape is
+/// not declared in [`TAINT_SHAPES`], naming the first such path. Only a batch [`resolve_root_for`]
+/// places under the root is checked, since [`record_taint`] records nothing for any other; and the
+/// check runs whether or not this process is activated, so every write the suites drive is checked,
+/// not only the ones whose sync fails. It compiles to nothing in a release build.
+pub(crate) fn assert_declared(final_paths: &[&Path]) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(root) = resolve_root_for(final_paths) else {
+        return;
+    };
+
+    for relative in to_root_relative(&root, final_paths) {
+        debug_assert!(
+            taint_shape(&relative).is_some(),
+            "a write under \"{}\" names \"{}\", a path whose shape no entry of TAINT_SHAPES declares",
+            root.to_string_lossy(), taint_record_line(&relative)
+        );
+    }
+}
+
 /// Strip `root` off every path in `final_paths`. Only ever called once [`resolve_root_for`] has
 /// already confirmed every path in `final_paths` is under `root`, so every `strip_prefix` here is
 /// infallible in practice; `filter_map` is used defensively rather than to signal a real partial
