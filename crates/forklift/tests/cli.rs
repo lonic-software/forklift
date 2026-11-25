@@ -14641,7 +14641,7 @@ fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder
     assert_eq!(value["error"]["code"], "durability_taint");
     let message = value["error"]["message"].as_str().unwrap();
     assert!(message.contains("torn"), "the message must still name the torn origin: {}", message);
-    assert!(message.contains(&parcel_hash) && message.contains("genuinely dangling"),
+    assert!(message.contains(&parcel_hash) && message.contains("still unresolved"),
         "the message must name the dangling hash the rescan found: {}", message);
 
     let next_step = value["error"]["next_step"].as_str().unwrap();
