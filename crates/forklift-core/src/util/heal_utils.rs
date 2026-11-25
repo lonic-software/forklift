@@ -1380,8 +1380,8 @@ mod tests {
     #[test]
     fn restage_object_still_reports_vanished_for_a_missing_pack_shaped_path() {
         // I4 non-regression (memo §8.5 test 6): a vanished `.pack`-shaped recorded path has no
-        // hash to check against packs at all (`loose_object_hash` returns `None`
-        // for it), so it must fall straight through to `Vanished`, exactly as before I4. (A
+        // hash to check against packs at all (`loose_object_hash` returns `None` for it), so it
+        // must fall straight through to `Vanished`, exactly as before I4. (A
         // *present* non-object path already escalates before `restage_object` is ever called for
         // it — see `entry_heal_escalates_a_present_non_object_path_rather_than_restaging_it_lock_free`;
         // this pins `restage_object` itself for the vanished case, so a future change to its

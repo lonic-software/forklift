@@ -651,9 +651,9 @@ async fn resolve_the_rest(
     // (`remote_utils::fetch_corrupt_replacements`, see the module doc comment); anything not in
     // it (no remote configured, or a hash-mismatch path whose declared shape is not a loose
     // object's — not reached, since `restage_object` reports `HashMismatch` only for a path
-    // `loose_object_hash` reads a hash from) commits straight to the remainder below. Nothing here deletes the corrupt dentry: it stays exactly
-    // as it is until (and unless) a verified good copy is ready to supersede it in one atomic
-    // rename.
+    // `loose_object_hash` reads a hash from) commits straight to the remainder below. Nothing
+    // here deletes the corrupt dentry: it stays exactly as it is until (and unless) a verified
+    // good copy is ready to supersede it in one atomic rename.
     let mut corrupt_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     for relative in &attempt.hash_mismatch {
         match (remote_configured, heal_utils::loose_object_hash(relative)) {

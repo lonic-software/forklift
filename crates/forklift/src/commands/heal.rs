@@ -67,9 +67,9 @@ const UNRECORDED_SHORT: &str = "No absent object was recorded unavailable again:
 ///
 /// A [`recovery_utils::HealOutcome`] means the taint (if any) is now fully resolved — exit 0. A
 /// [`forklift_core::error::CoreError::Refusal`] (routed through the ordinary `?`/`String` bridge,
-/// same as every other command) means a recorded path is still unresolved (a dangling reference,
-/// or a lost record heal has no recovery for), or the taint is torn — exit 21, machine-coded in the
-/// refusal message.
+/// same as every other command) means a recorded path is still unresolved (for example a dangling
+/// reference, a corrupt or unreadable object, a failed restage, or a lost record heal has no
+/// recovery for), or the taint is torn — exit 21, machine-coded in the refusal message.
 ///
 /// # Arguments
 /// * `store_access` - The command's shared store-access hold, which the record's push-down needs.
