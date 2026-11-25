@@ -576,6 +576,23 @@ pub fn remove_entry_unfollowed(path: impl AsRef<Path>, file_type: std::fs::FileT
     }
 }
 
+/// Create a symbolic link at `link` to `target`, on every platform: Windows needs to know whether
+/// the link stands for a folder (`is_dir`). For tests only.
+#[cfg(test)]
+pub(crate) fn link_for_test(target: &Path, link: &Path, is_dir: bool) {
+    #[cfg(unix)]
+    {
+        let _ = is_dir;
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+    #[cfg(windows)]
+    if is_dir {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    } else {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+}
+
 /// Remove the file or link at `path` without following it, as [`remove_entry_unfollowed`] does,
 /// for a caller that never means to remove a real folder: one there is refused at once with
 /// `IsADirectory`, never waited on.

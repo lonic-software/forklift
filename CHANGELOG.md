@@ -885,6 +885,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   judges a damaged ref's head. `heal` also never rewrites a recorded path that is not made only of
   plain names (a `..`, a leading `.`, a root or a drive prefix), since such a path could lead
   outside the warehouse.
+- **`heal` no longer reads or rewrites a file outside the warehouse through a symbolic link.** A
+  recorded path made of plain names could still leave the warehouse when one of its folders, or the
+  file itself, was a link: `heal` followed it, read the file it led to and could rewrite it.
+  When `heal` restages a recorded path, it now follows no link inside the warehouse: it refuses,
+  names the link and keeps the taint, even for a link that points nowhere, which used to read as a
+  file that is gone. Two folders may still be moved behind a link to another folder: a bay's
+  inventory folder and the configuration folder.
 - **An `undo` that stops after putting the pallets back can be retried.** An `undo` of a `stack`,
   `consolidate` or `pick` puts the bay's position and the pallets back first, then the
   consolidation or pick that was in progress before. When one of those later writes failed, or the

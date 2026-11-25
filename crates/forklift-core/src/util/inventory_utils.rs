@@ -5334,17 +5334,7 @@ mod tests {
     }
 
     fn link_to(target: &Path, link: &Path, is_dir: bool) {
-        #[cfg(unix)]
-        {
-            let _ = is_dir;
-            std::os::unix::fs::symlink(target, link).unwrap();
-        }
-        #[cfg(windows)]
-        if is_dir {
-            std::os::windows::fs::symlink_dir(target, link).unwrap();
-        } else {
-            std::os::windows::fs::symlink_file(target, link).unwrap();
-        }
+        file_utils::link_for_test(target, link, is_dir);
     }
 
     /// Windows removes a link to a folder as a folder.
