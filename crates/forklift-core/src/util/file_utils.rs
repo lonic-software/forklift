@@ -8108,7 +8108,8 @@ mod tests {
         // than mnemonic non-hex filenames ("alpha-object"/"beta-object", this test's own shape
         // before this slice): `heal_if_tainted` now gates its restage on content-addressability
         // (I1/I2, `heal_utils`'s module doc comment) *before* attempting anything, so a taint over
-        // a path `hash_from_object_path` does not recognize would escalate instead of healing —
+        // a path whose declared shape is not a loose object's (`heal_utils::loose_object_hash`)
+        // would escalate instead of healing —
         // this test needs the common, content-addressed case that must still heal inline.
         let _serial = lock_taint_activation();
         taint_utils::activate();

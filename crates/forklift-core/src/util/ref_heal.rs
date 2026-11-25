@@ -51,7 +51,7 @@ use serde::Serialize;
 use crate::globals::forklift_root;
 use crate::util::operation_utils::OperationKind;
 use crate::util::pallet_utils::{self, PalletNamespace, RefDamage, RefUpdateError};
-use crate::util::{bay_utils, file_utils, journal_utils, merge_utils, object_utils, operation_utils, taint_utils};
+use crate::util::{bay_utils, file_utils, heal_utils, journal_utils, merge_utils, object_utils, operation_utils, taint_utils};
 
 /// The shortest hex prefix a damaged ref's bytes are salvaged from.
 const MIN_SALVAGE_PREFIX: usize = 8;
@@ -441,7 +441,7 @@ impl Tainted {
     fn read(notes: &mut Vec<String>) -> Tainted {
         match taint_utils::read_taints(&forklift_root()) {
             Ok(state) => Tainted {
-                hashes: state.recorded.iter().filter_map(|path| file_utils::hash_from_object_path(path)).collect(),
+                hashes: state.recorded.iter().filter_map(|path| heal_utils::loose_object_hash(path)).collect(),
                 torn: state.torn,
                 unread: false,
                 standing: state.standing(),
@@ -3070,6 +3070,42 @@ mod tests {
         let bytes = format!("{}torn", absent).into_bytes();
         assert!(matches!(salvage(&bytes, &clean), Ok(Salvage::Absent(ref gone)) if *gone == absent));
         assert!(matches!(salvage(&bytes, &torn), Ok(Salvage::Nothing)));
+    }
+
+    // The taint covers a head only through a recorded path of a loose object's shape: a nested
+    // pallet ref whose last two names spell the same hash covers nothing. Mutation: build the
+    // hashes with a bare `hash_from_object_path` → the pallet ref covers the head, red. The object
+    // half shows the fixture reaches a covering record.
+    #[test]
+    fn only_a_recorded_loose_object_covers_a_head() {
+        // Taint activation is process-wide: reset it however the test ends.
+        struct Deactivate;
+        impl Drop for Deactivate {
+            fn drop(&mut self) {
+                taint_utils::reset_activation_for_test();
+            }
+        }
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_root, _scope) = scratch("ref-heal-taint-covers-loose-only");
+        let _deactivate = Deactivate;
+        taint_utils::activate();
+        let head = blake3::hash(b"named by a pallet and an object").to_hex().to_string();
+        let (fan, rest) = head.split_at(2);
+        let plant = |path: String| {
+            let taint = forklift_root().join("taint");
+            std::fs::create_dir_all(&taint).unwrap();
+            std::fs::write(taint.join("taint-77777-0"), taint_utils::taint_file_bytes([&path])).unwrap();
+            assert_eq!(taint_utils::read_taints(&forklift_root()).unwrap().recorded, BTreeSet::from([PathBuf::from(&path)]), "sanity: the record names it");
+        };
+
+        plant(format!("pallets/{}/{}", fan, rest));
+        let tainted = Tainted::read(&mut Vec::new());
+        assert!(!tainted.torn, "sanity: the record is complete");
+        assert!(!tainted.covers(&head), "a pallet ref is not an object: {:?}", tainted.hashes);
+
+        plant(format!("objects/{}/{}", fan, rest));
+        assert!(Tainted::read(&mut Vec::new()).covers(&head), "the loose object covers its own hash");
     }
 
     // Beside a copy whose head was not judged held when the state was read, a ref naming a gone
