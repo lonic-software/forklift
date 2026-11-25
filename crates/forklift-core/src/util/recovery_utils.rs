@@ -189,10 +189,15 @@
 //! [`heal_utils::restage_object`]'s own soundness section):
 //!
 //! 1. **Restage every present store path, enumerated *by directory*, never by
-//!    reachability, and never the torn record's own (untrusted, lower-bound) recorded set:**
-//!    every loose object under `objects/`'s fan-out, every `.pack`/`.idx` file under
+//!    reachability, and never by the torn record's own (untrusted, lower-bound) recorded set:**
+//!    every loose object under `objects/`'s fan-out, every `.pack`/`.idx`/`.sigs` file under
 //!    `objects/pack/`, and every staged inventory shard `data` file across every bay (see
-//!    [`enumerate_store_wide_paths`]) — each driven through the exact same
+//!    [`enumerate_store_wide_paths`]). The recorded set is still read for what these walks do
+//!    not cover (see [`rescan_walks_cover`]): a ref, the trust anchor, held heads, a signature table
+//!    or shard the walks did not list, and every other such path the record still names is
+//!    restaged where present and kept where not, so the replaced record never drops it. A torn
+//!    file's unreadable part may have named one too, and that entry is not recoverable from the
+//!    record. Each path is driven through the exact same
 //!    [`heal_utils::restage_object`] discipline (hash-verify a loose object, verbatim rewrite for
 //!    anything else this schema can record) the ordinary restage pass uses. Directory-driven is
 //!    load-bearing: an *un*reachable present-but-unproven object is still dedup bait for a future
@@ -428,12 +433,13 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
     let state = taint_utils::read_taints(root).map_err(|e| read_failure_refusal(root, &e))?;
 
     // §8.3 (I5): a torn taint's own recorded set is an untrusted lower bound, so it is never
-    // driven through the ordinary restage pass below — the directory-driven rescan ignores it
-    // entirely and derives an honest remainder from scratch. Entry-heal's own torn refusal
-    // (`heal_utils::heal_if_tainted`) is completely unaffected by this — it still refuses torn
-    // immediately, lock-free; only this locked verb rescans.
+    // driven through the ordinary restage pass below — the directory-driven rescan derives the
+    // store's part of the remainder from scratch, and keeps only the recorded paths its walks do
+    // not cover. Entry-heal's own torn refusal (`heal_utils::heal_if_tainted`) is completely
+    // unaffected by this — it still refuses torn immediately, lock-free; only this locked verb
+    // rescans.
     if state.torn {
-        return rescan_torn_taint(root, &state.files, progress);
+        return rescan_torn_taint(root, &state.recorded, &state.files, progress);
     }
     if state.recorded.is_empty() {
         // Companion fix (DESIGN.html §3.1.1): "nothing recorded" says nothing about the gate — a
@@ -1186,8 +1192,15 @@ fn mark_still_dangling(
 /// the *next* `forklift heal` invocation resolves it through the completely ordinary
 /// [`resolve_the_rest`] pipeline, refetch included, exactly like any other dangling remainder.
 /// This function's entire job is turning "unknown scope" into "a known, honest one."
+///
+/// `recorded` is what the torn snapshot could still read: every whole line of a torn file, and
+/// every line of a complete one beside it. The walks below account for a path only of a shape
+/// [`rescan_walks_cover`] names; every other recorded path (a ref, the trust anchor, held heads,
+/// …) is restaged where present and kept in the remainder where not, never dropped. A torn
+/// file's unreadable part can name such a path too, and nothing here can recover it.
 fn rescan_torn_taint(
     root: &Path,
+    recorded: &BTreeSet<PathBuf>,
     old_files: &[PathBuf],
     progress: Option<&dyn Fn(&str)>,
 ) -> Result<HealOutcome, RunRefused> {
@@ -1196,12 +1209,16 @@ fn rescan_torn_taint(
     let candidates = enumerate_store_wide_paths(root).map_err(|e| rescan_failure_refusal(root, &e))?;
     let (loose_count, packs_count, shards_count) =
         (candidates.loose.len(), candidates.packs.len(), candidates.shards.len());
+    let listed: BTreeSet<PathBuf> = candidates.packs.iter().chain(&candidates.shards).cloned().collect();
+    let carried: BTreeSet<PathBuf> =
+        recorded.iter().filter(|relative| !rescan_walks_cover(relative, &listed)).cloned().collect();
 
     report(format!(
         "torn durability taint: restaging {} loose object(s), {} pack file(s), and {} staged \
-        inventory shard file(s) across the whole object store — every present loose object is \
-        hash-verified, so this can take a while on a large or uncompacted store",
-        loose_count, packs_count, shards_count,
+        inventory shard file(s) across the whole object store, and {} other path(s) the torn \
+        record still names — every present loose object is hash-verified, so this can take a \
+        while on a large or uncompacted store",
+        loose_count, packs_count, shards_count, carried.len(),
     ));
 
     // The loose-object pass is the one that actually pays the hash-verify cost (see the module
@@ -1220,9 +1237,12 @@ fn rescan_torn_taint(
     let pack_and_shard: BTreeSet<PathBuf> =
         candidates.packs.into_iter().chain(candidates.shards).collect();
     let ps_attempt = heal_utils::attempt_restage_all(root, &pack_and_shard);
+    let carried_attempt = heal_utils::attempt_restage_all(root, &carried);
 
-    let restaged: BTreeSet<PathBuf> =
-        loose_attempt.restaged.iter().chain(ps_attempt.restaged.iter()).cloned().collect();
+    let restaged: BTreeSet<PathBuf> = loose_attempt.restaged.iter()
+        .chain(ps_attempt.restaged.iter())
+        .chain(carried_attempt.restaged.iter())
+        .cloned().collect();
     if !restaged.is_empty() {
         let parents: BTreeSet<PathBuf> = restaged.iter()
             .filter_map(|relative| root.join(relative).parent().map(Path::to_path_buf))
@@ -1237,13 +1257,26 @@ fn rescan_torn_taint(
     // failing) go straight to the remainder, unconditionally — the same rule the ordinary
     // (non-torn) `resolve_the_rest` already applies to these same two categories above, just at
     // store-wide scope here rather than the recorded set's.
-    for (relative, error) in loose_attempt.unreadable.iter().chain(ps_attempt.unreadable.iter()) {
+    for (relative, error) in loose_attempt.unreadable.iter().chain(&ps_attempt.unreadable).chain(&carried_attempt.unreadable) {
         remainder.insert(relative.clone());
         dangling_lines.push(format!("unreadable: \"{}\" ({})", relative.to_string_lossy(), error));
     }
-    for (relative, error) in loose_attempt.restage_failed.iter().chain(ps_attempt.restage_failed.iter()) {
+    for (relative, error) in loose_attempt.restage_failed.iter().chain(&ps_attempt.restage_failed).chain(&carried_attempt.restage_failed) {
         remainder.insert(relative.clone());
         dangling_lines.push(format!("could not be restaged: \"{}\" ({})", relative.to_string_lossy(), error));
+    }
+
+    // A carried path that was not restaged is kept as recorded, and the next, ordinary heal
+    // decides it like any other recorded path. A carried path never has a loose object's declared
+    // shape, so `restage_object` never hash-verifies it and the two loose-object verdicts do not
+    // arise for it; were one to, the path is kept rather than trusted.
+    for relative in carried_attempt.vanished.iter().chain(&carried_attempt.recovered_packed) {
+        remainder.insert(relative.clone());
+        dangling_lines.push(format!("named by the taint record and no longer present: \"{}\"", relative.to_string_lossy()));
+    }
+    for relative in &carried_attempt.hash_mismatch {
+        remainder.insert(relative.clone());
+        dangling_lines.push(format!("named by the taint record and could not be verified: \"{}\"", relative.to_string_lossy()));
     }
 
     // Corrupt-present (loose only — a pack/shard restage is verbatim, never hash-verified, so it
@@ -1264,11 +1297,13 @@ fn rescan_torn_taint(
 
     report(format!(
         "torn durability taint: step 1 done ({} restaged, {} corrupt-present, {} unreadable or \
-        failed to restage); walking every durable ref source for anything still referenced but \
-        genuinely absent...",
+        failed to restage, {} named by the taint record and kept); walking every durable ref \
+        source for anything still referenced but genuinely absent...",
         restaged.len(), loose_attempt.hash_mismatch.len(),
         loose_attempt.unreadable.len() + loose_attempt.restage_failed.len()
-            + ps_attempt.unreadable.len() + ps_attempt.restage_failed.len(),
+            + ps_attempt.unreadable.len() + ps_attempt.restage_failed.len()
+            + carried_attempt.unreadable.len() + carried_attempt.restage_failed.len(),
+        carried_attempt.vanished.len() + carried_attempt.recovered_packed.len() + carried_attempt.hash_mismatch.len(),
     ));
 
     // Step 2: the targetless enumerator (§8.1's shared walk core, collecting mode) — every hash
@@ -1341,9 +1376,10 @@ fn rescan_torn_taint(
         // rescan can only reach this `Ok` branch once every source was actually readable.
         let mut notes = vec![format!(
             "a torn taint was resolved by a full store-wide rescan: {} loose object(s), {} \
-            pack file(s), and {} inventory shard file(s) were candidates, of which {} were \
-            (re)restaged; individual paths are not listed here to keep this report readable",
-            loose_count, packs_count, shards_count, restaged.len(),
+            pack file(s), {} inventory shard file(s) and {} other path(s) the torn record still \
+            named were candidates, of which {} were (re)restaged; individual paths are not \
+            listed here to keep this report readable",
+            loose_count, packs_count, shards_count, carried.len(), restaged.len(),
         )];
         // F6, PR #120 round 2 — see `resolve_the_rest`'s identical fold-in for why this is a note,
         // never a reason to hold the taint open.
@@ -1379,6 +1415,30 @@ fn rescan_torn_taint(
     }
 }
 
+/// Whether the torn rescan's own walks account for a recorded path, so the rescan need not carry
+/// it from the record (see [`rescan_torn_taint`]). `listed` is every pack-folder file and staged
+/// shard step 1 enumerated.
+///
+/// - A loose object, a pack or a pack index: always. Step 1 restages every present one, and
+///   what such a file's loss can cost is objects, which step 2 finds store-wide wherever one is
+///   still referenced and absent.
+/// - A signature table or a staged shard: only when step 1 listed it. Its loss costs no object,
+///   so step 2 never sees it; one the walk did not list (gone, or in a bay the bay list skips) is
+///   carried, and the next ordinary heal resolves it with the note its loss is owed.
+/// - Every other shape, and a path no shape declares: never.
+///
+/// The match names every disposition, so a new one has to be placed.
+fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
+    use taint_utils::VanishedDisposition as Disposition;
+
+    match taint_utils::taint_shape(relative).and_then(|shape| shape.disposition) {
+        Some(Disposition::Loose | Disposition::PackData | Disposition::PackIndex) => true,
+        Some(Disposition::SignatureTable | Disposition::Shard) => listed.contains(relative),
+        // A loose signature sidecar is skipped by the loose walk (`walk_loose_object_paths`).
+        Some(Disposition::Signature | Disposition::Ref | Disposition::MetaCopy) | None => false,
+    }
+}
+
 /// Encode an object hash as its loose fan-out path, root-relative — the shape
 /// [`taint_utils::resolve_taints`] records and [`classify_vanished`] round-trips
 /// back to `VanishedClass::Loose` on the next (now non-torn) heal run. `Err` only if `hash` is not
@@ -1395,8 +1455,9 @@ fn loose_remainder_path(root: &Path, hash: &str) -> Result<PathBuf, String> {
 
 /// The result of directory-driving every present loose object, pack file and staged shard under a
 /// storage root — the §8.3 torn rescan's step 1 enumeration. A recordable path of any other shape
-/// is not walked, so a torn record naming one loses it when the rescan replaces the record. Every path is root-relative, exactly the shape
-/// `taint_utils`/`heal_utils::restage_object` already use. Never the working tree.
+/// is not walked: the rescan reads it from the torn record instead (see [`rescan_walks_cover`]).
+/// Every path is root-relative, exactly the shape `taint_utils`/`heal_utils::restage_object`
+/// already use. Never the working tree.
 struct StoreWidePaths {
     /// Every loose object's on-disk path (the `objects/<2-hex>/<rest>` fan-out) — every one
     /// currently *present*, not just whatever a torn taint's own (untrusted, lower-bound) record
@@ -3989,7 +4050,7 @@ fn torn_rescan_degraded_refusal(root: &Path, restaged_count: usize, degraded: &[
 }
 
 /// §8.3 (I5): the store-wide rescan completed and turned the torn record's unknown scope into a
-/// known one, but at least one reference in that known scope is still genuinely dangling. The
+/// known one, but at least one path in that known scope is still unresolved. The
 /// taint by this point already records exactly this remainder (no longer torn) — see
 /// [`rescan_torn_taint`] — so the *next* `forklift heal` run resolves it through the entirely
 /// ordinary [`resolve_the_rest`] pipeline (refetch included), not a special torn-only path.
@@ -3999,8 +4060,9 @@ fn torn_rescan_dangling_refusal(root: &Path, lines: &[String]) -> CoreError {
 
     let mut message = format!(
         "{} under \"{}\": its record was torn (a crash interrupted the write that would have \
-        named every affected path); a full store-wide rescan has resolved that unknown scope, \
-        and {} reference(s) turned out to be genuinely dangling: {}",
+        named every affected path); a full store-wide rescan, with a check of every other path the \
+        record still names, has replaced that unknown scope with a known one, \
+        and {} path(s) are still unresolved: {}",
         taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), lines.len(),
         named.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; "),
     );
@@ -6736,6 +6798,81 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
+    /// Enter a fresh Full warehouse with a position, for the torn-rescan fixtures below.
+    fn enter_torn_root(name: &str) -> (PathBuf, crate::globals::StorageRootScope) {
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-{}-{}", name, std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        (root, scope)
+    }
+
+    /// A torn rescan keeps every recorded path its store walks do not cover: one the torn file
+    /// still reads, and one a complete file beside it records. Each is gone, so the rescan
+    /// refuses, and the replaced record names them while the gate stands.
+    ///
+    /// Revert: build `carried` as an empty set in `rescan_torn_taint` → the rescan clears → red.
+    /// Revert: answer `true` for `Disposition::Ref` in `rescan_walks_cover` → the pallet ref is
+    /// dropped from the remainder → red.
+    /// Revert: answer `true` for a signature table the walk did not list → the gone `.sigs` is
+    /// dropped → red.
+    #[test]
+    fn a_torn_rescan_keeps_the_recorded_paths_its_walks_do_not_cover() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+        let (root, _scope) = enter_torn_root("torn-keeps-recorded");
+        let forklift = forklift_root();
+
+        plant_torn_taint(&forklift, &["held-heads", "pallets/gone", "objects/pack/gone.sigs"]);
+        plant_complete_taint(&forklift, &["mirror-roots"]);
+        assert!(taint_utils::read_taints(&forklift).unwrap().torn, "sanity: the fixture is torn");
+
+        let error = run_heal().expect_err("a torn rescan must not clear over recorded paths it cannot account for");
+        assert_durability_taint(&error, &[
+            "named by the taint record and no longer present: \"held-heads\"",
+            "named by the taint record and no longer present: \"pallets/gone\"",
+            "named by the taint record and no longer present: \"mirror-roots\"",
+            "named by the taint record and no longer present: \"objects/pack/gone.sigs\"",
+        ]);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn, "the replaced record is complete");
+        let expected: BTreeSet<PathBuf> = ["held-heads", "pallets/gone", "mirror-roots", "objects/pack/gone.sigs"].iter().map(PathBuf::from).collect();
+        assert_eq!(state.recorded, expected, "the replaced record keeps exactly the uncovered paths");
+        assert!(taint_utils::gate_check(&forklift).is_err(), "the gate must stand");
+
+        crate::util::file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// The positive half: an uncovered recorded path that is still present is restaged by the
+    /// rescan itself, which then clears and counts it.
+    ///
+    /// Revert: drop `carried_attempt.restaged` from the rescan's restaged set → the count reads
+    /// 0 → red.
+    #[test]
+    fn a_torn_rescan_restages_a_present_recorded_path_its_walks_do_not_cover() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+        let (root, _scope) = enter_torn_root("torn-restages-recorded");
+        let forklift = forklift_root();
+
+        std::fs::write(forklift.join("held-heads"), b"held heads, still present").unwrap();
+        plant_torn_taint(&forklift, &["held-heads"]);
+
+        let outcome = run_heal().expect("a present uncovered path restages, so the rescan clears");
+
+        assert!(outcome.notes.iter().any(|note| note.contains("1 other path(s)") && note.contains("of which 1 were")),
+            "the rescan must restage the recorded path: {:?}", outcome.notes);
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn && state.recorded.is_empty(), "nothing may remain recorded");
+        assert_eq!(std::fs::read(forklift.join("held-heads")).unwrap(), b"held heads, still present");
+
+        crate::util::file_utils::remove_dir_all(&root).ok();
+    }
+
     /// A torn taint over a store whose only absent reachable object is one a redaction applied
     /// here names clears, and its outcome notes the redacted absence rather than passing over it.
     ///
@@ -7272,8 +7409,10 @@ mod tests {
         // B vanishes — the crash-lost dentry this whole mechanism exists for.
         crate::util::file_utils::remove_file(&b_absolute).unwrap();
 
-        // Torn, and its surviving prefix deliberately does NOT mention B.
-        plant_torn_taint(&forklift, &["objects/aa/an-unrelated-surviving-line"]);
+        // Torn, and its surviving prefix deliberately does NOT mention B: it names an unrelated,
+        // absent and unreferenced loose object, a shape the walks cover, so it is not carried.
+        let unrelated = format!("objects/aa/{}", "a".repeat(62));
+        plant_torn_taint(&forklift, &[&unrelated]);
         assert!(taint_utils::read_taints(&forklift).unwrap().torn, "sanity: the fixture is torn");
 
         let error = run_heal()
@@ -7305,7 +7444,7 @@ mod tests {
     ///  - revert the corrupt-boundary carve-out in `walk_tree` (`corrupt.contains(&tree_hash) ||`
     ///    back to a bare presence check) → loading the corrupt reachable tree fails loud →
     ///    `run_heal()` still returns `Err`, but from `rescan_failure_refusal`, not
-    ///    `torn_rescan_dangling_refusal` — the `"genuinely dangling"` substring assertion below
+    ///    `torn_rescan_dangling_refusal` — the `"still unresolved"` substring assertion below
     ///    (unique to the latter) goes red.
     #[test]
     fn torn_taint_corrupt_present_is_unconditional_remainder_and_never_aborts_on_a_corrupt_reachable_tree() {
@@ -7366,7 +7505,7 @@ mod tests {
         let error = run_heal()
             .expect_err("a corrupt-present object must never let a torn taint clear");
         assert_durability_taint(&error, &[
-            "genuinely dangling",
+            "still unresolved",
             orphan_relative.to_string_lossy().as_ref(),
             corrupt_tree_relative.to_string_lossy().as_ref(),
         ]);

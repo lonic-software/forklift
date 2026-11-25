@@ -37,7 +37,7 @@
 //! it can resurrect bytes a concurrent lock-holder legitimately deleted moments earlier.
 //!
 //! So [`heal_if_tainted`] gates on **content-addressability alone** ([`is_content_addressed`], the
-//! same [`file_utils::hash_from_object_path`] check [`restage_object`] already uses to choose its
+//! same [`loose_object_hash`] check [`restage_object`] already uses to choose its
 //! own hash-verify-vs-verbatim branch — one predicate, not a per-path special case): if the
 //! standing taint's recorded set contains *any* path this returns `false` for, the whole taint
 //! escalates — refused with [`RefusalCode::DurabilityTaint`], directing the operator to
@@ -65,7 +65,7 @@
 //!
 //! ## Pack-aware restage (I4)
 //!
-//! A vanished **loose-shaped** recorded path (`file_utils::hash_from_object_path` recognizes it) is
+//! A vanished **loose-shaped** recorded path ([`loose_object_hash`] recognizes it) is
 //! not necessarily lost: `compact` legitimately repacks a loose object (deleting the loose copy) or
 //! `compact --all` drops a now-redundant loose copy once the object survives packed, and either one
 //! can race a taint's own restage attempt. Before [`restage_object`] reports
@@ -85,7 +85,7 @@
 //! folded into `Vanished` here, same as a genuine absence — this dentry has nothing durable to
 //! restage over either way, so the closure walk downstream is the right escalation for it, not a
 //! silent clear. A vanished **pack-/shard-shaped** path has no hash to check
-//! (`hash_from_object_path` returns `None` for it) and falls straight through to `Vanished`,
+//! ([`loose_object_hash`] returns `None` for it) and falls straight through to `Vanished`,
 //! unchanged — I4 only ever widens what a loose-shaped path can resolve to.
 //!
 //! ## Soundness
@@ -144,8 +144,8 @@ pub(crate) enum RestageOutcome {
     /// [`HashMismatch`](Self::HashMismatch)).
     Unreadable(String),
 
-    /// The recorded path is a loose object (its path has the fan-out shape
-    /// [`file_utils::hash_from_object_path`] recognizes) whose read-back content does not address
+    /// The recorded path is a loose object (its declared shape is one; see
+    /// [`loose_object_hash`]) whose read-back content does not address
     /// to the hash its own path encodes — either because the bytes are corrupt, because they will
     /// not even decompress, or because decoding them would exceed
     /// [`object_utils::MAX_OBJECT_BYTES`] (folded into this verdict rather than
@@ -162,9 +162,9 @@ pub(crate) enum RestageOutcome {
 /// the storage root the taint was recorded under (`root.join(relative_path)` is the absolute final
 /// path).
 ///
-/// For a loose object (`relative_path` has the shape [`file_utils::hash_from_object_path`]
-/// recognizes) the read-back bytes are decompressed and content-hash-verified against the hash the
-/// path itself encodes — the same check [`crate::util::object_utils::store_object_bytes`] runs on
+/// For a loose object (`relative_path`'s declared shape is one; see [`loose_object_hash`]) the
+/// read-back bytes are decompressed and content-hash-verified against the hash the path itself
+/// encodes — the same check [`crate::util::object_utils::store_object_bytes`] runs on
 /// the way in, run again here on the way out. For anything else this taint schema can record (a
 /// pack data/index file, an inventory shard file) no such check is possible — those are not
 /// content-addressed, so this restages their bytes exactly as read, verbatim, with no claim about
@@ -186,6 +186,16 @@ pub(crate) enum RestageOutcome {
 ///                          fold "the heal itself misfired" into a content verdict a later
 ///                          recovery pass would otherwise act on.
 pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<RestageOutcome, String> {
+    // A recorded path is acted on only when it names something under `root`: a root, a `.` or a
+    // `..` would let `root.join` reach a file outside the warehouse, and a torn record's lines are
+    // checked by no digest. Such a path is read as unreadable, so every caller keeps it.
+    if !relative_path.components().all(|component| matches!(component, std::path::Component::Normal(_))) {
+        return Ok(RestageOutcome::Unreadable(format!(
+            "\"{}\" is not a path under the storage root, so it was not read",
+            relative_path.to_string_lossy()
+        )));
+    }
+
     let final_path = root.join(relative_path);
 
     // A ref's (or the trust anchor's) read and rewrite below must not straddle another writer's
@@ -211,9 +221,9 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
             // distinct: either way this exact dentry has nothing durable to restage over, so the
             // taint schema's existing `Vanished` verdict (and the closure walk it feeds) is exactly
             // the right escalation, not a fourth outcome. A vanished pack-/shard-shaped path has no
-            // hash to check (`hash_from_object_path` returns `None`) and falls straight through to
+            // hash to check ([`loose_object_hash`] returns `None`) and falls straight through to
             // `Vanished`, unchanged.
-            return match file_utils::hash_from_object_path(&final_path) {
+            return match loose_object_hash(relative_path) {
                 Some(hash) => match file_utils::read_object_classified(&hash) {
                     Ok(file_utils::StoreReadOutcome::Verified(_)) => Ok(RestageOutcome::RecoveredPacked),
                     Ok(file_utils::StoreReadOutcome::Absent)
@@ -231,7 +241,7 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
         ))),
     };
 
-    if let Some(expected_hash) = file_utils::hash_from_object_path(&final_path) {
+    if let Some(expected_hash) = loose_object_hash(relative_path) {
         match object_utils::decode_object_bounded(bytes.as_slice()) {
             Ok(decompressed) => {
                 if object_utils::hash_object_bytes(&decompressed) != expected_hash {
@@ -405,7 +415,7 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
 /// Whether a taint's recorded final path is content-addressed — a loose object [`restage_object`]
 /// can hash-verify before rewriting it (see [`RestageOutcome`]). The one predicate that gates
 /// [`heal_if_tainted`]'s restage (I1/I2, see the module doc comment): the same
-/// [`file_utils::hash_from_object_path`] check `restage_object` already uses to pick its own
+/// [`loose_object_hash`] check `restage_object` already uses to pick its own
 /// hash-verify-vs-verbatim branch, reused here rather than reimplemented, so the two can never
 /// drift apart on what counts as "content-addressed."
 ///
@@ -417,7 +427,20 @@ pub fn heal_if_tainted() -> Result<(), CoreError> {
 /// `forklift heal` verb calls them directly, under the warehouse lock, for every shape — it is
 /// consulted only in [`heal_if_tainted`], which is the one caller that ever runs lock-free.
 fn is_content_addressed(relative_path: &Path) -> bool {
-    file_utils::hash_from_object_path(relative_path).is_some()
+    loose_object_hash(relative_path).is_some()
+}
+
+/// The hash a recorded path names, when its declared shape (see [`taint_utils::taint_shape`]) is a
+/// loose object; `None` for every other path. The shape is read from the whole path, never from
+/// its last two names alone: a nested pallet ref such as `pallets/fe/add` ends in a fan-out-like
+/// pair, and reading it as object `feadd` would judge a sound ref corrupt.
+fn loose_object_hash(relative_path: &Path) -> Option<String> {
+    let shape = taint_utils::taint_shape(relative_path)?;
+    if !matches!(shape.disposition, Some(taint_utils::VanishedDisposition::Loose)) {
+        return None;
+    }
+
+    file_utils::hash_from_object_path(relative_path)
 }
 
 /// The outcome of restaging every path in a recorded taint set — the shared core of
@@ -1134,6 +1157,56 @@ mod tests {
 
         let outcome = restage_object(&forklift, Path::new("objects/zz/never-written")).unwrap();
         assert_eq!(outcome, RestageOutcome::Vanished);
+    }
+
+    /// A recorded path that is not plain names under the root is never read or rewritten, and
+    /// the file it would reach keeps its very inode.
+    ///
+    /// Revert: drop the plain-names guard in `restage_object` → the outside file is restaged →
+    /// red.
+    #[test]
+    fn restage_object_never_rewrites_a_path_outside_the_storage_root() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("restage-outside-root");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        std::fs::create_dir_all(&forklift).unwrap();
+        let outside = root.join("outside-the-store");
+        std::fs::write(&outside, b"not the warehouse's").unwrap();
+        #[cfg(unix)]
+        let before = std::fs::metadata(&outside).unwrap().ino();
+
+        let relative = Path::new("..").join("outside-the-store");
+        assert!(forklift.join(&relative).exists(), "sanity: the path reaches the outside file");
+        let outcome = restage_object(&forklift, &relative).unwrap();
+
+        assert!(matches!(outcome, RestageOutcome::Unreadable(ref why) if why.contains("is not a path under the storage root")),
+            "an escaping path must be refused: {outcome:?}");
+        #[cfg(unix)]
+        assert_eq!(std::fs::metadata(&outside).unwrap().ino(), before, "the outside file must not be rewritten");
+    }
+
+    /// A nested pallet ref whose last two names look like a loose object's fan-out is restaged
+    /// verbatim: it is judged by its declared shape, never as object `feadd`.
+    ///
+    /// Revert: `loose_object_hash` back to a bare `hash_from_object_path` → `HashMismatch` → red.
+    #[test]
+    fn restage_object_judges_a_fan_out_like_ref_by_its_declared_shape() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("restage-fan-out-like-ref");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        let relative = Path::new("pallets/fe/add");
+        std::fs::create_dir_all(forklift.join("pallets/fe")).unwrap();
+        std::fs::write(forklift.join(relative), b"a ref, not an object").unwrap();
+
+        let outcome = restage_object(&forklift, relative).unwrap();
+        assert_eq!(outcome, RestageOutcome::Restaged);
+        assert_eq!(std::fs::read(forklift.join(relative)).unwrap(), b"a ref, not an object");
     }
 
     #[test]
