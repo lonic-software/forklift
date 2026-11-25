@@ -8647,6 +8647,67 @@ mod tests {
         }
     }
 
+    /// A nested pallet ref whose last two names spell a stored object's hash, `pallets/<ab>/<cd…>`,
+    /// is healed as the ref it is, whether it is present or gone. Present, its bytes are restaged
+    /// verbatim; read as object `<ab><cd…>`, they fail to decode and heal refuses a healthy ref as
+    /// corrupt. Gone, its removal is made durable by a sync of its folder; read as that object, it
+    /// is settled as recovered from the store, and the folder is never synced.
+    ///
+    /// Mutation: `loose_object_hash` back to a bare `hash_from_object_path` in `restage_object`.
+    /// The present half then refuses, and the gone half clears without the folder's sync.
+    #[test]
+    fn heal_treats_a_pallet_ref_named_like_a_stored_object_as_a_ref() {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let content = object_utils::blob_bytes(b"an object whose hash a pallet name spells");
+        let hash = object_utils::hash_object_bytes(&content);
+        let (fan, rest) = hash.split_at(2);
+        let pallet = format!("{}/{}", fan, rest);
+        let recorded = format!("pallets/{}", pallet);
+        let head = "1".repeat(64);
+
+        for gone in [false, true] {
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-ref-named-like-object-{}-{}", gone, std::process::id()));
+            let _ = crate::util::file_utils::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            assert!(object_utils::store_object_bytes(&hash, &content).unwrap(), "sanity: the object is stored");
+            pallet_utils::tests::update_pallet_head_unverified(&pallet, None, &head, &pallet_utils::RefPreconditions::NONE)
+                .unwrap();
+            let ref_path = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::User, &pallet);
+            assert_eq!(ref_path, forklift.join(&recorded), "sanity: the record names the ref's own file");
+            plant_complete_taint(&forklift, &[recorded.as_str()]);
+
+            if gone {
+                crate::util::file_utils::remove_file(&ref_path).unwrap();
+                let folder = forklift.join("pallets").join(fan);
+                let _syncs = crate::util::file_utils::SyncDirFaultGuard::recording();
+
+                let outcome = run_heal().unwrap_or_else(|error| panic!("a removed ref must heal, got {}", error));
+                assert!(outcome.resolved.contains(&recorded), "{:?}", outcome.resolved);
+                assert!(crate::util::file_utils::sync_dir_attempts().contains(&folder),
+                    "the removal is made durable through the ref's folder: {:?}", crate::util::file_utils::sync_dir_attempts());
+                assert!(!ref_path.exists(), "heal must never recreate a removed ref");
+            } else {
+                let outcome = run_heal().unwrap_or_else(|error| panic!("a healthy ref must heal, got {}", error));
+                assert!(outcome.restaged.contains(&recorded), "{:?}", outcome.restaged);
+                assert_eq!(pallet_utils::get_pallet_head(&pallet).unwrap().as_deref(), Some(head.as_str()));
+            }
+
+            let state = taint_utils::read_taints(&forklift).unwrap();
+            assert!(state.recorded.is_empty(), "gone={}: the ref's taint must clear: {:?}", gone, state.recorded);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
     // ---- Fail-closed/tolerant split on an unreadable bay (design call) ----
 
     /// A single fixture pinning BOTH halves of the split this fix makes, on the exact same
