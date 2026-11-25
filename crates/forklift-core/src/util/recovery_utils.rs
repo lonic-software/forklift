@@ -14,9 +14,9 @@
 //!
 //! ## The closure walk
 //!
-//! For every recorded path this attempt cannot restage, [`run`] classifies it (a loose object, a
-//! pack data/index file, or an inventory shard — the three shapes the taint schema can ever
-//! record) and, for the object-shaped ones, checks whether the object it names is genuinely absent
+//! For every recorded path this attempt cannot restage, [`run`] classifies it by the shape
+//! registry behind [`taint_utils::taint_shape`](crate::util::taint_utils), and, for the
+//! object-shaped ones, checks whether the object it names is genuinely absent
 //! (present elsewhere — another pack, or loose — is not a loss) and, if so, whether *any* durable
 //! ref source still reaches it: pallet heads (both namespaces), the warehouse's parked parcels,
 //! every parcel a bay's in-progress consolidation or cherry-pick records, the trust anchor's adopted
@@ -188,7 +188,7 @@
 //! standing for an idempotent rerun — restaging a path twice is harmless, see
 //! [`heal_utils::restage_object`]'s own soundness section):
 //!
-//! 1. **Restage every present recordable-shape path, enumerated *by directory*, never by
+//! 1. **Restage every present store path, enumerated *by directory*, never by
 //!    reachability, and never the torn record's own (untrusted, lower-bound) recorded set:**
 //!    every loose object under `objects/`'s fan-out, every `.pack`/`.idx` file under
 //!    `objects/pack/`, and every staged inventory shard `data` file across every bay (see
@@ -748,6 +748,13 @@ async fn resolve_the_rest(
                         relative.to_string_lossy(), hash
                     ));
                 }
+            }
+            VanishedClass::Undisposed(description) => {
+                remainder.insert(relative.clone());
+                dangling_lines.push(format!(
+                    "\"{}\" ({}) is gone, and heal has no recovery for it",
+                    relative.to_string_lossy(), description
+                ));
             }
             VanishedClass::Unrecognized => {
                 remainder.insert(relative.clone());
@@ -1386,8 +1393,9 @@ fn loose_remainder_path(root: &Path, hash: &str) -> Result<PathBuf, String> {
         .map_err(|_| format!("The object path for \"{}\" is not under the storage root.", hash))
 }
 
-/// The result of directory-driving every present recordable-shape path under a storage root — the
-/// §8.3 torn rescan's step 1 enumeration. Every path is root-relative, exactly the shape
+/// The result of directory-driving every present loose object, pack file and staged shard under a
+/// storage root — the §8.3 torn rescan's step 1 enumeration. A recordable path of any other shape
+/// is not walked, so a torn record naming one loses it when the rescan replaces the record. Every path is root-relative, exactly the shape
 /// `taint_utils`/`heal_utils::restage_object` already use. Never the working tree.
 struct StoreWidePaths {
     /// Every loose object's on-disk path (the `objects/<2-hex>/<rest>` fan-out) — every one
@@ -1513,9 +1521,9 @@ fn walk_pack_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-/// The three shapes a taint's recorded final path can ever take — see
-/// [`file_utils::hash_from_object_path`]'s doc comment — plus an escape hatch for a shape none of
-/// them recognize (never reached by any current write path, but a refusal beats a silent drop).
+/// What a vanished recorded path is, by its declared shape in
+/// [`taint_utils::taint_shape`]'s registry: one class per disposition heal has, one for a declared
+/// shape it has none for, and [`VanishedClass::Unrecognized`] for a path no shape declares.
 enum VanishedClass {
     /// A loose object; the hash its path encodes.
     Loose(String),
@@ -1539,46 +1547,40 @@ enum VanishedClass {
     ///
     /// [`META_PALLET_NAMES`]: crate::util::meta_tree::META_PALLET_NAMES
     MetaCopy(&'static str),
-    /// A shape none of the above recognizes.
+    /// A declared shape heal has no recovery for; the shape's description. Kept in the
+    /// remainder, with a line saying only what is gone.
+    Undisposed(&'static str),
+    /// A path whose shape the registry does not declare: one recorded by a writer no debug-build
+    /// test drives, or read from a record this build did not write. Kept in the remainder.
     Unrecognized,
 }
 
 fn classify_vanished(relative: &Path) -> VanishedClass {
-    if let Some(hash) = file_utils::hash_from_object_path(relative) {
-        return VanishedClass::Loose(hash);
-    }
+    use taint_utils::VanishedDisposition as Disposition;
 
-    if relative.file_name().and_then(|name| name.to_str()) == Some(file_utils::FILE_NAME_INVENTORY_DATA) {
-        return VanishedClass::Shard;
-    }
+    let Some(shape) = taint_utils::taint_shape(relative) else {
+        return VanishedClass::Unrecognized;
+    };
+    let Some(disposition) = shape.disposition else {
+        return VanishedClass::Undisposed(shape.description);
+    };
 
-    if matches!(relative.components().next(),
-                Some(std::path::Component::Normal(first)) if first == pallet_utils::FOLDER_NAME_PALLETS_ROOT) {
-        return VanishedClass::Ref;
-    }
+    // Each shape's pattern guarantees the part read here; a miss would be a registry defect, and
+    // keeping the path is the direction that fails loudly.
+    let class = match disposition {
+        Disposition::Loose => file_utils::hash_from_object_path(relative).map(VanishedClass::Loose),
+        Disposition::Signature => file_utils::hash_from_object_path(&relative.with_extension("")).map(VanishedClass::Signature),
+        Disposition::PackData => Some(VanishedClass::PackData(relative.with_extension(""))),
+        Disposition::PackIndex => Some(VanishedClass::PackIndex(relative.with_extension(""))),
+        Disposition::SignatureTable => Some(VanishedClass::SignatureTable),
+        Disposition::Shard => Some(VanishedClass::Shard),
+        Disposition::Ref => Some(VanishedClass::Ref),
+        Disposition::MetaCopy => relative.file_name().and_then(|name| crate::util::meta_tree::META_PALLET_NAMES.iter()
+            .find(|known| std::ffi::OsStr::new(known) == name))
+            .map(|name| VanishedClass::MetaCopy(name)),
+    };
 
-    if let Ok(name) = relative.strip_prefix(pallet_utils::FOLDER_NAME_META_COPY_ROOT) {
-        let mut parts = name.components();
-        if let (Some(std::path::Component::Normal(name)), None) = (parts.next(), parts.next()) {
-            if let Some(name) = crate::util::meta_tree::META_PALLET_NAMES.iter().find(|known| std::ffi::OsStr::new(known) == name) {
-                return VanishedClass::MetaCopy(name);
-            }
-        }
-    }
-
-    // `<fan-out>/<rest>.sig`: the sidecar of the parcel whose loose path that is.
-    if relative.extension().and_then(|ext| ext.to_str()) == sign_utils::FILE_SUFFIX_SIGNATURE.strip_prefix('.') {
-        if let Some(hash) = file_utils::hash_from_object_path(&relative.with_extension("")) {
-            return VanishedClass::Signature(hash);
-        }
-    }
-
-    match relative.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_DATA => VanishedClass::PackData(relative.with_extension("")),
-        Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_INDEX => VanishedClass::PackIndex(relative.with_extension("")),
-        Some(ext) if ext == signature_table::FILE_EXTENSION_SIGNATURE_TABLE => VanishedClass::SignatureTable,
-        _ => VanishedClass::Unrecognized,
-    }
+    class.unwrap_or(VanishedClass::Unrecognized)
 }
 
 /// Sync the nearest directory above `relative` (under `root`) that still exists: a removed nested
@@ -6286,45 +6288,158 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn classify_vanished_recognizes_every_shape_the_taint_schema_can_record() {
-        assert!(matches!(
-            classify_vanished(Path::new("objects/ab/cdef1234567890")),
-            VanishedClass::Loose(hash) if hash == "abcdef1234567890"
-        ));
-        assert!(matches!(
-            classify_vanished(&Path::new("inventory").join(file_utils::shard_folder_relative("src")).join("data")),
-            VanishedClass::Shard
-        ));
-        assert!(matches!(
-            classify_vanished(Path::new("objects/pack/abc123.pack")),
-            VanishedClass::PackData(stem) if stem == Path::new("objects/pack/abc123")
-        ));
-        assert!(matches!(
-            classify_vanished(Path::new("objects/pack/abc123.idx")),
-            VanishedClass::PackIndex(stem) if stem == Path::new("objects/pack/abc123")
-        ));
-        assert!(matches!(classify_vanished(Path::new("objects/pack/abc123.sigs")), VanishedClass::SignatureTable));
-        assert!(matches!(
-            classify_vanished(Path::new("objects/ab/cdef1234567890.sig")),
-            VanishedClass::Signature(hash) if hash == "abcdef1234567890"
-        ));
-        assert!(matches!(classify_vanished(Path::new("pallets/main")), VanishedClass::Ref));
-        assert!(matches!(classify_vanished(Path::new("pallets/team/feature")), VanishedClass::Ref));
-        assert!(matches!(
-            classify_vanished(Path::new("meta-copy/office")),
-            VanishedClass::MetaCopy("office")
-        ));
-        for shape in ["meta-copy", "meta-copy/main", "meta-copy/office/office", "meta-copy/../pallets/main"] {
-            assert!(matches!(classify_vanished(Path::new(shape)), VanishedClass::Unrecognized), "{}", shape);
+    /// A class as a literal the table below can be written in.
+    fn class_text(class: VanishedClass) -> String {
+        match class {
+            VanishedClass::Loose(hash) => format!("loose {}", hash),
+            VanishedClass::Shard => "shard".to_string(),
+            VanishedClass::PackData(stem) => format!("pack {}", stem.to_string_lossy()),
+            VanishedClass::PackIndex(stem) => format!("pack index {}", stem.to_string_lossy()),
+            VanishedClass::SignatureTable => "signature table".to_string(),
+            VanishedClass::Signature(hash) => format!("signature {}", hash),
+            VanishedClass::Ref => "ref".to_string(),
+            VanishedClass::MetaCopy(name) => format!("meta copy {}", name),
+            VanishedClass::Undisposed(description) => format!("kept: {}", description),
+            VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
-        // A meta ref gone beside its copy is rebuilt from it before the recovery restages, so
-        // one that is still gone has no copy to rebuild from: more than one fault.
-        assert!(matches!(classify_vanished(Path::new("meta/office")), VanishedClass::Unrecognized));
-        assert!(matches!(
-            classify_vanished(Path::new("something/unexpected.txt")),
-            VanishedClass::Unrecognized
-        ));
+    }
+
+    /// One literal path per declared shape, one per class the anchored registry changes, and the
+    /// undeclared paths that stay unrecognized: each classifies as written here.
+    #[test]
+    fn classify_vanished_classifies_each_declared_shape() {
+        let shard = Path::new("inventory").join(file_utils::shard_folder_relative("src")).join("data");
+        let cases: Vec<(PathBuf, &str)> = vec![
+            // The shapes heal has a disposition for.
+            ("objects/ab/cdef1234567890".into(), "loose abcdef1234567890"),
+            ("objects/ab/cdef1234567890.sig".into(), "signature abcdef1234567890"),
+            ("objects/pack/abc123.pack".into(), "pack objects/pack/abc123"),
+            ("objects/pack/abc123.idx".into(), "pack index objects/pack/abc123"),
+            ("objects/pack/abc123.sigs".into(), "signature table"),
+            (shard, "shard"),
+            ("bays/main/inventory/staged/data".into(), "shard"),
+            ("pallets/main".into(), "ref"),
+            ("pallets/team/feature".into(), "ref"),
+            ("meta-copy/office".into(), "meta copy office"),
+            // The shapes it has none for.
+            ("removed-refs/side".into(), "kept: a removed ref's keepsake"),
+            ("removed-refs/side.2".into(), "kept: a removed ref's keepsake"),
+            ("meta/office".into(), "kept: a meta pallet ref"),
+            ("meta-copy/main".into(), "kept: a copy of a ref that is no meta pallet's"),
+            ("inventory/incomplete-load".into(), "kept: the incomplete-load marker"),
+            ("position".into(), "kept: the checkout position"),
+            ("position-copy".into(), "kept: the checkout position's copy"),
+            ("scope".into(), "kept: the checkout scope"),
+            ("scope-copy".into(), "kept: the checkout scope's copy"),
+            ("consolidation".into(), "kept: the consolidation state"),
+            ("consolidation-copy".into(), "kept: the consolidation state's copy"),
+            ("consolidation-skeleton".into(), "kept: the consolidation skeleton"),
+            ("consolidation-skeleton-copy".into(), "kept: the consolidation skeleton's copy"),
+            ("journal.json".into(), "kept: the journal"),
+            ("bays/main/inventory/incomplete-load".into(), "kept: a bay's incomplete-load marker"),
+            ("bays/main/position".into(), "kept: a bay's checkout position"),
+            ("bays/main/position-copy".into(), "kept: a bay's checkout position's copy"),
+            ("bays/main/scope".into(), "kept: a bay's checkout scope"),
+            ("bays/main/scope-copy".into(), "kept: a bay's checkout scope's copy"),
+            ("bays/main/consolidation".into(), "kept: a bay's consolidation state"),
+            ("bays/main/consolidation-copy".into(), "kept: a bay's consolidation state's copy"),
+            ("bays/main/consolidation-skeleton".into(), "kept: a bay's consolidation skeleton"),
+            ("bays/main/consolidation-skeleton-copy".into(), "kept: a bay's consolidation skeleton's copy"),
+            ("bays/main/journal.json".into(), "kept: a bay's journal"),
+            ("bays/main/path".into(), "kept: a bay's path record"),
+            ("bays/main/cherry-pick".into(), "kept: a bay's cherry-pick state"),
+            ("bays/main/cherry-pick-copy".into(), "kept: a bay's cherry-pick state's copy"),
+            ("cherry-pick".into(), "kept: the cherry-pick state"),
+            ("cherry-pick-copy".into(), "kept: the cherry-pick state's copy"),
+            ("config/fetch-scope".into(), "kept: the fetch scope"),
+            ("fetched-heads".into(), "kept: the fetch ledger"),
+            ("held-heads".into(), "kept: the held-heads record"),
+            ("mirror-roots".into(), "kept: the mirror roots record"),
+            ("served".into(), "kept: the served record"),
+            ("tombstones".into(), "kept: the tombstones record"),
+            ("unvouched-heads".into(), "kept: the unvouched-heads record"),
+            ("trust".into(), "kept: the trust anchor"),
+            ("trust-copy".into(), "kept: the trust anchor's copy"),
+            ("bundles/latest".into(), "kept: the latest bundle's name"),
+            // Matched as the ref or keepsake it is, where the unanchored checks took it for an
+            // object, a shard, a signature or a pack.
+            ("pallets/data".into(), "ref"),
+            ("pallets/ab/cd".into(), "ref"),
+            ("removed-refs/ab/cd".into(), "kept: a removed ref's keepsake"),
+            ("removed-refs/side/data".into(), "kept: a removed ref's keepsake"),
+            ("meta/data".into(), "kept: a meta pallet ref"),
+            ("meta-copy/data".into(), "kept: a copy of a ref that is no meta pallet's"),
+            ("removed-refs/ab/cd.sig".into(), "kept: a removed ref's keepsake"),
+            ("removed-refs/side.pack".into(), "kept: a removed ref's keepsake"),
+            ("meta/side.idx".into(), "kept: a meta pallet ref"),
+            ("meta-copy/side.sigs".into(), "kept: a copy of a ref that is no meta pallet's"),
+            // Declared nowhere, including what the unanchored checks used to match at any depth.
+            ("meta-copy".into(), "unrecognized"),
+            ("meta-copy/office/office".into(), "unrecognized"),
+            ("meta-copy/../pallets/main".into(), "unrecognized"),
+            ("something/unexpected.txt".into(), "unrecognized"),
+            ("elsewhere/ab/cdef1234567890".into(), "unrecognized"),
+            ("elsewhere/data".into(), "unrecognized"),
+            ("elsewhere/abc123.pack".into(), "unrecognized"),
+            ("objects/AB/cdef1234567890".into(), "unrecognized"),
+            ("objects/pack/.pack".into(), "unrecognized"),
+            ("inventory/data".into(), "unrecognized"),
+        ];
+
+        for (path, expected) in cases {
+            assert_eq!(class_text(classify_vanished(&path)), expected, "{}", path.to_string_lossy());
+        }
+    }
+
+    /// Heal over a taint naming one path that is gone, in a fresh Full warehouse: the refusal,
+    /// and the record left standing.
+    fn heal_over_one_vanished_path(name: &str, relative: &str) -> (CoreError, BTreeSet<PathBuf>) {
+        use crate::globals::StorageRootScope;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-{}-{}", name, std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        let forklift = forklift_root();
+
+        plant_complete_taint(&forklift, &[relative]);
+        assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+        let error = run_heal().expect_err("heal has nothing that clears this path, so it refuses");
+        let recorded = taint_utils::read_taints(&forklift).unwrap().recorded;
+
+        crate::util::file_utils::remove_dir_all(&root).ok();
+        (error, recorded)
+    }
+
+    /// A lost path of a declared shape heal has no recovery for is named by its kind and stated
+    /// as a fact, and stays recorded.
+    #[test]
+    fn heal_names_a_lost_record_it_has_no_recovery_for() {
+        let (error, recorded) = heal_over_one_vanished_path("lost-held-heads", "held-heads");
+
+        assert_durability_taint(&error, &[
+            "\"held-heads\" (the held-heads record) is gone, and heal has no recovery for it",
+        ]);
+        assert!(!error.to_string().contains("cannot auto-classify"), "{}", error);
+        assert_eq!(recorded, [PathBuf::from("held-heads")].into_iter().collect());
+    }
+
+    /// A lost path no shape declares keeps today's line and a refusal, never a panic: the record
+    /// sink takes an undeclared remainder.
+    #[test]
+    fn heal_refuses_a_lost_path_of_an_undeclared_shape() {
+        let (error, recorded) = heal_over_one_vanished_path("lost-undeclared", "something/unexpected.txt");
+
+        assert_durability_taint(&error, &[
+            "of a shape the recovery walk does not recognize and cannot auto-classify: \"something/unexpected.txt\"",
+        ]);
+        assert_eq!(recorded, [PathBuf::from("something/unexpected.txt")].into_iter().collect());
     }
 
     #[test]
