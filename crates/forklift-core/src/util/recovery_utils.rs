@@ -8654,7 +8654,8 @@ mod tests {
     /// is settled as recovered from the store, and the folder is never synced.
     ///
     /// Mutation: `loose_object_hash` back to a bare `hash_from_object_path` in `restage_object`.
-    /// The present half then refuses, and the gone half clears without the folder's sync.
+    /// The present half then refuses, and the gone half clears without the folder's sync (seen
+    /// on unix only, where folders are synced).
     #[test]
     fn heal_treats_a_pallet_ref_named_like_a_stored_object_as_a_ref() {
         use crate::globals::StorageRootScope;
@@ -8687,11 +8688,15 @@ mod tests {
 
             if gone {
                 crate::util::file_utils::remove_file(&ref_path).unwrap();
+                #[cfg(unix)]
                 let folder = forklift.join("pallets").join(fan);
                 let _syncs = crate::util::file_utils::SyncDirFaultGuard::recording();
 
                 let outcome = run_heal().unwrap_or_else(|error| panic!("a removed ref must heal, got {}", error));
                 assert!(outcome.resolved.contains(&recorded), "{:?}", outcome.resolved);
+                // Folder syncs, and so their recording, happen on unix only; elsewhere this half
+                // cannot tell the two readings apart.
+                #[cfg(unix)]
                 assert!(crate::util::file_utils::sync_dir_attempts().contains(&folder),
                     "the removal is made durable through the ref's folder: {:?}", crate::util::file_utils::sync_dir_attempts());
                 assert!(!ref_path.exists(), "heal must never recreate a removed ref");
