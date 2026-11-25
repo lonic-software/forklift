@@ -10027,4 +10027,39 @@ mod tests {
 
         crate::util::file_utils::remove_dir_all(&root).ok();
     }
+
+    /// A recorded path that is a link, even a dangling one, is never read through: heal refuses,
+    /// names the link and its way out, and keeps the taint. The way out it names (remove the link,
+    /// then heal again) clears it, as a vanished path.
+    ///
+    /// Revert: drop the `link_under_root` guard in `restage_object` → the dangling link reads as
+    /// vanished and the first heal clears → red.
+    #[test]
+    fn heal_refuses_a_linked_recorded_path_and_its_way_out_clears_it() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+        let (root, _scope) = enter_signature_heal_root("linked-sig");
+        let forklift = forklift_root();
+
+        let hash = "ab".repeat(32);
+        let relative = format!("objects/{}/{}.sig", &hash[..2], &hash[2..]);
+        let path = forklift.join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::util::file_utils::link_for_test(&root.join("nowhere"), &path, false);
+        plant_complete_taint(&forklift, &[&relative]);
+
+        let error = run_heal().expect_err("a linked recorded path must not clear");
+        assert!(error.to_string().contains(&format!(
+            "\"{relative}\" is a link, which is never followed under the storage root, so \"{relative}\" was not read. \
+             Remove the link, then run \"forklift heal\" again"
+        )), "{error}");
+        assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "the taint must stand");
+
+        crate::util::file_utils::remove_file_or_link(&path).unwrap();
+        let outcome = run_heal().expect("with the link removed, the path is a vanished sidecar");
+        assert!(outcome.resolved.iter().any(|resolved| resolved.replace('\\', "/") == relative), "{:?}", outcome.resolved);
+        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "no taint may stand");
+
+        crate::util::file_utils::remove_dir_all(&root).ok();
+    }
 }

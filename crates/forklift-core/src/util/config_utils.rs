@@ -11,7 +11,7 @@ use crate::util::remote_utils;
 /// The folder inside the forklift root that holds configuration files. The warehouse-level
 /// configuration lives directly in it; per-pallet configuration files are planned to live
 /// in a `pallets` subfolder (so pallet names can never collide with the warehouse file).
-const FOLDER_NAME_CONFIG_ROOT: &str = "config";
+pub(crate) const FOLDER_NAME_CONFIG_ROOT: &str = "config";
 
 /// The name of the warehouse-level configuration file.
 const FILE_NAME_WAREHOUSE_CONFIG: &str = "warehouse.toml";
