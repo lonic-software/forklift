@@ -262,26 +262,31 @@ fn note_put_backs(said: &str, owed: &[String], outcomes: &mut [PalletMirror]) {
 /// Put `pallet`'s entry in `record` back to `previous_root` (or drop it) after the takedown check
 /// just before its push refused with `refused`, and write the record back with `put_back`
 /// ([`mirror_utils::put_back_mirror_roots`]). The record in memory stays the one put back. Returns
-/// the refusal to report, and whether the put-back is owed: when the record does not read back as
-/// put back, the refusal is returned as it was, and the run's retry of the put-back
-/// ([`put_back_owed`]) completes it with how that went.
+/// the refusal to report, and whether the put-back is owed. A record the failed step left as it
+/// was goes unmentioned; one the write put back gets that write's sentence
+/// ([`RootsWrite::put_back`], the vocabulary the later writes use too). When the write leaves the
+/// record not holding the put-back, or unreadable, the refusal is returned as it was, and the
+/// run's retry of the put-back ([`put_back_owed`]) completes it with how that went.
 fn put_back_on_takedown(
     record: &mut BTreeMap<String, String>,
     pallet: &str,
     previous_root: Option<String>,
     refused: String,
-    put_back: impl FnOnce(String, &BTreeMap<String, String>) -> String,
+    put_back: impl FnOnce(&BTreeMap<String, String>) -> RootsWrite,
 ) -> (String, bool) {
     match previous_root {
         Some(root) => record.insert(pallet.to_string(), root),
         None => record.remove(pallet),
     };
 
-    let said = put_back(refused.clone(), record);
-    match mirror_utils::read_mirror_roots().ok().as_ref() == Some(&*record) {
-        true => (said, false),
-        false => (refused, true),
+    let written = put_back(record);
+    if !written.holds_what_was_wanted() {
+        return (refused, true);
     }
+    if written == RootsWrite::AlreadyRead {
+        return (refused, false);
+    }
+    (format!("{} {}", refused, written.put_back()), false)
 }
 
 /// The key the remote's handshake lists `@tags` under.
@@ -1485,19 +1490,47 @@ mod tests {
         // A put-back that does not land: the record still holds the stepped head.
         let mut record = stepped.clone();
         let (refused, owed) = put_back_on_takedown(&mut record, "main", Some("a1".repeat(32)), "Refused.".to_string(),
-            |error, _| format!("{} said", error));
+            |_| RootsWrite::Failed("Disk full.".to_string()));
         assert_eq!((refused.as_str(), owed), ("Refused.", true));
         assert_eq!(record, BTreeMap::from([("main".to_string(), "a1".repeat(32))]));
 
         // One that lands, for a pallet with no prior root.
         let mut record = stepped.clone();
-        let (refused, owed) = put_back_on_takedown(&mut record, "main", None, "Refused.".to_string(), |error, back| {
-            mirror_utils::write_mirror_roots(back).unwrap();
-            format!("{} The mirror record was put back.", error)
-        });
+        let (refused, owed) = put_back_on_takedown(&mut record, "main", None, "Refused.".to_string(),
+            mirror_utils::put_back_mirror_roots);
         assert_eq!((refused.as_str(), owed), ("Refused. The mirror record was put back.", false));
         assert!(record.is_empty());
         assert!(mirror_utils::read_mirror_roots().unwrap().is_empty());
+    }
+
+    /// The takedown's put-back says what it did in the words the later writes use: a record the
+    /// failed step left as it was goes unmentioned, and one that landed but may not be durable
+    /// says so, as "reads as put back", the retry's sentence. Neither is owed.
+    /// Revert: mention a record the step left as it was → red. Revert: say the takedown's own
+    /// sentence ("holds what it held before") → red.
+    #[test]
+    fn a_takedown_put_back_is_said_in_the_words_the_later_writes_use() {
+        let _warehouse = crate::test_support::Warehouse::storage_only("mirror-takedown-words");
+        let mut record = BTreeMap::new();
+        let (refused, owed) = put_back_on_takedown(&mut record, "main", None, "Refused.".to_string(),
+            |_| RootsWrite::AlreadyRead);
+        assert_eq!((refused.as_str(), owed), ("Refused.", false));
+
+        let (refused, owed) = put_back_on_takedown(&mut record, "main", None, "Refused.".to_string(),
+            |_| RootsWrite::NotDurable("Sync failed.".to_string()));
+        assert_eq!((refused.as_str(), owed), (
+            "Refused. The mirror record reads as put back, but it may not be on disk durably yet (Sync failed.).",
+            false,
+        ));
+
+        for unsettled in [
+            RootsWrite::Unknown { failed: "Sync failed.".to_string(), unread: "Unreadable.".to_string() },
+            RootsWrite::Unread("Unreadable.".to_string()),
+        ] {
+            let (refused, owed) = put_back_on_takedown(&mut record, "main", None, "Refused.".to_string(),
+                |_| unsettled.clone());
+            assert_eq!((refused.as_str(), owed), ("Refused.", true), "{:?}", unsettled);
+        }
     }
 
     /// The run's last write decides what an owed pallet's message says: when it lands, the record
