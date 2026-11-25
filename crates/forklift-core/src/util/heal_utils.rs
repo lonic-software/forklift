@@ -1303,7 +1303,7 @@ mod tests {
         }
 
         // A dangling inventory root is refused, not read as a vanished path.
-        std::fs::remove_file(forklift.join("inventory")).unwrap();
+        file_utils::remove_file(forklift.join("inventory")).unwrap();
         std::os::unix::fs::symlink(root.join("unmounted"), forklift.join("inventory")).unwrap();
         refused("inventory/x/data", "inventory");
 
