@@ -186,9 +186,10 @@ pub(crate) enum RestageOutcome {
 ///                          fold "the heal itself misfired" into a content verdict a later
 ///                          recovery pass would otherwise act on.
 pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<RestageOutcome, String> {
-    // A recorded path is acted on only when it names something under `root`: a root, a `.` or a
+    // A recorded path is acted on only when every component is a plain name: a root, a `.` or a
     // `..` would let `root.join` reach a file outside the warehouse, and a torn record's lines are
-    // checked by no digest. Such a path is read as unreadable, so every caller keeps it.
+    // checked by no digest. Such a path is read as unreadable, so every caller keeps it. The check
+    // is lexical only: a symbolic link among the plain names is not judged here.
     if !relative_path.components().all(|component| matches!(component, std::path::Component::Normal(_))) {
         return Ok(RestageOutcome::Unreadable(format!(
             "\"{}\" is not a path under the storage root, so it was not read",
@@ -434,7 +435,7 @@ fn is_content_addressed(relative_path: &Path) -> bool {
 /// loose object; `None` for every other path. The shape is read from the whole path, never from
 /// its last two names alone: a nested pallet ref such as `pallets/fe/add` ends in a fan-out-like
 /// pair, and reading it as object `feadd` would judge a sound ref corrupt.
-fn loose_object_hash(relative_path: &Path) -> Option<String> {
+pub(crate) fn loose_object_hash(relative_path: &Path) -> Option<String> {
     let shape = taint_utils::taint_shape(relative_path)?;
     if !matches!(shape.disposition, Some(taint_utils::VanishedDisposition::Loose)) {
         return None;
@@ -1379,13 +1380,13 @@ mod tests {
     #[test]
     fn restage_object_still_reports_vanished_for_a_missing_pack_shaped_path() {
         // I4 non-regression (memo §8.5 test 6): a vanished `.pack`-shaped recorded path has no
-        // hash to check against packs at all (`file_utils::hash_from_object_path` returns `None`
-        // for it), so it must fall straight through to `Vanished`, exactly as before I4. (A
-        // *present* non-object path already escalates before `restage_object` is ever called for
-        // it — see `entry_heal_escalates_a_present_non_object_path_rather_than_restaging_it_lock_free`;
+        // hash to check against packs at all (`loose_object_hash` returns `None` for it), so it
+        // must fall straight through to `Vanished`, exactly as before I4. (A *present* non-object
+        // path already escalates before `restage_object` is ever called for it — see
+        // `entry_heal_escalates_a_present_non_object_path_rather_than_restaging_it_lock_free`;
         // this pins `restage_object` itself for the vanished case, so a future change to its
         // ENOENT branch cannot accidentally start "recovering" a pack-shaped path.) Mutation:
-        // widen the I4 pack check to run regardless of `hash_from_object_path`'s shape (e.g. hash
+        // widen the I4 pack check to run regardless of `loose_object_hash`'s shape (e.g. hash
         // some derived string for any vanished path) → this could spuriously return
         // `RecoveredPacked` → red.
         let _serial = lock_activation();

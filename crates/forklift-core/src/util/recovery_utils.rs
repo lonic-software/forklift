@@ -649,14 +649,14 @@ async fn resolve_the_rest(
     // D4: force-fetch bridge. `corrupt_candidates` collects exactly the entries this run will
     // attempt to recover via the dedicated corrupt-candidate fetch
     // (`remote_utils::fetch_corrupt_replacements`, see the module doc comment); anything not in
-    // it (no remote configured, or a hash-mismatch path with no shape `hash_from_object_path`
-    // recognizes — unreachable in practice, see `restage_object`'s `HashMismatch` verdict) commits
-    // straight to the remainder below. Nothing here deletes the corrupt dentry: it stays exactly
-    // as it is until (and unless) a verified good copy is ready to supersede it in one atomic
-    // rename.
+    // it (no remote configured, or a hash-mismatch path whose declared shape is not a loose
+    // object's — not reached, since `restage_object` reports `HashMismatch` only for a path
+    // `loose_object_hash` reads a hash from) commits straight to the remainder below. Nothing
+    // here deletes the corrupt dentry: it stays exactly as it is until (and unless) a verified
+    // good copy is ready to supersede it in one atomic rename.
     let mut corrupt_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     for relative in &attempt.hash_mismatch {
-        match (remote_configured, file_utils::hash_from_object_path(relative)) {
+        match (remote_configured, heal_utils::loose_object_hash(relative)) {
             (true, Some(hash)) => {
                 corrupt_candidates.insert(hash, relative.clone());
             }
@@ -6843,6 +6843,21 @@ mod tests {
         let expected: BTreeSet<PathBuf> = ["held-heads", "pallets/gone", "mirror-roots", "objects/pack/gone.sigs"].iter().map(PathBuf::from).collect();
         assert_eq!(state.recorded, expected, "the replaced record keeps exactly the uncovered paths");
         assert!(taint_utils::gate_check(&forklift).is_err(), "the gate must stand");
+
+        // A second heal reads the replaced record as it reads any complete one. With the two
+        // records put back, it restages them, makes the ref's removal durable, notes the lost
+        // signature table, and clears.
+        std::fs::write(forklift.join("held-heads"), b"held heads, put back").unwrap();
+        std::fs::write(forklift.join("mirror-roots"), b"mirror roots, put back").unwrap();
+        let outcome = run_heal().expect("a complete record whose every path has a verdict clears");
+        let restaged: BTreeSet<&str> = outcome.restaged.iter().map(String::as_str).collect();
+        assert_eq!(restaged, BTreeSet::from(["held-heads", "mirror-roots"]), "{:?}", outcome);
+        let resolved: BTreeSet<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+        assert_eq!(resolved, BTreeSet::from(["pallets/gone".to_string(), "objects/pack/gone.sigs".to_string()]), "{:?}", outcome);
+        assert!(outcome.notes.iter().any(|note| note.replace('\\', "/").starts_with("the signature table \"objects/pack/gone.sigs\" is gone")),
+            "the lost signature table must be noted: {:?}", outcome.notes);
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn && state.recorded.is_empty(), "nothing may remain recorded");
 
         crate::util::file_utils::remove_dir_all(&root).ok();
     }

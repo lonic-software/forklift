@@ -881,7 +881,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **`heal` no longer judges a nested pallet ref such as `fe/add` corrupt.** A recorded path is read
   as a loose object only when its whole path has a loose object's shape, so a pallet whose last two
   names happened to look like an object's hash was refused as corrupt on every `heal` and left the
-  taint standing. `heal` also never rewrites a recorded path that would lead outside the warehouse.
+  taint standing. The same reading now decides which objects a taint may yet restore when `heal`
+  judges a damaged ref's head. `heal` also never rewrites a recorded path that is not made only of
+  plain names (a `..`, a leading `.`, a root or a drive prefix), since such a path could lead
+  outside the warehouse.
 - **An `undo` that stops after putting the pallets back can be retried.** An `undo` of a `stack`,
   `consolidate` or `pick` puts the bay's position and the pallets back first, then the
   consolidation or pick that was in progress before. When one of those later writes failed, or the

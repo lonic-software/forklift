@@ -299,11 +299,12 @@ pub fn get_path_for_object(hash: &str) -> Result<(String, String), String> {
 }
 
 /// Recover the object hash a loose object's final on-disk path encodes — the exact inverse of
-/// [`get_path_for_object`]. Used by [`heal_utils`](crate::util::heal_utils) to tell a loose
-/// object apart from every other kind of path a taint can record (a pack data/index file, an
-/// inventory shard): only a loose object's path has this exact `<2 hex chars>/<rest>` shape, so
-/// `Some` here is also the signal that a content-hash re-check is possible (and required) before
-/// restaging — see [`heal_utils::restage_object`](crate::util::heal_utils::restage_object).
+/// [`get_path_for_object`]. It reads only the last two names, so it is sound only over a path
+/// already known to have a loose object's shape (one the loose-store walk listed, or one a matched
+/// taint shape declares). Other recorded paths can end in the same shape: a
+/// nested pallet ref `pallets/fe/add` reads as `feadd`. A path a taint recorded is read with
+/// [`heal_utils::loose_object_hash`](crate::util::heal_utils::loose_object_hash), which matches
+/// the whole declared shape first.
 ///
 /// # Returns
 /// * `Some(String)` - The hash, if `path`'s last two components have the `<2 hex chars>/<rest>`
@@ -8108,8 +8109,9 @@ mod tests {
         // than mnemonic non-hex filenames ("alpha-object"/"beta-object", this test's own shape
         // before this slice): `heal_if_tainted` now gates its restage on content-addressability
         // (I1/I2, `heal_utils`'s module doc comment) *before* attempting anything, so a taint over
-        // a path `hash_from_object_path` does not recognize would escalate instead of healing —
-        // this test needs the common, content-addressed case that must still heal inline.
+        // a path whose declared shape is not a loose object's (`heal_utils::loose_object_hash`)
+        // would escalate instead of healing — this test needs the common, content-addressed case
+        // that must still heal inline.
         let _serial = lock_taint_activation();
         taint_utils::activate();
 
