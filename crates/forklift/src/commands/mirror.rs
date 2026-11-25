@@ -1476,8 +1476,8 @@ mod tests {
 
     /// The takedown refusal's put-back is owed exactly when its write's outcome leaves the record
     /// not holding the put-back: then the refusal is reported as it was, for the retry to
-    /// complete; otherwise it carries that write's sentence. Either way the record in memory is the one put back.
-    /// Revert: owe the put-back when it read back as landed (or not when it did not) → red.
+    /// complete. A write that landed adds its sentence. Either way the record in memory is the one
+    /// put back. Revert: owe the put-back when its write landed (or not when it failed) → red.
     #[test]
     fn a_takedown_put_back_is_owed_when_the_record_does_not_read_back_as_put_back() {
         let _warehouse = crate::test_support::Warehouse::storage_only("mirror-takedown-owed");

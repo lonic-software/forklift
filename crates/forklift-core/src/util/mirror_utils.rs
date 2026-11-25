@@ -109,9 +109,10 @@ impl RootsWrite {
 
     /// Whether, after a write that went this way, the record holds the put-backs a takedown
     /// refusal wanted, as far as reading it shows. After the run's last write, when it does not,
-    /// or reading it failed, the owed put-backs are tried again ([`put_back_owed_roots`]). The
-    /// takedown's own put-back ([`put_back_mirror_roots`]) decides by its own exhaustive match,
-    /// which owes the same variants.
+    /// or reading it failed, the owed put-backs are tried again ([`put_back_owed_roots`]). Whether
+    /// the takedown's own put-back ([`put_back_mirror_roots`]) is owed is decided by an exhaustive
+    /// match on its outcome in the mirror command (`mirror::put_back_on_takedown`), which owes the
+    /// same variants.
     pub fn holds_what_was_wanted(&self) -> bool {
         match self {
             RootsWrite::AlreadyRead | RootsWrite::Landed | RootsWrite::NotDurable(_) => true,
