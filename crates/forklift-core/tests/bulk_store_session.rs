@@ -189,7 +189,7 @@ fn a_trailing_directory_sync_failure_through_bulk_store_session_records_a_taint(
 
     let blocked_dir = forklift.join("objects").join("bb");
     std::fs::create_dir_all(&blocked_dir).unwrap();
-    let target = blocked_dir.join("blocked-object");
+    let target = blocked_dir.join("b10c");
 
     let session = BulkStoreSession::open().unwrap();
     write_file_atomically(&target, b"content").unwrap();
@@ -209,7 +209,7 @@ fn a_trailing_directory_sync_failure_through_bulk_store_session_records_a_taint(
     assert!(target.exists(), "the rename itself must have landed before the directory sync failed");
 
     let state = taint_utils::read_taints(&forklift).unwrap();
-    assert!(state.recorded.contains(&std::path::PathBuf::from("objects/bb/blocked-object")),
+    assert!(state.recorded.contains(&std::path::PathBuf::from("objects/bb/b10c")),
         "the batch's final path must be recorded as tainted, got {:?}", state.recorded);
 
     forklift_core::util::file_utils::remove_dir_all(&root).ok();

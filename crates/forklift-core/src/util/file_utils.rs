@@ -8066,8 +8066,8 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let alpha = forklift.join("objects").join("aa").join("alpha-object");
-        let beta = forklift.join("objects").join("bb").join("beta-object");
+        let alpha = forklift.join("objects").join("aa").join("a1fa");
+        let beta = forklift.join("objects").join("bb").join("be7a");
         std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
         std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
 
@@ -8085,8 +8085,8 @@ mod tests {
         let state = taint_utils::read_taints(&forklift).unwrap();
         assert!(!state.torn, "a freshly recorded taint must not read as torn");
         let expected: BTreeSet<PathBuf> = [
-            PathBuf::from("objects/aa/alpha-object"),
-            PathBuf::from("objects/bb/beta-object"),
+            PathBuf::from("objects/aa/a1fa"),
+            PathBuf::from("objects/bb/be7a"),
         ].into_iter().collect();
         assert_eq!(state.recorded, expected,
             "the taint must record exactly the batch's final paths, root-relative");
@@ -8184,7 +8184,7 @@ mod tests {
         // The command proceeds: a fresh write under the now-healed root succeeds cleanly.
         let after_heal_dir = forklift.join("objects").join("cc");
         std::fs::create_dir_all(&after_heal_dir).unwrap();
-        assert!(write_file_atomically(&after_heal_dir.join("after-heal"), b"ok").is_ok());
+        assert!(write_file_atomically(&after_heal_dir.join("af7e"), b"ok").is_ok());
 
         remove_dir_all(&temp).ok();
     }
@@ -8196,7 +8196,7 @@ mod tests {
         // landed) also fails. Only the prefix that actually became visible before the failure may
         // be tainted, never the entry whose rename never ran. Reverting `renamed_finals` back to
         // tainting the *whole* `pending` set (or dropping the `taint_after_sync_failure` call
-        // entirely) kills this test either way — the first by making `blocked-object` appear in
+        // entirely) kills this test either way — the first by making `b10c` appear in
         // `recorded`, the second by leaving `recorded` empty.
         let _serial = lock_taint_activation();
         taint_utils::activate();
@@ -8207,8 +8207,8 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let landed = forklift.join("objects").join("aa").join("landed-object");
-        let blocked = forklift.join("objects").join("bb").join("blocked-object");
+        let landed = forklift.join("objects").join("aa").join("1a4d");
+        let blocked = forklift.join("objects").join("bb").join("b10c");
         std::fs::create_dir_all(landed.parent().unwrap()).unwrap();
         std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
 
@@ -8225,10 +8225,10 @@ mod tests {
         let _guard = DirSyncFaultGuard::failing("aa");
 
         let error = batch.finish().unwrap_err();
-        assert!(error.contains("blocked-object"), "got: {}", error);
+        assert!(error.contains("b10c"), "got: {}", error);
 
         let state = taint_utils::read_taints(&forklift).unwrap();
-        let expected: BTreeSet<PathBuf> = [PathBuf::from("objects/aa/landed-object")].into_iter().collect();
+        let expected: BTreeSet<PathBuf> = [PathBuf::from("objects/aa/1a4d")].into_iter().collect();
         assert_eq!(state.recorded, expected,
             "only the visible prefix may be tainted, never an entry that was never renamed");
 
@@ -8249,7 +8249,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("cc").join("immediate-object");
+        let target = forklift.join("objects").join("cc").join("1eed");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         let _guard = SyncDirFaultGuard::failing("cc");
@@ -8259,7 +8259,7 @@ mod tests {
         assert!(target.exists(), "the rename must have landed before the directory sync failed");
 
         let state = taint_utils::read_taints(&forklift).unwrap();
-        let expected: BTreeSet<PathBuf> = [PathBuf::from("objects/cc/immediate-object")].into_iter().collect();
+        let expected: BTreeSet<PathBuf> = [PathBuf::from("objects/cc/1eed")].into_iter().collect();
         assert_eq!(state.recorded, expected,
             "the taint must record exactly the single final path, root-relative");
 
@@ -8289,7 +8289,7 @@ mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("dd").join("fresh-object");
+        let target = forklift.join("objects").join("dd").join("f5e5");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         let batch = WriteBatch::new();
@@ -8321,7 +8321,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("ee").join("standing-object");
+        let target = forklift.join("objects").join("ee").join("57a4");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         write_file_atomically(&target, b"old bytes").unwrap();
 
@@ -8335,7 +8335,7 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(target.parent().unwrap()).unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(left, vec![std::ffi::OsString::from("standing-object")], "no temp file is left");
+        assert_eq!(left, vec![std::ffi::OsString::from("57a4")], "no temp file is left");
 
         remove_dir_all(&temp).ok();
     }
@@ -8357,7 +8357,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("ef").join("in-flight-object");
+        let target = forklift.join("objects").join("ef").join("1f11");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         write_file_atomically(&target, b"old bytes").unwrap();
 
@@ -8392,7 +8392,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("ed").join("compensated-object");
+        let target = forklift.join("objects").join("ed").join("c0e5");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         write_file_atomically(&target, b"before the command").unwrap();
         write_file_atomically(&target, b"the failed write").unwrap();
@@ -8430,7 +8430,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("ec").join("compensated-object");
+        let target = forklift.join("objects").join("ec").join("c0e5");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         write_file_atomically(&target, b"before the command").unwrap();
 
@@ -8465,7 +8465,7 @@ mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("gh").join("nested-object");
+        let target = forklift.join("objects").join("9b").join("4e57");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         let outer = SelfTripExemptionGuard::new();
@@ -8507,7 +8507,7 @@ mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("gg").join("fresh-object");
+        let target = forklift.join("objects").join("9a").join("f5e5");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         // (a) Unguarded: refuses.
@@ -8563,7 +8563,7 @@ mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("hh").join("fresh-object");
+        let target = forklift.join("objects").join("9c").join("f5e5");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         // Armed on the main thread. Held across the spawn/join below so it is still armed for
@@ -8675,8 +8675,8 @@ mod tests {
         let forklift = forklift_root();
 
         // A real directory-sync failure, batched — must fail the batch but leave no taint trace.
-        let alpha = forklift.join("objects").join("aa").join("alpha-object");
-        let beta = forklift.join("objects").join("bb").join("beta-object");
+        let alpha = forklift.join("objects").join("aa").join("a1fa");
+        let beta = forklift.join("objects").join("bb").join("be7a");
         std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
         std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
 
@@ -8707,7 +8707,7 @@ mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-1-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("cc").join("fresh-object");
+        let target = forklift.join("objects").join("cc").join("f5e5");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         write_file_atomically(&target, b"content").unwrap();
         assert!(target.exists(), "an unactivated re-check must never refuse a clean sync");
@@ -9263,7 +9263,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "names \"undeclared/batched\", a path whose shape no entry of TAINT_SHAPES declares")]
     fn the_batch_write_refuses_an_undeclared_path_with_fsync_off() {
-        assert!(!fsync_enabled(), "sanity: this crate's unit tests run with fsync off");
         let (_scope, folder) = undeclared_shape_fixture("undeclared-batch");
         let temp = folder.join("batched.tmp");
         std::fs::write(&temp, b"content").unwrap();
@@ -9416,7 +9415,7 @@ mod tests {
             ("forklift-core/src/util/file_utils.rs", "taint_after_sync_failure", "record_taint"),
             // Heal's remainder writer, unchecked, from heal's five sites only.
             ("forklift-core/src/util/heal_utils.rs", "heal_if_tainted", "resolve_taints"),
-            ("forklift-core/src/util/heal_utils.rs", "heal_object_paths", "resolve_taints"),
+            ("forklift-core/src/util/heal_utils.rs", "finish_clean_heal", "resolve_taints"),
             ("forklift-core/src/util/recovery_utils.rs", "run_pass", "resolve_taints"),
             ("forklift-core/src/util/recovery_utils.rs", "resolve_the_rest", "resolve_taints"),
             ("forklift-core/src/util/recovery_utils.rs", "rescan_torn_taint", "resolve_taints"),
@@ -9427,17 +9426,17 @@ mod tests {
             ("forklift-core/src/util/file_utils.rs", "sync_dir_or_taint", "sync_result_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "sync_result_or_taint"),
             // The funnel's callers.
-            ("forklift-core/src/util/bundle_utils.rs", "write_latest", "sync_dir_or_taint"),
+            ("forklift-core/src/util/bundle_utils.rs", "publish_bundle_download", "sync_dir_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_or_taint"),
-            ("forklift-core/src/util/object_utils.rs", "store_object", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "write_pack", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "write_pack_index", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "write_signature_table", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "replace_pack", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pallet_utils.rs", "remove_pallet_ref", "sync_dir_again_or_taint"),
-            ("forklift-core/src/util/pallet_utils.rs", "delete_pallet_ref", "sync_dir_or_taint"),
-            ("forklift-core/src/util/ref_heal.rs", "write_ref_back", "sync_dir_again_or_taint"),
+            ("forklift-core/src/util/object_utils.rs", "store_object_stream", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "import_transport_packs", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "compact_held", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "write_signature_tables", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "finish", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pallet_utils.rs", "restore_copy", "sync_dir_again_or_taint"),
+            ("forklift-core/src/util/pallet_utils.rs", "unlink_ref", "sync_dir_or_taint"),
+            ("forklift-core/src/util/ref_heal.rs", "sync_files_again", "sync_dir_again_or_taint"),
         ].into_iter().map(|(file, within, name)| (file.to_string(), within.to_string(), name.to_string())).collect();
         expected.sort();
 

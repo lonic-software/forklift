@@ -5,6 +5,13 @@ use std::process::Command;
 /// `forklift` with fsync off. Durability is not what these tests check, and paying an fsync per
 /// write made the suite much slower. `crash_consistency.rs` forces it on, and the in-process
 /// tests leave it on.
+///
+/// A child that panics is not caught here: this builds the command and runs nothing, so a test
+/// that asserts only that the command failed also passes on a panic, the debug build's
+/// undeclared-taint-shape assertion included. Every test that runs a child it expects to fail,
+/// through this or [`test_command`], is that uncovered case. So is any storage work run through
+/// `spawn_blocking` in `forklift-server` or `forklift-aws-lambda`, which turns a panic into an
+/// error reply before a child's exit could show it.
 pub fn forklift_command() -> Command {
     test_command(env!("CARGO_BIN_EXE_forklift"))
 }
