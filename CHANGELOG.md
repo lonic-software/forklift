@@ -871,6 +871,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **`heal` no longer clears a torn durability taint over a lost ref or record.** When a taint
+  record was torn, `heal` rebuilt it from the object store alone and dropped every other path the
+  record still named, such as a pallet ref, the trust anchor or the held-heads record, so the
+  taint could clear while that loss stood. It now restages each such path that is still there and
+  keeps the ones that are gone, so `heal` refuses and names them, and a second `heal` treats them
+  as it treats any other taint. Paths in the part of a torn record that cannot be read are still
+  not recoverable.
 - **An `undo` that stops after putting the pallets back can be retried.** An `undo` of a `stack`,
   `consolidate` or `pick` puts the bay's position and the pallets back first, then the
   consolidation or pick that was in progress before. When one of those later writes failed, or the

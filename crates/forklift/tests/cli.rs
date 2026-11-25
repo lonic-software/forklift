@@ -14630,7 +14630,10 @@ fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder
     // the torn record's own (lower-bound, untrusted) recorded set.
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("taint-1-0"), b"/forklift-taint 2\nobjects/aa/an-unrelated-surviving-line\n").unwrap();
+    // The line names an absent, unreferenced loose object: a shape the store walks cover, so the
+    // rescan does not carry it.
+    let unrelated = format!("/forklift-taint 2\nobjects/aa/{}\n", "a".repeat(62));
+    std::fs::write(dir.join("taint-1-0"), unrelated).unwrap();
 
     let status = warehouse.run(&["heal", "--json"]);
     assert_eq!(status.status.code(), Some(21));
