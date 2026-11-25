@@ -899,7 +899,8 @@ mod tests {
         // `attempt_restage_all_still_restages_a_present_non_object_path_verbatim`, the direct
         // successor of what this test used to assert before this boundary existed. Mutation: let
         // `heal_if_tainted` fall through to `attempt_restage_all` regardless of shape → this
-        // becomes `Ok`, the inode changes, and the taint clears → every assertion below reddens.
+        // becomes `Ok`, the inode changes, and the taint clears → the refusal, inode and record
+        // assertions below redden (the rewrite is verbatim, so the bytes assertion stays green).
         //
         // The second case is a nested pallet ref whose last two names spell a hash: it is judged
         // by its declared shape, a ref, never as loose object `feadd`. Mutation: read
