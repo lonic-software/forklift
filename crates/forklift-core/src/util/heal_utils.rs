@@ -900,41 +900,47 @@ mod tests {
         // successor of what this test used to assert before this boundary existed. Mutation: let
         // `heal_if_tainted` fall through to `attempt_restage_all` regardless of shape → this
         // becomes `Ok`, the inode changes, and the taint clears → every assertion below reddens.
+        //
+        // The second case is a nested pallet ref whose last two names spell a hash: it is judged
+        // by its declared shape, a ref, never as loose object `feadd`. Mutation: read
+        // `is_content_addressed` from the last two names alone → `restage_object` (which still
+        // matches the declared shape) rewrites the ref verbatim, lock-free, and the taint clears.
         let _serial = lock_activation();
         taint_utils::activate();
 
-        let root = scratch("non-object-escalates");
-        let _scope = StorageRootScope::enter(&root);
-        let forklift = forklift_root();
+        for (name, recorded) in [("non-object-escalates", "objects/pack/fake.pack"), ("fan-out-like-ref-escalates", "pallets/fe/add")] {
+            let root = scratch(name);
+            let _scope = StorageRootScope::enter(&root);
+            let forklift = forklift_root();
 
-        let pack_dir = forklift.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir).unwrap();
-        let pack_file = pack_dir.join("fake.pack");
-        std::fs::write(&pack_file, b"not a real pack, just bytes to restage").unwrap();
+            let file = forklift.join(recorded);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"not an object, just bytes to restage").unwrap();
 
-        #[cfg(unix)]
-        let inode_before = std::fs::metadata(&pack_file).unwrap().ino();
+            #[cfg(unix)]
+            let inode_before = std::fs::metadata(&file).unwrap().ino();
 
-        plant_taint(&forklift, &["objects/pack/fake.pack"]);
+            plant_taint(&forklift, &[recorded]);
 
-        let error = heal_if_tainted()
-            .expect_err("a non-content-addressed recorded path must never auto-heal lock-free");
-        assert_durability_taint(&error, &["objects/pack/fake.pack"]);
+            let error = heal_if_tainted()
+                .expect_err("a non-content-addressed recorded path must never auto-heal lock-free");
+            assert_durability_taint(&error, &["cannot be hash-verified before a lock-free rewrite", recorded]);
 
-        #[cfg(unix)]
-        {
-            let inode_after = std::fs::metadata(&pack_file).unwrap().ino();
-            assert_eq!(inode_before, inode_after,
-                "the dentry must never be rewritten lock-free for a non-content-addressed path");
+            #[cfg(unix)]
+            {
+                let inode_after = std::fs::metadata(&file).unwrap().ino();
+                assert_eq!(inode_before, inode_after,
+                    "{}: the dentry must never be rewritten lock-free for a non-content-addressed path", recorded);
+            }
+
+            assert_eq!(
+                std::fs::read(&file).unwrap(), b"not an object, just bytes to restage",
+                "{}: the bytes must be untouched — escalation never attempts a rewrite", recorded
+            );
+
+            assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
+                "{}: the taint must survive — escalation never clears it", recorded);
         }
-
-        assert_eq!(
-            std::fs::read(&pack_file).unwrap(), b"not a real pack, just bytes to restage",
-            "the bytes must be untouched — escalation never attempts a rewrite"
-        );
-
-        assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(),
-            "the taint must survive — escalation never clears it");
     }
 
     #[test]
