@@ -1,0 +1,3635 @@
+{
+  "format": 5,
+  "header": {
+    "seed": 1592590337,
+    "shape": "small",
+    "shape_detail": "400 text files in 3 levels of 4 directories, 2 binary files of 2097152 bytes, 40 commits on main changing 8 files each, 3 on perf-side",
+    "side_branch": "perf-side",
+    "reps": 5,
+    "tools": {
+      "forklift": "/home/runner/work/forklift/forklift/target/release/forklift (forklift 0.3.1)",
+      "forklift-server": "/home/runner/work/forklift/forklift/target/release/forklift-server (forklift-server 0.3.1)",
+      "git": "/usr/bin/git (git version 2.56.1)"
+    },
+    "platform": "linux",
+    "os": "Linux 7.0.0-1020-azure",
+    "filesystem": "ext2/ext3/ext4",
+    "configurations": {
+      "git": "gc.autoDetach=false maintenance.autoDetach=false",
+      "git-tuned": "core.fsync=all core.fsyncMethod=fsync transfer.fsckObjects=true fetch.fsckObjects=true receive.fsckObjects=true core.commitGraph=true gc.writeCommitGraph=true fetch.writeCommitGraph=true core.untrackedCache=true; core.fsmonitor=true (its daemon run by the harness); a commit-graph written untimed after the build"
+    },
+    "hardware": {
+      "cpu": "AMD EPYC 9V74 80-Core Processor",
+      "logical_cores": 4,
+      "ram_bytes": 16759431168
+    },
+    "drop_caches": "/home/runner/work/forklift/forklift/bin/perf-drop-caches"
+  },
+  "rows": [
+    {
+      "operation": "status",
+      "cache": "warm",
+      "note": "Forklift's stocktake --summary against git's status, on the clean tree",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "stocktake",
+              "--summary"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 12944,
+                "min": 11412,
+                "max": 14655
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 24424448,
+                  "min": 23977984,
+                  "max": 24604672
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "status"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 15333,
+                "min": 15207,
+                "max": 15921
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9007104,
+                  "min": 9007104,
+                  "max": 9007104
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "status"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 2928,
+                "min": 2892,
+                "max": 3508
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9007104,
+                  "min": 9007104,
+                  "max": 9007104
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "status",
+      "cache": "cold",
+      "note": "Forklift's stocktake --summary against git's status, on the clean tree",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "stocktake",
+              "--summary"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 89637,
+                "min": 72199,
+                "max": 106347
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 21983232,
+                  "min": 21635072,
+                  "max": 22200320
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 38
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "status"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 32654,
+                "min": 27443,
+                "max": 105183
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9007104,
+                  "min": 9007104,
+                  "max": 9007104
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "status"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 14777,
+                "min": 14174,
+                "max": 21531
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9007104,
+                  "min": 9007104,
+                  "max": 9007104
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "log",
+      "cache": "warm",
+      "note": "Forklift's history against git's log, the whole history",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "history"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 4325,
+                "min": 4240,
+                "max": 4651
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12627968,
+                  "min": 12353536,
+                  "max": 12910592
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "log"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 1503,
+                "min": 1435,
+                "max": 1596
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9007104,
+                  "min": 9007104,
+                  "max": 9007104
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "log"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 1727,
+                "min": 1693,
+                "max": 1744
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9007104,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "log",
+      "cache": "cold",
+      "note": "Forklift's history against git's log, the whole history",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "history"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 37787,
+                "min": 34853,
+                "max": 44080
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12308480,
+                  "min": 12111872,
+                  "max": 12648448
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "log"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 15394,
+                "min": 13853,
+                "max": 20341
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "log"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 15091,
+                "min": 14204,
+                "max": 15683
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "blame",
+      "cache": "warm",
+      "note": "d0/d0/d0/f00000.txt, the file the history changes most, first-parent on both",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "blame",
+              "d0/d0/d0/f00000.txt"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 6741,
+                "min": 6712,
+                "max": 7233
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13103104,
+                  "min": 13049856,
+                  "max": 13230080
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "blame",
+              "--first-parent",
+              "d0/d0/d0/f00000.txt"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 2162,
+                "min": 2109,
+                "max": 2372
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "blame",
+              "--first-parent",
+              "d0/d0/d0/f00000.txt"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 2844,
+                "min": 2828,
+                "max": 2954
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "blame",
+      "cache": "cold",
+      "note": "d0/d0/d0/f00000.txt, the file the history changes most, first-parent on both",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "blame",
+              "d0/d0/d0/f00000.txt"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 46903,
+                "min": 43729,
+                "max": 61406
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12726272,
+                  "min": 12345344,
+                  "max": 12873728
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "blame",
+              "--first-parent",
+              "d0/d0/d0/f00000.txt"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 17247,
+                "min": 16583,
+                "max": 21220
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "blame",
+              "--first-parent",
+              "d0/d0/d0/f00000.txt"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 18610,
+                "min": 18164,
+                "max": 20715
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "verify",
+      "cache": "warm",
+      "note": "Forklift's audit --full against git's fsck --full --strict, every record of the whole history; the imported parcels carry no signatures, which the audit counts as legacy",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "audit",
+              "--full"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 14581,
+                "min": 14536,
+                "max": 14743
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13242368,
+                  "min": 13180928,
+                  "max": 13508608
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "fsck",
+              "--full",
+              "--strict"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 45533,
+                "min": 45482,
+                "max": 46345
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 14090240,
+                  "min": 14049280,
+                  "max": 14098432
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 100
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "fsck",
+              "--full",
+              "--strict"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 47325,
+                "min": 47185,
+                "max": 47630
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 14622720,
+                  "min": 14520320,
+                  "max": 14659584
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 99
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "verify",
+      "cache": "cold",
+      "note": "Forklift's audit --full against git's fsck --full --strict, every record of the whole history; the imported parcels carry no signatures, which the audit counts as legacy",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "audit",
+              "--full"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 51322,
+                "min": 50237,
+                "max": 71622
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13099008,
+                  "min": 12894208,
+                  "max": 13283328
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 40
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "fsck",
+              "--full",
+              "--strict"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 69632,
+                "min": 68170,
+                "max": 70171
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13967360,
+                  "min": 13905920,
+                  "max": 13975552
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 72
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "fsck",
+              "--full",
+              "--strict"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 70343,
+                "min": 69817,
+                "max": 72602
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 14315520,
+                  "min": 14192640,
+                  "max": 14626816
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 73
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "commit",
+      "cache": "warm",
+      "note": "the same 20 tracked files edited and staged, untimed, on a fresh copy for each repetition; Forklift's subject is enrolled, so its stack is signed, and git's commit is not",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "stack",
+              "-m",
+              "perf: a timed commit"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 17510,
+                "min": 17322,
+                "max": 17858
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 17625088,
+                  "min": 17481728,
+                  "max": 17780736
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "commit",
+              "-q",
+              "-m",
+              "perf: a timed commit"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 6975,
+                "min": 6675,
+                "max": 7123
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "commit",
+              "-q",
+              "-m",
+              "perf: a timed commit"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 9888,
+                "min": 9729,
+                "max": 112541
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "commit",
+      "cache": "cold",
+      "note": "the same 20 tracked files edited and staged, untimed, on a fresh copy for each repetition; Forklift's subject is enrolled, so its stack is signed, and git's commit is not",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "stack",
+              "-m",
+              "perf: a timed commit"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 60528,
+                "min": 55949,
+                "max": 77875
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 16941056,
+                  "min": 16584704,
+                  "max": 17129472
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 35
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "commit",
+              "-q",
+              "-m",
+              "perf: a timed commit"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 37122,
+                "min": 33291,
+                "max": 58734
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "commit",
+              "-q",
+              "-m",
+              "perf: a timed commit"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 32471,
+                "min": 29599,
+                "max": 77870
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9138176
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "switch",
+      "cache": "warm",
+      "note": "from the current branch to perf-side, on a fresh copy for each repetition",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "shift",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 42977,
+                "min": 42035,
+                "max": 48974
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 17391616,
+                  "min": 17338368,
+                  "max": 17670144
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 69
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "switch",
+              "-q",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 8304,
+                "min": 8186,
+                "max": 8812
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9138176,
+                  "min": 9138176,
+                  "max": 9269248
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "switch",
+              "-q",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 9103,
+                "min": 8920,
+                "max": 9238
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9269248,
+                  "min": 9269248,
+                  "max": 9269248
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "switch",
+      "cache": "cold",
+      "note": "from the current branch to perf-side, on a fresh copy for each repetition",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "shift",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 92377,
+                "min": 84616,
+                "max": 266599
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 16707584,
+                  "min": 16650240,
+                  "max": 16941056
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 43
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "switch",
+              "-q",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 22819,
+                "min": 21278,
+                "max": 33595
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9269248,
+                  "min": 9269248,
+                  "max": 9269248
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "switch",
+              "-q",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 21207,
+                "min": 20406,
+                "max": 22305
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9269248,
+                  "min": 9269248,
+                  "max": 9269248
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "merge",
+      "cache": "warm",
+      "note": "perf-side into the current branch, each with commits the other lacks, on a fresh copy for each repetition",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "consolidate",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 36742,
+                "min": 36022,
+                "max": 42693
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 19738624,
+                  "min": 19255296,
+                  "max": 21536768
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 75
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "merge",
+              "-q",
+              "--no-edit",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 11255,
+                "min": 11021,
+                "max": 11583
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9269248,
+                  "min": 9269248,
+                  "max": 9269248
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "merge",
+              "-q",
+              "--no-edit",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 16175,
+                "min": 15593,
+                "max": 16339
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9269248,
+                  "min": 9269248,
+                  "max": 9269248
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "merge",
+      "cache": "cold",
+      "note": "perf-side into the current branch, each with commits the other lacks, on a fresh copy for each repetition",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "consolidate",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 98664,
+                "min": 82059,
+                "max": 117952
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 20705280,
+                  "min": 19042304,
+                  "max": 20996096
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 40
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "merge",
+              "-q",
+              "--no-edit",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 41558,
+                "min": 37022,
+                "max": 63726
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9269248,
+                  "min": 9269248,
+                  "max": 9269248
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "merge",
+              "-q",
+              "--no-edit",
+              "perf-side"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 40637,
+                "min": 40000,
+                "max": 40878
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9269248,
+                  "min": 9269248,
+                  "max": 9269248
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "pack",
+      "cache": "warm",
+      "note": "every object of the store repacked, on a fresh copy for each repetition: Forklift's store compact --all against git's gc; an import leaves Forklift's store packed already",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "store",
+              "compact",
+              "--all"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 51977,
+                "min": 49691,
+                "max": 56749
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 21229568,
+                  "min": 21200896,
+                  "max": 21352448
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 59
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "gc",
+              "-q"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 63760,
+                "min": 61467,
+                "max": 64573
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12812288,
+                  "min": 12771328,
+                  "max": 12881920
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 66
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "gc",
+              "-q"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 65630,
+                "min": 64331,
+                "max": 78049
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13369344,
+                  "min": 13283328,
+                  "max": 13467648
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 67
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "pack",
+      "cache": "cold",
+      "note": "every object of the store repacked, on a fresh copy for each repetition: Forklift's store compact --all against git's gc; an import leaves Forklift's store packed already",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "store",
+              "compact",
+              "--all"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 106685,
+                "min": 101682,
+                "max": 211969
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 20623360,
+                  "min": 20574208,
+                  "max": 20652032
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 37
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "gc",
+              "-q"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 109901,
+                "min": 95969,
+                "max": 116302
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12857344,
+                  "min": 12722176,
+                  "max": 12922880
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 42
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "gc",
+              "-q"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 104647,
+                "min": 97801,
+                "max": 118597
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13320192,
+                  "min": 13283328,
+                  "max": 13438976
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 46
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "clone",
+      "cache": "warm",
+      "note": "the whole history of main, cloned into a new folder from a fresh copy of the remote for each repetition; Forklift's over HTTP on loopback to a forklift-server, git's to a bare repository by path",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "clone",
+              "{url}",
+              "{work}"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 1268008,
+                "min": 1137635,
+                "max": 1707437
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 43880448,
+                  "min": 43044864,
+                  "max": 44142592
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 34
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "clone",
+              "-q",
+              "--no-local",
+              "{url}",
+              "{work}"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 97903,
+                "min": 96846,
+                "max": 98846
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12603392,
+                  "min": 12558336,
+                  "max": 12820480
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 104
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "clone",
+              "-q",
+              "--no-local",
+              "{url}",
+              "{work}"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 99733,
+                "min": 99131,
+                "max": 111488
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12660736,
+                  "min": 12451840,
+                  "max": 12783616
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 102
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "clone",
+      "cache": "cold",
+      "note": "the whole history of main, cloned into a new folder from a fresh copy of the remote for each repetition; Forklift's over HTTP on loopback to a forklift-server, git's to a bare repository by path",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "clone",
+              "{url}",
+              "{work}"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 1617700,
+                "min": 1503720,
+                "max": 1950875
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 41447424,
+                  "min": 39481344,
+                  "max": 42557440
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 27
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "clone",
+              "-q",
+              "--no-local",
+              "{url}",
+              "{work}"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 127483,
+                "min": 125100,
+                "max": 146558
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12574720,
+                  "min": 12517376,
+                  "max": 12648448
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 86
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "clone",
+              "-q",
+              "--no-local",
+              "{url}",
+              "{work}"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 125907,
+                "min": 125435,
+                "max": 131315
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 12591104,
+                  "min": 12451840,
+                  "max": 12664832
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 86
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "push",
+      "cache": "warm",
+      "note": "the current branch with 3 commits more than the remote's, pushed from a fresh copy of the subject so advanced to a fresh copy of the remote for each repetition, which must leave the remote's branch at the pushed head; Forklift's over HTTP on loopback to a forklift-server, git's to a bare repository by path",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "lift"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 24035,
+                "min": 23330,
+                "max": 35093
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 17223680,
+                  "min": 17051648,
+                  "max": 17457152
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "push",
+              "-q",
+              "-u",
+              "origin",
+              "HEAD"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 21374,
+                "min": 20593,
+                "max": 21414
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9318400,
+                  "min": 9318400,
+                  "max": 9318400
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 101
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "push",
+              "-q",
+              "-u",
+              "origin",
+              "HEAD"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 21516,
+                "min": 21415,
+                "max": 22085
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9318400,
+                  "min": 9318400,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 100
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "push",
+      "cache": "cold",
+      "note": "the current branch with 3 commits more than the remote's, pushed from a fresh copy of the subject so advanced to a fresh copy of the remote for each repetition, which must leave the remote's branch at the pushed head; Forklift's over HTTP on loopback to a forklift-server, git's to a bare repository by path",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "lift"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 74235,
+                "min": 73607,
+                "max": 90503
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 16211968,
+                  "min": 16125952,
+                  "max": 16367616
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 28
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "push",
+              "-q",
+              "-u",
+              "origin",
+              "HEAD"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 47226,
+                "min": 45650,
+                "max": 48676
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 53
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "push",
+              "-q",
+              "-u",
+              "origin",
+              "HEAD"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 63122,
+                "min": 51179,
+                "max": 95410
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 40
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "pull",
+      "cache": "warm",
+      "note": "the remote's branch, 3 commits past the current one, pulled as a fast-forward into a fresh copy of the subject from a fresh copy of the remote for each repetition, which must leave the subject's head at the remote's; Forklift's over HTTP on loopback to a forklift-server, git's to a bare repository by path",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "lower"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 45750,
+                "min": 42092,
+                "max": 49244
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 23781376,
+                  "min": 23486464,
+                  "max": 24055808
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 78
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "pull",
+              "-q",
+              "--ff-only"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 21484,
+                "min": 21022,
+                "max": 21987
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 101
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "pull",
+              "-q",
+              "--ff-only"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 24543,
+                "min": 24031,
+                "max": 24737
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 92
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "pull",
+      "cache": "cold",
+      "note": "the remote's branch, 3 commits past the current one, pulled as a fast-forward into a fresh copy of the subject from a fresh copy of the remote for each repetition, which must leave the subject's head at the remote's; Forklift's over HTTP on loopback to a forklift-server, git's to a bare repository by path",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "lower"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 124117,
+                "min": 103132,
+                "max": 253021
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 23363584,
+                  "min": 23277568,
+                  "max": 23535616
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 41
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "pull",
+              "-q",
+              "--ff-only"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 53797,
+                "min": 51089,
+                "max": 68668
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 54
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "pull",
+              "-q",
+              "--ff-only"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 51398,
+                "min": 50673,
+                "max": 76676
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 54
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "diff",
+      "cache": "warm",
+      "note": "20 tracked files edited, unstaged",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "diff"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 13544,
+                "min": 12544,
+                "max": 14526
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 22462464,
+                  "min": 22380544,
+                  "max": 22564864
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 173
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "diff"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 2689,
+                "min": 2648,
+                "max": 2901
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "diff"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 2513,
+                "min": 2444,
+                "max": 2649
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "diff",
+      "cache": "cold",
+      "note": "20 tracked files edited, unstaged",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "diff"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 103041,
+                "min": 88633,
+                "max": 123066
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 21749760,
+                  "min": 21168128,
+                  "max": 21852160
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 37
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "diff"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 27910,
+                "min": 27005,
+                "max": 29111
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "diff"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 17881,
+                "min": 17649,
+                "max": 61017
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "diff --staged",
+      "cache": "warm",
+      "note": "the same 20 files staged, untimed, by Forklift's load . and git's add -A",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "diff",
+              "--staged"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 6007,
+                "min": 5940,
+                "max": 6469
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 14651392,
+                  "min": 14528512,
+                  "max": 14942208
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "diff",
+              "--staged"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 2135,
+                "min": 2112,
+                "max": 2168
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "diff",
+              "--staged"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 2751,
+                "min": 2702,
+                "max": 2867
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "diff --staged",
+      "cache": "cold",
+      "note": "the same 20 files staged, untimed, by Forklift's load . and git's add -A",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "diff",
+              "--staged"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 42655,
+                "min": 41934,
+                "max": 46528
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13967360,
+                  "min": 13881344,
+                  "max": 14217216
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git",
+            "command": [
+              "diff",
+              "--staged"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 24588,
+                "min": 21833,
+                "max": 70743
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          },
+          {
+            "subject": "git-tuned",
+            "command": [
+              "-c",
+              "core.fsync=all",
+              "-c",
+              "core.fsyncMethod=fsync",
+              "-c",
+              "transfer.fsckObjects=true",
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "receive.fsckObjects=true",
+              "-c",
+              "core.commitGraph=true",
+              "-c",
+              "gc.writeCommitGraph=true",
+              "-c",
+              "fetch.writeCommitGraph=true",
+              "-c",
+              "core.untrackedCache=true",
+              "diff",
+              "--staged"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 23655,
+                "min": 22296,
+                "max": 81490
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 9449472,
+                  "min": 9449472,
+                  "max": 9449472
+                }
+              },
+              "cores": {
+                "state": "not_measured",
+                "reason": "too short to measure: under 20 ms of CPU time"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "fresh compact",
+      "cache": "warm",
+      "note": "Forklift's store compact over the loose objects of a warehouse of 300 signed parcels, each repetition on a fresh copy, since it leaves nothing loose",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "--json",
+              "store",
+              "compact"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 693946,
+                "min": 690631,
+                "max": 715096
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 22958080,
+                  "min": 22667264,
+                  "max": 23068672
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 50
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "repack",
+      "cache": "warm",
+      "note": "Forklift's store compact --all over the same store, packed by the fresh compact",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "store",
+              "compact",
+              "--all"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 56731,
+                "min": 56351,
+                "max": 57846
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 22024192,
+                  "min": 21659648,
+                  "max": 22204416
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 98
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "audit main",
+      "cache": "warm",
+      "note": "Forklift's audit of main, which checks every parcel's signature",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "audit",
+              "main"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 10713,
+                "min": 10546,
+                "max": 10783
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13488128,
+                  "min": 13242368,
+                  "max": 13697024
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 239
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "audit main, one core",
+      "cache": "warm",
+      "note": "the same audit pinned to one core with taskset -c 0",
+      "outcome": {
+        "state": "timed",
+        "cells": [
+          {
+            "subject": "forklift",
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/runner/work/forklift/forklift/target/release/forklift",
+              "audit",
+              "main"
+            ],
+            "result": {
+              "state": "timed",
+              "wall": {
+                "median": 20992,
+                "min": 20495,
+                "max": 21347
+              },
+              "memory": {
+                "state": "measured",
+                "peak_bytes": {
+                  "median": 13361152,
+                  "min": 13258752,
+                  "max": 13422592
+                }
+              },
+              "cores": {
+                "state": "measured",
+                "median_percent": 99
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "verdict": {
+    "gate": "all",
+    "failures": [],
+    "slower": [
+      {
+        "operation": "status",
+        "cache": "warm",
+        "forklift": {
+          "median": 12944,
+          "min": 11412,
+          "max": 14655
+        },
+        "git_tuned": {
+          "median": 2928,
+          "min": 2892,
+          "max": 3508
+        },
+        "ticket": "FORK-525"
+      },
+      {
+        "operation": "status",
+        "cache": "cold",
+        "forklift": {
+          "median": 89637,
+          "min": 72199,
+          "max": 106347
+        },
+        "git_tuned": {
+          "median": 14777,
+          "min": 14174,
+          "max": 21531
+        },
+        "ticket": "FORK-525"
+      },
+      {
+        "operation": "log",
+        "cache": "warm",
+        "forklift": {
+          "median": 4325,
+          "min": 4240,
+          "max": 4651
+        },
+        "git_tuned": {
+          "median": 1727,
+          "min": 1693,
+          "max": 1744
+        },
+        "ticket": "FORK-532"
+      },
+      {
+        "operation": "log",
+        "cache": "cold",
+        "forklift": {
+          "median": 37787,
+          "min": 34853,
+          "max": 44080
+        },
+        "git_tuned": {
+          "median": 15091,
+          "min": 14204,
+          "max": 15683
+        },
+        "ticket": "FORK-532"
+      },
+      {
+        "operation": "blame",
+        "cache": "warm",
+        "forklift": {
+          "median": 6741,
+          "min": 6712,
+          "max": 7233
+        },
+        "git_tuned": {
+          "median": 2844,
+          "min": 2828,
+          "max": 2954
+        },
+        "ticket": "FORK-530"
+      },
+      {
+        "operation": "blame",
+        "cache": "cold",
+        "forklift": {
+          "median": 46903,
+          "min": 43729,
+          "max": 61406
+        },
+        "git_tuned": {
+          "median": 18610,
+          "min": 18164,
+          "max": 20715
+        },
+        "ticket": "FORK-530"
+      },
+      {
+        "operation": "switch",
+        "cache": "warm",
+        "forklift": {
+          "median": 42977,
+          "min": 42035,
+          "max": 48974
+        },
+        "git_tuned": {
+          "median": 9103,
+          "min": 8920,
+          "max": 9238
+        },
+        "ticket": "FORK-527"
+      },
+      {
+        "operation": "switch",
+        "cache": "cold",
+        "forklift": {
+          "median": 92377,
+          "min": 84616,
+          "max": 266599
+        },
+        "git_tuned": {
+          "median": 21207,
+          "min": 20406,
+          "max": 22305
+        },
+        "ticket": "FORK-527"
+      },
+      {
+        "operation": "merge",
+        "cache": "warm",
+        "forklift": {
+          "median": 36742,
+          "min": 36022,
+          "max": 42693
+        },
+        "git_tuned": {
+          "median": 16175,
+          "min": 15593,
+          "max": 16339
+        },
+        "ticket": "FORK-528"
+      },
+      {
+        "operation": "merge",
+        "cache": "cold",
+        "forklift": {
+          "median": 98664,
+          "min": 82059,
+          "max": 117952
+        },
+        "git_tuned": {
+          "median": 40637,
+          "min": 40000,
+          "max": 40878
+        },
+        "ticket": "FORK-528"
+      },
+      {
+        "operation": "clone",
+        "cache": "warm",
+        "forklift": {
+          "median": 1268008,
+          "min": 1137635,
+          "max": 1707437
+        },
+        "git_tuned": {
+          "median": 99733,
+          "min": 99131,
+          "max": 111488
+        },
+        "ticket": "FORK-526"
+      },
+      {
+        "operation": "clone",
+        "cache": "cold",
+        "forklift": {
+          "median": 1617700,
+          "min": 1503720,
+          "max": 1950875
+        },
+        "git_tuned": {
+          "median": 125907,
+          "min": 125435,
+          "max": 131315
+        },
+        "ticket": "FORK-526"
+      },
+      {
+        "operation": "pull",
+        "cache": "warm",
+        "forklift": {
+          "median": 45750,
+          "min": 42092,
+          "max": 49244
+        },
+        "git_tuned": {
+          "median": 24543,
+          "min": 24031,
+          "max": 24737
+        },
+        "ticket": "FORK-529"
+      },
+      {
+        "operation": "pull",
+        "cache": "cold",
+        "forklift": {
+          "median": 124117,
+          "min": 103132,
+          "max": 253021
+        },
+        "git_tuned": {
+          "median": 51398,
+          "min": 50673,
+          "max": 76676
+        },
+        "ticket": "FORK-529"
+      },
+      {
+        "operation": "diff",
+        "cache": "warm",
+        "forklift": {
+          "median": 13544,
+          "min": 12544,
+          "max": 14526
+        },
+        "git_tuned": {
+          "median": 2513,
+          "min": 2444,
+          "max": 2649
+        },
+        "ticket": "FORK-525"
+      },
+      {
+        "operation": "diff",
+        "cache": "cold",
+        "forklift": {
+          "median": 103041,
+          "min": 88633,
+          "max": 123066
+        },
+        "git_tuned": {
+          "median": 17881,
+          "min": 17649,
+          "max": 61017
+        },
+        "ticket": "FORK-525"
+      },
+      {
+        "operation": "diff --staged",
+        "cache": "warm",
+        "forklift": {
+          "median": 6007,
+          "min": 5940,
+          "max": 6469
+        },
+        "git_tuned": {
+          "median": 2751,
+          "min": 2702,
+          "max": 2867
+        },
+        "ticket": "FORK-534"
+      }
+    ],
+    "closable": [
+      {
+        "operation": "commit",
+        "shape": "small",
+        "cache": "warm",
+        "os": "linux",
+        "ticket": "FORK-533"
+      },
+      {
+        "operation": "commit",
+        "shape": "small",
+        "cache": "cold",
+        "os": "linux",
+        "ticket": "FORK-533"
+      },
+      {
+        "operation": "push",
+        "shape": "small",
+        "cache": "cold",
+        "os": "linux",
+        "ticket": "FORK-529"
+      },
+      {
+        "operation": "diff --staged",
+        "shape": "small",
+        "cache": "cold",
+        "os": "linux",
+        "ticket": "FORK-534"
+      }
+    ]
+  },
+  "against": {
+    "path": "/home/runner/work/_temp/earlier-small.json",
+    "outcome": {
+      "state": "compared",
+      "tools": {
+        "forklift": "/home/runner/work/forklift/forklift/target/release/forklift (forklift 0.3.1)",
+        "forklift-server": "/home/runner/work/forklift/forklift/target/release/forklift-server (forklift-server 0.3.1)",
+        "git": "/usr/bin/git (git version 2.56.1)"
+      },
+      "hardware": {
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "logical_cores": 4,
+        "ram_bytes": 16759439360
+      },
+      "rows": [
+        {
+          "operation": "status",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 385,
+            "percent": 442
+          }
+        },
+        {
+          "operation": "status",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 500,
+            "percent": 607
+          }
+        },
+        {
+          "operation": "log",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 244,
+            "percent": 250
+          }
+        },
+        {
+          "operation": "log",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 228,
+            "percent": 250
+          }
+        },
+        {
+          "operation": "blame",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 230,
+            "percent": 237
+          }
+        },
+        {
+          "operation": "blame",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 203,
+            "percent": 252
+          }
+        },
+        {
+          "operation": "verify",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 31,
+            "percent": 31
+          }
+        },
+        {
+          "operation": "verify",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 69,
+            "percent": 73
+          }
+        },
+        {
+          "operation": "commit",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 188,
+            "percent": 177
+          }
+        },
+        {
+          "operation": "commit",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 160,
+            "percent": 186
+          }
+        },
+        {
+          "operation": "switch",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 484,
+            "percent": 472
+          }
+        },
+        {
+          "operation": "switch",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 333,
+            "percent": 436
+          }
+        },
+        {
+          "operation": "merge",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 236,
+            "percent": 227
+          }
+        },
+        {
+          "operation": "merge",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 184,
+            "percent": 243
+          }
+        },
+        {
+          "operation": "pack",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 67,
+            "percent": 79
+          }
+        },
+        {
+          "operation": "pack",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 103,
+            "percent": 102
+          }
+        },
+        {
+          "operation": "clone",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 1366,
+            "percent": 1271
+          }
+        },
+        {
+          "operation": "clone",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 1152,
+            "percent": 1285
+          }
+        },
+        {
+          "operation": "push",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 119,
+            "percent": 112
+          }
+        },
+        {
+          "operation": "push",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 151,
+            "percent": 118
+          }
+        },
+        {
+          "operation": "pull",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 186,
+            "percent": 186
+          }
+        },
+        {
+          "operation": "pull",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 177,
+            "percent": 241
+          }
+        },
+        {
+          "operation": "diff",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 512,
+            "percent": 539
+          }
+        },
+        {
+          "operation": "diff",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 405,
+            "percent": 576
+          }
+        },
+        {
+          "operation": "diff --staged",
+          "cache": "warm",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 213,
+            "percent": 218
+          }
+        },
+        {
+          "operation": "diff --staged",
+          "cache": "cold",
+          "change": {
+            "state": "compared",
+            "earlier_percent": 167,
+            "percent": 180
+          }
+        },
+        {
+          "operation": "fresh compact",
+          "cache": "warm",
+          "change": {
+            "state": "not_compared",
+            "reason": "Forklift and tuned git were not both timed in either run"
+          }
+        },
+        {
+          "operation": "repack",
+          "cache": "warm",
+          "change": {
+            "state": "not_compared",
+            "reason": "Forklift and tuned git were not both timed in either run"
+          }
+        },
+        {
+          "operation": "audit main",
+          "cache": "warm",
+          "change": {
+            "state": "not_compared",
+            "reason": "Forklift and tuned git were not both timed in either run"
+          }
+        },
+        {
+          "operation": "audit main, one core",
+          "cache": "warm",
+          "change": {
+            "state": "not_compared",
+            "reason": "Forklift and tuned git were not both timed in either run"
+          }
+        }
+      ]
+    }
+  }
+}
