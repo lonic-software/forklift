@@ -9279,8 +9279,10 @@ mod tests {
     ];
 
     /// Every mention of a [`TAINT_FAMILY`] function in non-test source, as (file under `crates/`,
-    /// the function it is in, the function named). A call, the function taken as a value, and a
-    /// name anywhere in a macro's tokens all count; an item under `#[cfg(test)]` is skipped whole.
+    /// the function it is in, the function named). A call, the function taken as a value, a name
+    /// anywhere in a macro's tokens, and the original name of a renamed import all count. An item
+    /// under `#[cfg(test)]` or `#[cfg(all(test, …))]` is skipped whole, and so is the file of an
+    /// out-of-line module declared under one.
     #[derive(Default)]
     struct TaintCallers {
         file: String,
@@ -9288,11 +9290,35 @@ mod tests {
         found: Vec<(String, String, String)>,
     }
 
+    /// Whether a `cfg` predicate holds only in a test build: `test`, or an `all(…)` holding one
+    /// that does. `any(test, …)` also holds in another build, so it is not test-only.
+    fn cfg_requires_test(meta: &syn::Meta) -> bool {
+        match meta {
+            syn::Meta::Path(path) => path.is_ident("test"),
+            syn::Meta::List(list) if list.path.is_ident("all") => list
+                .parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                .is_ok_and(|predicates| predicates.iter().any(cfg_requires_test)),
+            _ => false,
+        }
+    }
+
     fn is_test_only(attributes: &[syn::Attribute]) -> bool {
         attributes.iter().any(|attribute| {
-            attribute.path().is_ident("cfg")
-                && attribute.parse_args::<syn::Meta>().is_ok_and(|meta| meta.path().is_ident("test"))
+            attribute.path().is_ident("cfg") && attribute.parse_args::<syn::Meta>().is_ok_and(|meta| cfg_requires_test(&meta))
         })
+    }
+
+    /// The folders and files of the out-of-line modules `file` declares under a test-only `cfg`.
+    fn test_only_module_paths(file: &Path, parsed: &syn::File) -> Vec<PathBuf> {
+        let folder = match file.file_stem().and_then(|stem| stem.to_str()) {
+            Some("lib" | "main" | "mod") => file.parent().unwrap().to_path_buf(),
+            Some(stem) => file.parent().unwrap().join(stem),
+            None => return Vec::new(),
+        };
+        parsed.items.iter().filter_map(|item| match item {
+            syn::Item::Mod(module) if module.content.is_none() && is_test_only(&module.attrs) => Some(module.ident.to_string()),
+            _ => None,
+        }).flat_map(|name| [folder.join(format!("{}.rs", name)), folder.join(name)]).collect()
     }
 
     impl TaintCallers {
@@ -9333,6 +9359,19 @@ mod tests {
             }
         }
 
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_trait_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+            self.note(&rename.ident.to_string());
+            syn::visit::visit_use_rename(self, rename);
+        }
+
         fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
             if let Some(last) = path.path.segments.last() {
                 self.note(&last.ident.to_string());
@@ -9364,6 +9403,33 @@ mod tests {
             }
             syn::visit::visit_macro(self, mac);
         }
+    }
+
+    /// What the census visitor counts, over literal sources: a renamed import, a trait's default
+    /// method and an `any(test, …)` item count; an `all(test, …)` item does not, and an out-of-line
+    /// module under `cfg(test)` names its files for skipping.
+    /// Revert: drop `visit_use_rename` → the renamed row is missing → red; read only a bare
+    /// `cfg(test)` → the `all(test, unix)` row is counted → red.
+    #[test]
+    fn the_census_visitor_counts_what_it_claims() {
+        let census = |source: &str| {
+            let mut callers = TaintCallers { file: "f.rs".to_string(), ..TaintCallers::default() };
+            syn::visit::Visit::visit_file(&mut callers, &syn::parse_file(source).unwrap());
+            callers.found.into_iter().map(|(_, within, name)| format!("{} {}", within, name)).collect::<Vec<_>>()
+        };
+
+        assert_eq!(census("use crate::util::taint_utils::record_taint as note;\nfn f() { note(); }"),
+            vec!["<item> record_taint"]);
+        assert_eq!(census("trait T { fn f() { resolve_taints(); } }"), vec!["f resolve_taints"]);
+        assert_eq!(census("#[cfg(any(test, feature = \"docgen\"))]\nfn f() { record_taint(); }"), vec!["f record_taint"]);
+        assert_eq!(census("#[cfg(all(test, unix))]\nmod m { fn f() { record_taint(); } }"), Vec::<String>::new());
+        assert_eq!(census("#[cfg(all(unix, not(test)))]\nfn f() { record_taint(); }"), vec!["f record_taint"]);
+
+        let module = syn::parse_file("#[cfg(test)]\nmod helper;\nmod kept;").unwrap();
+        assert_eq!(test_only_module_paths(Path::new("/c/src/util.rs"), &module),
+            vec![PathBuf::from("/c/src/util/helper.rs"), PathBuf::from("/c/src/util/helper")]);
+        assert_eq!(test_only_module_paths(Path::new("/c/src/main.rs"), &module),
+            vec![PathBuf::from("/c/src/helper.rs"), PathBuf::from("/c/src/helper")]);
     }
 
     fn rust_files_under(folder: &Path, out: &mut Vec<PathBuf>) {
@@ -9399,13 +9465,22 @@ mod tests {
         assert!(files.iter().any(|file| file.ends_with("forklift-server/src/server.rs")),
             "sanity: the scan reads every crate, not only this one: {:?}", files.len());
 
+        let parsed: Vec<(&PathBuf, syn::File)> = files.iter().map(|file| {
+            let source = std::fs::read_to_string(file).unwrap();
+            (file, syn::parse_file(&source).unwrap_or_else(|e| panic!("parse {}: {}", file.display(), e)))
+        }).collect();
+        let test_only: Vec<PathBuf> = parsed.iter().flat_map(|(file, syntax)| test_only_module_paths(file, syntax)).collect();
+        assert!(test_only.iter().any(|path| path.ends_with("forklift/src/test_support.rs")),
+            "sanity: an out-of-line test module is found: {:?}", test_only);
+
         let mut callers = TaintCallers::default();
-        for file in &files {
+        for (file, syntax) in &parsed {
+            if test_only.iter().any(|path| file.starts_with(path)) {
+                continue;
+            }
             callers.file = file.strip_prefix(crates).unwrap().components()
                 .map(|component| component.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
-            let source = std::fs::read_to_string(file).unwrap();
-            let parsed = syn::parse_file(&source).unwrap_or_else(|e| panic!("parse {}: {}", file.display(), e));
-            syn::visit::Visit::visit_file(&mut callers, &parsed);
+            syn::visit::Visit::visit_file(&mut callers, syntax);
         }
         let mut found = callers.found;
         found.sort();

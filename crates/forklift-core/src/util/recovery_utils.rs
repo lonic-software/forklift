@@ -14,9 +14,9 @@
 //!
 //! ## The closure walk
 //!
-//! For every recorded path this attempt cannot restage, [`run`] classifies it (a loose object, a
-//! pack data/index file, or an inventory shard — the three shapes the taint schema can ever
-//! record) and, for the object-shaped ones, checks whether the object it names is genuinely absent
+//! For every recorded path this attempt cannot restage, [`run`] classifies it by the shape
+//! registry behind [`taint_utils::taint_shape`](crate::util::taint_utils), and, for the
+//! object-shaped ones, checks whether the object it names is genuinely absent
 //! (present elsewhere — another pack, or loose — is not a loss) and, if so, whether *any* durable
 //! ref source still reaches it: pallet heads (both namespaces), the warehouse's parked parcels,
 //! every parcel a bay's in-progress consolidation or cherry-pick records, the trust anchor's adopted
@@ -6347,6 +6347,8 @@ mod tests {
             ("bays/main/consolidation-skeleton-copy".into(), "kept: a bay's consolidation skeleton's copy"),
             ("bays/main/journal.json".into(), "kept: a bay's journal"),
             ("bays/main/path".into(), "kept: a bay's path record"),
+            ("bays/main/cherry-pick".into(), "kept: a bay's cherry-pick state"),
+            ("bays/main/cherry-pick-copy".into(), "kept: a bay's cherry-pick state's copy"),
             ("cherry-pick".into(), "kept: the cherry-pick state"),
             ("cherry-pick-copy".into(), "kept: the cherry-pick state's copy"),
             ("config/fetch-scope".into(), "kept: the fetch scope"),

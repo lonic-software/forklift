@@ -317,6 +317,8 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "a bay's consolidation skeleton's copy", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation-skeleton-copy")] },
     TaintShape { description: "a bay's journal", disposition: None, pattern: &[Is("bays"), Name, Is("journal.json")] },
     TaintShape { description: "a bay's path record", disposition: None, pattern: &[Is("bays"), Name, Is("path")] },
+    TaintShape { description: "a bay's cherry-pick state", disposition: None, pattern: &[Is("bays"), Name, Is("cherry-pick")] },
+    TaintShape { description: "a bay's cherry-pick state's copy", disposition: None, pattern: &[Is("bays"), Name, Is("cherry-pick-copy")] },
 
     TaintShape { description: "the cherry-pick state", disposition: None, pattern: &[Is("cherry-pick")] },
     TaintShape { description: "the cherry-pick state's copy", disposition: None, pattern: &[Is("cherry-pick-copy")] },
@@ -1054,6 +1056,41 @@ mod tests {
     /// with every other module's activation-sensitive tests — see its doc comment.
     fn lock_activation() -> std::sync::MutexGuard<'static, ()> {
         ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A record the format keeps per bay is declared for a bay exactly when it is declared for
+    /// the main tree: every rewritable `{bay}` row of the warehouse format's path table, read from
+    /// the spec itself, with its placeholders filled in.
+    /// Revert: drop the `bays/<name>/cherry-pick` entry → the pair disagrees → red.
+    #[test]
+    fn every_bay_record_is_declared_for_a_bay_as_for_the_main_tree() {
+        let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/format/WAREHOUSE_FORMAT.md");
+        let spec = std::fs::read_to_string(&spec).unwrap_or_else(|e| panic!("read {}: {}", spec.display(), e));
+
+        let mut declared_for_both = 0;
+        let mut mismatched = Vec::new();
+        for row in spec.lines().filter(|line| line.starts_with("| `{bay}")) {
+            let columns: Vec<&str> = row.split('|').map(str::trim).collect();
+            if columns[2] != "rewritable" {
+                continue;
+            }
+            for path in columns[1].split(", ").map(|path| path.trim_matches('`')) {
+                if path.ends_with('/') {
+                    continue;
+                }
+                let rest = path.strip_prefix("{bay}").unwrap().replace("<xx>", "ab").replace("<hash>", "cd");
+                let main_tree = taint_shape(Path::new(&rest)).is_some();
+                let bay = taint_shape(&Path::new("bays").join("side").join(&rest)).is_some();
+                if main_tree != bay {
+                    mismatched.push((rest.clone(), main_tree, bay));
+                } else if main_tree {
+                    declared_for_both += 1;
+                }
+            }
+        }
+
+        assert_eq!(mismatched, Vec::<(String, bool, bool)>::new(), "(path, declared for the main tree, for a bay)");
+        assert!(declared_for_both >= 10, "sanity: the spec's bay rows were read: {}", declared_for_both);
     }
 
     fn scratch(name: &str) -> PathBuf {
