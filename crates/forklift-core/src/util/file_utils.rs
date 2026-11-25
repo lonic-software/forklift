@@ -300,7 +300,8 @@ pub fn get_path_for_object(hash: &str) -> Result<(String, String), String> {
 
 /// Recover the object hash a loose object's final on-disk path encodes — the exact inverse of
 /// [`get_path_for_object`]. It reads only the last two names, so it is sound only over a path
-/// already known to be in the loose store. Other recorded paths can end in the same shape: a
+/// already known to have a loose object's shape (one the loose-store walk listed, or one a matched
+/// taint shape declares). Other recorded paths can end in the same shape: a
 /// nested pallet ref `pallets/fe/add` reads as `feadd`. A path a taint recorded is read with
 /// [`heal_utils::loose_object_hash`](crate::util::heal_utils::loose_object_hash), which matches
 /// the whole declared shape first.
