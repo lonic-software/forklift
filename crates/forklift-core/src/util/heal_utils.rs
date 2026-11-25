@@ -102,7 +102,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
-use crate::globals::forklift_root;
+use crate::globals::{forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::lock_utils::RefLock;
 use crate::util::{fanout_utils, file_utils, object_utils, office_utils, pallet_utils, taint_utils};
 
@@ -188,13 +188,18 @@ pub(crate) enum RestageOutcome {
 pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<RestageOutcome, String> {
     // A recorded path is acted on only when every component is a plain name: a root, a `.` or a
     // `..` would let `root.join` reach a file outside the warehouse, and a torn record's lines are
-    // checked by no digest. Such a path is read as unreadable, so every caller keeps it. The check
-    // is lexical only: a symbolic link among the plain names is not judged here.
+    // checked by no digest. Such a path is read as unreadable, so every caller keeps it.
     if !relative_path.components().all(|component| matches!(component, std::path::Component::Normal(_))) {
         return Ok(RestageOutcome::Unreadable(format!(
             "\"{}\" is not a path under the storage root, so it was not read",
             relative_path.to_string_lossy()
         )));
+    }
+
+    // Plain names can still leave the warehouse through a link among them, which the read and the
+    // rename below would both follow: such a path is read as unreadable too.
+    if let Some(why) = link_under_root(root, relative_path) {
+        return Ok(RestageOutcome::Unreadable(why));
     }
 
     let final_path = root.join(relative_path);
@@ -255,6 +260,41 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
 
     rewrite_dentry(&final_path, &bytes)?;
     Ok(RestageOutcome::Restaged)
+}
+
+/// Why `relative_path` must not be read under `root` because of a link among its names, judged
+/// level by level without following any, or `None` when no level is one. `root` itself is not
+/// judged. A bay's inventory root (`inventory`, or `bays/<name>/inventory`) may be a link to a
+/// folder, since the inventory may be moved behind one; a link there that does not resolve to a
+/// folder is refused like any other. Every other link under the root is damage, whatever it
+/// points at. The walk stops at the first level that does not exist or cannot be judged: the read
+/// that follows reports that level.
+fn link_under_root(root: &Path, relative_path: &Path) -> Option<String> {
+    let names: Vec<&std::ffi::OsStr> = relative_path.iter().collect();
+    let mut level = root.to_path_buf();
+
+    for (index, name) in names.iter().enumerate() {
+        level.push(name);
+        let Ok(metadata) = std::fs::symlink_metadata(&level) else { return None };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let inventory_root = *name == FOLDER_NAME_INVENTORY_ROOT
+            && (index == 0 || (index == 2 && names[0] == FOLDER_NAME_BAYS_ROOT));
+        let last = index + 1 == names.len();
+        if inventory_root && !last && std::fs::metadata(&level).is_ok_and(|target| target.is_dir()) {
+            continue;
+        }
+
+        let link = names[..=index].iter().collect::<PathBuf>();
+        return Some(format!(
+            "\"{}\" is a link, which is never followed under the storage root, so \"{}\" was not read",
+            link.to_string_lossy(), relative_path.to_string_lossy()
+        ));
+    }
+
+    None
 }
 
 /// Whether `relative_path` (under the forklift root) is written only under the ref lock: a pallet
@@ -1194,6 +1234,83 @@ mod tests {
             "an escaping path must be refused: {outcome:?}");
         #[cfg(unix)]
         assert_eq!(std::fs::metadata(&outside).unwrap().ino(), before, "the outside file must not be rewritten");
+    }
+
+    /// A link among a recorded path's names is never followed: a linked parent folder and a linked
+    /// final name are both refused, and neither the file behind the link nor the link itself is
+    /// rewritten. A bay's inventory root moved behind a link to a folder is still restaged
+    /// through; one that is dangling, or that is itself the recorded path, is refused.
+    ///
+    /// Revert: drop the `link_under_root` guard in `restage_object` → the linked parent and the
+    /// linked final name are restaged → red. Never exempt the inventory root → the relocated
+    /// inventory is refused → red. Exempt it without the folder check → the dangling root reads
+    /// vanished → red.
+    #[cfg(unix)]
+    #[test]
+    fn restage_object_never_follows_a_link_under_the_storage_root() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = scratch("restage-through-link");
+        let _scope = StorageRootScope::enter(&root);
+        let forklift = forklift_root();
+        let outside = root.join("outside-the-store");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("position"), b"not the warehouse's").unwrap();
+        let outside_file = outside.join("position");
+        let before = std::fs::metadata(&outside_file).unwrap().ino();
+
+        let refused = |relative: &str, link: &str| {
+            let outcome = restage_object(&forklift, Path::new(relative)).unwrap();
+            let expected = format!("\"{link}\" is a link, which is never followed under the storage root, so \"{relative}\" was not read");
+            assert_eq!(outcome, RestageOutcome::Unreadable(expected), "{relative}");
+        };
+
+        // A linked parent folder.
+        std::fs::create_dir_all(forklift.join("bays")).unwrap();
+        std::os::unix::fs::symlink(&outside, forklift.join("bays/x")).unwrap();
+        assert!(forklift.join("bays/x/position").is_file(), "sanity: the path reaches the outside file");
+        refused("bays/x/position", "bays/x");
+
+        // A linked final name.
+        std::fs::create_dir_all(forklift.join("pallets")).unwrap();
+        std::os::unix::fs::symlink(&outside_file, forklift.join("pallets/main")).unwrap();
+        refused("pallets/main", "pallets/main");
+        assert!(std::fs::symlink_metadata(forklift.join("pallets/main")).unwrap().file_type().is_symlink(),
+            "the link itself must not be replaced");
+
+        assert_eq!(std::fs::metadata(&outside_file).unwrap().ino(), before, "the outside file must not be rewritten");
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"not the warehouse's");
+
+        // A bay's inventory root moved behind a link to a folder is restaged through, at both of
+        // the places one lives.
+        for (inventory, moved) in [("inventory", "moved-inventory"), ("bays/b/inventory", "moved-bay-inventory")] {
+            let moved = root.join(moved);
+            std::fs::create_dir_all(moved.join("x")).unwrap();
+            std::fs::write(moved.join("x/data"), b"a shard").unwrap();
+            let link = forklift.join(inventory);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&moved, &link).unwrap();
+
+            let shard_before = std::fs::metadata(moved.join("x/data")).unwrap().ino();
+            let relative = format!("{inventory}/x/data");
+            assert_eq!(restage_object(&forklift, Path::new(&relative)).unwrap(), RestageOutcome::Restaged, "{relative}");
+            assert_ne!(std::fs::metadata(moved.join("x/data")).unwrap().ino(), shard_before, "{relative} is rewritten");
+            assert_eq!(std::fs::read(moved.join("x/data")).unwrap(), b"a shard", "{relative} keeps its bytes");
+
+            // The inventory root itself is never read through.
+            refused(inventory, inventory);
+        }
+
+        // A dangling inventory root is refused, not read as a vanished path.
+        std::fs::remove_file(forklift.join("inventory")).unwrap();
+        std::os::unix::fs::symlink(root.join("unmounted"), forklift.join("inventory")).unwrap();
+        refused("inventory/x/data", "inventory");
+
+        // Only the inventory root's own places are exempt.
+        std::fs::create_dir_all(forklift.join("objects")).unwrap();
+        std::os::unix::fs::symlink(root.join("moved-inventory"), forklift.join("objects/inventory")).unwrap();
+        refused("objects/inventory/x/data", "objects/inventory");
     }
 
     /// A nested pallet ref whose last two names look like a loose object's fan-out is restaged
