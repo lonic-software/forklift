@@ -265,7 +265,8 @@ pub(crate) fn restage_object(root: &Path, relative_path: &Path) -> Result<Restag
 /// Why `relative_path` must not be read under `root` because of a link among its names, judged
 /// level by level without following any, or `None` when no level is one. `root` itself is not
 /// judged. A folder a user may move behind a link (see [`may_be_relocated`]) is followed when it
-/// resolves to a folder; one that does not is refused with its own way out. Every other link under
+/// resolves to a folder; one whose target is out of reach is refused with that way out, and one
+/// that resolves to anything else is refused like any other link. Every other link under
 /// the root is damage, whatever it points at. The walk stops at the first level that does not
 /// exist or cannot be judged: the read that follows reports that level.
 fn link_under_root(root: &Path, relative_path: &Path) -> Option<String> {
@@ -282,18 +283,18 @@ fn link_under_root(root: &Path, relative_path: &Path) -> Option<String> {
 
         let (link, recorded) = (shown(index + 1), shown(names.len()));
         if index + 1 < names.len() && may_be_relocated(&names, index) {
-            if std::fs::metadata(&level).is_ok_and(|target| target.is_dir()) {
-                continue;
+            match std::fs::metadata(&level) {
+                Ok(target) if target.is_dir() => continue,
+                Ok(_) => {}
+                Err(_) => return Some(format!(
+                    "\"{link}\" is a link whose target is out of reach, so \"{recorded}\" was not read. Make its \
+                     target available, then run \"forklift heal\" again"
+                )),
             }
-            return Some(format!(
-                "\"{link}\" is a link that does not resolve to a folder, so \"{recorded}\" was not read. Make its \
-                 target available, then run \"forklift heal\" again"
-            ));
         }
 
         return Some(format!(
-            "\"{link}\" is a link, which is never followed under the storage root, so \"{recorded}\" was not \
-             read. Remove the link, then run \"forklift heal\" again"
+            "\"{link}\" is a link, which is never followed under the storage root, so \"{recorded}\" was not read"
         ));
     }
 
@@ -1254,8 +1255,9 @@ mod tests {
     /// A link among a recorded path's names is never followed: a linked parent folder and a linked
     /// final name are both refused, and neither the file behind the link nor the link itself is
     /// rewritten. A folder a user may move behind a link (a bay's inventory root, the configuration
-    /// folder) is still restaged through when it resolves to a folder; one that is dangling, or that
-    /// is itself the recorded path, is refused, each with its way out.
+    /// folder) is still restaged through when it resolves to a folder. One whose target is out of
+    /// reach is refused with that way out; one that resolves to a file, or that is itself the
+    /// recorded path, is refused like any other link.
     ///
     /// Revert: drop the `link_under_root` guard in `restage_object` → the linked parent and the
     /// linked final name are restaged → red. `may_be_relocated` always false → the relocated
@@ -1279,7 +1281,7 @@ mod tests {
         let restage = |relative: &str| restage_object(&forklift, Path::new(relative)).unwrap();
         let refused = |relative: &str, link: &str| {
             let expected = format!("\"{link}\" is a link, which is never followed under the storage root, so \
-                \"{relative}\" was not read. Remove the link, then run \"forklift heal\" again");
+                \"{relative}\" was not read");
             assert_eq!(restage(relative), RestageOutcome::Unreadable(expected), "{relative}");
         };
 
@@ -1331,8 +1333,13 @@ mod tests {
         file_utils::remove_file_or_link(forklift.join("inventory")).unwrap();
         file_utils::link_for_test(&root.join("unmounted"), &forklift.join("inventory"), true);
         assert_eq!(restage("inventory/x/data"), RestageOutcome::Unreadable(
-            "\"inventory\" is a link that does not resolve to a folder, so \"inventory/x/data\" was not read. Make \
+            "\"inventory\" is a link whose target is out of reach, so \"inventory/x/data\" was not read. Make \
              its target available, then run \"forklift heal\" again".to_string()));
+
+        // One that resolves to a file is refused like any other link.
+        file_utils::remove_file_or_link(forklift.join("inventory")).unwrap();
+        file_utils::link_for_test(&outside_file, &forklift.join("inventory"), false);
+        refused("inventory/x/data", "inventory");
 
         // Only those folders' own places are exempt.
         std::fs::create_dir_all(forklift.join("objects")).unwrap();

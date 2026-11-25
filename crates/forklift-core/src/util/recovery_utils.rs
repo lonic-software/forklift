@@ -10029,13 +10029,13 @@ mod tests {
     }
 
     /// A recorded path that is a link, even a dangling one, is never read through: heal refuses,
-    /// names the link and its way out, and keeps the taint. The way out it names (remove the link,
-    /// then heal again) clears it, as a vanished path.
+    /// names the link and keeps the taint. Once it is no longer a link, heal reads it again, here
+    /// as a vanished sidecar that clears.
     ///
     /// Revert: drop the `link_under_root` guard in `restage_object` → the dangling link reads as
     /// vanished and the first heal clears → red.
     #[test]
-    fn heal_refuses_a_linked_recorded_path_and_its_way_out_clears_it() {
+    fn heal_refuses_a_linked_recorded_path_until_it_is_no_longer_a_link() {
         let _serial = lock_activation();
         taint_utils::activate();
         let (root, _scope) = enter_signature_heal_root("linked-sig");
@@ -10050,8 +10050,7 @@ mod tests {
 
         let error = run_heal().expect_err("a linked recorded path must not clear");
         assert!(error.to_string().contains(&format!(
-            "\"{relative}\" is a link, which is never followed under the storage root, so \"{relative}\" was not read. \
-             Remove the link, then run \"forklift heal\" again"
+            "\"{relative}\" is a link, which is never followed under the storage root, so \"{relative}\" was not read"
         )), "{error}");
         assert!(!taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "the taint must stand");
 

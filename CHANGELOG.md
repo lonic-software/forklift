@@ -888,9 +888,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **`heal` no longer reads or rewrites a file outside the warehouse through a symbolic link.** A
   recorded path made of plain names could still leave the warehouse when one of its folders, or the
   file itself, was a link: `heal` followed it, read the file it led to and could rewrite it.
-  `heal` now never follows a link inside the warehouse. It refuses, keeps the taint and names the
-  link: remove it, then run `heal` again. Two folders may still be moved behind a link to another
-  folder: a bay's inventory folder and the configuration folder.
+  When `heal` restages a recorded path, it now follows no link inside the warehouse: it refuses,
+  names the link and keeps the taint, even for a link that points nowhere, which used to read as a
+  file that is gone. Two folders may still be moved behind a link to another folder: a bay's
+  inventory folder and the configuration folder.
 - **An `undo` that stops after putting the pallets back can be retried.** An `undo` of a `stack`,
   `consolidate` or `pick` puts the bay's position and the pallets back first, then the
   consolidation or pick that was in progress before. When one of those later writes failed, or the
