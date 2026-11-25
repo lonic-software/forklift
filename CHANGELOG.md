@@ -923,7 +923,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   taint as the first put-back does, changes only the refused pallets' entries, and the message
   says what reading the record back shows. Before, the retry was only the ordinary write, which a
   taint standing at the run's end refused, so the record kept naming the refused head as the
-  pallet's root and gc kept the redacted or withheld history it reaches.
+  pallet's root and gc kept the redacted or withheld history it reaches. A refusal whose first
+  put-back lands but may not be on disk durably yet now says the record "reads as put back", in
+  the words of the later writes, rather than that it "holds what it held before".
 
   An `undo` of a `stack`, `consolidate` or `pick` whose put-back of a pallet failed in this way
   could not be retried, even after `forklift heal`: the current pallet and the bay's position were

@@ -83,7 +83,8 @@ pub enum RootsWrite {
     /// The write failed with `failed`, and the record could not be read back (`unread`).
     Unknown { failed: String, unread: String },
     /// The record could not be read, so what to write could not be worked out, and nothing was.
-    /// Only a put-back of owed entries ([`put_back_owed_roots`]) ends this way.
+    /// Only a put-back of owed entries ([`put_back_owed_roots`]) ends this way: the takedown's
+    /// put-back ([`put_back_mirror_roots`]) writes an unreadable record back whole.
     Unread(String),
 }
 
@@ -107,8 +108,11 @@ impl RootsWrite {
     }
 
     /// Whether, after a write that went this way, the record holds the put-backs a takedown
-    /// refusal could not make, as far as reading it shows: when it does not, or reading it failed,
-    /// those put-backs are tried again ([`put_back_owed_roots`]).
+    /// refusal wanted, as far as reading it shows. After the run's last write, when it does not,
+    /// or reading it failed, the owed put-backs are tried again ([`put_back_owed_roots`]). Whether
+    /// the takedown's own put-back ([`put_back_mirror_roots`]) is owed is decided by an exhaustive
+    /// match on its outcome in the mirror command (`mirror::put_back_on_takedown`), which owes the
+    /// same variants.
     pub fn holds_what_was_wanted(&self) -> bool {
         match self {
             RootsWrite::AlreadyRead | RootsWrite::Landed | RootsWrite::NotDurable(_) => true,
@@ -116,8 +120,9 @@ impl RootsWrite {
         }
     }
 
-    /// The sentence for a put-back a takedown refusal could not make, when this is the write
-    /// that settled it.
+    /// The sentence for a put-back of the record after a takedown refusal, said by the write that
+    /// settled it: the takedown's own put-back ([`put_back_mirror_roots`]), the run's last write,
+    /// or the retry of the owed entries ([`put_back_owed_roots`]). One vocabulary for all three.
     pub fn put_back(&self) -> String {
         match self {
             RootsWrite::AlreadyRead => "The mirror record reads as put back.".to_string(),
@@ -157,15 +162,26 @@ fn read_back(failed: String, wanted: &BTreeMap<String, String>) -> RootsWrite {
     }
 }
 
-/// Put the record back to `before`, what it held before a mirror step that then failed with
-/// `error`, and return `error` with what happened to the record appended
-/// ([`file_utils::put_back_as_read`]). The write is a compensating one
-/// ([`file_utils::write_file_compensating`]): it puts back what stood before the step, so a taint
-/// standing for the storage root does not refuse it, whoever recorded that taint.
-pub fn put_back_mirror_roots(error: String, before: &BTreeMap<String, String>) -> String {
-    file_utils::put_back_as_read(error, "mirror record", before, read_mirror_roots, |before| {
-        file_utils::write_file_compensating(&mirror_roots_path(), &roots_bytes(before))
-    })
+/// Put the record back to `before`, what it held before a mirror step that then failed, and say
+/// what that did. A record that already reads as `before` is left alone (`AlreadyRead`): the
+/// failed step did not change it. One that cannot be read is written back, as it may have changed.
+/// The write is a compensating one ([`file_utils::write_file_compensating`]): it puts back what
+/// stood before the step, so a taint standing for the storage root does not refuse it, whoever
+/// recorded that taint.
+pub fn put_back_mirror_roots(before: &BTreeMap<String, String>) -> RootsWrite {
+    if read_mirror_roots().ok().as_ref() == Some(before) {
+        return RootsWrite::AlreadyRead;
+    }
+
+    write_compensating(before)
+}
+
+/// Write the record as `wanted` through the compensating write, read back after a failure.
+fn write_compensating(wanted: &BTreeMap<String, String>) -> RootsWrite {
+    match file_utils::write_file_compensating(&mirror_roots_path(), &roots_bytes(wanted)) {
+        Ok(()) => RootsWrite::Landed,
+        Err(failed) => read_back(failed, wanted),
+    }
 }
 
 /// Put back the entries of the pallets in `owed`, whose takedown refusal could not put the record
@@ -193,10 +209,7 @@ pub fn put_back_owed_roots(record: &BTreeMap<String, String>, owed: &[String]) -
         return RootsWrite::AlreadyRead;
     }
 
-    match file_utils::write_file_compensating(&mirror_roots_path(), &roots_bytes(&wanted)) {
-        Ok(()) => RootsWrite::Landed,
-        Err(failed) => read_back(failed, &wanted),
-    }
+    write_compensating(&wanted)
 }
 
 fn roots_bytes(roots: &BTreeMap<String, String>) -> Vec<u8> {
@@ -306,13 +319,16 @@ mod tests {
         let ordinary = write_mirror_roots(&stepped).expect_err("an ordinary write of the record is refused under the taint");
         assert!(ordinary.contains(crate::util::taint_utils::GATE_TAINT_MARKER), "got: {}", ordinary);
 
-        let reported = put_back_mirror_roots("The step was refused.".to_string(), &before);
-
+        assert_eq!(put_back_mirror_roots(&before), RootsWrite::Landed);
         assert_eq!(read_mirror_roots().unwrap(), before, "the record is put back");
-        assert_eq!(reported, "The step was refused. The mirror record was put back.");
 
-        // A record that already reads as `before` is left alone and goes unmentioned.
-        assert_eq!(put_back_mirror_roots("Refused again.".to_string(), &before), "Refused again.");
+        // A record that already reads as `before` is left alone.
+        assert_eq!(put_back_mirror_roots(&before), RootsWrite::AlreadyRead);
+
+        // An unreadable record is written back whole, under the taint too.
+        std::fs::write(mirror_roots_path(), b"not a record").unwrap();
+        assert_eq!(put_back_mirror_roots(&before), RootsWrite::Landed);
+        assert_eq!(read_mirror_roots().unwrap(), before, "an unreadable record is put back");
 
         // The run's last write leaves a record that already holds what it would write alone, and
         // still refuses one that would change it.
