@@ -702,16 +702,7 @@ async fn resolve_the_rest(
             // other ref, the record stays: nothing else would say the copy is lost.
             VanishedClass::MetaCopy(name) => {
                 let reference = format!("{}/{}", pallet_utils::FOLDER_NAME_META_ROOT, name);
-                let why = match pallet_utils::read_file_state(&pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, name)) {
-                    Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => match pallet_utils::parse_ref_bytes(&bytes) {
-                        Some(_) => None,
-                        None => Some("does not hold a head either".to_string()),
-                    },
-                    Ok(pallet_utils::MetaCopyState::Absent) => Some("is lost too".to_string()),
-                    Ok(pallet_utils::MetaCopyState::Other) => Some("is not a file".to_string()),
-                    Err(error) => Some(format!("cannot be read ({})", error)),
-                };
-                match why {
+                match meta_partner_lacks_head(&pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, name)) {
                     None => match sync_nearest_ancestor(root, relative) {
                         Ok(()) => refs_resolved.push(relative.to_string_lossy().into_owned()),
                         Err(error) => {
@@ -727,6 +718,33 @@ async fn resolve_the_rest(
                         dangling_lines.push(format!(
                             "a lost meta pallet ref copy whose ref (\"{}\") {}: \"{}\"",
                             reference, why, relative.to_string_lossy()
+                        ));
+                    }
+                }
+            }
+            // A ref lost beside a copy holding a head reads as lost, on every run, as on a
+            // warehouse with no taint: every read of it refuses it as damaged, and the meta pass
+            // after the recovery rebuilds it from the copy, or says why not. So the record is
+            // resolved here, its absence made durable. Beside any other copy, the record stays:
+            // the pallet would read as never written, and nothing else would say its ref is lost.
+            VanishedClass::MetaRef(name) => {
+                let copy = format!("{}/{}", pallet_utils::FOLDER_NAME_META_COPY_ROOT, name);
+                match meta_partner_lacks_head(&pallet_utils::get_meta_copy_path(name)) {
+                    None => match sync_nearest_ancestor(root, relative) {
+                        Ok(()) => refs_resolved.push(relative.to_string_lossy().into_owned()),
+                        Err(error) => {
+                            remainder.insert(relative.clone());
+                            dangling_lines.push(format!(
+                                "a lost meta pallet ref whose loss could not be made durable: \"{}\" ({})",
+                                relative.to_string_lossy(), error
+                            ));
+                        }
+                    },
+                    Some(why) => {
+                        remainder.insert(relative.clone());
+                        dangling_lines.push(format!(
+                            "a lost meta pallet ref whose copy (\"{}\") {}: \"{}\"",
+                            copy, why, relative.to_string_lossy()
                         ));
                     }
                 }
@@ -1472,7 +1490,7 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         Some(Disposition::Loose | Disposition::PackData | Disposition::PackIndex) => true,
         Some(Disposition::SignatureTable | Disposition::Shard) => listed.contains(relative),
         // A loose signature sidecar is skipped by the loose walk (`walk_loose_object_paths`).
-        Some(Disposition::Signature | Disposition::Ref | Disposition::MetaCopy | Disposition::Keepsake) | None => false,
+        Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake) | None => false,
     }
 }
 
@@ -1638,6 +1656,13 @@ enum VanishedClass {
     /// A user pallet's ref, removed since the taint was recorded (a delete whose directory sync
     /// failed, or a later delete of the same pallet).
     Ref,
+    /// A meta pallet's ref (`meta/<name>`), gone since the taint was recorded: a first write whose
+    /// folder sync failed, then a power loss that undid the ref's birth. That write writes the copy
+    /// once the ref reads back at its head, so the copy can outlive the ref. The meta pallet's name,
+    /// one of [`META_PALLET_NAMES`]: a path of any other name under `meta/` is undisposed.
+    ///
+    /// [`META_PALLET_NAMES`]: crate::util::meta_tree::META_PALLET_NAMES
+    MetaRef(&'static str),
     /// The copy of a meta pallet's ref (`meta-copy/<name>`), gone since the taint was recorded:
     /// the first write of a meta pallet whose copy's directory sync failed, then a power loss that
     /// undid the copy's birth. The meta pallet's name, one of [`META_PALLET_NAMES`]: a path of any
@@ -1679,13 +1704,35 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::SignatureTable => Some(VanishedClass::SignatureTable),
         Disposition::Shard => Some(VanishedClass::Shard),
         Disposition::Ref => Some(VanishedClass::Ref),
-        Disposition::MetaCopy => relative.file_name().and_then(|name| crate::util::meta_tree::META_PALLET_NAMES.iter()
-            .find(|known| std::ffi::OsStr::new(known) == name))
-            .map(|name| VanishedClass::MetaCopy(name)),
+        Disposition::MetaRef => meta_pallet_name(relative).map(VanishedClass::MetaRef),
+        Disposition::MetaCopy => meta_pallet_name(relative).map(VanishedClass::MetaCopy),
         Disposition::Keepsake => Some(VanishedClass::Keepsake),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
+}
+
+/// The meta pallet `relative`'s final name is, one of [`META_PALLET_NAMES`], or `None`.
+///
+/// [`META_PALLET_NAMES`]: crate::util::meta_tree::META_PALLET_NAMES
+fn meta_pallet_name(relative: &Path) -> Option<&'static str> {
+    let name = relative.file_name()?;
+    crate::util::meta_tree::META_PALLET_NAMES.iter().copied().find(|known| std::ffi::OsStr::new(known) == name)
+}
+
+/// Why the file at `path`, the other record of a meta pallet's head beside one that vanished,
+/// does not stand in for the lost one: `None` when it is a file holding a head, never read through
+/// a link.
+fn meta_partner_lacks_head(path: &Path) -> Option<String> {
+    match pallet_utils::read_file_state(path) {
+        Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => match pallet_utils::parse_ref_bytes(&bytes) {
+            Some(_) => None,
+            None => Some("does not hold a head either".to_string()),
+        },
+        Ok(pallet_utils::MetaCopyState::Absent) => Some("is lost too".to_string()),
+        Ok(pallet_utils::MetaCopyState::Other) => Some("is not a file".to_string()),
+        Err(error) => Some(format!("cannot be read ({})", error)),
+    }
 }
 
 /// The user pallet whose ref a keepsake at `relative` (`removed-refs/<…>`) was taken from, when
@@ -6432,6 +6479,7 @@ mod tests {
             VanishedClass::SignatureTable => "signature table".to_string(),
             VanishedClass::Signature(hash) => format!("signature {}", hash),
             VanishedClass::Ref => "ref".to_string(),
+            VanishedClass::MetaRef(name) => format!("meta ref {}", name),
             VanishedClass::MetaCopy(name) => format!("meta copy {}", name),
             VanishedClass::Keepsake => "keepsake".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
@@ -6455,11 +6503,12 @@ mod tests {
             ("bays/main/inventory/staged/data".into(), "shard"),
             ("pallets/main".into(), "ref"),
             ("pallets/team/feature".into(), "ref"),
+            ("meta/office".into(), "meta ref office"),
+            ("meta/tags".into(), "meta ref tags"),
             ("meta-copy/office".into(), "meta copy office"),
             // The shapes it has none for.
             ("removed-refs/side".into(), "keepsake"),
             ("removed-refs/side+2".into(), "keepsake"),
-            ("meta/office".into(), "kept: a meta pallet ref"),
             ("meta-copy/main".into(), "kept: a copy of a ref that is no meta pallet's"),
             ("inventory/incomplete-load".into(), "kept: the incomplete-load marker"),
             ("position".into(), "kept: the checkout position"),
@@ -6502,11 +6551,11 @@ mod tests {
             ("pallets/ab/cd".into(), "ref"),
             ("removed-refs/ab/cd".into(), "keepsake"),
             ("removed-refs/side/data".into(), "keepsake"),
-            ("meta/data".into(), "kept: a meta pallet ref"),
+            ("meta/data".into(), "kept: a ref in the meta folder that is no meta pallet's"),
             ("meta-copy/data".into(), "kept: a copy of a ref that is no meta pallet's"),
             ("removed-refs/ab/cd.sig".into(), "keepsake"),
             ("removed-refs/side.pack".into(), "keepsake"),
-            ("meta/side.idx".into(), "kept: a meta pallet ref"),
+            ("meta/side.idx".into(), "kept: a ref in the meta folder that is no meta pallet's"),
             ("meta-copy/side.sigs".into(), "kept: a copy of a ref that is no meta pallet's"),
             // Declared nowhere, including what the unanchored checks used to match at any depth.
             ("meta-copy".into(), "unrecognized"),
