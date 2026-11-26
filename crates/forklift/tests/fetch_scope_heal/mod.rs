@@ -84,8 +84,8 @@ fn heal_rebuilds_a_lost_or_damaged_fetch_scope_from_the_checkouts() {
 /// sync failed, is rebuilt by heal before its taint recovery, which then finds it standing and
 /// clears the taint: heal exits 0 with nothing left recorded, and `load` works.
 ///
-/// Revert: drop `scope_heal::repair` from heal → the taint recovery finds the file gone and the
-/// next `load` refuses it as missing → red.
+/// Revert: drop `scope_heal::repair` from heal → the report holds no `fetch_scope_rebuilt` and the
+/// fetch scope stays gone → red.
 #[test]
 fn heal_rebuilds_a_tainted_lost_fetch_scope_and_clears_its_taint() {
     let area = TestArea::new("fetch-scope-heal-tainted");

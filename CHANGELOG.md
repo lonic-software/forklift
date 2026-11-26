@@ -210,9 +210,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   as one that records no directory, as it does with no taint. While the bay's state folder
   stands, the note names `forklift bay remove <name>`, or the deletion to make by hand where no
   command line spells the name. Before, it kept heal refusing.
-  A lost fetch scope (`.forklift/config/fetch-scope`) is now cleared the same way. Its note says
-  what the warehouse's recorded mode makes of the absence: a full or cache warehouse keeps none,
-  and a sparse one is refused until heal rebuilds it. Before, it kept heal refusing.
+  A lost fetch scope (`.forklift/config/fetch-scope`) in a full or cache warehouse, which keeps
+  none, is now cleared the same way, with a note saying so. Before, it kept heal refusing. A
+  sparse warehouse's lost fetch scope is still rebuilt by the same heal run, which then clears
+  its taint.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
