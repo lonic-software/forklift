@@ -1000,19 +1000,22 @@ fn is_resumable(entry: &JournalEntry, now: &BayState) -> Result<bool, String> {
 /// and its next step resumes the undo. All of these must hold:
 ///
 /// 1. the journal's latest entry, a pallet delete included, is marked as an undo started — with a
-///    delete above it, the undo would first have to restore that pallet, which can refuse for good;
+///    delete above it, the next undo restores that pallet first, which can refuse for good, so the
+///    refusal could name an undo that never reaches the marked entry;
 /// 2. it is resumable ([`is_resumable`]);
 /// 3. its pick source, if it records one, is still in the store — the undo's own gate refuses it
 ///    otherwise ([`check_undoable`]);
-/// 4. the bay's consolidation or pick is not yet the one the entry's `before` records: once it is,
-///    neither command loses anything the undo would put back;
+/// 4. the entry completed a merge (its `before` records a consolidation or pick), and the bay's
+///    consolidation or pick is not yet the one `before` records: once it is, neither command loses
+///    anything the undo would put back;
 /// 5. the current pallet's ref reads the entry's `before` or `after` head: moved on by another
 ///    writer, the undo's put-back refuses the pallet as moved, and the stack's own refusal of a
 ///    bay behind its pallet is the way out instead.
 ///
 /// Journaling is best-effort, so a journal that cannot be read refuses nothing (undo reports it),
-/// and nor does a failed store or ref read in conditions 3 and 5. A failed read of the bay's own
-/// state is returned: both commands read it themselves next.
+/// and nor does a failed store or ref read in conditions 2, 3 and 5. A failed read of the bay's
+/// own state (its position or merge records, a consolidation's skeleton included) is returned as
+/// the command's error.
 pub fn refuse_a_stack_over_an_unfinished_undo(verb: &str) -> Result<(), CoreError> {
     let Ok(Some(entry)) = peek() else { return Ok(()) };
 
@@ -1027,6 +1030,15 @@ pub fn refuse_a_stack_over_an_unfinished_undo(verb: &str) -> Result<(), CoreErro
         return Ok(());
     }
 
+    // Only an operation that completed a merge has one for the undo to put back: an entry with no
+    // merge before it, one that started a merge included, is undone by aborting, which never
+    // resumes.
+    let merge = match (&entry.before.consolidation, &entry.before.cherry_pick) {
+        (Some(consolidation), _) => format!("the consolidation of \"{}\"", crate::error::sanitize(&consolidation.their_pallet)),
+        (None, Some(pick)) => format!("the pick of {}", pick.source),
+        (None, None) => return Ok(()),
+    };
+
     let before = entry.before.bay_state();
 
     if now.consolidation == before.consolidation && now.cherry_pick == before.cherry_pick {
@@ -1039,12 +1051,6 @@ pub fn refuse_a_stack_over_an_unfinished_undo(verb: &str) -> Result<(), CoreErro
         Ok(head) if head.as_ref() == entry.before.head(pallet) || head.as_ref() == entry.after.head(pallet) => {},
         _ => return Ok(()),
     }
-
-    let merge = match (&entry.before.consolidation, &entry.before.cherry_pick) {
-        (Some(consolidation), _) => format!("the consolidation of \"{}\"", crate::error::sanitize(&consolidation.their_pallet)),
-        (None, Some(pick)) => format!("the pick of {}", pick.source),
-        (None, None) => "the merge state".to_string(),
-    };
 
     Err(CoreError::refusal(
         RefusalCode::UndoUnfinished,
@@ -3038,6 +3044,45 @@ mod tests {
                 && refused.contains("the bay's position is already back"), "{}: {}", state, refused);
             assert!(!refused.contains("Nothing was undone") && !refused.contains("pallet"), "{}: {}", state, refused);
         }
+    }
+
+    /// A stopped undo refuses a stack in its name only over an entry that completed a merge. One
+    /// that started a merge is undone by aborting it, which never resumes: even marked, with the
+    /// bay as the operation left it and the ref at its head, it is not refused.
+    ///
+    /// Revert: build a merge name for an entry with none before it → the marked start is refused.
+    #[test]
+    fn only_a_stopped_undo_of_a_merge_completion_refuses_a_stack() {
+        let refusal = |entry: &JournalEntry, consolidation_in_progress: bool, ref_head: char| {
+            let _scratch = Scratch::new("unfinished-undo-merge-start");
+            advance("main", pallet_utils::get_pallet_head("main").unwrap().as_deref(), &hash(ref_head)).unwrap();
+            pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(hash('2')))).unwrap();
+            if consolidation_in_progress {
+                start_consolidation(&hash('5'), "side");
+            }
+            in_journal(entry);
+
+            match refuse_a_stack_over_an_unfinished_undo("stacked") {
+                Ok(()) => None,
+                Err(CoreError::Refusal { code, next_step, .. }) => Some((code, next_step)),
+                Err(other) => panic!("not a refusal: {}", other),
+            }
+        };
+
+        let mut started = entry("consolidate", "main", &hash('2'), &hash('2'));
+        started.after.consolidation = Some(consolidating(&hash('5'), "side"));
+        started.undo_started = true;
+        assert_eq!(refusal(&started, true, '2'), None, "a marked merge start");
+
+        // The domain is not empty: the stack that completed that consolidation, its undo stopped
+        // with the bay back on the merge's base and no merge in progress, is refused, whether the
+        // undo had put the pallet's ref back ('2') or not yet ('3', the head the stack left).
+        let mut completed = entry("stack", "main", &hash('2'), &hash('3'));
+        completed.before.consolidation = Some(consolidating(&hash('5'), "side"));
+        completed.undo_started = true;
+        let refused = Some((RefusalCode::UndoUnfinished, "forklift undo".to_string()));
+        assert_eq!(refusal(&completed, false, '2'), refused, "ref put back");
+        assert_eq!(refusal(&completed, false, '3'), refused, "ref not yet put back");
     }
 
     #[test]

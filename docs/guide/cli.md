@@ -772,8 +772,9 @@ again. While an undo of the `stack` that completed a consolidation or pick has p
 not yet the merge, `stack` and `park` refuse with `undo_unfinished` and name `forklift undo`: a
 stack would record the merge's output as an ordinary parcel, losing the second parent or the picked
 parcel's author, and a park would take that output away from the merge the undo puts back. They
-do not refuse when the undo could not finish either: with the picked parcel gone from the
-warehouse, with a pallet delete journaled since, or with the pallet moved on by another bay.
+do not refuse when the undo could not finish (the picked parcel gone from the warehouse, or the
+pallet moved on by another bay), nor when a pallet delete was journaled since: the next `undo`
+would bring that pallet back first, so only a second `undo` after it finishes the stopped one.
 
 A journal that cannot be read — corrupt, truncated, or written by a forklift with a
 different journal format — makes `undo` fail naming the file, never "nothing to undo".
