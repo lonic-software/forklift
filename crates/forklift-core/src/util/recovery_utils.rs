@@ -1867,22 +1867,12 @@ fn lost_position_note(relative: &Path) -> String {
     let recorded = match &directory {
         Ok(Some(directory)) => format!("the bay records its directory as \"{}\"", directory.to_string_lossy()),
         Ok(None) => "the bay records no directory".to_string(),
-        Err(_) => "the bay's record of its directory does not read".to_string(),
+        Err(error) => format!("the bay's record of its directory does not read ({})", error.trim_end_matches('.')),
     };
     let remove = match bay_utils::remove_command(name) {
         Some(command) => format!("\"{}\"", command),
-        // No command line spells the name: the by-hand removal `bay remove` itself names.
-        None => {
-            let state = bay_utils::bay_state_dir(name);
-            let state = std::path::absolute(&state).unwrap_or(state);
-            match &directory {
-                Ok(Some(directory)) => format!(
-                    "deleting by hand the \".forklift\" entry in \"{}\" and the folder \"{}\"",
-                    directory.to_string_lossy(), state.to_string_lossy()
-                ),
-                _ => format!("deleting by hand the folder \"{}\"", state.to_string_lossy()),
-            }
-        }
+        // No command line spells the name: the deletions `bay remove` would make, by hand.
+        None => format!("by hand: {}", bay_utils::manual_removal_steps(name, &directory)),
     };
     format!(
         "the position of {} (\"{}\") is lost, and {}; the ways out are \"forklift heal\" run in the bay's working \
@@ -7107,16 +7097,20 @@ mod tests {
                 its directory as \"/elsewhere/b-dir\"; the ways out are \"forklift heal\" run in the bay's working \
                 directory, or \"forklift bay remove b\""),
             ("bays/b/position", Bay::Unreadable, "the position of bay \"b\" (\"bays/b/position\") is lost, and the bay's \
-                record of its directory does not read; the ways out are \"forklift heal\" run in the bay's working \
-                directory, or \"forklift bay remove b\""),
-            // A name no command line can spell names the folders `bay remove` would delete.
+                record of its directory does not read (The bay path file \"{record}\" has no format header; an older version of Forklift wrote it); the ways out are \
+                \"forklift heal\" run in the bay's working directory, or \"forklift bay remove b\""),
+            // A name no command line can spell names the deletions `bay remove` would make, by hand.
             ("bays/it's/position", Bay::NoPath, "the position of bay \"it's\" (\"bays/it's/position\") is lost, and the \
-                bay records no directory; the ways out are \"forklift heal\" run in the bay's working directory, or \
-                deleting by hand the folder \"{state}\""),
+                bay records no directory; the ways out are \"forklift heal\" run in the bay's working directory, or by \
+                hand: delete the folder \"{state}\""),
+            ("bays/it's/position", Bay::Unreadable, "the position of bay \"it's\" (\"bays/it's/position\") is lost, and \
+                the bay's record of its directory does not read (The bay path file \"{record}\" has no format header; an older version of Forklift wrote it); the ways \
+                out are \"forklift heal\" run in the bay's working directory, or by hand: delete the \".forklift\" entry \
+                in the bay's working directory if it still redirects to this bay, then the folder \"{state}\""),
             ("bays/it's/position", Bay::Path, "the position of bay \"it's\" (\"bays/it's/position\") is lost, and the \
                 bay records its directory as \"/elsewhere/b-dir\"; the ways out are \"forklift heal\" run in the bay's \
-                working directory, or deleting by hand the \".forklift\" entry in \"/elsewhere/b-dir\" and the folder \
-                \"{state}\""),
+                working directory, or by hand: delete the \".forklift\" entry in \"/elsewhere/b-dir\" if it still \
+                redirects to this bay, then the folder \"{state}\""),
         ];
 
         for (relative, bay, note) in cases {
@@ -7149,7 +7143,8 @@ mod tests {
             let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
             assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
             let state = std::path::absolute(root.join(".forklift").join("bays").join(name)).unwrap();
-            let note = note.replace("{state}", &state.to_string_lossy());
+            let record = root.join(".forklift").join("bays").join(name).join("path");
+            let note = note.replace("{state}", &state.to_string_lossy()).replace("{record}", &record.to_string_lossy());
             assert!(outcome.notes.contains(&note), "{}: {:?}", relative, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
 
