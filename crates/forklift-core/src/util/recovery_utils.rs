@@ -2156,7 +2156,7 @@ fn lost_bay_path_note(name: &str, relative: &Path) -> String {
             lost, shown.to_string_lossy()
         ),
         Err(error) => format!(
-            "{}, and the bay's state folder \"{}\" does not read ({})", lost, shown.to_string_lossy(), error.trim_end_matches('.')
+            "{}, and whether the bay's state folder stands does not read ({})", lost, error.trim_end_matches('.')
         ),
         Ok(Some(true)) => {
             let reads = format!("{}; the bay reads as one that records no directory, as it would with no taint", lost);
