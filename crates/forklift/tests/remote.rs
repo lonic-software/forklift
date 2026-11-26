@@ -208,15 +208,15 @@ impl Server {
             None => args.push("--open".to_string()),
         }
 
-        let mut child = server_command()
+        let mut process = ServerProcess::new(server_command()
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
 
         // The single startup line carries the bound address (port 0 picks a free one).
-        let stdout = child.stdout.take().unwrap();
+        let stdout = process.child().stdout.take().unwrap();
         let mut line = String::new();
 
         BufReader::new(stdout).read_line(&mut line).unwrap();
@@ -229,7 +229,7 @@ impl Server {
 
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { process: ServerProcess::new(child), url }
+        Server { process, url }
     }
 
     /// Stop serving, so the remote cannot be reached.
@@ -265,17 +265,27 @@ impl Server {
 }
 
 /// A server process that has already ended: `serve` with nothing to serve refuses and exits,
-/// standing in for a server that aborted.
+/// standing in for a server that aborted. Nothing waits for it but [`ServerProcess::exited`],
+/// so the harness's own look is the one that finds the exit, as it is for a server that aborts.
 fn ended_server() -> ServerProcess {
-    let mut child = server_command().arg("serve").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let status = child.wait().unwrap();
+    let mut server = ServerProcess::new(
+        server_command().arg("serve").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = server.exited() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "serve with nothing to serve exits");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert!(!status.success(), "serve with nothing to serve refuses");
-    ServerProcess::new(child)
+    server
 }
 
 /// A server that ended before the test stopped it fails the test when the harness stops it, so
 /// a debug server's abort on a swallowed storage panic is not read as the failed request a test
-/// expected. Every other test here drops a server still running and passes.
+/// expected. Every other test here stops or drops a server still running, and passes.
 ///
 /// Revert: stop without looking at how the server had ended → no panic → red.
 #[test]

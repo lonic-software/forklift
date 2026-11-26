@@ -111,19 +111,19 @@ impl Server {
             .args(["prepare", "--root", root]).output().unwrap();
         assert_success(&prepared);
 
-        let mut child = Command::new(server_binary()).env("FORKLIFT_FSYNC", "0")
+        let mut process = ServerProcess::new(Command::new(server_binary()).env("FORKLIFT_FSYNC", "0")
             .args(["serve", "--root", root, "--addr", "127.0.0.1:0", "--open"])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
 
         let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(process.child().stdout.take().unwrap()).read_line(&mut line).unwrap();
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { _process: ServerProcess::new(child), url }
+        Server { _process: process, url }
     }
 }
 

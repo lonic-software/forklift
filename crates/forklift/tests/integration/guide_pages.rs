@@ -687,9 +687,9 @@ impl Reader {
 
                 let stderr = self.area.join(format!("server-{}.stderr", step.line));
                 let stderr_file = std::fs::File::create(&stderr).unwrap();
-                let mut child = command.stdout(Stdio::piped()).stderr(stderr_file).spawn().unwrap();
+                let mut process = ServerProcess::new(command.stdout(Stdio::piped()).stderr(stderr_file).spawn().unwrap());
 
-                let mut stdout = BufReader::new(child.stdout.take().unwrap());
+                let mut stdout = BufReader::new(process.child().stdout.take().unwrap());
                 let mut line = String::new();
                 stdout.read_line(&mut line).unwrap_or_else(|e| fail(&e));
 
@@ -698,7 +698,7 @@ impl Reader {
                     self.address = Some(address.to_string());
                 }
 
-                self.servers.push(Server { line: step.line, later: Vec::new(), process: ServerProcess::new(child), _stdout: stdout, stderr });
+                self.servers.push(Server { line: step.line, later: Vec::new(), process, _stdout: stdout, stderr });
                 (Some(0), line.into_bytes())
             }
             ("forklift-server", None) => {

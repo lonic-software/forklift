@@ -748,19 +748,20 @@ impl Server {
         use std::io::BufRead;
 
         let root = root.to_str().unwrap();
-        let mut child = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
+        let mut process = common::ServerProcess::new(std::process::Command::new(common::server_binary())
+            .env("FORKLIFT_FSYNC", "0")
             .args(["serve", "--root", root, "--addr", "127.0.0.1:0", "--open"]).args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
 
         let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        std::io::BufReader::new(process.child().stdout.take().unwrap()).read_line(&mut line).unwrap();
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { process: common::ServerProcess::new(child), url, root: PathBuf::from(root) }
+        Server { process, url, root: PathBuf::from(root) }
     }
 
     /// The head this server serves for `main`, read from its own ref: a fresh clone could not
@@ -769,7 +770,6 @@ impl Server {
         std::fs::read_to_string(self.root.join(".forklift/pallets/main")).unwrap().trim().to_string()
     }
 }
-
 
 /// A head stacked before a redaction came down by `lower` is refused by this warehouse's own check
 /// before it is sent. The remote holds the redaction here too; in a full warehouse a recorded

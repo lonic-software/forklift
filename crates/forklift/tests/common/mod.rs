@@ -12,9 +12,10 @@ use std::process::Command;
 /// through this or [`test_command`], is that uncovered case. So, partly, is a launched
 /// `forklift-server`: a debug build raises a request's storage panic again on a task of the
 /// server process, so the client sees only a dropped connection and the server keeps serving.
-/// A storage panic a reply swallowed aborts a debug server instead, and [`ServerProcess`] fails
-/// the test on a server that ended. The same work under `forklift-aws-lambda`'s `spawn_blocking` turns a panic into an
-/// error reply.
+/// A storage panic a reply swallowed aborts a debug server instead, and a harness that holds its
+/// server in a [`ServerProcess`] fails the test on that, if the abort came before the stop. A
+/// server launched without one is not checked. The same work under `forklift-aws-lambda`'s
+/// `spawn_blocking` turns a panic into an error reply.
 pub fn forklift_command() -> Command {
     test_command(env!("CARGO_BIN_EXE_forklift"))
 }
@@ -78,30 +79,38 @@ impl ServerProcess {
         self.child.try_wait().unwrap()
     }
 
-    /// Stop the server, failing the test if it had ended on its own first.
+    /// Stop the server, failing the test if it had ended on its own first. While the thread is
+    /// already panicking it only kills and waits, ignoring what either returns.
     pub fn stop(&mut self) {
-        if let Some(status) = self.stop_and_report() {
-            if !std::thread::panicking() {
-                panic!(
-                    "the server this test launched ended on its own ({}) before the test stopped \
-                    it; its stderr says why. A debug build aborts on a storage panic a reply \
-                    swallowed.",
-                    status
-                );
+        if std::thread::panicking() {
+            if !self.stopped {
+                self.stopped = true;
+                let _ = self.child.kill();
+                let _ = self.child.wait();
             }
+            return;
+        }
+
+        if let Some(status) = self.stop_and_report() {
+            panic!(
+                "the server this test launched ended on its own ({}) before the test stopped it; \
+                its stderr says why. A debug build aborts on a storage panic a reply swallowed.",
+                status
+            );
         }
     }
 
     /// Stop the server and return how it ended if it had ended on its own first, for a caller
-    /// that reports that itself. A server already stopped returns `None`.
+    /// that reports that itself. A server already stopped returns `None`. A kill or wait that
+    /// fails fails the test, so a server stopped here has ended.
     pub fn stop_and_report(&mut self) -> Option<std::process::ExitStatus> {
         if self.stopped {
             return None;
         }
         self.stopped = true;
         let exited = self.exited();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
         exited
     }
 }

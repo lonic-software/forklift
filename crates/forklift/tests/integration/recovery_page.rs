@@ -128,17 +128,17 @@ impl Server {
     const SECRET_SHA256: &str = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b";
 
     fn serve(root: &str) -> Server {
-        let mut child = Command::new(server_binary())
+        let mut process = ServerProcess::new(Command::new(server_binary())
             .args(["serve", "--token-sha256", Self::SECRET_SHA256, "--root", root, "--addr", "127.0.0.1:0"])
             .env("FORKLIFT_FSYNC", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
         let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(process.child().stdout.take().unwrap()).read_line(&mut line).unwrap();
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
-        Server { process: ServerProcess::new(child), url }
+        Server { process, url }
     }
 }
 

@@ -482,19 +482,19 @@ struct Server {
 
 impl Server {
     fn start(root: &Path) -> Server {
-        let mut child = test_command(server_binary())
+        let mut process = ServerProcess::new(test_command(server_binary())
             .args(["serve", "--root", root.to_str().unwrap(), "--addr", "127.0.0.1:0", "--open"])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
 
         let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(process.child().stdout.take().unwrap()).read_line(&mut line).unwrap();
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { _process: ServerProcess::new(child), url }
+        Server { _process: process, url }
     }
 }
 
