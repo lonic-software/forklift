@@ -143,6 +143,18 @@ fn unusable_reason(scope: &PathScope, sparse: bool, fetch: &Fetch) -> Option<Str
     }
 }
 
+/// Why a scope file that parses cannot be the scope of a checkout of this warehouse, judged as
+/// [`repair`] judges it, or `None` when it can.
+pub(crate) fn unusable_scope(scope: &PathScope) -> Result<Option<String>, String> {
+    let sparse = warehouse_utils::warehouse_mode()? == WarehouseMode::Sparse;
+    Ok(unusable_reason(scope, sparse, &Fetch::read(sparse)?))
+}
+
+/// The scope file of the checkout heal runs in, the one [`repair`] mends.
+pub(crate) fn active_scope_path() -> PathBuf {
+    checkout().path
+}
+
 /// Restore the scope of the checkout heal runs in from its copy, or re-sync the copy from it (see
 /// the module doc comment). The bay position must read: the stranding guard judges the working tree
 /// against the tree the checkout stands on.

@@ -31,12 +31,12 @@ use crate::util::record_utils::{self, RecordError};
 use crate::util::warehouse_utils::{self, WarehouseMode};
 
 /// The bay-local file that records a bay's checkout scope (under `<bay_root>/`).
-const FILE_NAME_BAY_SCOPE: &str = "scope";
+pub(crate) const FILE_NAME_BAY_SCOPE: &str = "scope";
 
 /// The witness beside every checkout's scope file: the same bytes, written before the scope file
 /// on every write, so `heal` can restore a scope file that is lost. Written first, so an
 /// interrupted write never leaves a copy wider than the scope file it would replace.
-const FILE_NAME_SCOPE_COPY: &str = "scope-copy";
+pub(crate) const FILE_NAME_SCOPE_COPY: &str = "scope-copy";
 
 /// The shared configuration folder (matches `config_utils`' own folder name) and the
 /// warehouse fetch-scope file inside it.
@@ -456,7 +456,7 @@ fn read_scope_file_if_present(path: &Path, remedy: &str) -> Result<Option<PathSc
 
 /// Whether a scope file is present, without reading it: a scope file found where none belongs is
 /// refused whatever it holds.
-fn scope_file_is_present(path: &Path) -> Result<bool, String> {
+pub(crate) fn scope_file_is_present(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),

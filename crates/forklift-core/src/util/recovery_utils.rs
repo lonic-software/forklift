@@ -249,7 +249,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
-    audit_utils, bay_utils, fanout_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, mirror_utils, object_utils,
+    audit_utils, bay_utils, checkout_scope_heal, fanout_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, mirror_utils, object_utils,
     office_utils, pack_utils, pallet_utils, park_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     signature_table, taint_utils, tombstone_utils,
 };
@@ -850,22 +850,26 @@ async fn resolve_the_rest(
                     ));
                 }
             },
-            // A lost position is refused by its readers, taint or none (see `VanishedClass::Position`),
-            // and no copy is a state its writer leaves: each absence is made durable and the record
-            // resolved, with a note naming the ways out, which nothing else will say once it is.
-            VanishedClass::Position | VanishedClass::PositionCopy => match sync_nearest_ancestor(root, relative) {
-                Ok(()) => {
-                    refs_resolved.push(relative.to_string_lossy().into_owned());
-                    vanished_notes.push(lost_position_note(relative));
+            // A lost position or scope is refused by its readers, taint or none (see
+            // `VanishedClass::Position` and `VanishedClass::Scope`), and a lost copy costs nothing
+            // a reader relies on: each absence is made durable and the record resolved, with a note
+            // naming the ways out, which nothing else will say once it is.
+            VanishedClass::Position | VanishedClass::PositionCopy | VanishedClass::Scope | VanishedClass::ScopeCopy => {
+                let lost = LostCheckoutRecord::of(relative);
+                match sync_nearest_ancestor(root, relative) {
+                    Ok(()) => {
+                        refs_resolved.push(relative.to_string_lossy().into_owned());
+                        vanished_notes.push(lost_checkout_record_note(&lost));
+                    }
+                    Err(error) => {
+                        remainder.insert(relative.clone());
+                        dangling_lines.push(format!(
+                            "a lost checkout {} or copy whose loss could not be made durable: \"{}\" ({})",
+                            lost.record.name(), relative.to_string_lossy(), error
+                        ));
+                    }
                 }
-                Err(error) => {
-                    remainder.insert(relative.clone());
-                    dangling_lines.push(format!(
-                        "a lost checkout position or copy whose loss could not be made durable: \"{}\" ({})",
-                        relative.to_string_lossy(), error
-                    ));
-                }
-            },
+            }
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1584,7 +1588,8 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         Some(Disposition::SignatureTable | Disposition::Shard) => listed.contains(relative),
         // A loose signature sidecar is skipped by the loose walk (`walk_loose_object_paths`).
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
-            | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy) | None => false,
+            | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy | Disposition::Scope
+            | Disposition::ScopeCopy) | None => false,
     }
 }
 
@@ -1794,6 +1799,19 @@ enum VanishedClass {
     /// its writer leaves on purpose: `pallet_utils::write_position_in` removes a copy it cannot
     /// write, and `pallet_utils::read_position_copy_in` reads a missing one as witnessing nothing.
     PositionCopy,
+    /// A checkout's scope (`scope`, or a bay's), gone since the taint was recorded. Its readers
+    /// refuse a missing one as damaged (`scope_utils::read_bay_scope`, and
+    /// `scope_utils::read_main_tree_scope` in a sparse warehouse), taint or none, and the main
+    /// tree of a warehouse that is not sparse records none, so keeping the record would guard
+    /// nothing the absence does not already stop. Heal mends the scope of the checkout it runs in
+    /// before the taint recovery (`checkout_scope_heal::repair`), restoring it or refusing, except
+    /// for the main tree of a warehouse that is not sparse, which it leaves alone.
+    Scope,
+    /// The copy of a checkout's scope, gone since the taint was recorded. Only heal reads it: it
+    /// writes a missing one again from a usable scope file (`checkout_scope_heal::repair`), and
+    /// every scope write writes the copy first (`scope_utils::write_checkout_scope`). The copy of
+    /// the checkout heal runs in can still be found gone here, where that pass left it so.
+    ScopeCopy,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -1828,35 +1846,162 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::LoadMarker => Some(VanishedClass::LoadMarker),
         Disposition::Position => Some(VanishedClass::Position),
         Disposition::PositionCopy => Some(VanishedClass::PositionCopy),
+        Disposition::Scope => Some(VanishedClass::Scope),
+        Disposition::ScopeCopy => Some(VanishedClass::ScopeCopy),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
 }
 
-/// The note for a resolved [`VanishedClass::Position`] or [`VanishedClass::PositionCopy`] at
-/// `relative` (`position`, `position-copy`, or a bay's under `bays/<name>/`), naming the checkout
-/// it belongs to and, for a position, the commands that are its ways out.
-fn lost_position_note(relative: &Path) -> String {
-    let names: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
-    let bay = match names.as_slice() {
-        [bays, name, _] if bays == crate::globals::FOLDER_NAME_BAYS_ROOT => Some(name.as_str()),
-        _ => None,
-    };
-    let which = match bay {
+/// A checkout's record whose loss heal resolves with a note: its position or its scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckoutRecord {
+    Position,
+    Scope,
+}
+
+impl CheckoutRecord {
+    /// The record's name in a sentence.
+    fn name(self) -> &'static str {
+        match self {
+            CheckoutRecord::Position => "position",
+            CheckoutRecord::Scope => scope_utils::FILE_NAME_BAY_SCOPE,
+        }
+    }
+}
+
+/// A resolved [`VanishedClass::Position`], [`VanishedClass::PositionCopy`],
+/// [`VanishedClass::Scope`] or [`VanishedClass::ScopeCopy`]: the record, whether it is the copy,
+/// and whose it is, read from its path (`position`, `scope`, their copies, or a bay's under
+/// `bays/<name>/`).
+struct LostCheckoutRecord {
+    record: CheckoutRecord,
+    copy: bool,
+    /// The bay's name, or `None` for the warehouse's own working tree.
+    bay: Option<String>,
+    /// The path, root-relative, with "/" between its names.
+    path: String,
+}
+
+impl LostCheckoutRecord {
+    fn of(relative: &Path) -> LostCheckoutRecord {
+        let names: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+        let bay = match names.as_slice() {
+            [bays, name, _] if bays == crate::globals::FOLDER_NAME_BAYS_ROOT => Some(name.clone()),
+            _ => None,
+        };
+        let last = names.last().map(String::as_str);
+        let record = match last == Some(scope_utils::FILE_NAME_BAY_SCOPE) || last == Some(scope_utils::FILE_NAME_SCOPE_COPY) {
+            true => CheckoutRecord::Scope,
+            false => CheckoutRecord::Position,
+        };
+        let copy = last == Some(pallet_utils::FILE_NAME_POSITION_COPY) || last == Some(scope_utils::FILE_NAME_SCOPE_COPY);
+
+        LostCheckoutRecord { record, copy, bay, path: names.join("/") }
+    }
+}
+
+/// The note for a [`LostCheckoutRecord`], naming the checkout the record belongs to and, for a
+/// position or scope, the commands that are its ways out. The main tree's scope of a warehouse
+/// that is not sparse is the exception: that working tree records none, so its absence, or its
+/// copy's, is said as the state the warehouse keeps, unless a scope file stands there anyway.
+fn lost_checkout_record_note(lost: &LostCheckoutRecord) -> String {
+    let record = lost.record.name();
+    let path = &lost.path;
+    let which = match &lost.bay {
         Some(name) => format!("bay \"{}\"", name),
         None => "the warehouse's own working tree".to_string(),
     };
-    let path = names.join("/");
+    let subject = match lost.copy {
+        true => format!("the copy of the {} of {} (\"{}\")", record, which, path),
+        false => format!("the {} of {} (\"{}\")", record, which, path),
+    };
 
-    if names.last().map(String::as_str) == Some(pallet_utils::FILE_NAME_POSITION_COPY) {
-        return format!(
-            "the copy of the position of {} (\"{}\") is gone; the next write of that position writes it again",
-            which, path
-        );
+    let scope_path = forklift_root().join(Path::new(path).with_file_name(scope_utils::FILE_NAME_BAY_SCOPE));
+
+    // The main tree's scope follows the warehouse's mode (`scope_utils::read_main_tree_scope`).
+    let mut mode_unread = None;
+    if lost.record == CheckoutRecord::Scope && lost.bay.is_none() {
+        match crate::util::warehouse_utils::warehouse_mode() {
+            Ok(crate::util::warehouse_utils::WarehouseMode::Sparse) => {}
+            Ok(_) => {
+                let records_none = format!("{} is gone; in a warehouse that is not sparse, that working tree records no scope", subject);
+                // A lost copy can stand beside a scope file, which that working tree's reader
+                // refuses whatever it holds.
+                return match scope_utils::scope_file_is_present(&scope_path) {
+                    Ok(false) => records_none,
+                    Ok(true) => format!(
+                        "{}, but a scope file stands beside it (\"{}\"), which its reader refuses; the way out is \
+                        deleting that file", records_none, Path::new(path).with_file_name(scope_utils::FILE_NAME_BAY_SCOPE)
+                            .to_string_lossy().replace('\\', "/")
+                    ),
+                    Err(error) => format!(
+                        "{}, and whether a scope file stands beside it does not read ({})", records_none, error.trim_end_matches('.')
+                    ),
+                };
+            }
+            Err(error) => mode_unread = Some(format!(", and the warehouse's mode does not read ({})", error.trim_end_matches('.'))),
+        }
     }
+    let mode_unread = mode_unread.unwrap_or_default();
 
-    let Some(name) = bay else {
-        return format!("the position of {} (\"{}\") is lost; the way out is \"forklift heal\" run in that working tree", which, path);
+    // The checkout heal runs in had its scope mended before the taint recovery
+    // (`checkout_scope_heal::repair`), so a record of its scope found gone here is one that pass
+    // left gone: heal run there again is not named as a way out.
+    let active = lost.record == CheckoutRecord::Scope && checkout_scope_heal::active_scope_path() == scope_path;
+
+    // A scope's copy is what heal restores a lost scope from, so its note says what the scope file
+    // beside it reads, judged as heal judges it. Beside one that can be used, heal run in that
+    // checkout writes the copy again or says why not; beside one a newer Forklift wrote, that
+    // Forklift is the way out; beside any other, the checkout's scope is as good as lost, so the
+    // note names the ways out a lost scope's does.
+    let lost_what = match (lost.copy, lost.record) {
+        (true, CheckoutRecord::Position) => {
+            return format!("{} is gone{}; the next write of that {} writes it again", subject, mode_unread, record);
+        }
+        (true, CheckoutRecord::Scope) => {
+            let beside = match scope_utils::read_scope_raw(&scope_path) {
+                Ok(scope_utils::RawScope::Read(scope)) => match checkout_scope_heal::unusable_scope(&scope) {
+                    Ok(None) if active => return format!(
+                        "{} is gone{}, and the scope file beside it can be used, but this heal, which runs in that \
+                        checkout, left no copy of it; the next write of that scope writes the copy again",
+                        subject, mode_unread
+                    ),
+                    Ok(None) => {
+                        let heal_there = match lost.bay {
+                            Some(_) => "the bay's working directory",
+                            None => "that working tree",
+                        };
+                        return format!(
+                            "{} is gone{}, and the scope file beside it can be used; the way out is \"forklift heal\" \
+                            run in {}", subject, mode_unread, heal_there
+                        );
+                    }
+                    Ok(Some(reason)) => format!("parses but {}", reason.trim_end_matches('.')),
+                    Err(error) => format!("parses, but whether it can be used does not read ({})", error.trim_end_matches('.')),
+                },
+                Ok(scope_utils::RawScope::Newer(reason)) => return format!(
+                    "{} is gone{}, and the scope file beside it {}; the way out is the Forklift that wrote it",
+                    subject, mode_unread, reason.trim_end_matches('.')
+                ),
+                Ok(scope_utils::RawScope::Missing) => "is gone too".to_string(),
+                Ok(scope_utils::RawScope::Damaged(reason)) => reason.trim_end_matches('.').to_string(),
+                Err(error) => format!("does not read ({})", error.trim_end_matches('.')),
+            };
+            format!("{} is gone{}, and the scope file beside it {}", subject, mode_unread, beside)
+        }
+        (false, _) => format!("{} is lost{}", subject, mode_unread),
+    };
+
+    // Heal run in a checkout whose scope is lost restores it from a usable copy or refuses naming
+    // `heal --scope`; in the checkout heal already runs in, that command is the way out.
+    let heal = match active {
+        true => "\"forklift heal --scope <path>...\", naming the paths it held,",
+        false => "\"forklift heal\"",
+    };
+
+    let Some(name) = lost.bay.as_deref() else {
+        return format!("{}; the way out is {} run in that working tree", lost_what, heal);
     };
 
     // The note states what it read itself, the bay's record of its directory, and names the
@@ -1875,9 +2020,8 @@ fn lost_position_note(relative: &Path) -> String {
         None => format!("by hand: {}", bay_utils::manual_removal_steps(name, &directory)),
     };
     format!(
-        "the position of {} (\"{}\") is lost, and {}; the ways out are \"forklift heal\" run in the bay's working \
-        directory, or {}",
-        which, path, recorded, remove
+        "{}, and {}; the ways out are {} run in the bay's working directory, or {}",
+        lost_what, recorded, heal, remove
     )
 }
 
@@ -6713,6 +6857,8 @@ mod tests {
             VanishedClass::LoadMarker => "load marker".to_string(),
             VanishedClass::Position => "position".to_string(),
             VanishedClass::PositionCopy => "position copy".to_string(),
+            VanishedClass::Scope => "checkout scope".to_string(),
+            VanishedClass::ScopeCopy => "scope copy".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -6744,8 +6890,8 @@ mod tests {
             ("inventory/incomplete-load".into(), "load marker"),
             ("position".into(), "position"),
             ("position-copy".into(), "position copy"),
-            ("scope".into(), "kept: the checkout scope"),
-            ("scope-copy".into(), "kept: the checkout scope's copy"),
+            (scope_utils::FILE_NAME_BAY_SCOPE.into(), "checkout scope"),
+            ("scope-copy".into(), "scope copy"),
             ("consolidation".into(), "kept: the consolidation state"),
             ("consolidation-copy".into(), "kept: the consolidation state's copy"),
             ("consolidation-skeleton".into(), "kept: the consolidation skeleton"),
@@ -6754,8 +6900,8 @@ mod tests {
             ("bays/main/inventory/incomplete-load".into(), "load marker"),
             ("bays/main/position".into(), "position"),
             ("bays/main/position-copy".into(), "position copy"),
-            ("bays/main/scope".into(), "kept: a bay's checkout scope"),
-            ("bays/main/scope-copy".into(), "kept: a bay's checkout scope's copy"),
+            ("bays/main/scope".into(), "checkout scope"),
+            ("bays/main/scope-copy".into(), "scope copy"),
             ("bays/main/consolidation".into(), "kept: a bay's consolidation state"),
             ("bays/main/consolidation-copy".into(), "kept: a bay's consolidation state's copy"),
             ("bays/main/consolidation-skeleton".into(), "kept: a bay's consolidation skeleton"),
@@ -7146,6 +7292,216 @@ mod tests {
             let record = root.join(".forklift").join("bays").join(name).join("path");
             let note = note.replace("{state}", &state.to_string_lossy()).replace("{record}", &record.to_string_lossy());
             assert!(outcome.notes.contains(&note), "{}: {:?}", relative, outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A bay's first scope write fails a folder sync and taints what it was writing: the copy,
+    /// which goes first, or the scope file after it. A power loss then undoes that file. Heal, run
+    /// from the warehouse's own working tree, resolves the lost record with a note that says what
+    /// the scope file beside a lost copy reads, and names the ways out. Where the absence cannot be
+    /// made durable, the record stays and heal refuses.
+    ///
+    /// Revert: the scope shapes' disposition back to `None` → heal refuses → red. Revert: resolve
+    /// without `sync_nearest_ancestor` → the failing-sync heal clears → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_bay_scope_or_copy_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        // (the syncs of the state folder that pass before the one that fails, the path recorded,
+        // whether heal can make its absence durable, the note)
+        let cases: &[(usize, &str, bool, &str)] = &[
+            (0, "bays/b/scope-copy", true, "the copy of the scope of bay \"b\" (\"bays/b/scope-copy\") is gone, and the \
+                scope file beside it is gone too, and the bay records no directory; the ways out are \"forklift heal\" \
+                run in the bay's working directory, or \"forklift bay remove b\""),
+            (1, "bays/b/scope", true, "the scope of bay \"b\" (\"bays/b/scope\") is lost, and the bay records no \
+                directory; the ways out are \"forklift heal\" run in the bay's working directory, or \"forklift bay \
+                remove b\""),
+            (1, "bays/b/scope", false, ""),
+        ];
+
+        for (passed, relative, durable, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-scope-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            let folder = bay_utils::bay_state_dir("b");
+            std::fs::create_dir_all(&folder).unwrap();
+            {
+                let _fault = SyncDirFaultGuard::failing_exactly_after(&folder, *passed);
+                scope_utils::set_bay_scope_in(&folder, &PathScope::full())
+                    .expect_err("a scope write whose folder sync fails fails");
+            }
+            assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                [PathBuf::from(relative)].into_iter().collect(), "{}: the record written alone is recorded", relative);
+
+            crate::util::file_utils::remove_file(&forklift.join(relative)).unwrap();
+
+            if !durable {
+                let _fault = SyncDirFaultGuard::failing_exactly(&folder);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[
+                    "a lost checkout scope or copy whose loss could not be made durable: \"bays/b/scope\"",
+                ]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{}: a lost scope record is resolved: {}", relative, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
+            assert!(outcome.notes.contains(&note.to_string()), "{}: {:?}", relative, outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            scope_utils::read_bay_scope("b").expect_err("the lost scope is still refused by its readers");
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost path of each scope shape is resolved with the note for its checkout. The main tree's
+    /// scope in a warehouse that is not sparse is the state that working tree keeps, unless a
+    /// scope file stands there. A copy's note says what the scope file beside it is, judged as
+    /// heal's repair judges it: one that can be used names heal run in that checkout, one a newer
+    /// Forklift wrote names that Forklift, and any other names the ways out a lost scope has. The
+    /// main tree is the checkout these tests run in, so its rows never send heal back to itself.
+    ///
+    /// Revert: any of the four shapes' disposition back to `None` → its row refuses → red. Revert:
+    /// the main tree's note not judged by the mode → the full and sparse rows' notes agree → red.
+    /// Revert: the scope beside a copy judged only by whether it parses → the full-in-sparse and
+    /// outside-the-fetch-scope rows name heal → red. Revert: the active checkout not told apart →
+    /// the main tree's sparse rows name plain heal → red.
+    #[test]
+    fn heal_resolves_a_lost_scope_or_copy_of_each_shape() {
+        use crate::globals::StorageRootScope;
+        use crate::util::warehouse_utils::WarehouseMode;
+
+        #[derive(Clone, Copy)]
+        enum Beside {
+            Nothing,
+            /// A scope file naming these prefixes (none: full).
+            Scope(&'static [&'static str]),
+            Damaged,
+            Newer,
+        }
+
+        const HEAL_SCOPE: &str = "the way out is \"forklift heal --scope <path>...\", naming the paths it held, run in \
+            that working tree";
+        const BAY_WAYS_OUT: &str = "the bay records no directory; the ways out are \"forklift heal\" run in the bay's \
+            working directory, or \"forklift bay remove b\"";
+
+        // (the path, the mode marked (`None`: no mark; a sparse one records the fetch scope "a"),
+        // what stands at the scope file beside it, the note)
+        let cases: &[(&str, Option<WarehouseMode>, Beside, String)] = &[
+            (scope_utils::FILE_NAME_BAY_SCOPE, Some(WarehouseMode::Full), Beside::Nothing, "the scope of the warehouse's \
+                own working tree (\"{scope}\") is gone; in a warehouse that is not sparse, that working tree records no \
+                scope".to_string()),
+            ("scope-copy", Some(WarehouseMode::Cache), Beside::Nothing, "the copy of the scope of the warehouse's own \
+                working tree (\"scope-copy\") is gone; in a warehouse that is not sparse, that working tree records no \
+                scope".to_string()),
+            ("scope-copy", Some(WarehouseMode::Full), Beside::Damaged, "the copy of the scope of the warehouse's own \
+                working tree (\"scope-copy\") is gone; in a warehouse that is not sparse, that working tree records no \
+                scope, but a scope file stands beside it (\"{scope}\"), which its reader refuses; the way out is \
+                deleting that file".to_string()),
+            (scope_utils::FILE_NAME_BAY_SCOPE, Some(WarehouseMode::Sparse), Beside::Nothing, format!("the scope of the \
+                warehouse's own working tree (\"{{scope}}\") is lost; {}", HEAL_SCOPE)),
+            (scope_utils::FILE_NAME_BAY_SCOPE, None, Beside::Nothing, format!("the scope of the warehouse's own working \
+                tree (\"{{scope}}\") is lost, and the warehouse's mode does not read ({{mode}}); {}", HEAL_SCOPE)),
+            ("scope-copy", Some(WarehouseMode::Sparse), Beside::Scope(&["a"]), "the copy of the scope of the \
+                warehouse's own working tree (\"scope-copy\") is gone, and the scope file beside it can be used, but \
+                this heal, which runs in that checkout, left no copy of it; the next write of that scope writes the copy \
+                again".to_string()),
+            ("scope-copy", Some(WarehouseMode::Sparse), Beside::Scope(&[]), format!("the copy of the scope of the \
+                warehouse's own working tree (\"scope-copy\") is gone, and the scope file beside it parses but names no \
+                path, which only a bay of a warehouse that is not sparse may do; {}", HEAL_SCOPE)),
+            ("scope-copy", Some(WarehouseMode::Sparse), Beside::Nothing, format!("the copy of the scope of the \
+                warehouse's own working tree (\"scope-copy\") is gone, and the scope file beside it is gone too; {}",
+                HEAL_SCOPE)),
+            ("bays/b/scope-copy", Some(WarehouseMode::Full), Beside::Scope(&[]), "the copy of the scope of bay \"b\" \
+                (\"bays/b/scope-copy\") is gone, and the scope file beside it can be used; the way out is \"forklift \
+                heal\" run in the bay's working directory".to_string()),
+            ("bays/b/scope-copy", Some(WarehouseMode::Sparse), Beside::Scope(&["a"]), "the copy of the scope of bay \
+                \"b\" (\"bays/b/scope-copy\") is gone, and the scope file beside it can be used; the way out is \
+                \"forklift heal\" run in the bay's working directory".to_string()),
+            ("bays/b/scope-copy", Some(WarehouseMode::Sparse), Beside::Scope(&["z"]), format!("the copy of the scope \
+                of bay \"b\" (\"bays/b/scope-copy\") is gone, and the scope file beside it parses but names \"z\", \
+                outside the fetch scope (\"a\"), and {}", BAY_WAYS_OUT)),
+            ("bays/b/scope-copy", Some(WarehouseMode::Full), Beside::Damaged, format!("the copy of the scope of bay \
+                \"b\" (\"bays/b/scope-copy\") is gone, and the scope file beside it has no format header: it is damaged, or an older version of \
+                Forklift wrote it, whose sparse checkouts left out the ignore files, so it cannot be read safely, and {}",
+                BAY_WAYS_OUT)),
+            ("bays/b/scope-copy", Some(WarehouseMode::Full), Beside::Newer, "the copy of the scope of bay \"b\" \
+                (\"bays/b/scope-copy\") is gone, and the scope file beside it is in a format this version of Forklift does not know \
+                (\"/forklift-scope 99\"); the way out is the Forklift that wrote it".to_string()),
+            ("bays/b/scope", Some(WarehouseMode::Sparse), Beside::Nothing, format!("the scope of bay \"b\" \
+                (\"bays/b/scope\") is lost, and {}", BAY_WAYS_OUT)),
+        ];
+
+        for (relative, mode, beside, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-scope-shape-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            if let Some(mode) = mode {
+                crate::util::warehouse_utils::mark_for_test(*mode);
+            }
+            if *mode == Some(WarehouseMode::Sparse) {
+                std::fs::create_dir_all(scope_utils::fetch_scope_path().parent().unwrap()).unwrap();
+                scope_utils::set_fetch_scope(&PathScope::from_prefixes(["a"])).unwrap();
+            }
+            let forklift = forklift_root();
+            let mode_error = crate::util::warehouse_utils::warehouse_mode().err().unwrap_or_default();
+
+            // What stands beside the record is set up before the taint, which refuses the writes.
+            let scope_file = forklift.join(Path::new(relative).with_file_name(scope_utils::FILE_NAME_BAY_SCOPE));
+            std::fs::create_dir_all(scope_file.parent().unwrap()).unwrap();
+            match beside {
+                Beside::Nothing => {}
+                Beside::Scope(prefixes) => {
+                    let scope = match prefixes.is_empty() {
+                        true => PathScope::full(),
+                        false => PathScope::from_prefixes(prefixes.iter().copied()),
+                    };
+                    scope_utils::write_checkout_scope(&scope_file, &scope).unwrap();
+                    crate::util::file_utils::remove_file(&forklift.join(relative)).unwrap();
+                }
+                Beside::Damaged => std::fs::write(&scope_file, b"").unwrap(),
+                Beside::Newer => {
+                    scope_utils::write_checkout_scope(&scope_file, &PathScope::from_prefixes(["a"])).unwrap();
+                    crate::util::file_utils::remove_file(&forklift.join(relative)).unwrap();
+                    let text = String::from_utf8(std::fs::read(&scope_file).unwrap()).unwrap();
+                    // The record's own kind, read from the header it was written with, at a version past this build's.
+                    let header = text.lines().next().unwrap();
+                    let kind = header.strip_prefix("/forklift-").unwrap().rsplit_once(' ').unwrap().0;
+                    std::fs::write(&scope_file, record_utils::to_bytes(kind, 99, ["a"])).unwrap();
+                    assert!(matches!(scope_utils::read_scope_raw(&scope_file), Ok(scope_utils::RawScope::Newer(_))),
+                        "sanity: the scope file beside the copy reads as newer");
+                }
+            }
+            plant_complete_taint(&forklift, &[relative]);
+            assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{}: {}", relative, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
+            let note = note.replace("{mode}", mode_error.trim_end_matches('.')).replace("{scope}", scope_utils::FILE_NAME_BAY_SCOPE);
+            assert!(outcome.notes.contains(&note), "{}:\n  want {}\n  got  {:?}", relative, note, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
 
             crate::util::file_utils::remove_dir_all(&root).ok();
