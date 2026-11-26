@@ -7055,8 +7055,8 @@ mod tests {
     /// A lost path of each position shape, the warehouse's own and a bay's, position and copy, is
     /// resolved with the note for its checkout.
     ///
-    /// Revert: the copy shapes' disposition back to `None` → their rows refuse → red. Revert: the
-    /// root position's row named by a bay → its note differs → red.
+    /// Revert: any of the four shapes' disposition back to `None` → its row refuses → red. Revert:
+    /// a bay's path named as the warehouse's own working tree → its note differs → red.
     #[test]
     fn heal_resolves_a_lost_position_or_copy_of_each_shape() {
         use crate::globals::StorageRootScope;
