@@ -252,6 +252,7 @@ pub(crate) enum VanishedDisposition {
     MergeRecord,
     MergeRecordCopy,
     Journal,
+    BayPath,
 }
 
 /// One kind of root-relative path a taint record may name.
@@ -327,7 +328,7 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "a bay's consolidation skeleton", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("consolidation-skeleton")] },
     TaintShape { description: "a bay's consolidation skeleton's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("consolidation-skeleton-copy")] },
     TaintShape { description: "a bay's journal", disposition: Some(Disposition::Journal), pattern: &[Is("bays"), Name, Is("journal.json")] },
-    TaintShape { description: "a bay's path record", disposition: None, pattern: &[Is("bays"), Name, Is("path")] },
+    TaintShape { description: "a bay's path record", disposition: Some(Disposition::BayPath), pattern: &[Is("bays"), Name, Is("path")] },
     TaintShape { description: "a bay's cherry-pick state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("cherry-pick")] },
     TaintShape { description: "a bay's cherry-pick state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("cherry-pick-copy")] },
 

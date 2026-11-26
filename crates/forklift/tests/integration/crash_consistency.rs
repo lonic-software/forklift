@@ -1276,3 +1276,45 @@ fn a_stopped_first_meta_write_leaves_ref_and_copy_agreeing_after_heal() {
         assert_eq!(meta_file(area, "meta"), meta_file(area, "meta-copy"), "stopped at rename {at}: the ref and its copy must agree");
     });
 }
+
+// A `bay add` stopped before its path record's rename, with that record tainted as a failed folder
+// sync of its write leaves it, is the state a power loss leaves when it undoes the record's birth.
+// Heal resolves the record, naming `bay remove`, and that command then removes the bay, with its
+// creation marker still standing. Mutation: the bay path shape's disposition back to `None` → heal
+// refuses → red.
+#[test]
+fn a_bay_add_stopped_before_its_tainted_path_record_is_healed_then_removed() {
+    let mut reached = 0;
+
+    for at in 1..=MAX_CRASH_POINTS {
+        let area = Area::new(&format!("bay-path-{at}"));
+        tagged_warehouse(&area, false);
+
+        let output = area.command(&["bay", "add", "b"]).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string()).output().unwrap();
+        if output.status.code() != Some(CRASH_POINT_EXIT_CODE) {
+            assert!(output.status.success(), "bay add stopped before rename {at}: {}", String::from_utf8_lossy(&output.stderr));
+            break;
+        }
+
+        let state = area.warehouse().join(".forklift").join("bays").join("b");
+        if !state.join("position").exists() || state.join("path").exists() {
+            continue;
+        }
+        reached += 1;
+
+        let taint = area.warehouse().join(".forklift").join("taint");
+        std::fs::create_dir_all(&taint).unwrap();
+        std::fs::write(taint.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(["bays/b/path"])).unwrap();
+
+        let healed = area.run(&["heal"]);
+        let said = format!("{}{}", String::from_utf8_lossy(&healed.stdout), String::from_utf8_lossy(&healed.stderr));
+        assert!(healed.status.success(), "heal after a stop at rename {at}: {said}");
+        assert!(said.contains("the way out is \"forklift bay remove b\""), "stopped at rename {at}: {said}");
+
+        let removed = area.run(&["bay", "remove", "b"]);
+        assert!(removed.status.success(), "bay remove after a stop at rename {at}: {}", String::from_utf8_lossy(&removed.stderr));
+        assert!(!state.exists(), "stopped at rename {at}: the bay's state is removed");
+    }
+
+    assert!(reached > 0, "no stop of bay add left a position without a path record");
+}

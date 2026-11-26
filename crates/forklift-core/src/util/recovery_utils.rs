@@ -908,6 +908,22 @@ async fn resolve_the_rest(
                     ));
                 }
             },
+            // A gone bay path record reads as a bay that records no directory, here as with no
+            // taint (see `VanishedClass::BayPath`), so its absence is made durable and the record
+            // resolved, with a note naming the way out where the bay is still listed.
+            VanishedClass::BayPath(name) => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => {
+                    refs_resolved.push(relative.to_string_lossy().into_owned());
+                    vanished_notes.push(lost_bay_path_note(&name, relative));
+                }
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost bay path record whose loss could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy(), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1627,7 +1643,8 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         // A loose signature sidecar is skipped by the loose walk (`walk_loose_object_paths`).
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
             | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy | Disposition::Scope
-            | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy | Disposition::Journal)
+            | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy | Disposition::Journal
+            | Disposition::BayPath)
             | None => false,
     }
 }
@@ -1885,6 +1902,16 @@ enum VanishedClass {
     /// missing journal reads as an empty one (`journal_utils::read_in`), taint or none, so keeping
     /// the record would guard nothing the absence does not already settle.
     Journal,
+    /// A bay's path record (`bays/<name>/path`), gone since the taint was recorded; the bay's
+    /// name. Its one writer is `bay_utils::write_bay_path`, which only `bay add` calls, once per
+    /// bay, before it writes the bay's redirect; a write that records a taint returns an error,
+    /// which stops `bay add` there, so no redirect names a bay whose path record is tainted.
+    /// Besides it, `bay_utils::remove_bay_state` removes the record with the bay's folder, and a
+    /// user may remove one; heal never writes it. A missing record reads as a bay that records no
+    /// directory (`bay_utils::read_bay_path`), taint or none, and `bay remove` then drops the
+    /// bay's state with no redirect to remove, so keeping the record would guard nothing the
+    /// absence does not already settle.
+    BayPath(String),
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -1924,6 +1951,8 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::MergeRecord => Some(VanishedClass::MergeRecord),
         Disposition::MergeRecordCopy => Some(VanishedClass::MergeRecordCopy),
         Disposition::Journal => Some(VanishedClass::Journal),
+        Disposition::BayPath => relative.parent().and_then(Path::file_name).and_then(|name| name.to_str())
+            .map(|name| VanishedClass::BayPath(name.to_string())),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
@@ -2099,6 +2128,36 @@ fn lost_checkout_record_note(lost: &LostCheckoutRecord) -> String {
         "{}, and {}; the ways out are {} run in the bay's working directory, or {}",
         lost_what, recorded, heal, remove
     )
+}
+
+/// The note for a resolved [`VanishedClass::BayPath`]: what heal reads of the bay's state folder.
+/// Where it stands, the bay reads as one that records no directory, and `bay remove` is the way
+/// out (by hand where no command line spells the name); where it went with the record, no such
+/// bay stands, and none is needed.
+///
+/// The folder is read directly, not through `bay_utils::is_listed_bay`, which refuses some names
+/// whose folders stand (one ending in "." or a space): those are the names removed by hand.
+fn lost_bay_path_note(name: &str, relative: &Path) -> String {
+    let lost = format!(
+        "the path record of bay \"{}\" (\"{}\") is gone", name, relative.to_string_lossy().replace('\\', "/")
+    );
+    let state = bay_utils::bay_state_dir(name);
+
+    match std::fs::symlink_metadata(&state) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("{}, and so is the bay's state folder: no bay of that name stands, as it would with no taint", lost)
+        }
+        Err(e) => format!(
+            "{}, and the bay's state folder \"{}\" does not read ({})", lost, state.to_string_lossy(), e
+        ),
+        Ok(_) => {
+            let reads = format!("{}; the bay reads as one that records no directory, as it would with no taint", lost);
+            match bay_utils::remove_command(name) {
+                Some(command) => format!("{}; the way out is \"{}\"", reads, command),
+                None => format!("{}; the way out is by hand: {}", reads, bay_utils::manual_removal_steps(name, &Ok(None))),
+            }
+        }
+    }
 }
 
 /// A record of a consolidation or pick in progress whose loss heal resolves with a note.
@@ -7105,6 +7164,7 @@ mod tests {
             VanishedClass::MergeRecord => "merge record".to_string(),
             VanishedClass::MergeRecordCopy => "merge record copy".to_string(),
             VanishedClass::Journal => "journal".to_string(),
+            VanishedClass::BayPath(name) => format!("bay path {}", name),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -7153,7 +7213,7 @@ mod tests {
             ("bays/main/consolidation-skeleton".into(), "merge record"),
             ("bays/main/consolidation-skeleton-copy".into(), "merge record copy"),
             ("bays/main/journal.json".into(), "journal"),
-            ("bays/main/path".into(), "kept: a bay's path record"),
+            ("bays/main/path".into(), "bay path main"),
             ("bays/main/cherry-pick".into(), "merge record"),
             ("bays/main/cherry-pick-copy".into(), "merge record copy"),
             ("cherry-pick".into(), "merge record"),
@@ -7473,6 +7533,96 @@ mod tests {
             assert!(outcome.notes.contains(&note.to_string()), "{}: {:?}", relative, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
             assert!(crate::util::journal_utils::read_in(&folder).unwrap().is_empty(), "{}: the journal reads as empty", relative);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost bay path record is resolved with a note, and the bay reads as one that records no
+    /// directory. Bay "b"'s is lost as `bay add` loses it: its write fails its folder sync, which
+    /// taints it and stops `bay add` before the redirect, and a power loss then undoes its birth.
+    /// While the bay's state folder stands the note names `bay remove`, by hand for a name no
+    /// command line spells; where the folder went too, the note says no such bay stands. Where the
+    /// absence cannot be made durable, the record stays and heal refuses.
+    ///
+    /// Revert: the shape's disposition back to `None` → every row refuses → red. Revert: resolve
+    /// without `sync_nearest_ancestor` → the failing-sync row clears → red. Revert: the folder
+    /// not read → the folder-gone row's note differs → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_bay_path_record_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Row { Listed, FolderGone, Undurable }
+
+        // (the bay, the row, the note, or the refusal's line where heal cannot make the absence
+        // durable); `{state}` stands for the bay's state folder, absolute.
+        let cases: &[(&str, Row, &str)] = &[
+            ("b", Row::Listed, "the path record of bay \"b\" (\"bays/b/path\") is gone; the bay reads as one that \
+                records no directory, as it would with no taint; the way out is \"forklift bay remove b\""),
+            ("it's", Row::Listed, "the path record of bay \"it's\" (\"bays/it's/path\") is gone; the bay reads as one \
+                that records no directory, as it would with no taint; the way out is by hand: delete the folder \
+                \"{state}\""),
+            // A name `bay_utils::is_listed_bay` refuses, whose folder stands: removed by hand too.
+            ("x.", Row::Listed, "the path record of bay \"x.\" (\"bays/x./path\") is gone; the bay reads as one \
+                that records no directory, as it would with no taint; the way out is by hand: delete the folder \
+                \"{state}\""),
+            ("b", Row::FolderGone, "the path record of bay \"b\" (\"bays/b/path\") is gone, and so is the bay's state \
+                folder: no bay of that name stands, as it would with no taint"),
+            ("b", Row::Undurable, "a lost bay path record whose loss could not be made durable: \"bays/b/path\""),
+        ];
+
+        for (name, row, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-bay-path-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            let relative = format!("bays/{}/path", name);
+            let folder = bay_utils::bay_state_dir(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            if *name == "b" {
+                let _fault = SyncDirFaultGuard::failing_exactly(&folder);
+                bay_utils::write_bay_path(name, Path::new("/elsewhere/b-dir"))
+                    .expect_err("a path write whose folder sync fails fails");
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(&relative)].into_iter().collect(), "the path record alone is recorded");
+            } else {
+                plant_complete_taint(&forklift, &[&relative]);
+            }
+
+            match row {
+                Row::FolderGone => crate::util::file_utils::remove_dir_all(&folder).unwrap(),
+                _ => { let _ = crate::util::file_utils::remove_file(&forklift.join(&relative)); }
+            }
+            assert!(!forklift.join(&relative).exists(), "sanity: the recorded path is gone");
+
+            if *row == Row::Undurable {
+                let _fault = SyncDirFaultGuard::failing_exactly(&folder);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[*note]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(&relative)].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{}: a lost bay path record is resolved: {}", relative, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative.clone()], "{:?}", outcome);
+            let state = std::path::absolute(&folder).unwrap();
+            let note = note.replace("{state}", &state.to_string_lossy());
+            assert!(outcome.notes.contains(&note), "{}: {:?}", relative, outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            assert_eq!(bay_utils::read_bay_path(name).unwrap(), None, "{}: the bay records no directory", relative);
 
             crate::util::file_utils::remove_dir_all(&root).ok();
         }
