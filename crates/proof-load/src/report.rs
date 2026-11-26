@@ -485,7 +485,7 @@ impl Completeness {
                 }
             }
         }
-        let cell = if checked { Cell::Run } else { Cell::not_run("no forklift row was graded") };
+        let cell = if checked { Cell::Run } else { Cell::not_run("no row was graded for Forklift") };
         Completeness { subject: Some(Tool::Forklift), check, cell, missing }
     }
 
@@ -1163,7 +1163,7 @@ mod tests {
         assert!(Report { completeness: vec![check], ..sample() }.failed(), "a crash fails the run");
         let clean = Completeness::crashes(&rows[1..], &out);
         assert_eq!((clean.missing.as_slice(), &clean.cell), (&[][..], &Cell::Run));
-        assert_eq!(Completeness::crashes(&rows[1..2], &out).cell, Cell::not_run("no forklift row was graded"), "git's row alone checks nothing");
+        assert_eq!(Completeness::crashes(&rows[1..2], &out).cell, Cell::not_run("no row was graded for Forklift"), "git's row alone checks nothing");
         // Two rows pointing into one file are each judged at their own pointer.
         let point = |outcome: Outcome| serde_json::json!({"graded": {"steps": [outcome]}});
         std::fs::write(out.join("points.json"), serde_json::json!({"killed": [point(step(&["heal"], 0)), point(panicked(&["retried"]))]}).to_string()).expect("written");
