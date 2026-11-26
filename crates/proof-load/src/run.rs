@@ -1519,6 +1519,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<Report, RunE
     completeness.extend(server_kill_completeness);
     completeness.extend(power_completeness);
     completeness.extend(server_power_completeness);
+    completeness.push(Completeness::crashes(&rows, output.root()));
     completeness.push(Completeness::budget(started.elapsed(), budget.map(std::time::Duration::from_secs)));
     let report = Report {
         format: REPORT_FORMAT,
@@ -1936,7 +1937,10 @@ mod tests {
     }
 
     /// A run given no tools still completes in-process: it returns its report and writes the
-    /// same report, which reads back.
+    /// same report, which reads back. Its forklift checks include the crash check, not run, since
+    /// no forklift row was graded.
+    ///
+    /// Revert: drop the crash check from the run's completeness → it is not listed.
     #[test]
     fn a_run_returns_the_report_it_writes() {
         let out = fresh("out");
@@ -1944,6 +1948,8 @@ mod tests {
         let written = Report::from_json(&std::fs::read_to_string(out.join("report.json")).unwrap()).expect("the written report reads");
         assert_eq!(written.json(), report.json());
         assert_eq!(report.format, REPORT_FORMAT);
+        let crash = report.completeness.iter().find(|check| check.check == "commands ran without a crash").expect("the crash check is listed");
+        assert_eq!((crash.subject, &crash.cell), (Some(Tool::Forklift), &Cell::not_run("no row was graded for Forklift")));
     }
 
     /// An `--only` that names no scenario is refused, not run as an empty run; one that names a
