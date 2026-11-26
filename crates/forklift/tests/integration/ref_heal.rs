@@ -2405,7 +2405,7 @@ fn link_file(target: &Path, link: &Path) -> bool {
 // whatever its copy holds → "ref-copy-damaged" red (the taint clears).
 #[test]
 fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
-    for case in ["copy", "ref", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both", "ref-deferred", "ref-copy-damaged"] {
+    for case in ["copy", "ref", "ref-deferred", "ref-copy-damaged", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
         let area = Area::new(&format!("meta-vanished-{}", case));
         let (root, _, second) = tagged(&area);
         let (copy, reference) = (meta_copy_path(&root, "tags"), meta_path(&root, "tags"));
