@@ -456,7 +456,7 @@ fn read_scope_file_if_present(path: &Path, remedy: &str) -> Result<Option<PathSc
 
 /// Whether a scope file is present, without reading it: a scope file found where none belongs is
 /// refused whatever it holds.
-fn scope_file_is_present(path: &Path) -> Result<bool, String> {
+pub(crate) fn scope_file_is_present(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
