@@ -2150,8 +2150,10 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
 
     match lost.record {
         ConsolidationRecord::State => {
-            // `merge_utils::state_present` counts a skeleton alone as a consolidation in progress.
-            let reads = match std::fs::symlink_metadata(dir.join(merge_utils::FILE_NAME_SKELETON)).is_ok() {
+            // `merge_utils::state_present` counts a skeleton alone as a consolidation in progress, until
+            // this checkout's own marker recovery, later in this run, clears it.
+            let skeleton_stands = std::fs::symlink_metadata(dir.join(merge_utils::FILE_NAME_SKELETON)).is_ok();
+            let reads = match skeleton_stands && !(active && marker_stands) {
                 true => "a consolidation skeleton still stands beside it",
                 false => "that checkout reads as having no consolidation in progress, as it would with no taint",
             };
@@ -2191,8 +2193,9 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
             };
             let tail = match (marker, step) {
                 (Some(marker), _) => format!("; {}", marker),
-                // A newer state's way out is the same from every checkout.
-                (None, Step::Newer) => "; the way out is the Forklift that wrote it".to_string(),
+                // A newer state's way out is the same from every checkout, unless this one's marker
+                // recovery, later in this run, clears the consolidation records.
+                (None, Step::Newer) if !(active && marker_stands) => "; the way out is the Forklift that wrote it".to_string(),
                 (None, Step::Run(step)) if !active => format!("; the way out is \"{}\" run in {}", step, there),
                 (None, _) => String::new(),
             };
@@ -7787,6 +7790,13 @@ mod tests {
             Damaged,
             /// A folder in the consolidation state's place.
             Folder,
+            /// A consolidation state file of bytes that do not parse, and a usable copy of a state that
+            /// agrees with the bay's position.
+            DamagedWithStateCopy,
+            /// A consolidation state file a newer Forklift wrote, and an operation marker.
+            NewerStateAndMarker,
+            /// A consolidation skeleton and an operation marker.
+            SkeletonAndMarker,
             /// A consolidation skeleton.
             Skeleton,
             /// An operation marker.
@@ -7841,6 +7851,15 @@ mod tests {
             ("bays/b/consolidation-skeleton", Beside::Folder, format!("the consolidation skeleton of bay \"b\" \
                 (\"bays/b/consolidation-skeleton\") is gone, and the consolidation state beside it is not a file; {}",
                 BAY_ABORT_KEEPING)),
+            ("bays/b/consolidation-skeleton", Beside::DamagedWithStateCopy, format!("the consolidation skeleton of bay \
+                \"b\" (\"bays/b/consolidation-skeleton\") is gone, and the consolidation state beside it has no format \
+                header; an older version of Forklift wrote it; {}", BAY_HEAL)),
+            // The marker recovery later in the run clears the records these would describe.
+            ("consolidation-skeleton", Beside::NewerStateAndMarker, "the consolidation skeleton of the warehouse's own \
+                working tree (\"consolidation-skeleton\") is gone, and the consolidation state beside it is in a format \
+                this version of Forklift does not know (\"/forklift-consolidation 99\")".to_string()),
+            ("consolidation", Beside::SkeletonAndMarker, format!("the consolidation state of the warehouse's own \
+                working tree (\"consolidation\") is gone; {}", NO_TAINT)),
             ("consolidation", Beside::Skeleton, format!("the consolidation state of the warehouse's own working tree \
                 (\"consolidation\") is gone; a consolidation skeleton still stands beside it; {}", RUN_AGAIN)),
             ("bays/b/consolidation-skeleton", Beside::Marker, format!("the consolidation skeleton of bay \"b\" \
@@ -7882,6 +7901,21 @@ mod tests {
                     merge_utils::FILE_NAME_CONSOLIDATION, 99, [head.as_str(), "side", head.as_str(), "main", "0"],
                 )).unwrap(),
                 Beside::Damaged => std::fs::write(&state, b"not a state\n").unwrap(),
+                Beside::DamagedWithStateCopy => {
+                    std::fs::write(&state, b"not a state\n").unwrap();
+                    std::fs::write(dir.join(merge_utils::FILE_NAME_CONSOLIDATION_COPY), state_of("0".repeat(64))).unwrap();
+                    crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", Some(head.clone()))).unwrap();
+                }
+                Beside::NewerStateAndMarker => {
+                    std::fs::write(&state, record_utils::to_bytes(
+                        merge_utils::FILE_NAME_CONSOLIDATION, 99, [head.as_str(), "side", head.as_str(), "main", "0"],
+                    )).unwrap();
+                    std::fs::write(dir.join(operation_utils::FILE_NAME_OPERATION), b"").unwrap();
+                }
+                Beside::SkeletonAndMarker => {
+                    std::fs::write(dir.join(merge_utils::FILE_NAME_SKELETON), &skeleton).unwrap();
+                    std::fs::write(dir.join(operation_utils::FILE_NAME_OPERATION), b"").unwrap();
+                }
                 Beside::Folder => std::fs::create_dir_all(&state).unwrap(),
                 Beside::Skeleton => std::fs::write(dir.join(merge_utils::FILE_NAME_SKELETON), &skeleton).unwrap(),
                 Beside::Marker => std::fs::write(dir.join(operation_utils::FILE_NAME_OPERATION), b"").unwrap(),

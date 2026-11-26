@@ -196,8 +196,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   the way out is that Forklift. For a checkout other than the one heal runs in, the note names
   `forklift heal` run there when an interrupted operation's marker stands there; beside a lost
   skeleton, it names the step the refusal over that state names there: `forklift heal` where a
-  copy can be written back, else `forklift abort` or `forklift abort --keep-files`. Before, any of these kept heal refusing, and an interrupted consolidation's own
-  recovery, which waits for heal's taint recovery, could never run.
+  copy can be written back, else `forklift abort` or `forklift abort --keep-files`. Before, any
+  of these kept heal refusing, and an interrupted consolidation's own recovery, which waits for
+  heal's taint recovery, could never run.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
