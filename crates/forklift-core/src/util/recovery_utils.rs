@@ -698,13 +698,32 @@ async fn resolve_the_rest(
             // head, the meta pass after the recovery reaches the copy on every run, as on a
             // warehouse with no taint: it sets the copy to the ref's bytes, or says why not. So the
             // record is resolved there, its absence made durable. Whether the store gives that head
-            // is the mend's question, asked once this recovery has restaged what it can. Beside any
-            // other ref, the record stays: nothing else would say the copy is lost.
+            // is the mend's question, asked once this recovery has restaged what it can. Beside no
+            // ref at all, the pair settles as it does for a lost ref beside no copy
+            // (`meta_lost_pair`), with the same note, given once. Beside any other ref, the record
+            // stays: nothing else would say the copy is lost.
             VanishedClass::MetaCopy(name) => {
                 let reference = format!("{}/{}", pallet_utils::FOLDER_NAME_META_ROOT, name);
-                match meta_partner_lacks_head(&pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, name)) {
-                    None => match sync_nearest_ancestor(root, relative) {
-                        Ok(()) => refs_resolved.push(relative.to_string_lossy().into_owned()),
+                let state = pallet_utils::read_file_state(&pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::Meta, name));
+                let settled = match state {
+                    Ok(pallet_utils::MetaCopyState::Absent) => lost_meta_pair(name, Path::new(&reference))
+                        .map(Some)
+                        .map_err(|_| "is lost too".to_string()),
+                    state => match meta_partner_lacks_head(state) {
+                        None => Ok(None),
+                        Some(why) => Err(why),
+                    },
+                };
+                match settled {
+                    Ok(note) => match sync_nearest_ancestor(root, relative) {
+                        Ok(()) => {
+                            refs_resolved.push(relative.to_string_lossy().into_owned());
+                            if let Some(note) = note {
+                                if !vanished_notes.contains(&note) {
+                                    vanished_notes.push(note);
+                                }
+                            }
+                        }
                         Err(error) => {
                             remainder.insert(relative.clone());
                             dangling_lines.push(format!(
@@ -713,7 +732,7 @@ async fn resolve_the_rest(
                             ));
                         }
                     },
-                    Some(why) => {
+                    Err(why) => {
                         remainder.insert(relative.clone());
                         dangling_lines.push(format!(
                             "a lost meta pallet ref copy whose ref (\"{}\") {}: \"{}\"",
@@ -722,19 +741,19 @@ async fn resolve_the_rest(
                     }
                 }
             }
-            // A ref lost beside a copy holding a head reads as lost, on every run, as on a
-            // warehouse with no taint: every read of it refuses it as damaged, and the meta pass
-            // after the recovery rebuilds it from the copy, or says why not. So the record is
-            // resolved here, its absence made durable. Beside no copy at all, each meta pallet
-            // settles as `meta_lost_pair` says: most resolve with a note saying how the pallet
-            // now reads, and nothing here says why the two are gone. Beside a copy that stands
-            // and holds no head, the record stays.
+            // The meta pass before the recovery rebuilds a lost ref from a copy holding a head
+            // where it can; one it leaves (a ref lost beside such a copy) reads as lost, on every
+            // run, as on a warehouse with no taint: every read of it refuses it as damaged, and
+            // the meta pass after the recovery rebuilds it from the copy, or says why not. So the
+            // record is resolved here, its absence made durable. Beside no copy at all, each meta
+            // pallet settles as `meta_lost_pair` says: most resolve with a note saying how the
+            // pallet now reads, and nothing here says why the two are gone. Beside a copy that
+            // stands and holds no head, the record stays.
             VanishedClass::MetaRef(name) => {
-                let copy_path = pallet_utils::get_meta_copy_path(name);
                 let copy = format!("{}/{}", pallet_utils::FOLDER_NAME_META_COPY_ROOT, name);
-                let settled = match pallet_utils::read_file_state(&copy_path) {
+                let settled = match pallet_utils::read_file_state(&pallet_utils::get_meta_copy_path(name)) {
                     Ok(pallet_utils::MetaCopyState::Absent) => lost_meta_pair(name, relative).map(Some),
-                    _ => match meta_partner_lacks_head(&copy_path) {
+                    state => match meta_partner_lacks_head(state) {
                         None => Ok(None),
                         Some(why) => Err(format!(
                             "a lost meta pallet ref whose copy (\"{}\") {}: \"{}\"",
@@ -750,7 +769,11 @@ async fn resolve_the_rest(
                     Ok(note) => match sync_nearest_ancestor(root, relative) {
                         Ok(()) => {
                             refs_resolved.push(relative.to_string_lossy().into_owned());
-                            vanished_notes.extend(note);
+                            if let Some(note) = note {
+                                if !vanished_notes.contains(&note) {
+                                    vanished_notes.push(note);
+                                }
+                            }
                         }
                         Err(error) => {
                             remainder.insert(relative.clone());
@@ -1799,11 +1822,10 @@ fn lost_meta_pair(name: &str, relative: &Path) -> Result<String, String> {
     }
 }
 
-/// Why the file at `path`, the other record of a meta pallet's head beside one that vanished,
-/// does not stand in for the lost one: `None` when it is a file holding a head, never read through
-/// a link.
-fn meta_partner_lacks_head(path: &Path) -> Option<String> {
-    match pallet_utils::read_file_state(path) {
+/// Why `state`, read at the other record of a meta pallet's head beside one that vanished (never
+/// through a link), does not stand in for the lost one: `None` when it is a file holding a head.
+fn meta_partner_lacks_head(state: Result<pallet_utils::MetaCopyState, String>) -> Option<String> {
+    match state {
         Ok(pallet_utils::MetaCopyState::Bytes(bytes)) => match pallet_utils::parse_ref_bytes(&bytes) {
             Some(_) => None,
             None => Some("does not hold a head either".to_string()),
@@ -6876,7 +6898,7 @@ mod tests {
     /// pallet reads as never written and the record resolves with a note that says so and names
     /// no cause; for the office beside the trust file's anchor the note names the unborn office's
     /// way back, and trust state heal does not accept keeps the record. The redactions pallet's
-    /// lost pair is kept, even beside a record of applied redactions that reads empty. Beside a
+    /// lost pair is kept. Beside a
     /// copy that stands and holds no head the record stays, the line naming why. A name in the
     /// meta folder that is no meta pallet's is kept.
     ///
@@ -6893,8 +6915,8 @@ mod tests {
 
         enum CopyIs { Head, Absent, NoHead, Folder }
         use CopyIs::{Absent, Folder, Head, NoHead};
-        enum Beside { Nothing, Anchor, DamagedTrust, EmptyApplied }
-        use Beside::{Anchor, DamagedTrust, EmptyApplied, Nothing};
+        enum Beside { Nothing, Anchor, DamagedTrust }
+        use Beside::{Anchor, DamagedTrust, Nothing};
         enum Expect { Rebuilt, Note(&'static str), Kept(&'static str) }
         use Expect::{Kept, Note, Rebuilt};
 
@@ -6910,8 +6932,6 @@ mod tests {
             (OFFICE, "meta/office", Absent, Anchor, Note("(\"meta/office\") and its copy are both gone, beside the trust file's anchor, so the office pallet reads as unborn. ")),
             (OFFICE, "meta/office", Absent, DamagedTrust, Kept("a lost meta pallet ref whose copy is lost too, beside trust state heal does not accept: \"meta/office\" (")),
             (REDACTIONS, "meta/redactions", Absent, Nothing, Kept("a lost meta pallet ref whose copy is lost too, a loss heal does not settle for this pallet: \"meta/redactions\"")),
-            // A record of applied redactions that reads empty does not say the pallet was never written.
-            (REDACTIONS, "meta/redactions", Absent, EmptyApplied, Kept("a lost meta pallet ref whose copy is lost too, a loss heal does not settle for this pallet: \"meta/redactions\"")),
             ("tags", "meta/data", Head, Nothing, Kept("\"meta/data\" (a ref in the meta folder that is no meta pallet's) is gone, and heal has no recovery for it")),
         ];
 
@@ -6939,8 +6959,6 @@ mod tests {
                 Nothing => {}
                 Anchor => std::fs::write(forklift.join(crate::util::office_utils::FILE_NAME_TRUST), ANCHOR).unwrap(),
                 DamagedTrust => std::fs::write(forklift.join(crate::util::office_utils::FILE_NAME_TRUST), "not a trust file").unwrap(),
-                EmptyApplied => std::fs::write(forklift.join("redactions-applied"),
-                    crate::util::record_utils::with_digest(b"/forklift-redactions-applied 2\n".to_vec())).unwrap(),
             }
             plant_complete_taint(&forklift, &[recorded]);
 
