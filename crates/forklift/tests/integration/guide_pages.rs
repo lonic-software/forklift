@@ -27,10 +27,10 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 
 use crate::common;
-use common::{fence, forklift_command, repository_root, server_binary, tracked_pages};
+use common::{fence, forklift_command, repository_root, server_binary, tracked_pages, ServerProcess};
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.
 const RUN_PAGES: &[&str] =
@@ -484,16 +484,9 @@ struct Server {
     line: usize,
     /// What the page shows the server printing on stderr after its startup line.
     later: Vec<String>,
-    child: Child,
+    process: ServerProcess,
     _stdout: BufReader<ChildStdout>,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// The reader's machines, each a scratch folder with a global configuration and key folder of its
@@ -705,7 +698,7 @@ impl Reader {
                     self.address = Some(address.to_string());
                 }
 
-                self.servers.push(Server { line: step.line, later: Vec::new(), child, _stdout: stdout, stderr });
+                self.servers.push(Server { line: step.line, later: Vec::new(), process: ServerProcess::new(child), _stdout: stdout, stderr });
                 (Some(0), line.into_bytes())
             }
             ("forklift-server", None) => {
@@ -734,7 +727,7 @@ impl Reader {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut mismatch = String::new();
         for server in &mut self.servers {
-            let mut exited = server.child.try_wait().unwrap();
+            let mut exited = server.process.exited();
             if finished && exited.is_none() {
                 loop {
                     let printed = read(server);
@@ -745,9 +738,7 @@ impl Reader {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                exited = server.child.try_wait().unwrap();
-                let _ = server.child.kill();
-                let _ = server.child.wait();
+                exited = server.process.stop_and_report();
             }
             let printed = read(server);
             // Mid-run, lines the page shows a server printing later may not be due yet, so only

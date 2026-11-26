@@ -4,11 +4,11 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use forklift_core::util::progress_utils::Progress;
 
 mod common;
-use common::{backdate, forklift_command, hold_store_access, server_binary};
+use common::{backdate, forklift_command, hold_store_access, server_binary, ServerProcess};
 
 /// `forklift-server` with fsync off, for the same reason as [`forklift_command`].
 fn server_command() -> Command {
@@ -112,7 +112,7 @@ impl Drop for TestArea {
 
 /// A running forklift-server over a bare warehouse in the test area.
 struct Server {
-    child: Child,
+    process: ServerProcess,
     url: String,
 }
 
@@ -229,13 +229,12 @@ impl Server {
 
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { child, url }
+        Server { process: ServerProcess::new(child), url }
     }
 
     /// Stop serving, so the remote cannot be reached.
     fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.process.stop();
     }
 
     /// Serve `server-root` again at the same address, after [`Server::stop`] killed it: the killed
@@ -265,11 +264,44 @@ impl Server {
     }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+/// A server process that has already ended: `serve` with nothing to serve refuses and exits,
+/// standing in for a server that aborted.
+fn ended_server() -> ServerProcess {
+    let mut child = server_command().arg("serve").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "serve with nothing to serve refuses");
+    ServerProcess::new(child)
+}
+
+/// A server that ended before the test stopped it fails the test when the harness stops it, so
+/// a debug server's abort on a swallowed storage panic is not read as the failed request a test
+/// expected. Every other test here drops a server still running and passes.
+///
+/// Revert: stop without looking at how the server had ended → no panic → red.
+#[test]
+#[should_panic(expected = "the server this test launched ended on its own (")]
+fn a_server_that_ended_before_it_was_stopped_fails_the_test() {
+    drop(ended_server());
+}
+
+/// A test already failing reports its own failure over a server that ended: a second panic,
+/// raised while the first unwinds, would abort the whole test binary.
+///
+/// Revert: check the server while the thread panics → the binary aborts → red.
+#[test]
+#[should_panic(expected = "the test's own failure")]
+fn a_failing_test_reports_its_own_failure_over_a_server_that_ended() {
+    let _server = ended_server();
+    panic!("the test's own failure");
+}
+
+/// A caller that reports the ending itself gets it once, and the drop after it passes.
+///
+/// Revert: a drop that checks again after the report → panic → red.
+#[test]
+fn an_ending_reported_to_the_caller_is_not_reported_again() {
+    let mut server = ended_server();
+    assert!(server.stop_and_report().is_some_and(|status| status.code() == Some(1)));
 }
 
 /// Send a bodyless raw GET and return `(status line, response body)` — the GET counterpart of

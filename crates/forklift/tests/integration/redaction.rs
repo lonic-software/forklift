@@ -723,7 +723,7 @@ fn a_meta_pallet_may_not_start_naming_redacted_content() {
 
 /// A running forklift-server over a bare warehouse at `root`.
 struct Server {
-    child: std::process::Child,
+    process: common::ServerProcess,
     url: String,
     root: PathBuf,
 }
@@ -760,7 +760,7 @@ impl Server {
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { child, url, root: PathBuf::from(root) }
+        Server { process: common::ServerProcess::new(child), url, root: PathBuf::from(root) }
     }
 
     /// The head this server serves for `main`, read from its own ref: a fresh clone could not
@@ -770,12 +770,6 @@ impl Server {
     }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 /// A head stacked before a redaction came down by `lower` is refused by this warehouse's own check
 /// before it is sent. The remote holds the redaction here too; in a full warehouse a recorded
@@ -4155,8 +4149,7 @@ fn git_export_in_a_served_root_leaves_out_content_its_host_withholds() {
                 takedown.owner.stack("media/film.mkv", b"the new film\n", "new film");
                 takedown.owner.run_ok(&["lift"]);
                 let head = takedown.server.main();
-                let _ = takedown.server.child.kill();
-                let _ = takedown.server.child.wait();
+                takedown.server.process.stop();
                 takedown.film = hash_of(b"the new film\n");
                 let added = withhold(&takedown.server.root, &["add", &takedown.film, "--statement", TAKEDOWN]);
                 assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
