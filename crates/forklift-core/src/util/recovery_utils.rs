@@ -756,7 +756,7 @@ async fn resolve_the_rest(
                 Ok(None) => {
                     remainder.insert(relative.clone());
                     dangling_lines.push(format!(
-                        "a lost keepsake of a pallet's ref, beside no ref of the pallet it names: \"{}\"",
+                        "a lost keepsake of a pallet's ref, beside no ref file of a pallet whose slot it is: \"{}\"",
                         relative.to_string_lossy()
                     ));
                 }
@@ -1689,38 +1689,31 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
 }
 
 /// The user pallet whose ref a keepsake at `relative` (`removed-refs/<…>`) was taken from, when
-/// that ref still stands as a file: the name the keepsake's path encodes (`%2F` for `/`), whole
-/// or without a numbered slot's `.<n>`, since a slot can be either pallet's (`ref_heal`'s
-/// `kept_path`). `None` when no such ref stands, or the name is no pallet's; a state that cannot
-/// be read is an error, never taken for either answer.
+/// that ref still stands as a file: the one pallet whose slot the keepsake's single name is
+/// (`ref_heal::kept_pallet`). `None` when the path is no pallet's slot, or nothing stands at the
+/// ref but a link, a folder or nothing at all; a state that cannot be read is an error, never
+/// taken for either answer.
 fn keepsake_ref_standing(relative: &Path) -> Result<Option<String>, String> {
-    let encoded: Vec<String> = relative.components().skip(1)
+    let names: Vec<String> = relative.components().skip(1)
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect();
-    let whole = encoded.join("/").replace("%2F", "/");
+    let [name] = names.as_slice() else {
+        return Ok(None);
+    };
+    let Some(pallet) = crate::util::ref_heal::kept_pallet(name) else {
+        return Ok(None);
+    };
 
-    let mut names = vec![whole.clone()];
-    if let Some((stem, slot)) = whole.rsplit_once('.') {
-        if !stem.is_empty() && !slot.is_empty() && slot.bytes().all(|byte| byte.is_ascii_digit()) {
-            names.push(stem.to_string());
-        }
+    let path = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::User, &pallet);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(pallet)),
+        Ok(_) => Ok(None),
+        // As `pallet_utils::does_pallet_exist` reads them: a ref under a parent that is a file,
+        // or at a name the host cannot hold, is not there.
+        Err(error) if matches!(error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidFilename) => Ok(None),
+        Err(error) => Err(format!("\"{}\": {}", path.to_string_lossy(), error)),
     }
-
-    for name in names {
-        if pallet_utils::validate_pallet_name(&name).is_err() {
-            continue;
-        }
-
-        let path = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::User, &name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => return Ok(Some(name)),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("\"{}\": {}", path.to_string_lossy(), error)),
-        }
-    }
-
-    Ok(None)
 }
 
 /// Sync the nearest directory above `relative` (under `root`) that still exists: a removed nested
@@ -6465,7 +6458,7 @@ mod tests {
             ("meta-copy/office".into(), "meta copy office"),
             // The shapes it has none for.
             ("removed-refs/side".into(), "keepsake"),
-            ("removed-refs/side.2".into(), "keepsake"),
+            ("removed-refs/side+2".into(), "keepsake"),
             ("meta/office".into(), "kept: a meta pallet ref"),
             ("meta-copy/main".into(), "kept: a copy of a ref that is no meta pallet's"),
             ("inventory/incomplete-load".into(), "kept: the incomplete-load marker"),
@@ -6637,31 +6630,58 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
-    /// A lost keepsake is resolved only beside a standing ref of the pallet its path names, whole
-    /// or without a numbered slot; beside none, the bytes may be in neither file, so the record
-    /// stays and heal refuses.
+    /// A lost keepsake is resolved only beside a ref file of the one pallet whose slot its name
+    /// is (`ref_heal::kept_name`); beside none, or at a name that is no pallet's slot, the bytes
+    /// may be in neither file, so the record stays and heal refuses.
     ///
     /// Revert: resolve without asking `keepsake_ref_standing` → the no-ref rows clear → red.
-    /// Revert: drop the slot-less candidate → "side.1" beside "side" refuses → red. Revert: drop
-    /// the `%2F` decoding → "team%2Fx" refuses → red.
+    /// Revert: drop the round trip in `kept_pallet` → "side+01" beside "side" clears → red.
+    /// Revert: drop the `%2F` decoding → "team%2Fx" refuses → red. Revert: join a nested path's
+    /// names → "team/x" clears → red. Revert: take any `symlink_metadata` success for a ref → the
+    /// folder row clears → red.
     #[test]
     fn heal_resolves_a_lost_keepsake_only_beside_a_standing_ref_it_names() {
         use crate::globals::StorageRootScope;
 
-        // (keepsake, the pallet whose ref stands, the pallet the note names; None: heal refuses)
-        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
-            ("removed-refs/side.1", Some("side"), Some("side")),
-            ("removed-refs/side.1", Some("side.1"), Some("side.1")),
-            ("removed-refs/team%2Fx", Some("team/x"), Some("team/x")),
+        enum Stands { File, Folder, Link }
+        use Stands::{File, Folder, Link};
+
+        // (keepsake, the pallet's ref and what stands there, the pallet the note names; None:
+        // heal refuses)
+        let cases: &[(&str, Option<(&str, Stands)>, Option<&str>)] = &[
+            ("removed-refs/side", Some(("side", File)), Some("side")),
+            ("removed-refs/side+1", Some(("side", File)), Some("side")),
+            ("removed-refs/side+12", Some(("side", File)), Some("side")),
+            ("removed-refs/side.1", Some(("side.1", File)), Some("side.1")),
+            ("removed-refs/side.1+1", Some(("side.1", File)), Some("side.1")),
+            ("removed-refs/team%2Fx", Some(("team/x", File)), Some("team/x")),
+            // A dotted number is part of a pallet's name, never a slot.
+            ("removed-refs/side.1", Some(("side", File)), None),
+            ("removed-refs/side+1", Some(("side.1", File)), None),
             ("removed-refs/side", None, None),
-            ("removed-refs/side.1", Some("other"), None),
-            ("removed-refs/side", Some("side.1"), None),
+            ("removed-refs/side+1", Some(("other", File)), None),
+            // Spellings the encoder never writes are no pallet's slot.
+            ("removed-refs/side+0", Some(("side", File)), None),
+            ("removed-refs/side+01", Some(("side", File)), None),
+            ("removed-refs/side+1+1", Some(("side", File)), None),
+            ("removed-refs/side+", Some(("side", File)), None),
+            ("removed-refs/team%2fx", Some(("team/x", File)), None),
+            ("removed-refs/team%2F", Some(("team", File)), None),
+            ("removed-refs/team/x", Some(("team/x", File)), None),
+            // Only a ref file is a standing ref.
+            ("removed-refs/side", Some(("side", Folder)), None),
+            ("removed-refs/side", Some(("side", Link)), None),
         ];
 
         let _serial = lock_activation();
         taint_utils::activate();
 
-        for (n, &(keepsake, standing, named)) in cases.iter().enumerate() {
+        for (n, (keepsake, standing, named)) in cases.iter().enumerate() {
+            let (keepsake, named) = (*keepsake, *named);
+            #[cfg(not(unix))]
+            if matches!(standing, Some((_, Link))) {
+                continue;
+            }
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             let root = std::env::temp_dir()
                 .join(format!("forklift-recovery-utils-keepsake-{}-{}-{}", n, std::process::id(), nanos));
@@ -6670,10 +6690,19 @@ mod tests {
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
             let forklift = forklift_root();
 
-            if let Some(pallet) = standing {
+            if let Some((pallet, stands)) = standing {
                 let reference = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::User, pallet);
                 std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
-                std::fs::write(&reference, [0u8; 16]).unwrap();
+                match stands {
+                    File => std::fs::write(&reference, [0u8; 16]).unwrap(),
+                    Folder => std::fs::create_dir(&reference).unwrap(),
+                    Link => {
+                        let target = root.join("elsewhere");
+                        std::fs::write(&target, [0u8; 16]).unwrap();
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(&target, &reference).unwrap();
+                    }
+                }
             }
             plant_complete_taint(&forklift, &[keepsake]);
 
@@ -6685,13 +6714,13 @@ mod tests {
                 }
                 (Err(error), None) => {
                     assert_durability_taint(&error, &[&format!(
-                        "a lost keepsake of a pallet's ref, beside no ref of the pallet it names: \"{}\"", keepsake
+                        "a lost keepsake of a pallet's ref, beside no ref file of a pallet whose slot it is: \"{}\"", keepsake
                     )]);
                     let recorded = taint_utils::read_taints(&forklift).unwrap().recorded;
                     assert_eq!(recorded, [PathBuf::from(keepsake)].into_iter().collect(), "{}: the record stays", keepsake);
                     BTreeSet::new()
                 }
-                (result, _) => panic!("{} beside {:?}: {:?}", keepsake, standing, result.map(|outcome| outcome.notes)),
+                (result, _) => panic!("row {} ({}): {:?}", n, keepsake, result.map(|outcome| outcome.notes)),
             };
             assert!(recorded.is_empty(), "{}: nothing else may remain recorded: {:?}", keepsake, recorded);
 

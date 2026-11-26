@@ -147,6 +147,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   writing it stopped before it removed the ref. Before, a plainly named one kept heal refusing,
   and every command that records anything refused with it. A name that matches an object the
   store holds is still settled before this, as before.
+- **`heal --remove-ref` numbers a pallet's later keepsakes `<name>+1`, `<name>+2`, …** under
+  `.forklift/removed-refs`, where it used `<name>.1`, a name that was also the first keepsake of a
+  pallet called `<name>.1`. Every keepsake's name now gives the one pallet it was taken from. A
+  keepsake kept before this under a `.<n>` name now reads as that dotted pallet's.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens

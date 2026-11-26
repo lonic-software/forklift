@@ -129,7 +129,7 @@ pub const EXEMPTIONS: &[Exemption] = &[
     Exemption { name: "taint/<name>", reason: SYNC_FAILED },
     Exemption { name: "removed-refs/", reason: KEPT_ONLY },
     Exemption { name: "removed-refs/<name>", reason: KEPT_ONLY },
-    Exemption { name: "removed-refs/<name>.<n>", reason: KEPT_ONLY },
+    Exemption { name: "removed-refs/<name>+<n>", reason: KEPT_ONLY },
     Exemption { name: "config/warehouse.toml.damaged", reason: SET_ASIDE },
 ];
 
