@@ -186,7 +186,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   working tree is said to be the state that working tree keeps, since it records no scope, unless
   a scope file stands there, which the note says to delete. A bay's scope, and a sparse
   warehouse's own, stays lost, and its readers still refuse it. Before, any of these kept heal
-  refusing, so a bay whose first scope write was lost could not even be removed.
+  refusing, so a bay whose first scope write was lost could not even be removed. A lost
+  consolidation state or skeleton (`.forklift/consolidation`, `.forklift/consolidation-skeleton`,
+  or a bay's), or a lost copy of either, is cleared the same way, with a note. A lost state reads
+  as no consolidation in progress, as it would without the loss, and where no interrupted
+  operation's marker stands there, the note says to run again a command that failed there before
+  the heal. A lost skeleton's note says what the state beside it
+  reads. For a checkout other than the one heal runs in, the note names `forklift heal` run there
+  when an interrupted operation's marker stands there, or when a state stands beside a lost
+  skeleton. Before, any of these kept heal refusing, and an interrupted consolidation's own
+  recovery, which waits for heal's taint recovery, could never run.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens

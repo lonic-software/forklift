@@ -249,6 +249,8 @@ pub(crate) enum VanishedDisposition {
     PositionCopy,
     Scope,
     ScopeCopy,
+    MergeRecord,
+    MergeRecordCopy,
 }
 
 /// One kind of root-relative path a taint record may name.
@@ -308,10 +310,10 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "the checkout position's copy", disposition: Some(Disposition::PositionCopy), pattern: &[Is("position-copy")] },
     TaintShape { description: "the checkout scope", disposition: Some(Disposition::Scope), pattern: &[Is("scope")] },
     TaintShape { description: "the checkout scope's copy", disposition: Some(Disposition::ScopeCopy), pattern: &[Is("scope-copy")] },
-    TaintShape { description: "the consolidation state", disposition: None, pattern: &[Is("consolidation")] },
-    TaintShape { description: "the consolidation state's copy", disposition: None, pattern: &[Is("consolidation-copy")] },
-    TaintShape { description: "the consolidation skeleton", disposition: None, pattern: &[Is("consolidation-skeleton")] },
-    TaintShape { description: "the consolidation skeleton's copy", disposition: None, pattern: &[Is("consolidation-skeleton-copy")] },
+    TaintShape { description: "the consolidation state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("consolidation")] },
+    TaintShape { description: "the consolidation state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("consolidation-copy")] },
+    TaintShape { description: "the consolidation skeleton", disposition: Some(Disposition::MergeRecord), pattern: &[Is("consolidation-skeleton")] },
+    TaintShape { description: "the consolidation skeleton's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("consolidation-skeleton-copy")] },
     TaintShape { description: "the journal", disposition: None, pattern: &[Is("journal.json")] },
 
     TaintShape { description: "a bay's incomplete-load marker", disposition: Some(Disposition::LoadMarker), pattern: &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")] },
@@ -319,10 +321,10 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "a bay's checkout position's copy", disposition: Some(Disposition::PositionCopy), pattern: &[Is("bays"), Name, Is("position-copy")] },
     TaintShape { description: "a bay's checkout scope", disposition: Some(Disposition::Scope), pattern: &[Is("bays"), Name, Is("scope")] },
     TaintShape { description: "a bay's checkout scope's copy", disposition: Some(Disposition::ScopeCopy), pattern: &[Is("bays"), Name, Is("scope-copy")] },
-    TaintShape { description: "a bay's consolidation state", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation")] },
-    TaintShape { description: "a bay's consolidation state's copy", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation-copy")] },
-    TaintShape { description: "a bay's consolidation skeleton", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation-skeleton")] },
-    TaintShape { description: "a bay's consolidation skeleton's copy", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation-skeleton-copy")] },
+    TaintShape { description: "a bay's consolidation state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("consolidation")] },
+    TaintShape { description: "a bay's consolidation state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("consolidation-copy")] },
+    TaintShape { description: "a bay's consolidation skeleton", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("consolidation-skeleton")] },
+    TaintShape { description: "a bay's consolidation skeleton's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("consolidation-skeleton-copy")] },
     TaintShape { description: "a bay's journal", disposition: None, pattern: &[Is("bays"), Name, Is("journal.json")] },
     TaintShape { description: "a bay's path record", disposition: None, pattern: &[Is("bays"), Name, Is("path")] },
     TaintShape { description: "a bay's cherry-pick state", disposition: None, pattern: &[Is("bays"), Name, Is("cherry-pick")] },
