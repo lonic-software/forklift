@@ -6778,6 +6778,77 @@ mod tests {
         }
     }
 
+    /// A meta pallet's first write whose folder sync failed, then a power loss that undid the
+    /// ref's birth: the taint records `meta/<name>`, and the copy the write set after the ref read
+    /// back may stand. Beside a copy that is a file holding a head, the record resolves, while the
+    /// ref still reads as lost (the meta pass after the recovery rebuilds it from the copy). Beside
+    /// any other copy the record stays, the line naming why. A name in the meta folder that is no
+    /// meta pallet's is kept, as heal has no recovery for it.
+    ///
+    /// Revert: the meta ref shape's disposition back to `None` → the head row refuses → red.
+    /// Revert: resolve without asking `meta_partner_lacks_head` → the absent row clears → red.
+    #[test]
+    fn heal_resolves_a_lost_meta_ref_only_beside_a_copy_holding_a_head() {
+        use crate::globals::StorageRootScope;
+
+        enum CopyIs { Head, Absent, NoHead, Folder }
+        use CopyIs::{Absent, Folder, Head, NoHead};
+
+        let head = "c".repeat(64);
+        // (recorded path, what stands at meta-copy/tags, the refusal's line; None: heal clears)
+        let cases: &[(&str, CopyIs, Option<&str>)] = &[
+            ("meta/tags", Head, None),
+            ("meta/tags", Absent, Some("a lost meta pallet ref whose copy (\"meta-copy/tags\") is lost too: \"meta/tags\"")),
+            ("meta/tags", NoHead, Some("a lost meta pallet ref whose copy (\"meta-copy/tags\") does not hold a head either: \"meta/tags\"")),
+            ("meta/tags", Folder, Some("a lost meta pallet ref whose copy (\"meta-copy/tags\") is not a file: \"meta/tags\"")),
+            ("meta/data", Head, Some("\"meta/data\" (a ref in the meta folder that is no meta pallet's) is gone, and heal has no recovery for it")),
+        ];
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        for (n, (recorded, copy, line)) in cases.iter().enumerate() {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-meta-ref-{}-{}-{}", n, std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            let copy_path = pallet_utils::get_meta_copy_path("tags");
+            std::fs::create_dir_all(copy_path.parent().unwrap()).unwrap();
+            match copy {
+                Head => std::fs::write(&copy_path, format!("{}\n", head)).unwrap(),
+                Absent => {}
+                NoHead => std::fs::write(&copy_path, b"not a hash").unwrap(),
+                Folder => std::fs::create_dir(&copy_path).unwrap(),
+            }
+            plant_complete_taint(&forklift, &[recorded]);
+
+            match (run_heal(), line) {
+                (Ok(outcome), None) => {
+                    let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+                    assert_eq!(resolved, [recorded.to_string()], "row {}: {:?}", n, outcome);
+                    assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "row {}: nothing may remain recorded", n);
+                    let read = pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::Meta, "tags")
+                        .expect_err("the ref still reads as lost");
+                    assert!(read.contains("is lost") && read.contains("its copy (\""), "row {}: {}", n, read);
+                    assert_eq!(std::fs::read(&copy_path).unwrap(), format!("{}\n", head).into_bytes(), "row {}: the copy is left", n);
+                }
+                (Err(error), Some(line)) => {
+                    assert_durability_taint(&error, &[line]);
+                    assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                        [PathBuf::from(recorded)].into_iter().collect(), "row {}: the record stays", n);
+                }
+                (result, _) => panic!("row {} ({}): {:?}", n, recorded, result.map(|outcome| outcome.notes)),
+            }
+
+            drop(_scope);
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
     #[test]
     fn shard_referenced_hash_is_found_even_when_never_registered_in_the_ledger() {
         // A shard file exists on disk referencing an object, but the registration ledger

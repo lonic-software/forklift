@@ -2392,30 +2392,24 @@ fn link_file(target: &Path, link: &Path) -> bool {
 /// resolves in the taint recovery, and the meta pass after it sets the copy to the ref's bytes;
 /// where the store does not give that head, the copy is left, the pass says why, and the run
 /// refuses the head as lost, as on a warehouse with no taint. A ref gone beside its copy is
-/// rebuilt from the copy before the recovery; where that rebuild waits on the taint, which records
-/// the copy's head too, the ref resolves in the recovery beside the copy holding the head, and the
-/// meta pass after it rebuilds the ref from the copy. A copy gone beside a ref that is gone,
-/// damaged or not a file, or a ref gone beside a copy that holds no head, is more than one fault,
-/// and the taint stands.
+/// rebuilt from the copy before the recovery. A copy gone beside a ref that is gone, damaged or
+/// not a file, or a ref gone beside a copy that holds no head, is more than one fault, and the
+/// taint stands.
 // Mutations: file a vanished copy as unrecognized again → "copy" red (the run refuses, the
 // taint stands); resolve a vanished copy whatever its ref holds → "copy-ref-damaged" red (the
 // taint clears); read the ref through a link → "copy-ref-link" red (the taint clears); judge
 // the ref's head against the store in the recovery → "copy-head-absent" red (the taint stands);
-// keep a vanished ref undisposed → "ref-deferred" red (the taint stands); resolve a vanished ref
-// whatever its copy holds → "ref-copy-damaged" red (the taint clears).
+// resolve a vanished ref whatever its copy holds → "ref-copy-damaged" red (the taint clears).
 #[test]
 fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
-    for case in ["copy", "ref", "ref-deferred", "ref-copy-damaged", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
+    for case in ["copy", "ref", "ref-copy-damaged", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
         let area = Area::new(&format!("meta-vanished-{}", case));
         let (root, _, second) = tagged(&area);
         let (copy, reference) = (meta_copy_path(&root, "tags"), meta_path(&root, "tags"));
         let absent = format!("{}{}", if second.starts_with('0') { '1' } else { '0' }, &second[1..]);
-        // The copy's head, recorded too: the rebuild before the recovery waits on the taint.
-        let head_object = format!("objects/{}/{}", &second[..2], &second[2..]);
         let recorded: Vec<&str> = match case {
             "copy" | "copy-ref-damaged" | "copy-head-absent" | "copy-ref-link" => vec!["meta-copy/tags"],
             "ref" | "ref-copy-damaged" => vec!["meta/tags"],
-            "ref-deferred" => vec!["meta/tags", &head_object],
             _ => vec!["meta/tags", "meta-copy/tags"],
         };
         let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
@@ -2425,7 +2419,7 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
             forklift_core::util::file_utils::remove_file(&copy).unwrap();
         }
         match case {
-            "ref" | "both" | "ref-deferred" => forklift_core::util::file_utils::remove_file(&reference).unwrap(),
+            "ref" | "both" => forklift_core::util::file_utils::remove_file(&reference).unwrap(),
             "ref-copy-damaged" => {
                 forklift_core::util::file_utils::remove_file(&reference).unwrap();
                 std::fs::write(&copy, b"not a hash").unwrap();
@@ -2450,7 +2444,7 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
         let said = format!("{}{}", text(&output.stdout), text(&output.stderr));
         let taint_left = std::fs::read_dir(&dir).map(|mut entries| entries.next().is_some()).unwrap_or(false);
         match case {
-            "copy" | "ref" | "ref-deferred" => {
+            "copy" | "ref" => {
                 assert!(output.status.success(), "{}: {}", case, said);
                 assert!(!taint_left, "{}: the taint clears: {}", case, said);
                 assert_eq!(meta_head(&root, "tags").as_deref(), Some(second.as_str()), "{}: {}", case, said);
