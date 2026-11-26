@@ -1839,16 +1839,16 @@ enum VanishedClass {
     /// Heal also writes a damaged record back from its copy, with no marker
     /// (`merge_state_heal::repair`); an absence after that write is lost reads the same as an
     /// interrupted clear, which removes the record before its copy, and heal never writes an
-    /// absent record back (`merge_state_heal`'s module rule), so it is treated as one. A missing state
-    /// reads as no consolidation in progress (`merge_utils::read_consolidation_state_in`), and a
+    /// absent record back (`merge_state_heal`'s module rule), so it is treated as one. A missing
+    /// state reads as no consolidation in progress (`merge_utils::read_consolidation_state_in`), and a
     /// skeleton missing beside a state is refused as damaged
     /// (`merge_utils::OutOfScopeSkeleton::read_required`), taint or none, so keeping the record
     /// would guard nothing the absence does not already settle, and it stands before the marker's
     /// recovery, which waits for the taint. A checkout's pick state (`cherry-pick`, or a bay's) is
     /// the same: a command's write of one runs under the pick's operation marker (`pick` raises it
-    /// first) or is an undo putting a pick back, which a retry of that undo resumes, heal writes
-    /// one back as above, and a missing one reads as no pick in
-    /// progress (`cherry_pick_utils::read_state_in`).
+    /// first) or is an undo putting a pick back, which a retry of that undo resumes; heal writes
+    /// one back as above; and a missing one reads as no pick in progress
+    /// (`cherry_pick_utils::read_state_in`).
     MergeRecord,
     /// The copy of a consolidation state, skeleton or pick state, gone since the taint was
     /// recorded. Only heal reads a copy, to write a damaged record back (`merge_state_heal::repair`).
