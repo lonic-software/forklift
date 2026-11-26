@@ -2562,6 +2562,10 @@ fn office_lookup_test_checkpoint(_identifier: &str) {}
 /// The key [`REF_WRITE_TEST_SEAMS`] arms `PUT /v1/trust` under: no pallet name holds a `/`.
 const TRUST_WRITE_SEAM: &str = "/v1/trust";
 
+/// The key [`REF_WRITE_TEST_SEAMS`] arms a redaction apply's storage task under, at its start
+/// ([`apply_redactions`]): no pallet name holds a `/`.
+const APPLY_SEAM: &str = "/apply";
+
 /// How many times a ref update decides at most: a further attempt runs only when the write found
 /// that the office or the trust anchor its decision consumed moved meanwhile.
 const REF_UPDATE_ATTEMPTS: u32 = 3;
@@ -2860,7 +2864,7 @@ async fn blocking<T: Send + 'static>(
     warehouse: Arc<WarehouseHandle>,
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
-    scoped_storage_task(warehouse, work).await.unwrap_or_else(|error| Err(storage_task_failed(error)))
+    scoped_storage_task(warehouse, work).await.unwrap_or_else(|error| Err(storage_task_failed(&error)))
 }
 
 /// [`blocking`] for a request's handler: a debug build raises a panic of the work again on the
@@ -2870,7 +2874,7 @@ async fn request_blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
     scoped_storage_task(warehouse, work).await
-        .unwrap_or_else(|error| Err(storage_task_failed(reraise_storage_panic(error))))
+        .unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
 }
 
 /// [`request_blocking`] outside any warehouse's scope — for work on the server's folders
@@ -2879,7 +2883,7 @@ async fn request_blocking_unscoped<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
     tokio::task::spawn_blocking(work).await
-        .unwrap_or_else(|error| Err(storage_task_failed(reraise_storage_panic(error))))
+        .unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
 }
 
 /// Run blocking storage work inside the warehouse's scope, as [`blocking`] does, handing back a
@@ -2897,7 +2901,7 @@ async fn scoped_storage_task<T: Send + 'static>(
 }
 
 /// The internal error a storage task that did not finish is reported as.
-fn storage_task_failed(error: tokio::task::JoinError) -> HandlerError {
+fn storage_task_failed(error: &tokio::task::JoinError) -> HandlerError {
     internal(format!("A storage task failed: {}", error))
 }
 
@@ -2918,6 +2922,14 @@ fn reraise_storage_panic_when(error: tokio::task::JoinError, reraise: bool) -> t
     }
 
     error
+}
+
+/// Raise a request's failed storage task again ([`reraise_storage_panic`]), once the caller has
+/// settled what it failed: a panic, in a debug build. Anything else was already reported.
+fn raise_storage_panic(failed: Option<tokio::task::JoinError>) {
+    if let Some(error) = failed {
+        let _ = reraise_storage_panic(error);
+    }
 }
 
 /// What a warehouse creation found.
@@ -4136,7 +4148,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 failed => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     // Raised again only now, once the apply the write took is asked for again.
-                    failed.unwrap_or_else(|error| Err(storage_task_failed(reraise_storage_panic(error))))
+                    failed.unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
                         .map(|_| ())
                 }
             }
@@ -4335,7 +4347,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                 failed => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     // Raised again only now, once the apply the deletion took is asked for again.
-                    failed.unwrap_or_else(|error| Err(storage_task_failed(reraise_storage_panic(error))))
+                    failed.unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
                         .map(|_| ())
                 }
             }
@@ -4361,7 +4373,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
 /// stays owed, so no content is served until the run's retry or a later write's apply discharges
 /// it.
 async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
-    let (applied, apply) = apply_discharging(&warehouse).await;
+    let (applied, apply, failed) = apply_discharging(&warehouse).await;
 
     if applied {
         cut_bundle_downloads(&warehouse);
@@ -4375,6 +4387,9 @@ async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>)
     }
 
     run_redactions(Arc::clone(state), warehouse);
+
+    // Raised again only now, with the run that retries the apply already started.
+    raise_storage_panic(failed);
 }
 
 /// What follows a ref write request here that moved no ref, answered with an error or as already
@@ -4389,7 +4404,7 @@ async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseH
         return;
     }
 
-    let (applied, apply) = apply_discharging(&warehouse).await;
+    let (applied, apply, failed) = apply_discharging(&warehouse).await;
 
     if applied {
         cut_bundle_downloads(&warehouse);
@@ -4404,6 +4419,9 @@ async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseH
     if applied || warehouse.apply_owed() || warehouse.rebuild_after_drain.load(std::sync::atomic::Ordering::SeqCst) {
         run_redactions(Arc::clone(state), warehouse);
     }
+
+    // Raised again only now, with the run that retries the apply already started.
+    raise_storage_panic(failed);
 }
 
 /// How long the redaction deleter waits for a drained warehouse's requests to end before it gives
@@ -4838,7 +4856,9 @@ async fn redaction_round(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>
     let applied = match warehouse.apply_owed() {
         false => false,
         true => {
-            let (applied, apply) = apply_discharging(warehouse).await;
+            // A failed storage task was settled and reported like any failed apply; no request
+            // awaits this run, so a panic is not raised again here.
+            let (applied, apply, _) = apply_discharging(warehouse).await;
 
             // Still owed: a later round retries it.
             if let Err(error) = apply {
@@ -5114,8 +5134,14 @@ async fn retake_store_access(warehouse: &Arc<WarehouseHandle>) {
 /// * `Ok(ApplyOutcome)`  - What it applied, and whether it decided every redaction.
 /// * `Err(HandlerError)` - The redactions, the applied record or the configuration could not be
 ///                         read, or the apply could not be written.
-async fn apply_redactions(warehouse: Arc<WarehouseHandle>) -> Result<ApplyOutcome, HandlerError> {
-    blocking(warehouse, || {
+/// * `Err(JoinError)`    - The storage task itself failed: the caller decides whether a panic is
+///                         raised again ([`apply_discharging`]).
+async fn apply_redactions(
+    warehouse: Arc<WarehouseHandle>
+) -> Result<Result<ApplyOutcome, HandlerError>, tokio::task::JoinError> {
+    scoped_storage_task(warehouse, || {
+        ref_write_test_checkpoint(APPLY_SEAM);
+
         let before = read_applied()?;
         let read = redaction_utils::read_redactions().map_err(internal)?;
 
@@ -5161,13 +5187,23 @@ struct ApplyOutcome {
 /// applied.
 ///
 /// # Returns
-/// Whether it applied a redaction, and the error that left the applies owed, if one did.
-async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<(), String>) {
+/// Whether it applied a redaction; the error that left the applies owed, if one did; and the
+/// apply's storage task, when it failed, which is settled here like any failed apply and handed
+/// back for a request's caller to raise again once that caller has settled too
+/// ([`raise_storage_panic`]).
+async fn apply_discharging(
+    warehouse: &Arc<WarehouseHandle>
+) -> (bool, Result<(), String>, Option<tokio::task::JoinError>) {
     use std::sync::atomic::Ordering;
 
     let owed = warehouse.dischargeable();
 
-    let outcome = match apply_redactions(Arc::clone(warehouse)).await {
+    let (outcome, failed) = match apply_redactions(Arc::clone(warehouse)).await {
+        Ok(outcome) => (outcome, None),
+        Err(error) => (Err(storage_task_failed(&error)), Some(error)),
+    };
+
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err((_, error)) => {
             let damage = is_damage(&error).then(|| error.clone());
@@ -5178,7 +5214,7 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
                 warehouse.applies_wake.notify_waiters();
             }
 
-            return (false, Err(error));
+            return (false, Err(error), failed);
         }
     };
 
@@ -5186,13 +5222,13 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
     *warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
     if let Some(why) = outcome.undecided {
-        return (outcome.applied, Err(why));
+        return (outcome.applied, Err(why), None);
     }
 
     warehouse.applies_discharged.fetch_max(owed, Ordering::SeqCst);
     warehouse.applies_wake.notify_waiters();
 
-    (outcome.applied, Ok(()))
+    (outcome.applied, Ok(()), None)
 }
 
 /// Wait, up to [`APPLY_WAIT`], until no apply is owed for `warehouse` (see
@@ -7141,48 +7177,49 @@ mod tests {
         let raised = unscoped.await.expect_err("the unscoped storage panic is raised again");
         assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
 
-        let warehouse = Arc::new(WarehouseHandle::new(scratch_dir("storage-panic-scoped")));
+        let root = scratch_dir("storage-panic-scoped");
+        let warehouse = Arc::new(WarehouseHandle::new(root.clone()));
         let scoped = tokio::spawn(request_blocking(warehouse, || -> Result<(), HandlerError> { panic!("planted storage panic") }));
         let raised = scoped.await.expect_err("the scoped storage panic is raised again");
         assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// Work no request awaits gets a storage panic back as an internal error in every build, so its
     /// caller logs it and keeps its own state straight.
     ///
-    /// Revert: raise it again in `blocking` (`storage_task_failed(reraise_storage_panic(error))`) →
+    /// Revert: raise it again in `blocking` (`storage_task_failed(&reraise_storage_panic(error))`) →
     /// the awaiting task panics → "a background caller gets an error back" fails.
     #[tokio::test]
     async fn work_no_request_awaits_gets_a_storage_panic_back_as_an_error() {
-        let warehouse = Arc::new(WarehouseHandle::new(scratch_dir("storage-panic-background")));
+        let root = scratch_dir("storage-panic-background");
+        let warehouse = Arc::new(WarehouseHandle::new(root.clone()));
         let background = tokio::spawn(blocking(warehouse, || -> Result<(), HandlerError> { panic!("planted storage panic") }));
         let (status, message) = background.await.expect("a background caller gets an error back")
             .expect_err("the panic is an error");
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(message.starts_with("A storage task failed: ") && message.contains("planted storage panic"), "{message}");
+
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
-    /// In a debug build, a Heavy ref write's storage panic reaches the request's own task too, though
-    /// the write runs in the permit's task; and only once the apply the write owed is settled, as a
-    /// failed write's is, so the warehouse does not stay closed to content.
-    ///
-    /// Revert: report the permit task's panic (`internal(format!("A ref write failed: {}", error))`)
-    /// → the request answers 500 → "the storage panic is raised again" fails; raise it before
-    /// `after_failed_ref_write` → the apply stays owed → the last assertion fails.
+    /// Push `pushed` with `seam` armed to panic in its warehouse, and return the request's task's
+    /// failure, the warehouse and the state. `observe` runs at the seam, before the panic.
     #[cfg(debug_assertions)]
-    #[tokio::test]
-    async fn a_debug_build_raises_a_ref_writes_storage_panic_once_its_apply_is_settled() {
-        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+    async fn push_with_a_planted_panic(
+        fixture: &HeavyFixture,
+        seam: &str,
+        observe: impl Fn(&WarehouseHandle) + Send + 'static,
+    ) -> (tokio::task::JoinError, Arc<WarehouseHandle>, Arc<AppState>) {
         let heavy = Arc::new(tokio::sync::Semaphore::new(1));
         let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
         let handle = resolve_handle(&state, &PathParams::new()).unwrap();
-        let closed_at_the_panic = Arc::new(AtomicUsize::new(0));
-        let _seam = arm_write_seam(&fixture.root, "pushed/owed", {
+        let _seam = arm_write_seam(&fixture.root, seam, {
             let handle = Arc::clone(&handle);
-            let closed = Arc::clone(&closed_at_the_panic);
             move || {
-                closed.store(usize::from(handle.applies_closed()) + 1, Ordering::SeqCst);
+                observe(&handle);
                 panic!("planted storage panic")
             }
         });
@@ -7199,11 +7236,73 @@ mod tests {
         });
         let raised = push.await.expect_err("the storage panic is raised again");
 
+        (raised, handle, state)
+    }
+
+    /// Wait, up to five seconds, until no redaction run is running for `handle`; a run is marked
+    /// running before it is spawned ([`run_redactions`]), so one asked for has started by then.
+    async fn redactions_settled(handle: &WarehouseHandle) {
+        for _ in 0..500 {
+            if !handle.redacting.load(Ordering::SeqCst) {
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("the redaction run did not end");
+    }
+
+    /// In a debug build, a storage panic in the redaction apply a landed write's answer waits for
+    /// reaches the request's task too; and only once the run that retries the apply is started, so
+    /// the warehouse is open to content again once that run ends.
+    ///
+    /// Revert: hand the apply's task back without raising it (`raise_storage_panic(None)` in
+    /// `after_ref_write`) → the push answers 200 → "the storage panic is raised again" fails; raise
+    /// it before `run_redactions` → no run retries the apply → the last assertion fails.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_debug_build_raises_a_writes_apply_panic_once_its_retry_is_started() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let closed_at_the_panic = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::clone(&closed_at_the_panic);
+        let (raised, handle, state) = push_with_a_planted_panic(&fixture, APPLY_SEAM, move |handle| {
+            closed.store(usize::from(handle.applies_closed()) + 1, Ordering::SeqCst);
+        }).await;
+
+        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+        assert!(fixture.changed(HeavyRoute::RefUpdate), "the push landed before its apply");
+        assert_eq!(closed_at_the_panic.load(Ordering::SeqCst), 2, "the write's apply was owed when it panicked");
+        redactions_settled(&handle).await;
+        assert!(!handle.applies_closed(), "the run started before the panic was raised applied what the write owed");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// In a debug build, a Heavy ref write's storage panic reaches the request's own task too, though
+    /// the write runs in the permit's task; and only once the apply the write owed is settled, as a
+    /// failed write's is, so the warehouse does not stay closed to content.
+    ///
+    /// Revert: report the permit task's panic (`internal(format!("A ref write failed: {}", error))`)
+    /// → the request answers 500 → "the storage panic is raised again" fails; raise it before
+    /// `after_failed_ref_write` → the apply stays owed → the last assertion fails.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_debug_build_raises_a_ref_writes_storage_panic_once_its_apply_is_settled() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let closed_at_the_panic = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::clone(&closed_at_the_panic);
+        let (raised, handle, state) = push_with_a_planted_panic(&fixture, "pushed/owed", move |handle| {
+            closed.store(usize::from(handle.applies_closed()) + 1, Ordering::SeqCst);
+        }).await;
+
         assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
         assert!(!fixture.changed(HeavyRoute::RefUpdate), "the push did not land");
         assert_eq!(closed_at_the_panic.load(Ordering::SeqCst), 2, "the write owed its apply when it panicked");
         assert!(!handle.applies_closed(), "the apply the write owed was settled before the panic was raised");
 
+        redactions_settled(&handle).await;
         drop((handle, state));
         let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
     }
@@ -9411,7 +9510,7 @@ mod tests {
 
         drop(handle.owe_apply());
         let writing = handle.owe_apply();
-        let (_, applied) = apply_discharging(&handle).await;
+        let (_, applied, _) = apply_discharging(&handle).await;
         applied.unwrap();
         assert!(handle.applies_closed(), "the write in flight is still owed");
 
