@@ -90,8 +90,8 @@ refuse with it while an undo of the stack that completed a consolidation or pick
 before putting the merge back: the bay stands where it stood before that stack, and no merge is in
 progress yet. So do `pallet create`, `deliver`, `lower` and `shift`, which would move the bay to
 another pallet or head. The `next_step` is `forklift undo`, which finishes the stopped undo. A merge
-that `consolidate`, `haul` or `lift` starts there is refused too, but usually first as a dirty bay,
-since the merge's output is uncommitted. Before, the stack went through as an ordinary parcel, the
+that `consolidate` or `haul` starts there is refused too, but usually first as a dirty bay, since
+the merge's output is uncommitted; `lift` starts no merge over uncommitted files. Before, the stack went through as an ordinary parcel, the
 park went through, and `pallet create`, `deliver` and a fast-forward `lower` went through and left
 the undo unable to finish. With a pallet delete journaled after the stopped undo, none of them
 refuses.
