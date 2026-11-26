@@ -987,7 +987,7 @@ impl ErrorCode {
             ErrorCode::SignatureMissing =>
                 "A parcel stacked after trust was established carries no signature. A lost signature and a stripped one look alike, so the warehouse may have been tampered with",
             ErrorCode::UndoUnfinished =>
-                "A stack or a park met an undo that stopped before it finished: the bay stands where it stood before the undone operation, but the consolidation or pick that operation completed is not in progress again yet. Nothing was changed; running undo again finishes it and puts the merge back in progress"
+                "A stack, a park or a move to another pallet or head met an undo that stopped before it finished: the bay stands where it stood before the undone operation, but the consolidation or pick that operation completed is not in progress again yet. Nothing was changed; running undo again finishes it and puts the merge back in progress"
         }
     }
 
