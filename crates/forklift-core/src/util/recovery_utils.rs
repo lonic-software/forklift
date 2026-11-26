@@ -2150,10 +2150,9 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
 
     match lost.record {
         ConsolidationRecord::State => {
-            // `merge_utils::state_present` counts a skeleton alone as a consolidation in progress, until
-            // this checkout's own marker recovery, later in this run, clears it.
-            let skeleton_stands = std::fs::symlink_metadata(dir.join(merge_utils::FILE_NAME_SKELETON)).is_ok();
-            let reads = match skeleton_stands && !(active && marker_stands) {
+            // `merge_utils::state_present` counts a skeleton alone as a consolidation in progress. The
+            // note says what stands as heal reads it here; a marker's recovery may change it after.
+            let reads = match std::fs::symlink_metadata(dir.join(merge_utils::FILE_NAME_SKELETON)).is_ok() {
                 true => "a consolidation skeleton still stands beside it",
                 false => "that checkout reads as having no consolidation in progress, as it would with no taint",
             };
@@ -2193,9 +2192,8 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
             };
             let tail = match (marker, step) {
                 (Some(marker), _) => format!("; {}", marker),
-                // A newer state's way out is the same from every checkout, unless this one's marker
-                // recovery, later in this run, clears the consolidation records.
-                (None, Step::Newer) if !(active && marker_stands) => "; the way out is the Forklift that wrote it".to_string(),
+                // A newer state's way out is the same from every checkout.
+                (None, Step::Newer) => "; the way out is the Forklift that wrote it".to_string(),
                 (None, Step::Run(step)) if !active => format!("; the way out is \"{}\" run in {}", step, there),
                 (None, _) => String::new(),
             };
@@ -7854,12 +7852,13 @@ mod tests {
             ("bays/b/consolidation-skeleton", Beside::DamagedWithStateCopy, format!("the consolidation skeleton of bay \
                 \"b\" (\"bays/b/consolidation-skeleton\") is gone, and the consolidation state beside it has no format \
                 header; an older version of Forklift wrote it; {}", BAY_HEAL)),
-            // The marker recovery later in the run clears the records these would describe.
+            // A marker standing changes neither what the record beside reads nor a newer state's way out.
             ("consolidation-skeleton", Beside::NewerStateAndMarker, "the consolidation skeleton of the warehouse's own \
                 working tree (\"consolidation-skeleton\") is gone, and the consolidation state beside it is in a format \
-                this version of Forklift does not know (\"/forklift-consolidation 99\")".to_string()),
-            ("consolidation", Beside::SkeletonAndMarker, format!("the consolidation state of the warehouse's own \
-                working tree (\"consolidation\") is gone; {}", NO_TAINT)),
+                this version of Forklift does not know (\"/forklift-consolidation 99\"); the way out is the Forklift \
+                that wrote it".to_string()),
+            ("consolidation", Beside::SkeletonAndMarker, "the consolidation state of the warehouse's own working tree \
+                (\"consolidation\") is gone; a consolidation skeleton still stands beside it".to_string()),
             ("consolidation", Beside::Skeleton, format!("the consolidation state of the warehouse's own working tree \
                 (\"consolidation\") is gone; a consolidation skeleton still stands beside it; {}", RUN_AGAIN)),
             ("bays/b/consolidation-skeleton", Beside::Marker, format!("the consolidation skeleton of bay \"b\" \
