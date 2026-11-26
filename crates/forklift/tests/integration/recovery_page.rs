@@ -4,10 +4,10 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use crate::common;
-use common::{forklift_command, repository_root, server_binary};
+use common::{forklift_command, repository_root, server_binary, ServerProcess};
 
 struct Area {
     root: PathBuf,
@@ -108,7 +108,7 @@ fn object_files(folder: &Path) -> Vec<PathBuf> {
 }
 
 struct Server {
-    child: Child,
+    process: ServerProcess,
     url: String,
 }
 
@@ -128,24 +128,17 @@ impl Server {
     const SECRET_SHA256: &str = "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b";
 
     fn serve(root: &str) -> Server {
-        let mut child = Command::new(server_binary())
+        let mut process = ServerProcess::new(Command::new(server_binary())
             .args(["serve", "--token-sha256", Self::SECRET_SHA256, "--root", root, "--addr", "127.0.0.1:0"])
             .env("FORKLIFT_FSYNC", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
         let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(process.child().stdout.take().unwrap()).read_line(&mut line).unwrap();
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
-        Server { child, url }
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        Server { process, url }
     }
 }
 
@@ -264,8 +257,7 @@ fn a_lock_a_dead_process_held_refuses_nothing() {
 fn a_hard_killed_server_holds_no_serve_lock() {
     let area = Area::new("serve-lock");
     let mut server = Server::start(&area, "server");
-    server.child.kill().unwrap();
-    server.child.wait().unwrap();
+    server.process.stop();
     let root = area.path("server");
     let root = root.to_str().unwrap();
     assert!(area.path("server/.forklift/serve.lock").exists(), "the killed server's sidecar stays");

@@ -7,8 +7,8 @@ use crate::common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Output, Stdio};
-use common::{forklift_command, repository_root, server_binary, test_command};
+use std::process::{Output, Stdio};
+use common::{forklift_command, repository_root, server_binary, test_command, ServerProcess};
 
 /// The prefixes of a constant that names a file or folder.
 const NAME_PREFIXES: [&str; 4] = ["FILE_NAME", "FOLDER_NAME", "FILE_SUFFIX", "FILE_EXTENSION"];
@@ -476,32 +476,25 @@ fn older_format_fixtures_upgrade_and_open() {
 
 /// A `forklift-server` serving `root` until it is dropped.
 struct Server {
-    child: Child,
+    _process: ServerProcess,
     url: String,
 }
 
 impl Server {
     fn start(root: &Path) -> Server {
-        let mut child = test_command(server_binary())
+        let mut process = ServerProcess::new(test_command(server_binary())
             .args(["serve", "--root", root.to_str().unwrap(), "--addr", "127.0.0.1:0", "--open"])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
 
         let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(process.child().stdout.take().unwrap()).read_line(&mut line).unwrap();
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { child, url }
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        Server { _process: process, url }
     }
 }
 

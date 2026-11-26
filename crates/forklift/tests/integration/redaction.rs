@@ -723,7 +723,7 @@ fn a_meta_pallet_may_not_start_naming_redacted_content() {
 
 /// A running forklift-server over a bare warehouse at `root`.
 struct Server {
-    child: std::process::Child,
+    process: common::ServerProcess,
     url: String,
     root: PathBuf,
 }
@@ -748,32 +748,26 @@ impl Server {
         use std::io::BufRead;
 
         let root = root.to_str().unwrap();
-        let mut child = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
+        let mut process = common::ServerProcess::new(std::process::Command::new(common::server_binary())
+            .env("FORKLIFT_FSYNC", "0")
             .args(["serve", "--root", root, "--addr", "127.0.0.1:0", "--open"]).args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
 
         let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        std::io::BufReader::new(process.child().stdout.take().unwrap()).read_line(&mut line).unwrap();
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { child, url, root: PathBuf::from(root) }
+        Server { process, url, root: PathBuf::from(root) }
     }
 
     /// The head this server serves for `main`, read from its own ref: a fresh clone could not
     /// fetch history naming content whose redaction the server has applied.
     fn main(&self) -> String {
         std::fs::read_to_string(self.root.join(".forklift/pallets/main")).unwrap().trim().to_string()
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -4155,8 +4149,7 @@ fn git_export_in_a_served_root_leaves_out_content_its_host_withholds() {
                 takedown.owner.stack("media/film.mkv", b"the new film\n", "new film");
                 takedown.owner.run_ok(&["lift"]);
                 let head = takedown.server.main();
-                let _ = takedown.server.child.kill();
-                let _ = takedown.server.child.wait();
+                takedown.server.process.stop();
                 takedown.film = hash_of(b"the new film\n");
                 let added = withhold(&takedown.server.root, &["add", &takedown.film, "--statement", TAKEDOWN]);
                 assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));

@@ -7,7 +7,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::gc_utils;
@@ -15,7 +15,7 @@ use forklift_core::util::gc_utils;
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
 use crate::common;
-use common::{forklift_command, server_binary};
+use common::{forklift_command, server_binary, ServerProcess};
 
 /// The git config file every launch here reads as its global one: none.
 const NO_CONFIG: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -98,7 +98,7 @@ impl Drop for TestArea {
 
 /// A running forklift-server over a bare warehouse in the test area.
 struct Server {
-    child: Child,
+    _process: ServerProcess,
     url: String,
 }
 
@@ -111,26 +111,19 @@ impl Server {
             .args(["prepare", "--root", root]).output().unwrap();
         assert_success(&prepared);
 
-        let mut child = Command::new(server_binary()).env("FORKLIFT_FSYNC", "0")
+        let mut process = ServerProcess::new(Command::new(server_binary()).env("FORKLIFT_FSYNC", "0")
             .args(["serve", "--root", root, "--addr", "127.0.0.1:0", "--open"])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap();
+            .unwrap());
 
         let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(process.child().stdout.take().unwrap()).read_line(&mut line).unwrap();
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { child, url }
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        Server { _process: process, url }
     }
 }
 
