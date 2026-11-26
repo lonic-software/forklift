@@ -174,7 +174,16 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   directory record does not read) and `forklift bay` (for a bay folder no command line can name)
   give now delete the bay's `.forklift` entry only while it still redirects to that bay, and
   before the bay's state folder. `forklift bay` used to say only to remove the state folder,
-  which left a working directory redirecting to a bay that no longer exists.
+  which left a working directory redirecting to a bay that no longer exists. A lost checkout scope
+  of a checkout other than the one heal runs in (`.forklift/scope`, or a bay's), or a lost scope
+  copy, is cleared the same way, with a note. Heal still restores the scope of the checkout it runs
+  in from its copy before this, as before. For a scope, the note names the ways out as it does
+  for a position. For a copy, it says whether the scope file beside it parses: beside one that
+  parses, the way out is `forklift heal` run in that checkout; beside any other, the note names the
+  ways out a lost scope has. In a warehouse that is not sparse, a lost scope or copy of its own
+  working tree is said to be the state that working tree keeps, since it records no scope. The
+  scope stays lost, and its readers still refuse it. Before, it kept heal refusing, so a bay whose
+  first scope write was lost could not even be removed.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
