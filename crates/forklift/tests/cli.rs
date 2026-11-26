@@ -11690,6 +11690,98 @@ fn an_empty_pick_clears_an_interrupted_undos_mark() {
     assert!(!text.contains("\"undo_started\":true"), "the mark is cleared: {}", text);
 }
 
+/// Put `warehouse` where an undo of its last stack stops after it put the refs back and before it
+/// wrote the merge state back: the undo runs, then the journal goes back to `stacked` with the
+/// entry marked, and the merge state files the undo wrote (`state`, its copy, and for a
+/// consolidation its skeleton) are removed, as they were before the undo.
+fn stop_the_undo_before_its_merge_state(warehouse: &TestWarehouse, stacked: &str, state: &[&str]) {
+    let journal = warehouse.root.join(".forklift/journal.json");
+    let undone = json(&warehouse.run(&["--json", "undo"]));
+    assert_eq!(undone["data"]["op"], "stack", "{}", undone);
+
+    for name in state {
+        let path = warehouse.root.join(".forklift").join(name);
+        if path.exists() {
+            forklift_core::util::file_utils::remove_file(&path).unwrap();
+        }
+    }
+
+    std::fs::write(&journal, stacked).unwrap();
+    mark_undo_started(warehouse, None);
+}
+
+// SPIKE (FORK-619): an undo of the stack that completed a conflicted pick, stopped before it put
+// the pick back. A stack now goes through as an ordinary parcel: the source's author is dropped.
+#[test]
+fn spike_619_stack_over_a_stopped_undo_of_a_pick() {
+    let warehouse = TestWarehouse::new("spike-619-pick");
+    warehouse.write_file("f.txt", "alpha\nbeta\ngamma\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
+    warehouse.write_file("f.txt", "alpha\nbeta-FEATURE\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "feature edits beta"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits beta"]));
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
+    assert_eq!(picked["data"]["outcome"], "conflicts");
+
+    warehouse.write_file("f.txt", "alpha\nbeta-RESOLVED\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved pick"]));
+    let stacked = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+
+    stop_the_undo_before_its_merge_state(&warehouse, &stacked, &["cherry-pick", "cherry-pick-copy"]);
+    assert!(!warehouse.root.join(".forklift/cherry-pick").exists());
+
+    let journal = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+    let resume = std::env::var("SPIKE_619_RESUME").is_ok();
+    if resume {
+        let undone = warehouse.run(&["undo"]);
+        assert_success(&undone);
+        assert!(warehouse.root.join(".forklift/cherry-pick").exists(), "the resumed undo put the pick back");
+    }
+
+    let restacked = warehouse.run(&["stack", "-m", "restacked"]);
+    assert_success(&restacked);
+    let history = json(&warehouse.run(&["--json", "history"]));
+    let actions: Vec<String> = history["data"]["entries"][0]["actions"].as_array().unwrap().iter()
+        .map(|action| format!("{} {}", action["action"].as_str().unwrap().trim(), action["operator"].as_str().unwrap()))
+        .collect();
+    assert!(actions.contains(&"stack test@forklift".to_string()), "{:?}", actions);
+    assert_eq!(actions.iter().any(|action| action.contains("bob@forklift")), resume,
+        "bob's authorship is kept only after the resume: {:?} (journal {})", actions, journal);
+}
+
+// SPIKE (FORK-619): the same for the stack that completed a conflicted consolidation: the stack
+// goes through single-parent, so the merge parent is lost.
+#[test]
+fn spike_619_stack_over_a_stopped_undo_of_a_consolidation() {
+    let warehouse = a_conflicted_consolidation("spike-619-consolidation");
+    warehouse.write_file("f.txt", "resolved\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved"]));
+    let stacked = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+
+    stop_the_undo_before_its_merge_state(&warehouse, &stacked,
+        &["consolidation", "consolidation-copy", "consolidation-skeleton", "consolidation-skeleton-copy"]);
+
+    let restacked = warehouse.run(&["stack", "-m", "restacked"]);
+    assert_success(&restacked);
+    let history = json(&warehouse.run(&["--json", "history"]));
+    let top = &history["data"]["entries"][0];
+    assert!(top["consolidates"].as_array().map_or(true, |parents| parents.is_empty()), "DEFECT: single-parent: {}", top);
+}
+
 // A parcel with no description (a git commit imported with an empty message) is picked only with
 // -m: without one the pick refuses before it applies anything, since the parcel would record none.
 #[test]
