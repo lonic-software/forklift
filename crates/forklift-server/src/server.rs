@@ -2940,9 +2940,11 @@ fn tag_storage_panic<T>(work: impl FnOnce() -> T) -> T {
 
 /// A debug build's storage task panic, holding the payload it was raised with. It has to end at a
 /// request's boundary ([`storage_panic_boundary`]) or a disposition of work no request awaits
-/// ([`disarm_storage_panic`]): dropped holding its payload anywhere else inside a runtime, it was
-/// lost, so a reply may have hidden it, and it aborts the process. Outside every runtime it is a
-/// panic that reached a thread's top, which is reported there already.
+/// ([`disarm_storage_panic`]): dropped holding its payload anywhere else while a runtime is
+/// current, it was lost, so a reply may have hidden it, and it aborts the process. With no runtime
+/// current it does nothing. That is where a panic raised to a thread's top is dropped, which is
+/// reported there already, and also where a `JoinError` carried out of a `block_on` would be,
+/// which is then not caught.
 #[cfg(debug_assertions)]
 struct StoragePanic(Option<PanicPayload>);
 
@@ -7386,20 +7388,27 @@ mod tests {
     const STORAGE_PANIC_CHILD: &str = "FORKLIFT_TEST_STORAGE_PANIC_CHILD";
 
     /// Run this binary's ignored test `name` of this module in a child process, with output
-    /// capture left on, so a line that reaches its stderr was written past the capture.
+    /// capture left on, so a line that reaches its stderr was written past the capture. Fails
+    /// unless the child started that one test: a filter matching none exits 0.
     #[cfg(debug_assertions)]
     fn run_child_test(name: &str) -> std::process::Output {
         let (_, module) = module_path!().split_once("::").unwrap();
 
-        std::process::Command::new(std::env::current_exe().unwrap())
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([&format!("{module}::{name}"), "--exact", "--ignored", "--test-threads=1"])
             .env(STORAGE_PANIC_CHILD, "1")
             .output()
-            .unwrap()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+
+        assert!(stdout.contains("running 1 test\n"), "the child ran {name}: {stdout}");
+
+        child
     }
 
-    /// Whether a child process ended on an abort: on Unix, killed by SIGABRT, which a panic
-    /// (exit 101) or a clean exit never is; elsewhere, an exit status that is neither.
+    /// Whether a child process ended on an abort: on Unix, killed by SIGABRT; on Windows, the
+    /// status `std::process::abort`'s fast fail exits with (`STATUS_STACK_BUFFER_OVERRUN`). A panic
+    /// (exit 101) or a clean exit is neither.
     #[cfg(debug_assertions)]
     fn aborted(status: &std::process::ExitStatus) -> bool {
         #[cfg(unix)]
@@ -7409,9 +7418,9 @@ mod tests {
             status.signal() == Some(6)
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            !matches!(status.code(), Some(0) | Some(101))
+            status.code() == Some(0xC000_0409_u32 as i32)
         }
     }
 
@@ -7541,6 +7550,8 @@ mod tests {
         let _ = redaction_round(&state, &warehouse).await;
 
         assert_eq!(fired.load(Ordering::SeqCst), 1, "the round's apply reached its planted panic");
+
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// In a debug build, a storage panic a test raises to its top fails it as a panic, with no
@@ -13763,15 +13774,17 @@ mod tests {
     /// It pins names, not flow, and proves no absence of masking: a task boundary between a
     /// handler and its wrapper (a `tokio::spawn` whose `JoinError` the handler answers, a helper
     /// in between) passes it. A debug build's [`StoragePanic`] catches that shape at run time
-    /// instead, when the swallowed panic is dropped (`a_storage_panic_a_reply_swallows_…`). That a
-    /// raise comes after its settling is the behavioural tests' (`a_debug_build_raises_…`).
+    /// instead, when the swallowed panic is dropped still armed (`a_storage_panic_a_reply_swallows_…`);
+    /// what may disarm one, or format a storage task's failure, is pinned here. That a raise comes
+    /// after its settling is the behavioural tests' (`a_debug_build_raises_…`).
     ///
     /// Reverts: a handler on `blocking` → its literal set fails; a bare `spawn_blocking` in a
     /// handler → the `spawn_blocking` set fails; a redaction round that drops the apply's failure
     /// with `_` → the `.reported` set fails; arguments that parse left unvisited (the fallback is
     /// not reached for them) → the Heavy handlers' raise inside `format!` is unseen → red;
     /// `blocking` named only inside a `tokio::select!` in a handler → its literal set fails; with
-    /// the unparsed-macro fallback removed as well, the same plant passes unseen.
+    /// the unparsed-macro fallback removed as well, the same plant passes unseen; a helper that
+    /// formats and disarms a storage panic on a handler's path → the two disarm/format sets fail.
     #[test]
     fn storage_wrappers_are_named_where_this_test_pins_them() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
@@ -13807,6 +13820,13 @@ mod tests {
         assert_eq!(named.by("apply_discharging"), disposed, "every apply's caller disposes of its failure");
         let raising_callers: BTreeSet<String> = named.by("after_ref_write").union(&named.by("after_failed_ref_write")).cloned().collect();
         assert!(raising_callers.is_subset(&handlers), "only route handlers await an apply they raise: {raising_callers:?}");
+
+        // A storage panic disarmed only at a request's boundary (its future's `poll`) and by the
+        // background dispositions; formatted only where it is then raised or disposed of.
+        assert_eq!(named.by("disarm_storage_panic"), set(&["blocking", "poll", "reported"]),
+            "the functions disarming a storage panic");
+        assert_eq!(named.by("storage_task_failed"), set(&["apply_discharging", "blocking", "reported_request_failure"]),
+            "the functions formatting a storage task's failure");
     }
 
     /// `serve`'s capacity: a set value is used as given; zero, and more than the semaphore can
