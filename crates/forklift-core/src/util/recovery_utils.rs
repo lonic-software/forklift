@@ -1846,7 +1846,8 @@ enum VanishedClass {
     /// would guard nothing the absence does not already settle, and it stands before the marker's
     /// recovery, which waits for the taint. A checkout's pick state (`cherry-pick`, or a bay's) is
     /// the same: a command's write of one runs under the pick's operation marker (`pick` raises it
-    /// first) or is that undo, heal writes one back as above, and a missing one reads as no pick in
+    /// first) or is an undo putting a pick back, which a retry of that undo resumes, heal writes
+    /// one back as above, and a missing one reads as no pick in
     /// progress (`cherry_pick_utils::read_state_in`).
     MergeRecord,
     /// The copy of a consolidation state, skeleton or pick state, gone since the taint was
@@ -2161,14 +2162,14 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
     };
 
     // A lost state's tail: heal run there where a marker stands in another checkout, nothing where
-    // one stands in this checkout (its recovery follows), else the commands that record one, run
-    // again if they failed (`who`, or any such command where it is `None`).
+    // one stands in this checkout (its recovery follows), else the command that records one, run
+    // again if it failed (`who`, or any such command where it is `None`).
     let state_tail = |marker: Option<String>, who: Option<&str>| match (marker, marker_stands) {
         (Some(marker), _) => format!("; {}", marker),
         (None, true) => String::new(),
         (None, false) => format!(
-            "; if {} that records one failed there before this heal, run it again",
-            who.unwrap_or("a command")
+            "; if {} failed there before this heal, run it again",
+            who.unwrap_or("a command that records one")
         ),
     };
 
@@ -2182,14 +2183,15 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
             };
             format!("the {} of {} (\"{}\") is gone; {}{}", record, which, path, reads, state_tail(marker, None))
         }
-        // A missing pick state reads as no pick in progress (`cherry_pick_utils::read_state_in`). Two
-        // commands record one: the pick itself, and an undo of the stack that completed one
-        // (`journal_utils::restore_refs`). Heal also writes one back from its copy
+        // A missing pick state reads as no pick in progress (`cherry_pick_utils::read_state_in`). Where
+        // no marker stands, the one command whose failed write of one can be left is an undo putting a
+        // pick back (`journal_utils::restore_refs`): the pick writes it under its marker, which a
+        // failure leaves standing. Heal also writes one back from its copy
         // (`merge_state_heal::repair`), but an absence is never written back, so it is not named.
         InProgressRecord::Pick => format!(
             "the {} of {} (\"{}\") is gone; that checkout reads as having no pick in progress, as it would with no \
             taint{}",
-            record, which, path, state_tail(marker, Some("a \"forklift pick\" or \"forklift undo\""))
+            record, which, path, state_tail(marker, Some("a \"forklift undo\" putting a pick back"))
         ),
         InProgressRecord::Skeleton => {
             // The way out where no marker stands: the step for the record the refusal over this
@@ -7736,7 +7738,7 @@ mod tests {
                 (\"bays/b/cherry-pick-copy\") is gone; only heal reads a copy, to write a damaged record back"),
             ("cherry-pick", 1, "bays/b/cherry-pick", true, "the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
                 gone; that checkout reads as having no pick in progress, as it would with no taint; if a \"forklift \
-                pick\" or \"forklift undo\" that records one failed there before this heal, run it again"),
+                undo\" putting a pick back failed there before this heal, run it again"),
             ("cherry-pick", 1, "bays/b/cherry-pick", false, "a lost pick state or copy whose loss could not be made \
                 durable: \"bays/b/cherry-pick\""),
             ("consolidation", 0, "bays/b/consolidation-copy", true, "the copy of the consolidation state of bay \"b\" \
@@ -7796,10 +7798,13 @@ mod tests {
 
     /// A lost path of each consolidation or pick shape is resolved with the note for its checkout. A
     /// lost state's note says whether a skeleton still stands beside it, a lost skeleton's what the
-    /// state beside it reads, and a lost pick state's that no pick reads as in progress. For a checkout other than the one heal runs in, the note names heal run
-    /// there where an operation marker stands, and beside a lost skeleton the step the refusal over
-    /// that state names; for the one heal runs in, which these tests run in, it names neither.
+    /// state beside it reads, and a lost pick state's that no pick reads as in progress. For a
+    /// checkout other than the one heal runs in, the note names heal run there where an operation
+    /// marker stands, and beside a lost skeleton the step the refusal over that state names; for the
+    /// one heal runs in, which these tests run in, it names neither.
     ///
+    /// Revert: the pick folded into the state's note → the pick rows say consolidation → red.
+    /// Revert: the pick's tail named generically → the pick rows without a marker → red.
     /// Revert: any of the shapes' disposition back to `None` → its row refuses → red. Revert: the
     /// marker not read → the marker rows say "run it again" or nothing → red. Revert: the active
     /// checkout not told apart → the main tree's rows name heal → red. Revert: the state beside a
@@ -7839,8 +7844,8 @@ mod tests {
         const RUN_AGAIN: &str = "if a command that records one failed there before this heal, run it again";
         const NO_TAINT: &str = "that checkout reads as having no consolidation in progress, as it would with no taint";
         const NO_PICK: &str = "that checkout reads as having no pick in progress, as it would with no taint";
-        const RUN_PICK_AGAIN: &str = "if a \"forklift pick\" or \"forklift undo\" that records one failed there before \
-            this heal, run it again";
+        const RUN_PICK_AGAIN: &str = "if a \"forklift undo\" putting a pick back failed there before this heal, run it \
+            again";
         const BAY_HEAL: &str = "the way out is \"forklift heal\" run in the bay's working directory";
         const BAY_ABORT: &str = "the way out is \"forklift abort\" run in the bay's working directory";
         const BAY_ABORT_KEEPING: &str = "the way out is \"forklift abort --keep-files\" run in the bay's working directory";
