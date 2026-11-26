@@ -241,6 +241,14 @@ pub async fn stack_parcel(description: Option<String>,
     let scope = scope_utils::current_scope()?;
     let position = pallet_utils::read_position()?;
     let pallet = position.pallet.clone();
+
+    // An undo that stopped before it put back the merge its operation completed would otherwise
+    // read here as a bay with no merge in progress, and the parcel would drop that merge. A caller
+    // passing `expected_base` stacks a merge it has just started itself.
+    if expected_base.is_none() {
+        journal_utils::refuse_a_stack_over_an_unfinished_undo("stacked")?;
+    }
+
     let consolidation = merge_utils::read_consolidation_state()?;
 
     // A cherry-pick in progress (§9.1 #8) completes here, single-parent: the picked

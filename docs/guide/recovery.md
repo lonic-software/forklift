@@ -37,6 +37,19 @@ lists every case.
 To throw away edits on purpose, `forklift restore` previews what it would discard, and acts with
 `--confirm`.
 
+### `undo_unfinished` (exit 72)
+
+An undo of the `stack` that completed a consolidation or pick stopped before it finished: the bay
+stands where it stood before that stack, but the merge is not in progress again yet. `stack` and
+`park` refuse, and nothing was changed. Run `forklift undo` again: it finishes the undo and puts
+the merge back in progress, with the merge's output still in your files. The next `stack`
+completes it as before, keeping the second parent or the picked parcel's author. To make an
+ordinary parcel of the files instead, run `forklift abort --keep-files` once the merge is back.
+
+This refusal is not given once a pallet delete has been journaled after the stopped undo. Then the
+next `undo` brings the deleted pallet back first, and a `stack` goes through as an ordinary parcel.
+To keep the merge, run `forklift undo` twice before stacking.
+
 ## Interrupted and locked
 
 ### `warehouse_locked` (exit 6), `store_locked` (exit 6), `serve_locked` (exit 6)

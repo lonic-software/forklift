@@ -85,7 +85,13 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 60** (current): a metadata pallet's ref whose file is missing while its copy
+**Schema 61** (current): the `undo_unfinished` error code exists (exit 72). `stack` and `park`
+refuse with it while an undo of the stack that completed a consolidation or pick has stopped
+before putting the merge back: the bay stands where it stood before that stack, and no merge is in
+progress yet. The `next_step` is `forklift undo`, which finishes the stopped undo. Before, the stack
+went through as an ordinary parcel and the park went through.
+
+**Schema 60**: a metadata pallet's ref whose file is missing while its copy
 (`.forklift/meta-copy/<name>`) stands is refused as `ref_damaged` (exit 53) wherever it is read,
 where it used to read as a pallet never written, and the `next_step` names `forklift heal` when the
 copy holds a parcel hash, or a damaged ref's file names one parcel. `heal`'s

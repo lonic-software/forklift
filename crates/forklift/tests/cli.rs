@@ -9127,7 +9127,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 60);
+    assert_eq!(value["schema"], 61);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -9169,7 +9169,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 60);
+    assert_eq!(value["schema"], 61);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -9228,7 +9228,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 60);
+    assert_eq!(value["schema"], 61);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -9436,7 +9436,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 60,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 61,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -11688,6 +11688,234 @@ fn an_empty_pick_clears_an_interrupted_undos_mark() {
     assert_ne!(main_after, main_head, "the fixture's undo took the completing stack off");
     let text = std::fs::read_to_string(&journal).unwrap();
     assert!(!text.contains("\"undo_started\":true"), "the mark is cleared: {}", text);
+}
+
+/// Put `warehouse` where an undo of its last stack stops after it put the refs back and before it
+/// wrote the merge state back: the undo runs, then the journal goes back to `stacked` with the
+/// entry marked, and the merge state files the undo wrote (`state`, its copy, and for a
+/// consolidation its skeleton) are removed, as they were before the undo.
+fn stop_the_undo_before_its_merge_state(warehouse: &TestWarehouse, stacked: &str, state: &[&str]) {
+    let journal = warehouse.root.join(".forklift/journal.json");
+    let undone = json(&warehouse.run(&["--json", "undo"]));
+    assert_eq!(undone["data"]["op"], "stack", "{}", undone);
+
+    for name in state {
+        let path = warehouse.root.join(".forklift").join(name);
+        if path.exists() {
+            forklift_core::util::file_utils::remove_file(&path).unwrap();
+        }
+    }
+
+    std::fs::write(&journal, stacked).unwrap();
+    mark_undo_started(warehouse, None);
+}
+
+/// bob@forklift's parcel picked onto "main" with a conflict, resolved and stacked by test@forklift,
+/// and then an undo of that stack stopped before it put the pick back. Returns the pick source.
+fn a_stopped_undo_of_a_pick(name: &str) -> (TestWarehouse, String) {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("f.txt", "alpha\nbeta\ngamma\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
+    warehouse.write_file("f.txt", "alpha\nbeta-FEATURE\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "feature edits beta"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
+
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits beta"]));
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
+    assert_eq!(picked["data"]["outcome"], "conflicts");
+
+    warehouse.write_file("f.txt", "alpha\nbeta-RESOLVED\ngamma\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved pick"]));
+    let stacked = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+
+    stop_the_undo_before_its_merge_state(&warehouse, &stacked, &["cherry-pick", "cherry-pick-copy"]);
+    assert!(!warehouse.root.join(".forklift/cherry-pick").exists(), "the stopped undo has not put the pick back");
+    (warehouse, source)
+}
+
+/// A conflicted consolidation of "other" into "main", resolved as f.txt "resolved" and stacked,
+/// and then an undo of that stack stopped before it put the consolidation back.
+fn a_stopped_undo_of_a_consolidation(name: &str) -> TestWarehouse {
+    let warehouse = a_conflicted_consolidation(name);
+    warehouse.write_file("f.txt", "resolved\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved"]));
+    let stacked = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+
+    stop_the_undo_before_its_merge_state(&warehouse, &stacked,
+        &["consolidation", "consolidation-copy", "consolidation-skeleton", "consolidation-skeleton-copy"]);
+    assert!(!warehouse.root.join(".forklift/consolidation").exists(), "the stopped undo has not put the consolidation back");
+    warehouse
+}
+
+/// Asserts `refused` is the `undo_unfinished` refusal (run with `--json`), naming the undo.
+fn assert_undo_unfinished(refused: &Output, verb: &str) {
+    assert_eq!(refused.status.code(), Some(72), "{}{}", stdout(refused), stderr(refused));
+    let error = json(refused)["error"].clone();
+    assert_eq!((error["code"].as_str(), error["next_step"].as_str()), (Some("undo_unfinished"), Some("forklift undo")), "{}", error);
+    assert!(error["message"].as_str().unwrap().contains(&format!("Nothing was {}.", verb)), "{}", error);
+}
+
+/// The latest parcel's history entry.
+fn top_history_entry(warehouse: &TestWarehouse) -> serde_json::Value {
+    json(&warehouse.run(&["--json", "history"]))["data"]["entries"][0].clone()
+}
+
+/// The latest parcel's actions, as "<action> <operator>".
+fn top_actions(warehouse: &TestWarehouse) -> Vec<String> {
+    top_history_entry(warehouse)["actions"].as_array().unwrap().iter()
+        .map(|action| format!("{} {}", action["action"].as_str().unwrap().trim(), action["operator"].as_str().unwrap()))
+        .collect()
+}
+
+/// The latest parcel's parent count.
+fn top_parent_count(warehouse: &TestWarehouse) -> usize {
+    top_history_entry(warehouse)["parents"].as_array().map_or(0, Vec::len)
+}
+
+// An undo of the stack that completed a conflicted pick, stopped before it put the pick back: a
+// stack is refused, naming the undo, and stacks nothing, since it would record the pick's output as
+// an ordinary parcel without its source's author. The undo then finishes, and the stack after it
+// keeps bob's action.
+//
+// Revert: drop the refusal from stack_parcel → the stack goes through.
+#[test]
+fn a_stack_over_a_stopped_undo_of_a_pick_names_the_undo() {
+    let (warehouse, _) = a_stopped_undo_of_a_pick("stack-over-stopped-undo-pick");
+    let main_head = pallet_head_hash(&warehouse, "main");
+
+    assert_undo_unfinished(&warehouse.run(&["--json", "stack", "-m", "restacked"]), "stacked");
+    assert_eq!(pallet_head_hash(&warehouse, "main"), main_head, "nothing was stacked");
+
+    assert_success(&warehouse.run(&["undo"]));
+    assert!(warehouse.root.join(".forklift/cherry-pick").exists(), "the resumed undo put the pick back");
+
+    assert_success(&warehouse.run(&["stack", "-m", "restacked"]));
+    let actions = top_actions(&warehouse);
+    assert!(actions.contains(&"stack test@forklift".to_string()), "{:?}", actions);
+    assert!(actions.iter().any(|action| action.ends_with(" bob@forklift")), "the source's author is kept: {:?}", actions);
+}
+
+// The same for the stack that completed a conflicted consolidation: refused, and after the undo
+// the stack has both parents.
+//
+// Revert: drop the refusal from stack_parcel → the stack goes through single-parent.
+#[test]
+fn a_stack_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
+    let warehouse = a_stopped_undo_of_a_consolidation("stack-over-stopped-undo-consolidation");
+    let main_head = pallet_head_hash(&warehouse, "main");
+
+    assert_undo_unfinished(&warehouse.run(&["--json", "stack", "-m", "restacked"]), "stacked");
+    assert_eq!(pallet_head_hash(&warehouse, "main"), main_head, "nothing was stacked");
+
+    assert_success(&warehouse.run(&["undo"]));
+    assert!(warehouse.root.join(".forklift/consolidation").exists(), "the resumed undo put the consolidation back");
+
+    assert_success(&warehouse.run(&["stack", "-m", "restacked"]));
+    assert_eq!(top_parent_count(&warehouse), 2, "{}", top_history_entry(&warehouse));
+}
+
+// Park is the other door: over the same stopped undo it would take the merged output away, and the
+// resumed undo would put the consolidation back over a tree without it. It is refused, and the
+// output stays.
+//
+// Revert: drop the refusal from park_changes → park goes through and f.txt reads "ours".
+#[test]
+fn a_park_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
+    let warehouse = a_stopped_undo_of_a_consolidation("park-over-stopped-undo");
+
+    assert_undo_unfinished(&warehouse.run(&["--json", "park"]), "parked");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("f.txt")).unwrap(), "resolved\n", "the merged output stays");
+
+    assert_success(&warehouse.run(&["undo"]));
+    assert_success(&warehouse.run(&["stack", "-m", "restacked"]));
+    assert_eq!(top_parent_count(&warehouse), 2, "{}", top_history_entry(&warehouse));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("f.txt")).unwrap(), "resolved\n");
+}
+
+// Where the undo itself would refuse, the stack is not refused in its name. With the pick's source
+// gone from the store, the undo's gate refuses the resume, so the stack goes through as before.
+//
+// Revert: drop the pick-source condition → the stack is refused naming an undo that cannot finish.
+#[test]
+fn a_stack_over_a_stopped_undo_whose_pick_source_is_gone_goes_through() {
+    let (warehouse, source) = a_stopped_undo_of_a_pick("stack-over-stopped-undo-source-gone");
+    forklift_core::util::file_utils::remove_file(warehouse.root.join(".forklift/objects").join(&source[..2]).join(&source[2..])).unwrap();
+
+    let undo = warehouse.run(&["undo"]);
+    assert!(!undo.status.success() && stderr(&undo).contains("no longer holds that parcel"), "the undo refuses: {}", stderr(&undo));
+
+    let stacked = warehouse.run(&["--json", "stack", "-m", "restacked"]);
+    assert_success(&stacked);
+}
+
+// An undo stopped after every write but before its journal pop has the pick back in progress: the
+// stack completes it, keeping bob's action, and is not refused.
+//
+// Revert: drop the merge-state condition → the stack is refused though nothing would be lost.
+#[test]
+fn a_stack_over_an_undo_stopped_before_its_pop_completes_the_pick() {
+    let (warehouse, _) = a_stopped_undo_of_a_pick("stack-over-undo-stopped-before-pop");
+    let journal = warehouse.root.join(".forklift/journal.json");
+    let marked = std::fs::read_to_string(&journal).unwrap();
+    assert_success(&warehouse.run(&["undo"]));
+    assert!(warehouse.root.join(".forklift/cherry-pick").exists(), "the undo put the pick back");
+    std::fs::write(&journal, marked).unwrap();
+
+    assert_success(&warehouse.run(&["--json", "stack", "-m", "restacked"]));
+    let actions = top_actions(&warehouse);
+    assert!(actions.iter().any(|action| action.ends_with(" bob@forklift")), "the source's author is kept: {:?}", actions);
+}
+
+// A pallet delete journaled above the marked entry stands between the undo and it: the undo would
+// first restore that pallet, which can refuse for good, so the stack is not refused in its name.
+//
+// Revert: read the latest entry that is not a pallet delete → the stack is refused.
+#[test]
+fn a_stack_over_a_stopped_undo_under_a_pallet_delete_goes_through() {
+    let warehouse = a_stopped_undo_of_a_consolidation("stack-over-stopped-undo-under-delete");
+    assert_success(&warehouse.run(&["pallet", "delete", "spare", "--force"]));
+    assert!(std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap().contains("\"op\":\"delete\""),
+        "the delete is journaled above the marked entry");
+
+    assert_success(&warehouse.run(&["--json", "stack", "-m", "restacked"]));
+}
+
+// A pallet another writer moved since, to a head the undone operation never recorded, makes the
+// resumed undo refuse the pallet as moved: the stack meets its own refusal of a bay behind its
+// pallet instead, whose way out works.
+//
+// Revert: drop the ref condition → the stack is refused as undo_unfinished.
+#[test]
+fn a_stack_over_a_stopped_undo_of_a_moved_pallet_is_behind() {
+    let warehouse = a_stopped_undo_of_a_consolidation("stack-over-stopped-undo-moved");
+    let pallets = warehouse.root.join(".forklift/pallets");
+    std::fs::write(pallets.join("main"), std::fs::read(pallets.join("other")).unwrap()).unwrap();
+
+    let refused = warehouse.run(&["--json", "stack", "-m", "restacked"]);
+    assert_eq!(json(&refused)["error"]["code"], "behind", "{}{}", stdout(&refused), stderr(&refused));
+}
+
+// Journaling is best-effort: a journal that does not parse refuses nothing here.
+//
+// Revert: return the journal's read error → the stack fails on it.
+#[test]
+fn a_stack_over_an_unparsable_journal_goes_through() {
+    let warehouse = a_stopped_undo_of_a_consolidation("stack-over-unparsable-journal");
+    std::fs::write(warehouse.root.join(".forklift/journal.json"), "{\"version\":5,\"entries\":[").unwrap();
+
+    assert_success(&warehouse.run(&["--json", "stack", "-m", "restacked"]));
 }
 
 // A parcel with no description (a git commit imported with an empty message) is picked only with

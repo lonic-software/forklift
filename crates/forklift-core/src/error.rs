@@ -503,6 +503,13 @@ refusal_codes! {
     /// empty.
     SignatureMissing => "signature_missing",
 
+    /// A stack or a park met an undo that stopped before it finished: the bay stands where it stood
+    /// before the undone operation, but the consolidation or pick that operation completed is not
+    /// in progress again yet, so the stack would record the merge's output as an ordinary parcel
+    /// and the park would take that output away. Nothing was changed; the next step is
+    /// `forklift undo`, which finishes the stopped undo.
+    UndoUnfinished => "undo_unfinished",
+
     /// Another forklift process that is still running holds the bay's warehouse lock, which every
     /// mutating command takes for its whole run. Nothing waits on it, and nothing was changed; the
     /// next step is to let that process finish, then run the command again. The lock is a kernel

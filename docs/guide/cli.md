@@ -767,6 +767,17 @@ pallet; it only abandons the merge in progress, leaving the working directory (m
 included) as it is. Undoing the `stack` that completed one puts it back in progress, so the
 next `stack` completes it again.
 
+An undo that stops part-way through (killed, or a write that fails) resumes when you run `undo`
+again. While an undo of the `stack` that completed a consolidation or pick has put the bay back but
+not yet the merge, `stack` and `park` refuse with `undo_unfinished` and name `forklift undo`: a
+stack would record the merge's output as an ordinary parcel, losing the second parent or the picked
+parcel's author, and a park would take that output away from the merge the undo puts back. They
+do not refuse when the undo could not finish (the picked parcel gone from the warehouse, or the
+pallet moved on by another bay), nor when a pallet delete was journaled since: the next `undo`
+would bring that pallet back first, so only a second `undo` after it finishes the stopped one. A
+`stack` there is not refused and records an ordinary parcel, without the second parent or the
+picked parcel's author: run `forklift undo` twice first to keep them.
+
 A journal that cannot be read — corrupt, truncated, or written by a forklift with a
 different journal format — makes `undo` fail naming the file, never "nothing to undo".
 Remove the file to start a fresh journal; the undo history is lost, nothing else. Other
