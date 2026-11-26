@@ -753,6 +753,55 @@ fn a_boundary_survives_gc_and_only_the_new_parcel_exports() {
     assert_eq!(outcome(&second, "feat")["exported"], 1, "{}", second);
 }
 
+/// A roots record that is tainted and then lost, as a power loss leaves a birth write whose folder
+/// sync failed, is resolved by heal with a note: no heal pass writes the record, so this reaches
+/// the vanished disposition through the command. Heal exits 0 with nothing left recorded and
+/// writes no record back. After a gc that no record holds feat's history through, the next run
+/// still pushes feat and records its root again, as the note says.
+///
+/// Revert: the mirror roots shape's disposition back to `None` → heal refuses with exit 21 → red.
+#[test]
+fn heal_clears_a_taint_naming_a_lost_roots_record_and_the_next_run_records_it_again() {
+    let fixture = Fixture::new("lost-roots-heal");
+    let area = &fixture.area;
+
+    fixture.franchise("b");
+    area.forklift_ok("b", &["pallet", "create", "feat"]);
+    area.stack("b", "feat.txt", "feat 1\n", "feat one");
+    area.lift("b");
+
+    let first = area.json("a", &["git", "mirror"]);
+    assert_eq!(outcome(&first, "feat")["status"], "pushed", "{}", first);
+    let record = fixture.roots_record("a");
+    assert!(record_entries(&record).iter().any(|(pallet, _)| pallet == "feat"), "sanity: feat is recorded");
+
+    let taints = forklift_core::util::taint_utils::taint_dir_path_under(&area.path("a"));
+    std::fs::create_dir_all(&taints).unwrap();
+    std::fs::write(taints.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(["mirror-roots"])).unwrap();
+    forklift_core::util::file_utils::remove_file(&record).unwrap();
+
+    let healed = area.forklift("a", &["heal"]);
+    let said = format!("{}{}", stdout(&healed), stderr(&healed));
+    assert_success(&healed);
+    assert!(said.contains("the git mirror's roots record \"mirror-roots\" is gone; Forklift reads a missing one as \
+        an empty one"), "{}", said);
+    assert!(std::fs::read_dir(&taints).map(|entries| entries.count() == 0).unwrap_or(true),
+        "nothing stays recorded: {}", said);
+    assert!(!record.exists(), "heal writes no roots record back");
+
+    {
+        let _scope = StorageRootScope::enter(&area.path("a"));
+        gc_utils::collect_garbage(0).expect("gc runs");
+    }
+
+    area.stack("b", "feat.txt", "feat 2\n", "feat two");
+    area.lift("b");
+
+    let second = area.json("a", &["git", "mirror"]);
+    assert_eq!(outcome(&second, "feat")["status"], "pushed", "{}", second);
+    assert!(record_entries(&record).iter().any(|(pallet, _)| pallet == "feat"), "feat is recorded again");
+}
+
 /// Memo test 20: a mirror failure never fails the lift. An unreachable mirror is reported with
 /// git's message and the step `forklift git mirror`; a mirror that asks for credentials fails at once,
 /// because git may not prompt inside a lift.
