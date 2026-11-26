@@ -2596,6 +2596,17 @@ fn ref_write_test_checkpoint(name: &str) {
 #[cfg(not(test))]
 fn ref_write_test_checkpoint(_name: &str) {}
 
+/// Test seam: a ref update for the armed pallet name runs the closure armed as `<name>/owed` once
+/// the write owes its apply, just before it lands: a window no decision-time arm reaches. No
+/// pallet name holds a `/`, so the key meets no other arm.
+#[cfg(test)]
+fn ref_write_owed_test_checkpoint(name: &str) {
+    ref_write_test_checkpoint(&format!("{}/owed", name));
+}
+
+#[cfg(not(test))]
+fn ref_write_owed_test_checkpoint(_name: &str) {}
+
 /// Test counter: the decisions each ref update made, by warehouse forklift root and pallet name.
 #[cfg(test)]
 static REF_UPDATE_ATTEMPTS_TEST_COUNT: Mutex<BTreeMap<(PathBuf, String), u32>> = Mutex::new(BTreeMap::new());
@@ -2841,31 +2852,61 @@ fn resolve_handle(state: &AppState,
 /// Run blocking storage work on the blocking pool, inside the warehouse's storage-root
 /// scope. The scope is thread-local and the closure runs synchronously on one blocking
 /// thread, so it can never leak into another request.
+///
+/// A task that did not finish, a panic included, comes back as an internal error in every build:
+/// this is for work no request awaits, whose caller logs a failure and keeps its own state
+/// straight. A request's handler uses [`request_blocking`] instead.
 async fn blocking<T: Send + 'static>(
     warehouse: Arc<WarehouseHandle>,
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
-    blocking_unscoped(move || {
+    scoped_storage_task(warehouse, work).await.unwrap_or_else(|error| Err(storage_task_failed(error)))
+}
+
+/// [`blocking`] for a request's handler: a debug build raises a panic of the work again on the
+/// awaiting task ([`reraise_storage_panic`]), so a test driving the handler fails on it.
+async fn request_blocking<T: Send + 'static>(
+    warehouse: Arc<WarehouseHandle>,
+    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
+) -> Result<T, HandlerError> {
+    scoped_storage_task(warehouse, work).await
+        .unwrap_or_else(|error| Err(storage_task_failed(reraise_storage_panic(error))))
+}
+
+/// [`request_blocking`] outside any warehouse's scope — for work on the server's folders
+/// themselves, such as creating a warehouse.
+async fn request_blocking_unscoped<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
+) -> Result<T, HandlerError> {
+    tokio::task::spawn_blocking(work).await
+        .unwrap_or_else(|error| Err(storage_task_failed(reraise_storage_panic(error))))
+}
+
+/// Run blocking storage work inside the warehouse's scope, as [`blocking`] does, handing back a
+/// task that did not finish as it is, for a caller that has state to settle before it reports it
+/// or raises it again.
+async fn scoped_storage_task<T: Send + 'static>(
+    warehouse: Arc<WarehouseHandle>,
+    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
+) -> Result<Result<T, HandlerError>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
         let _scope = StorageRootScope::enter(&warehouse.root);
 
         work()
     }).await
 }
 
-/// Run blocking work on the blocking pool outside any warehouse's scope — for work on the server's
-/// folders themselves, such as creating a warehouse.
-async fn blocking_unscoped<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
-) -> Result<T, HandlerError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| internal(format!("A storage task failed: {}", reraise_storage_panic(e))))?
+/// The internal error a storage task that did not finish is reported as.
+fn storage_task_failed(error: tokio::task::JoinError) -> HandlerError {
+    internal(format!("A storage task failed: {}", error))
 }
 
-/// What a storage task that did not finish leaves for its caller to report. A debug build raises a
-/// panic again on the caller's task instead: a reply or a log line would let a test that expects
-/// any failure pass over it, the debug build's undeclared-taint-shape assertion included. A
-/// release build reports it, so one request's panic never takes the server down.
+/// What a request's storage task that did not finish leaves for its caller to report. A debug build
+/// raises a panic again on the caller's task instead: a reply would let a test that expects any
+/// failure pass over it, the debug build's undeclared-taint-shape assertion included. A release
+/// build reports it, so one request's panic never takes the server down. Only a request's task
+/// calls it: a panic raised in a task nobody awaits is lost, and the state that task keeps is left
+/// unsettled.
 fn reraise_storage_panic(error: tokio::task::JoinError) -> tokio::task::JoinError {
     reraise_storage_panic_when(error, cfg!(debug_assertions))
 }
@@ -3051,7 +3092,7 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
     }
 
     let (base, create_id) = (base.clone(), id.clone());
-    let result = blocking_unscoped(move || create_warehouse(&base, &create_id)).await;
+    let result = request_blocking_unscoped(move || create_warehouse(&base, &create_id)).await;
 
     match result {
         Ok(creation) => {
@@ -3088,7 +3129,7 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         let mut pallets = std::collections::BTreeMap::new();
 
         // Both namespaces travel in one map, keyed by the qualified reference form: user
@@ -3150,7 +3191,7 @@ async fn post_missing(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         // A chunk an owed deletion withholds is missing here, as `GET` answers it: a lift naming
         // it uploads it. Content the host withholds is never missing, held or not: this head
         // takes none of it, and its ref writes tolerate its absence.
@@ -3222,7 +3263,7 @@ async fn post_holds(State(state): State<Arc<AppState>>,
         return Json(HoldsResponse { holds }).into_response();
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         let _permit = permit;
         let head = match pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name).map_err(internal)? {
             Some(head) => Some(head),
@@ -3271,7 +3312,7 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         let (applied, withheld) = (read_applied()?, read_withheld()?);
 
         // A redacted hash refuses the lift: the client checks its history against its own
@@ -3361,13 +3402,13 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = permit.spawn(blocking(warehouse, move || {
+    let result = permit.spawn(request_blocking(warehouse, move || {
         let removed = withholding::removed().map_err(internal)?;
         let withheld = withheld_among(&gate, &removed, &request.hashes)?;
         let hashes: Vec<String> = request.hashes.into_iter().filter(|hash| !withheld.contains(hash)).collect();
 
         partial_bundle(&hashes)
-    })).await.unwrap_or_else(|e| Err(internal(format!("A batch fetch failed: {}", e))));
+    })).await.unwrap_or_else(|e| Err(internal(format!("A batch fetch failed: {}", reraise_storage_panic(e)))));
 
     match result {
         Ok(bytes) => (
@@ -3420,7 +3461,7 @@ async fn get_object(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         let (applied, withheld) = (read_applied()?, read_withheld()?);
         refuse_removed(&applied, &withheld, &hash)?;
 
@@ -3459,7 +3500,7 @@ async fn put_object(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         require_uploader(&principal)?;
 
         // An upload that checked before a redaction applied, or before its host withheld it, and
@@ -3499,7 +3540,7 @@ async fn put_withheld_recipe(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         require_uploader(&principal)?;
 
         let digest = withholding::recipe_digest(&hash, &body).map_err(unprocessable)?;
@@ -3526,7 +3567,7 @@ async fn get_signature(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         sign_utils::load_raw_parcel_signature(&hash).map_err(internal)
     }).await;
 
@@ -3558,7 +3599,7 @@ async fn put_signature(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         require_uploader(&principal)?;
 
         let existed = sign_utils::load_raw_parcel_signature(&hash).map_err(internal)?;
@@ -3608,7 +3649,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
     };
 
     let counted = RefWriteCounted::start(&warehouse);
-    let result = permit.spawn(blocking(Arc::clone(&warehouse), move || {
+    let result = permit.spawn(request_blocking(Arc::clone(&warehouse), move || {
         let _counted = counted;
 
         match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
@@ -3724,7 +3765,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 Ok(Some(event))
             }
         }
-    })).await.unwrap_or_else(|e| Err(internal(format!("A trust install failed: {}", e))));
+    })).await.unwrap_or_else(|e| Err(internal(format!("A trust install failed: {}", reraise_storage_panic(e)))));
 
     match result {
         Ok(Some(mut event)) => {
@@ -3782,7 +3823,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     // Whether the write reached the point where it may land, and so owes an apply.
     let took = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let took_owe = Arc::clone(&took);
-    let write = blocking(Arc::clone(&warehouse), move || {
+    let write = scoped_storage_task(Arc::clone(&warehouse), move || {
         let counted = counted;
         // A meta pallet arrives as `@office`. The server routes by *namespace*, never by a
         // hard-coded name (DESIGN.html §3.3).
@@ -4033,6 +4074,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // Owed from before the write may land until it returns; its apply discharges it.
             took_owe.store(true, std::sync::atomic::Ordering::SeqCst);
             let owed = counted.0.owe_apply();
+            ref_write_owed_test_checkpoint(&name);
             let written = pallet_utils::update_pallet_head_verified(
                 namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified,
                 request.tombstone.as_deref()
@@ -4083,7 +4125,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         let state = Arc::clone(&state);
         async move {
             match write.await {
-                Ok(events) => {
+                Ok(Ok(events)) => {
                     for event in events {
                         emit_event(&state, event);
                     }
@@ -4091,9 +4133,11 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     after_ref_write(&state, warehouse).await;
                     Ok(())
                 }
-                Err(error) => {
+                failed => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
-                    Err(error)
+                    // Raised again only now, once the apply the write took is asked for again.
+                    failed.unwrap_or_else(|error| Err(storage_task_failed(reraise_storage_panic(error))))
+                        .map(|_| ())
                 }
             }
         }
@@ -4102,7 +4146,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     match settled {
         Ok(Ok(())) => StatusCode::OK.into_response(),
         Ok(Err(error)) => error_response(error),
-        Err(error) => error_response(internal(format!("A ref write failed: {}", error))),
+        Err(error) => error_response(internal(format!("A ref write failed: {}", reraise_storage_panic(error)))),
     }
 }
 
@@ -4153,7 +4197,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     // Whether the write reached the point where it may land, and so owes an apply.
     let took = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let took_owe = Arc::clone(&took);
-    let deletion = blocking(Arc::clone(&warehouse), move || {
+    let deletion = scoped_storage_task(Arc::clone(&warehouse), move || {
         let counted = counted;
         if pallet_ref.namespace == pallet_utils::PalletNamespace::Meta {
             return Err(unprocessable(format!(
@@ -4278,19 +4322,21 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
         let state = Arc::clone(&state);
         async move {
             match deletion.await {
-                Ok(Some(event)) => {
+                Ok(Ok(Some(event))) => {
                     emit_event(&state, event);
 
                     after_ref_write(&state, warehouse).await;
                     Ok(())
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     Ok(())
                 }
-                Err(error) => {
+                failed => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
-                    Err(error)
+                    // Raised again only now, once the apply the deletion took is asked for again.
+                    failed.unwrap_or_else(|error| Err(storage_task_failed(reraise_storage_panic(error))))
+                        .map(|_| ())
                 }
             }
         }
@@ -4299,7 +4345,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     match settled {
         Ok(Ok(())) => StatusCode::OK.into_response(),
         Ok(Err(error)) => error_response(error),
-        Err(error) => error_response(internal(format!("A pallet deletion failed: {}", error))),
+        Err(error) => error_response(internal(format!("A pallet deletion failed: {}", reraise_storage_panic(error)))),
     }
 }
 
@@ -7075,17 +7121,91 @@ mod tests {
         assert!(handed_back.is_cancelled(), "{handed_back}");
     }
 
-    /// In a debug build, a panic in a request's storage work fails the request's own task, so a
-    /// test driving a handler fails on it rather than reading an internal-error reply. This is the
-    /// test the suite fails by when a debug assertion fires in server storage code.
+    /// The payload a task that panicked with a literal message raised, when it was that message.
+    fn literal_payload(raised: Box<dyn std::any::Any + Send>) -> Option<&'static str> {
+        raised.downcast_ref::<&'static str>().copied()
+    }
+
+    /// In a debug build, a panic in a request's storage work fails the request's own task with the
+    /// work's own payload, so a test driving a handler fails on it rather than reading an
+    /// internal-error reply.
     ///
     /// Revert: report every storage panic (`reraise_storage_panic_when(error, false)`) → the call
-    /// returns an internal error, and the test fails for not panicking.
+    /// returns an internal error → "the storage panic is raised again" fails; raise a new panic
+    /// naming the JoinError instead of resuming → the payload is a `String` → the payload
+    /// assertion fails.
     #[cfg(debug_assertions)]
     #[tokio::test]
-    #[should_panic(expected = "planted storage panic")]
     async fn a_debug_build_raises_a_storage_panic_on_the_requests_task() {
-        let _ = blocking_unscoped(|| -> Result<(), HandlerError> { panic!("planted storage panic") }).await;
+        let unscoped = tokio::spawn(request_blocking_unscoped(|| -> Result<(), HandlerError> { panic!("planted storage panic") }));
+        let raised = unscoped.await.expect_err("the unscoped storage panic is raised again");
+        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+
+        let warehouse = Arc::new(WarehouseHandle::new(scratch_dir("storage-panic-scoped")));
+        let scoped = tokio::spawn(request_blocking(warehouse, || -> Result<(), HandlerError> { panic!("planted storage panic") }));
+        let raised = scoped.await.expect_err("the scoped storage panic is raised again");
+        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+    }
+
+    /// Work no request awaits gets a storage panic back as an internal error in every build, so its
+    /// caller logs it and keeps its own state straight.
+    ///
+    /// Revert: raise it again in `blocking` (`storage_task_failed(reraise_storage_panic(error))`) →
+    /// the awaiting task panics → "a background caller gets an error back" fails.
+    #[tokio::test]
+    async fn work_no_request_awaits_gets_a_storage_panic_back_as_an_error() {
+        let warehouse = Arc::new(WarehouseHandle::new(scratch_dir("storage-panic-background")));
+        let background = tokio::spawn(blocking(warehouse, || -> Result<(), HandlerError> { panic!("planted storage panic") }));
+        let (status, message) = background.await.expect("a background caller gets an error back")
+            .expect_err("the panic is an error");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(message.starts_with("A storage task failed: ") && message.contains("planted storage panic"), "{message}");
+    }
+
+    /// In a debug build, a Heavy ref write's storage panic reaches the request's own task too, though
+    /// the write runs in the permit's task; and only once the apply the write owed is settled, as a
+    /// failed write's is, so the warehouse does not stay closed to content.
+    ///
+    /// Revert: report the permit task's panic (`internal(format!("A ref write failed: {}", error))`)
+    /// → the request answers 500 → "the storage panic is raised again" fails; raise it before
+    /// `after_failed_ref_write` → the apply stays owed → the last assertion fails.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_debug_build_raises_a_ref_writes_storage_panic_once_its_apply_is_settled() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let closed_at_the_panic = Arc::new(AtomicUsize::new(0));
+        let _seam = arm_write_seam(&fixture.root, "pushed/owed", {
+            let handle = Arc::clone(&handle);
+            let closed = Arc::clone(&closed_at_the_panic);
+            move || {
+                closed.store(usize::from(handle.applies_closed()) + 1, Ordering::SeqCst);
+                panic!("planted storage panic")
+            }
+        });
+
+        let push = tokio::spawn({
+            let state = Arc::clone(&state);
+            let pushed = fixture.pushed.clone();
+            async move {
+                post_ref_update(
+                    State(state), Extension(Principal::Open), Path(ref_update_params("pushed")),
+                    Json(RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None }),
+                ).await.into_response()
+            }
+        });
+        let raised = push.await.expect_err("the storage panic is raised again");
+
+        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+        assert!(!fixture.changed(HeavyRoute::RefUpdate), "the push did not land");
+        assert_eq!(closed_at_the_panic.load(Ordering::SeqCst), 2, "the write owed its apply when it panicked");
+        assert!(!handle.applies_closed(), "the apply the write owed was settled before the panic was raised");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
     }
 
     // ---------------------------------------------------------------------------------
