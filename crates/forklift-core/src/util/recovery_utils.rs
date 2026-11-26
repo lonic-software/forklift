@@ -972,6 +972,22 @@ async fn resolve_the_rest(
                     ));
                 }
             },
+            // A gone latest bundle reads as none built, as it does with no taint (see
+            // `VanishedClass::LatestBundle`), so its absence is made durable and the path
+            // resolved, with a note saying what the absence gives up.
+            VanishedClass::LatestBundle => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => {
+                    refs_resolved.push(relative.to_string_lossy().replace('\\', "/"));
+                    vanished_notes.push(lost_latest_bundle_note(relative));
+                }
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost latest bundle whose loss could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy().replace('\\', "/"), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1692,7 +1708,8 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
             | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy | Disposition::Scope
             | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy | Disposition::Journal
-            | Disposition::BayPath | Disposition::FetchScope | Disposition::FetchLedger | Disposition::MirrorRoots)
+            | Disposition::BayPath | Disposition::FetchScope | Disposition::FetchLedger | Disposition::MirrorRoots
+            | Disposition::LatestBundle)
             | None => false,
     }
 }
@@ -1998,6 +2015,17 @@ enum VanishedClass {
     /// only what the run loaded or recorded itself, so a lost entry comes back only for a pallet
     /// the run exported.
     MirrorRoots,
+    /// The warehouse's latest bundle (`bundles/latest`), gone since the taint was recorded. It is
+    /// written by a clone's publish of the bundle it imported (`bundle_utils::publish_bundle_download`,
+    /// the writer that records this taint) and by a bundle build (`bundle_utils::build_bundle`,
+    /// whose failed folder sync fails the build instead). It is removed by applying a redaction or
+    /// withholding content (`applied_redactions::reapply`, `withholding::withhold`), which withdraw
+    /// it, and by a resumed clone that recorded no import (`franchise_utils::keep_bundle`); no heal
+    /// pass writes it. Its reader, the server's bundle route, answers a missing one as none built,
+    /// taint or none, and a clone it answers so fetches objects instead. So a missing bundle is a
+    /// state the warehouse reaches without a fault. Keeping the taint would keep heal refusing over
+    /// it: the bundle reads the same either way, and only a build or a clone's publish writes one.
+    LatestBundle,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -2042,6 +2070,7 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::FetchScope => Some(VanishedClass::FetchScope),
         Disposition::FetchLedger => Some(VanishedClass::FetchLedger),
         Disposition::MirrorRoots => Some(VanishedClass::MirrorRoots),
+        Disposition::LatestBundle => Some(VanishedClass::LatestBundle),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
@@ -2311,6 +2340,17 @@ fn lost_mirror_roots_note(relative: &Path) -> String {
         "the git mirror's roots record \"{}\" is gone; Forklift reads a missing one as an empty one, as it \
         would with no taint, so the record no longer keeps the history it named from gc, and a later mirror run \
         records a root again only for a pallet it exports",
+        relative.to_string_lossy().replace('\\', "/")
+    )
+}
+
+/// The note for a resolved [`VanishedClass::LatestBundle`]: what reading the bundle as none built
+/// gives up.
+fn lost_latest_bundle_note(relative: &Path) -> String {
+    format!(
+        "the latest bundle \"{}\" is gone; Forklift reads a missing one as none built, as it would with no \
+        taint, so a server serving this warehouse answers that it has no bundle, and a clone from it fetches \
+        objects instead, until a bundle is built again",
         relative.to_string_lossy().replace('\\', "/")
     )
 }
@@ -7343,6 +7383,7 @@ mod tests {
             VanishedClass::FetchScope => "fetch scope".to_string(),
             VanishedClass::FetchLedger => "fetch ledger".to_string(),
             VanishedClass::MirrorRoots => "mirror roots".to_string(),
+            VanishedClass::LatestBundle => "latest bundle".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -7405,7 +7446,7 @@ mod tests {
             ("unvouched-heads".into(), "kept: the unvouched-heads record"),
             ("trust".into(), "kept: the trust anchor"),
             ("trust-copy".into(), "kept: the trust anchor's copy"),
-            ("bundles/latest".into(), "kept: the latest bundle's name"),
+            ("bundles/latest".into(), "latest bundle"),
             // Matched as the ref or keepsake it is, where the unanchored checks took it for an
             // object, a shard, a signature or a pack.
             ("pallets/data".into(), "ref"),
@@ -8083,6 +8124,75 @@ mod tests {
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
             assert!(!forklift.join(relative).exists(), "heal writes no mirror roots record back");
             assert!(mirror_utils::read_mirror_roots().unwrap().is_empty(), "the record reads as an empty one");
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost latest bundle is resolved with a note. It is lost as a write loses it: a clone's
+    /// publish of the bundle it imported fails its folder sync, which taints it, and a power loss
+    /// then undoes the publish. Where the absence cannot be made durable, the path stays and heal
+    /// refuses.
+    ///
+    /// Revert: the shape's disposition back to `None` → both rows refuse → red. Revert: resolve
+    /// without `sync_nearest_ancestor` → the failing-sync row clears → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_latest_bundle_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::bundle_utils;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        // (whether the absence can be made durable; the note, or the refusal's line where it cannot)
+        let cases: &[(bool, &str)] = &[
+            (true, "the latest bundle \"bundles/latest\" is gone; Forklift reads a missing one as none built, as \
+                it would with no taint, so a server serving this warehouse answers that it has no bundle, and a \
+                clone from it fetches objects instead, until a bundle is built again"),
+            (false, "a lost latest bundle whose loss could not be made durable: \"bundles/latest\""),
+        ];
+
+        for (durable, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-latest-bundle-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+            let relative = "bundles/latest";
+            let latest = bundle_utils::get_latest_bundle_path();
+            let bundles = latest.parent().unwrap().to_path_buf();
+            std::fs::create_dir_all(&bundles).unwrap();
+            std::fs::write(bundle_utils::get_bundle_download_path(), b"bundle").unwrap();
+
+            {
+                let _fault = SyncDirFaultGuard::failing_exactly(&bundles);
+                bundle_utils::publish_bundle_download().expect_err("a publish whose folder sync fails fails");
+            }
+            assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                [PathBuf::from(relative)].into_iter().collect(), "the bundle alone is recorded");
+            let _ = crate::util::file_utils::remove_file(&latest);
+            assert!(!latest.exists(), "sanity: the recorded path is gone");
+
+            if !*durable {
+                let _fault = SyncDirFaultGuard::failing_exactly(&bundles);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[*note]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the bundle stays recorded");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("a lost latest bundle is resolved: {}", error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative], "{:?}", outcome);
+            assert!(outcome.notes.iter().any(|said| said == note), "{:?}", outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            assert!(!latest.exists(), "heal writes no bundle back");
 
             crate::util::file_utils::remove_dir_all(&root).ok();
         }

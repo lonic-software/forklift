@@ -223,6 +223,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   as an empty record, as a missing one does with no taint, so it no longer keeps the history it
   named from gc, and a later mirror run records a root again only for a pallet it exports.
   Before, it kept heal refusing, even after the record was deleted as its own refusal advises.
+  A lost latest bundle (`.forklift/bundles/latest`) is now cleared the same way. It reads as none
+  built, as a missing one does with no taint, so a server serving the warehouse answers that it
+  has no bundle, and a clone from it fetches objects instead, until a bundle is built again.
+  Before, it kept heal refusing.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens

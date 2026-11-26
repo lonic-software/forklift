@@ -2745,6 +2745,34 @@ fn a_server_holding_a_previous_version_bundle_still_franchises() {
     assert!(!area.path("b/.forklift/bundles/latest").exists());
 }
 
+/// A clone's published bundle that is tainted and then lost, as a power loss leaves a publish
+/// whose folder sync failed, is resolved by heal with a note: no heal pass writes a bundle, so
+/// this reaches the vanished disposition through the command. Heal exits 0 with nothing left
+/// recorded and writes no bundle back.
+///
+/// Revert: the latest bundle shape's disposition back to `None` → heal refuses with exit 21 → red.
+#[test]
+fn heal_clears_a_taint_naming_a_lost_latest_bundle() {
+    let area = TestArea::new("bundle-lost-heal");
+    let (server, _) = warehouse_with_a_bundle(&area);
+
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
+    assert_success(&franchised);
+    let latest = area.path("b/.forklift/bundles/latest");
+    assert!(latest.is_file(), "sanity: the clone published the bundle it imported");
+
+    plant_taint(&area, "b", &["bundles/latest"]);
+    forklift_core::util::file_utils::remove_file(&latest).unwrap();
+
+    let healed = area.forklift("b", &["heal"]);
+    let said = format!("{}{}", stdout(&healed), stderr(&healed));
+    assert_success(&healed);
+    assert!(said.contains("the latest bundle \"bundles/latest\" is gone; Forklift reads a missing one as none built"),
+            "{}", said);
+    assert!(recorded_taint_paths(&area, "b").is_empty(), "nothing stays recorded: {}", said);
+    assert!(!latest.exists(), "heal writes no bundle back");
+}
+
 /// A head in front of a real server that answers the bundle itself, from `answer(n, head)` for its
 /// `n`th bundle request (the head lowercased), and forwards everything else. Each bundle request's
 /// head is kept.
