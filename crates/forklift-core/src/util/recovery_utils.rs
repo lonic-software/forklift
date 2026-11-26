@@ -249,8 +249,8 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
-    audit_utils, bay_utils, checkout_scope_heal, fanout_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, mirror_utils, object_utils,
-    office_utils, pack_utils, pallet_utils, park_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
+    audit_utils, bay_utils, checkout_scope_heal, fanout_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, merge_state_heal, merge_utils, mirror_utils, object_utils,
+    office_utils, operation_utils, pack_utils, pallet_utils, park_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     signature_table, taint_utils, tombstone_utils,
 };
 use crate::util::sealed_utils::{At, Held, Tolerated};
@@ -866,6 +866,25 @@ async fn resolve_the_rest(
                         dangling_lines.push(format!(
                             "a lost checkout {} or copy whose loss could not be made durable: \"{}\" ({})",
                             lost.record.name(), relative.to_string_lossy(), error
+                        ));
+                    }
+                }
+            }
+            // A lost consolidation record reads as its readers read it with no taint (see
+            // `VanishedClass::MergeRecord`), and a lost copy costs nothing a reader relies on: each
+            // absence is made durable and the record resolved, with a note saying what it read.
+            VanishedClass::MergeRecord | VanishedClass::MergeRecordCopy => {
+                let lost = LostMergeRecord::of(relative);
+                match sync_nearest_ancestor(root, relative) {
+                    Ok(()) => {
+                        refs_resolved.push(relative.to_string_lossy().into_owned());
+                        vanished_notes.push(lost_merge_record_note(&lost));
+                    }
+                    Err(error) => {
+                        remainder.insert(relative.clone());
+                        dangling_lines.push(format!(
+                            "a lost {} or copy whose loss could not be made durable: \"{}\" ({})",
+                            lost.record.what(), relative.to_string_lossy(), error
                         ));
                     }
                 }
@@ -1589,7 +1608,7 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         // A loose signature sidecar is skipped by the loose walk (`walk_loose_object_paths`).
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
             | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy | Disposition::Scope
-            | Disposition::ScopeCopy) | None => false,
+            | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy) | None => false,
     }
 }
 
@@ -1812,6 +1831,20 @@ enum VanishedClass {
     /// every scope write writes the copy first (`scope_utils::write_checkout_scope`). The copy of
     /// the checkout heal runs in can still be found gone here, where that pass left it so.
     ScopeCopy,
+    /// A checkout's consolidation state or out-of-scope skeleton (`consolidation`,
+    /// `consolidation-skeleton`, or a bay's), gone since the taint was recorded. Every write of
+    /// either runs under the merge's operation marker (`consolidate::merge_head_into_current`
+    /// raises it first), or is an undo putting a consolidation back (`journal_utils::restore_refs`),
+    /// which a retry of that undo resumes; every other change of either is a clear. A missing state
+    /// reads as no consolidation in progress (`merge_utils::read_consolidation_state_in`), and a
+    /// skeleton missing beside a state is refused as damaged
+    /// (`merge_utils::OutOfScopeSkeleton::read_required`), taint or none, so keeping the record
+    /// would guard nothing the absence does not already settle, and it stands before the marker's
+    /// recovery, which waits for the taint.
+    MergeRecord,
+    /// The copy of a consolidation state or skeleton, gone since the taint was recorded. Only heal
+    /// reads a copy, to write a damaged record back (`merge_state_heal::repair`).
+    MergeRecordCopy,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -1848,6 +1881,8 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::PositionCopy => Some(VanishedClass::PositionCopy),
         Disposition::Scope => Some(VanishedClass::Scope),
         Disposition::ScopeCopy => Some(VanishedClass::ScopeCopy),
+        Disposition::MergeRecord => Some(VanishedClass::MergeRecord),
+        Disposition::MergeRecordCopy => Some(VanishedClass::MergeRecordCopy),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
@@ -2023,6 +2058,148 @@ fn lost_checkout_record_note(lost: &LostCheckoutRecord) -> String {
         "{}, and {}; the ways out are {} run in the bay's working directory, or {}",
         lost_what, recorded, heal, remove
     )
+}
+
+/// A record of a consolidation in progress whose loss heal resolves with a note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsolidationRecord {
+    State,
+    Skeleton,
+}
+
+impl ConsolidationRecord {
+    /// The record in a sentence.
+    fn what(self) -> &'static str {
+        match self {
+            ConsolidationRecord::State => "consolidation state",
+            ConsolidationRecord::Skeleton => "consolidation skeleton",
+        }
+    }
+}
+
+/// The way out a lost skeleton's note names for what stands beside it.
+enum Step {
+    /// None is named.
+    Nothing,
+    /// The Forklift that wrote the state beside it.
+    Newer,
+    /// This command, run in that checkout.
+    Run(&'static str),
+}
+
+/// A resolved [`VanishedClass::MergeRecord`] or [`VanishedClass::MergeRecordCopy`]: the record,
+/// whether it is the copy, and whose it is, read from its path.
+struct LostMergeRecord {
+    record: ConsolidationRecord,
+    copy: bool,
+    /// The bay's name, or `None` for the warehouse's own working tree.
+    bay: Option<String>,
+    /// The path, root-relative, with "/" between its names.
+    path: String,
+}
+
+impl LostMergeRecord {
+    fn of(relative: &Path) -> LostMergeRecord {
+        let names: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+        let bay = match names.as_slice() {
+            [bays, name, _] if bays == crate::globals::FOLDER_NAME_BAYS_ROOT => Some(name.clone()),
+            _ => None,
+        };
+        let last = names.last().map(String::as_str);
+        let record = match last == Some(merge_utils::FILE_NAME_SKELETON) || last == Some(merge_utils::FILE_NAME_SKELETON_COPY) {
+            true => ConsolidationRecord::Skeleton,
+            false => ConsolidationRecord::State,
+        };
+        let copy = last == Some(merge_utils::FILE_NAME_CONSOLIDATION_COPY) || last == Some(merge_utils::FILE_NAME_SKELETON_COPY);
+
+        LostMergeRecord { record, copy, bay, path: names.join("/") }
+    }
+}
+
+/// The note for a [`LostMergeRecord`]. It says what the record's absence reads as and what it read
+/// beside it: the skeleton beside a lost state, the state beside a lost skeleton, an operation
+/// marker. For a checkout other than the one heal runs in, it names the way out there: heal where a
+/// marker stands; beside a lost skeleton, the step the refusal over that state names
+/// (`merge_state_heal::damaged_step_in`), or the Forklift that wrote a newer state. The checkout heal
+/// runs in recovers its own marker after the taint recovery, and has judged its own merge records
+/// before it (`merge_state_heal::repair`), so its notes name neither.
+fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
+    let record = lost.record.what();
+    let path = &lost.path;
+    let (which, dir, there) = match &lost.bay {
+        Some(name) => (format!("bay \"{}\"", name), bay_utils::bay_state_dir(name), "the bay's working directory"),
+        None => ("the warehouse's own working tree".to_string(), forklift_root(), "that working tree"),
+    };
+
+    if lost.copy {
+        return format!(
+            "the copy of the {} of {} (\"{}\") is gone; only heal reads a copy, to write a damaged record back",
+            record, which, path
+        );
+    }
+
+    let active = dir == crate::globals::bay_root();
+    let marker_stands = operation_utils::marker_stands_in(&dir);
+    let marker = match !active && marker_stands {
+        true => Some(format!(
+            "an interrupted operation's marker stands in that checkout, and the way out is \"forklift heal\" run in {}",
+            there
+        )),
+        false => None,
+    };
+
+    match lost.record {
+        ConsolidationRecord::State => {
+            // `merge_utils::state_present` counts a skeleton alone as a consolidation in progress. The
+            // note says what stands as heal reads it here; a marker's recovery may change it after.
+            let reads = match std::fs::symlink_metadata(dir.join(merge_utils::FILE_NAME_SKELETON)).is_ok() {
+                true => "a consolidation skeleton still stands beside it",
+                false => "that checkout reads as having no consolidation in progress, as it would with no taint",
+            };
+            let tail = match (marker, marker_stands) {
+                (Some(marker), _) => format!("; {}", marker),
+                (None, true) => String::new(),
+                (None, false) => "; if a command that records one failed there before this heal, run it again".to_string(),
+            };
+            format!("the {} of {} (\"{}\") is gone; {}{}", record, which, path, reads, tail)
+        }
+        ConsolidationRecord::Skeleton => {
+            // The way out where no marker stands: the step for the record the refusal over this
+            // state names. A state that does not read is judged first, a usable one's skeleton next.
+            let state = dir.join(merge_utils::FILE_NAME_CONSOLIDATION);
+            let (beside, step) = match merge_utils::read_record_bytes(&state) {
+                Ok(None) => ("no consolidation state stands beside it".to_string(), Step::Nothing),
+                Ok(Some(bytes)) => match merge_utils::parse_consolidation_state(&bytes) {
+                    Ok(state) => (
+                        "a consolidation state that reads stands beside it".to_string(),
+                        Step::Run(merge_state_heal::damaged_step_in(&dir, merge_state_heal::MergeRecord::Skeleton,
+                            Some(&state.skeleton_digest))),
+                    ),
+                    Err(merge_utils::Unusable::Newer(reason)) => (
+                        format!("the consolidation state beside it {}", reason.trim_end_matches('.')),
+                        Step::Newer,
+                    ),
+                    Err(merge_utils::Unusable::Damaged(reason)) => (
+                        format!("the consolidation state beside it {}", reason.trim_end_matches('.')),
+                        Step::Run(merge_state_heal::damaged_step_in(&dir, merge_state_heal::MergeRecord::State, None)),
+                    ),
+                },
+                Err(Ok(reason)) => (
+                    format!("the consolidation state beside it {}", reason.trim_end_matches('.')),
+                    Step::Run(merge_state_heal::damaged_step_in(&dir, merge_state_heal::MergeRecord::State, None)),
+                ),
+                Err(Err(error)) => (format!("the consolidation state beside it does not read ({})", error.trim_end_matches('.')), Step::Nothing),
+            };
+            let tail = match (marker, step) {
+                (Some(marker), _) => format!("; {}", marker),
+                // A newer state's way out is the same from every checkout.
+                (None, Step::Newer) => "; the way out is the Forklift that wrote it".to_string(),
+                (None, Step::Run(step)) if !active => format!("; the way out is \"{}\" run in {}", step, there),
+                (None, _) => String::new(),
+            };
+            format!("the {} of {} (\"{}\") is gone, and {}{}", record, which, path, beside, tail)
+        }
+    }
 }
 
 /// The meta pallet `relative`'s final name is, one of [`META_PALLET_NAMES`], or `None`.
@@ -6859,6 +7036,8 @@ mod tests {
             VanishedClass::PositionCopy => "position copy".to_string(),
             VanishedClass::Scope => "checkout scope".to_string(),
             VanishedClass::ScopeCopy => "scope copy".to_string(),
+            VanishedClass::MergeRecord => "merge record".to_string(),
+            VanishedClass::MergeRecordCopy => "merge record copy".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -6892,20 +7071,20 @@ mod tests {
             ("position-copy".into(), "position copy"),
             (scope_utils::FILE_NAME_BAY_SCOPE.into(), "checkout scope"),
             ("scope-copy".into(), "scope copy"),
-            ("consolidation".into(), "kept: the consolidation state"),
-            ("consolidation-copy".into(), "kept: the consolidation state's copy"),
-            ("consolidation-skeleton".into(), "kept: the consolidation skeleton"),
-            ("consolidation-skeleton-copy".into(), "kept: the consolidation skeleton's copy"),
+            ("consolidation".into(), "merge record"),
+            ("consolidation-copy".into(), "merge record copy"),
+            ("consolidation-skeleton".into(), "merge record"),
+            ("consolidation-skeleton-copy".into(), "merge record copy"),
             ("journal.json".into(), "kept: the journal"),
             ("bays/main/inventory/incomplete-load".into(), "load marker"),
             ("bays/main/position".into(), "position"),
             ("bays/main/position-copy".into(), "position copy"),
             ("bays/main/scope".into(), "checkout scope"),
             ("bays/main/scope-copy".into(), "scope copy"),
-            ("bays/main/consolidation".into(), "kept: a bay's consolidation state"),
-            ("bays/main/consolidation-copy".into(), "kept: a bay's consolidation state's copy"),
-            ("bays/main/consolidation-skeleton".into(), "kept: a bay's consolidation skeleton"),
-            ("bays/main/consolidation-skeleton-copy".into(), "kept: a bay's consolidation skeleton's copy"),
+            ("bays/main/consolidation".into(), "merge record"),
+            ("bays/main/consolidation-copy".into(), "merge record copy"),
+            ("bays/main/consolidation-skeleton".into(), "merge record"),
+            ("bays/main/consolidation-skeleton-copy".into(), "merge record copy"),
             ("bays/main/journal.json".into(), "kept: a bay's journal"),
             ("bays/main/path".into(), "kept: a bay's path record"),
             ("bays/main/cherry-pick".into(), "kept: a bay's cherry-pick state"),
@@ -7502,6 +7681,251 @@ mod tests {
             assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
             let note = note.replace("{mode}", mode_error.trim_end_matches('.')).replace("{scope}", scope_utils::FILE_NAME_BAY_SCOPE);
             assert!(outcome.notes.contains(&note), "{}:\n  want {}\n  got  {:?}", relative, note, outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A bay's consolidation record write fails a folder sync and taints what it was writing: the
+    /// copy, which goes first, or the record after it. A power loss then undoes that file. Heal,
+    /// run from the warehouse's own working tree, resolves the lost record with a note. Where the
+    /// absence cannot be made durable, the record stays and heal refuses.
+    ///
+    /// Revert: the consolidation shapes' disposition back to `None` → heal refuses → red. Revert:
+    /// resolve without `sync_nearest_ancestor` → the failing-sync heal clears → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_bay_consolidation_record_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        // (the record's name, the syncs of the state folder that pass before the one that fails,
+        // the path recorded, whether heal can make its absence durable, the note)
+        let cases: &[(&str, usize, &str, bool, &str)] = &[
+            ("consolidation", 0, "bays/b/consolidation-copy", true, "the copy of the consolidation state of bay \"b\" \
+                (\"bays/b/consolidation-copy\") is gone; only heal reads a copy, to write a damaged record back"),
+            ("consolidation", 1, "bays/b/consolidation", true, "the consolidation state of bay \"b\" \
+                (\"bays/b/consolidation\") is gone; that checkout reads as having no consolidation in progress, as it \
+                would with no taint; if a command that records one failed there before this heal, run it again"),
+            ("consolidation-skeleton", 1, "bays/b/consolidation-skeleton", true, "the consolidation skeleton of bay \
+                \"b\" (\"bays/b/consolidation-skeleton\") is gone, and no consolidation state stands beside it"),
+            ("consolidation", 1, "bays/b/consolidation", false, ""),
+        ];
+
+        for (name, passed, relative, durable, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-merge-record-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            let folder = bay_utils::bay_state_dir("b");
+            std::fs::create_dir_all(&folder).unwrap();
+            {
+                let _fault = SyncDirFaultGuard::failing_exactly_after(&folder, *passed);
+                merge_utils::write_record_and_copy(&folder.join(name), &folder.join(format!("{}-copy", name)), b"bytes")
+                    .expect_err("a record write whose folder sync fails fails");
+            }
+            assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                [PathBuf::from(relative)].into_iter().collect(), "{}: the file written alone is recorded", relative);
+
+            crate::util::file_utils::remove_file(&forklift.join(relative)).unwrap();
+
+            if !durable {
+                let _fault = SyncDirFaultGuard::failing_exactly(&folder);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[
+                    "a lost consolidation state or copy whose loss could not be made durable: \"bays/b/consolidation\"",
+                ]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{}: a lost merge record is resolved: {}", relative, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
+            assert!(outcome.notes.contains(&note.to_string()), "{}: {:?}", relative, outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost path of each consolidation shape is resolved with the note for its checkout. A lost
+    /// state's note says whether a skeleton still stands beside it, and a lost skeleton's what the
+    /// state beside it reads. For a checkout other than the one heal runs in, the note names heal run
+    /// there where an operation marker stands, and beside a lost skeleton the step the refusal over
+    /// that state names; for the one heal runs in, which these tests run in, it names neither.
+    ///
+    /// Revert: any of the shapes' disposition back to `None` → its row refuses → red. Revert: the
+    /// marker not read → the marker rows say "run it again" or nothing → red. Revert: the active
+    /// checkout not told apart → the main tree's rows name heal → red. Revert: the state beside a
+    /// skeleton not read → the rows beside one say none stands → red. Revert: heal named beside
+    /// every state → the rows naming abort are red; abort named beside every state → the copy row.
+    #[test]
+    fn heal_resolves_a_lost_consolidation_record_of_each_shape() {
+        use crate::globals::StorageRootScope;
+        use crate::model::tree_item::TreeItem;
+
+        #[derive(Clone, Copy)]
+        enum Beside {
+            Nothing,
+            /// A consolidation state that reads, and no skeleton copy.
+            State,
+            /// A consolidation state that reads, and a skeleton copy of the digest it records.
+            StateAndSkeletonCopy,
+            /// A consolidation state file a newer Forklift wrote.
+            NewerState,
+            /// A consolidation state file of bytes that do not parse.
+            Damaged,
+            /// A folder in the consolidation state's place.
+            Folder,
+            /// A consolidation state file of bytes that do not parse, and a usable copy of a state that
+            /// agrees with the bay's position.
+            DamagedWithStateCopy,
+            /// A consolidation state file a newer Forklift wrote, and an operation marker.
+            NewerStateAndMarker,
+            /// A consolidation skeleton and an operation marker.
+            SkeletonAndMarker,
+            /// A consolidation skeleton.
+            Skeleton,
+            /// An operation marker.
+            Marker,
+        }
+
+        const RUN_AGAIN: &str = "if a command that records one failed there before this heal, run it again";
+        const NO_TAINT: &str = "that checkout reads as having no consolidation in progress, as it would with no taint";
+        const BAY_HEAL: &str = "the way out is \"forklift heal\" run in the bay's working directory";
+        const BAY_ABORT: &str = "the way out is \"forklift abort\" run in the bay's working directory";
+        const BAY_ABORT_KEEPING: &str = "the way out is \"forklift abort --keep-files\" run in the bay's working directory";
+
+        // (the path, what stands beside it in its checkout, the note)
+        let cases: &[(&str, Beside, String)] = &[
+            ("consolidation", Beside::Nothing, format!("the consolidation state of the warehouse's own working tree \
+                (\"consolidation\") is gone; {}; {}", NO_TAINT, RUN_AGAIN)),
+            ("consolidation", Beside::Marker, format!("the consolidation state of the warehouse's own working tree \
+                (\"consolidation\") is gone; {}", NO_TAINT)),
+            ("bays/b/consolidation", Beside::Nothing, format!("the consolidation state of bay \"b\" \
+                (\"bays/b/consolidation\") is gone; {}; {}", NO_TAINT, RUN_AGAIN)),
+            ("bays/b/consolidation", Beside::Marker, format!("the consolidation state of bay \"b\" \
+                (\"bays/b/consolidation\") is gone; {}; an interrupted operation's marker stands in that checkout, and {}",
+                NO_TAINT, BAY_HEAL)),
+            ("consolidation-copy", Beside::State, "the copy of the consolidation state of the warehouse's own working \
+                tree (\"consolidation-copy\") is gone; only heal reads a copy, to write a damaged record back".to_string()),
+            ("bays/b/consolidation-skeleton-copy", Beside::Marker, "the copy of the consolidation skeleton of bay \"b\" \
+                (\"bays/b/consolidation-skeleton-copy\") is gone; only heal reads a copy, to write a damaged record \
+                back".to_string()),
+            ("consolidation-skeleton", Beside::Nothing, "the consolidation skeleton of the warehouse's own working tree \
+                (\"consolidation-skeleton\") is gone, and no consolidation state stands beside it".to_string()),
+            ("consolidation-skeleton", Beside::State, "the consolidation skeleton of the warehouse's own working tree \
+                (\"consolidation-skeleton\") is gone, and a consolidation state that reads stands beside it".to_string()),
+            ("bays/b/consolidation-skeleton", Beside::Nothing, "the consolidation skeleton of bay \"b\" \
+                (\"bays/b/consolidation-skeleton\") is gone, and no consolidation state stands beside it".to_string()),
+            ("bays/b/consolidation-skeleton", Beside::State, format!("the consolidation skeleton of bay \"b\" \
+                (\"bays/b/consolidation-skeleton\") is gone, and a consolidation state that reads stands beside it; {}",
+                BAY_ABORT)),
+            ("bays/b/consolidation-skeleton", Beside::StateAndSkeletonCopy, format!("the consolidation skeleton of bay \
+                \"b\" (\"bays/b/consolidation-skeleton\") is gone, and a consolidation state that reads stands beside \
+                it; {}", BAY_HEAL)),
+            ("bays/b/consolidation-skeleton", Beside::NewerState, "the consolidation skeleton of bay \"b\" \
+                (\"bays/b/consolidation-skeleton\") is gone, and the consolidation state beside it is in a format this \
+                version of Forklift does not know (\"/forklift-consolidation 99\"); the way out is the Forklift that \
+                wrote it".to_string()),
+            ("consolidation-skeleton", Beside::NewerState, "the consolidation skeleton of the warehouse's own working \
+                tree (\"consolidation-skeleton\") is gone, and the consolidation state beside it is in a format this \
+                version of Forklift does not know (\"/forklift-consolidation 99\"); the way out is the Forklift that \
+                wrote it".to_string()),
+            ("bays/b/consolidation-skeleton", Beside::Damaged, format!("the consolidation skeleton of bay \"b\" \
+                (\"bays/b/consolidation-skeleton\") is gone, and the consolidation state beside it has no format \
+                header; an older version of Forklift wrote it; {}", BAY_ABORT_KEEPING)),
+            ("bays/b/consolidation-skeleton", Beside::Folder, format!("the consolidation skeleton of bay \"b\" \
+                (\"bays/b/consolidation-skeleton\") is gone, and the consolidation state beside it is not a file; {}",
+                BAY_ABORT_KEEPING)),
+            ("bays/b/consolidation-skeleton", Beside::DamagedWithStateCopy, format!("the consolidation skeleton of bay \
+                \"b\" (\"bays/b/consolidation-skeleton\") is gone, and the consolidation state beside it has no format \
+                header; an older version of Forklift wrote it; {}", BAY_HEAL)),
+            // A marker standing changes neither what the record beside reads nor a newer state's way out.
+            ("consolidation-skeleton", Beside::NewerStateAndMarker, "the consolidation skeleton of the warehouse's own \
+                working tree (\"consolidation-skeleton\") is gone, and the consolidation state beside it is in a format \
+                this version of Forklift does not know (\"/forklift-consolidation 99\"); the way out is the Forklift \
+                that wrote it".to_string()),
+            ("consolidation", Beside::SkeletonAndMarker, "the consolidation state of the warehouse's own working tree \
+                (\"consolidation\") is gone; a consolidation skeleton still stands beside it".to_string()),
+            ("consolidation", Beside::Skeleton, format!("the consolidation state of the warehouse's own working tree \
+                (\"consolidation\") is gone; a consolidation skeleton still stands beside it; {}", RUN_AGAIN)),
+            ("bays/b/consolidation-skeleton", Beside::Marker, format!("the consolidation skeleton of bay \"b\" \
+                (\"bays/b/consolidation-skeleton\") is gone, and no consolidation state stands beside it; an interrupted \
+                operation's marker stands in that checkout, and {}", BAY_HEAL)),
+        ];
+
+        for (relative, beside, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-merge-record-shape-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            // What stands beside the record is set up before the taint, which refuses the writes.
+            let dir = forklift.join(relative).parent().unwrap().to_path_buf();
+            std::fs::create_dir_all(&dir).unwrap();
+            let state = dir.join(merge_utils::FILE_NAME_CONSOLIDATION);
+            let skeleton = merge_utils::OutOfScopeSkeleton::default().to_bytes();
+            // Stored parcels, since the closure walk roots both heads a state records.
+            let head = store_parcel_over(&TreeItem::new(String::new(), String::new(), DirEntryType::Tree), Vec::new());
+            let state_of = |skeleton_digest: String| merge_utils::consolidation_state_bytes(&merge_utils::ConsolidationState {
+                their_head: head.clone(), their_pallet: "side".to_string(), our_head: head.clone(),
+                our_pallet: "main".to_string(), skeleton_digest,
+            });
+            match beside {
+                Beside::Nothing => {}
+                Beside::State => std::fs::write(&state, state_of("0".repeat(64))).unwrap(),
+                Beside::StateAndSkeletonCopy => {
+                    std::fs::write(&state, state_of(merge_utils::skeleton_digest(&skeleton))).unwrap();
+                    std::fs::write(dir.join(merge_utils::FILE_NAME_SKELETON_COPY), &skeleton).unwrap();
+                }
+                Beside::NewerState => std::fs::write(&state, record_utils::to_bytes(
+                    merge_utils::FILE_NAME_CONSOLIDATION, 99, [head.as_str(), "side", head.as_str(), "main", "0"],
+                )).unwrap(),
+                Beside::Damaged => std::fs::write(&state, b"not a state\n").unwrap(),
+                Beside::DamagedWithStateCopy => {
+                    std::fs::write(&state, b"not a state\n").unwrap();
+                    std::fs::write(dir.join(merge_utils::FILE_NAME_CONSOLIDATION_COPY), state_of("0".repeat(64))).unwrap();
+                    crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", Some(head.clone()))).unwrap();
+                }
+                Beside::NewerStateAndMarker => {
+                    std::fs::write(&state, record_utils::to_bytes(
+                        merge_utils::FILE_NAME_CONSOLIDATION, 99, [head.as_str(), "side", head.as_str(), "main", "0"],
+                    )).unwrap();
+                    std::fs::write(dir.join(operation_utils::FILE_NAME_OPERATION), b"").unwrap();
+                }
+                Beside::SkeletonAndMarker => {
+                    std::fs::write(dir.join(merge_utils::FILE_NAME_SKELETON), &skeleton).unwrap();
+                    std::fs::write(dir.join(operation_utils::FILE_NAME_OPERATION), b"").unwrap();
+                }
+                Beside::Folder => std::fs::create_dir_all(&state).unwrap(),
+                Beside::Skeleton => std::fs::write(dir.join(merge_utils::FILE_NAME_SKELETON), &skeleton).unwrap(),
+                Beside::Marker => std::fs::write(dir.join(operation_utils::FILE_NAME_OPERATION), b"").unwrap(),
+            }
+            plant_complete_taint(&forklift, &[relative]);
+            assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{}: {}", relative, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
+            assert!(outcome.notes.contains(note), "{}:\n  want {}\n  got  {:?}", relative, note, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
 
             crate::util::file_utils::remove_dir_all(&root).ok();

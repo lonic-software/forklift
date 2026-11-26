@@ -172,6 +172,15 @@ pub(crate) fn damaged_in(dir: &Path, found: &str, record: MergeRecord, digest: O
     damaged_with(dir, found, record, agreement_in(dir).as_ref(), digest)
 }
 
+/// The step [`damaged_in`] names for a damaged `record` in the bay whose state lives in `dir`:
+/// `forklift heal` when heal can run for it ([`heal_can_run`]), the record's way out otherwise.
+pub(crate) fn damaged_step_in(dir: &Path, record: MergeRecord, digest: Option<&str>) -> &'static str {
+    match heal_can_run(dir, record, agreement_in(dir).as_ref(), digest) {
+        true => HEAL_COMMAND,
+        false => record.way_out().1,
+    }
+}
+
 /// [`damaged_in`] against `agreement`, the pallet and head heal resolved for the bay.
 fn damaged_with(dir: &Path, found: &str, record: MergeRecord, agreement: Option<&Agreement>, digest: Option<&str>) -> String {
     let (effect, step) = match heal_can_run(dir, record, agreement, digest) {
