@@ -11790,6 +11790,36 @@ fn spike_619_stack_over_a_stopped_undo_of_a_consolidation() {
         "the merge parent is kept only after the resume: {}", top);
 }
 
+// SPIKE (FORK-619): park is the other door. Over the stopped undo of a consolidation's completion
+// no merge is in progress, so park goes through and takes the merged output away; the undo then
+// resumes over a tree that no longer holds it, and the stack after it records a two-parent parcel.
+#[test]
+fn spike_619_park_over_a_stopped_undo_of_a_consolidation() {
+    let warehouse = a_conflicted_consolidation("spike-619-park");
+    warehouse.write_file("f.txt", "resolved\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved"]));
+    let stacked = std::fs::read_to_string(warehouse.root.join(".forklift/journal.json")).unwrap();
+
+    stop_the_undo_before_its_merge_state(&warehouse, &stacked,
+        &["consolidation", "consolidation-copy", "consolidation-skeleton", "consolidation-skeleton-copy"]);
+
+    let parked = warehouse.run(&["park"]);
+    assert_success(&parked);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("f.txt")).unwrap(), "ours\n", "park took the merged output away");
+
+    let undone = warehouse.run(&["undo"]);
+    assert_success(&undone);
+    assert!(warehouse.root.join(".forklift/consolidation").exists(), "the resumed undo put the consolidation back");
+
+    let restacked = warehouse.run(&["stack", "-m", "restacked"]);
+    assert_success(&restacked);
+    let history = json(&warehouse.run(&["--json", "history"]));
+    let top = &history["data"]["entries"][0];
+    assert_eq!(top["parents"].as_array().map_or(0, |parents| parents.len()), 2, "{}", top);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("f.txt")).unwrap(), "ours\n", "the two-parent parcel holds ours alone");
+}
+
 // A parcel with no description (a git commit imported with an empty message) is picked only with
 // -m: without one the pick refuses before it applies anything, since the parcel would record none.
 #[test]
