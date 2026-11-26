@@ -2257,9 +2257,9 @@ fn lost_fetch_ledger_note(relative: &Path) -> String {
     match warehouse_utils::warehouse_mode() {
         Ok(WarehouseMode::Sparse) => format!(
             "{}; the warehouse is recorded as sparse, and Forklift reads a missing fetch ledger as an empty one, \
-            as it would with no taint, so \"forklift scope fetch\" widens only what this bay's base and the pallets' \
-            heads reach; a head fetched earlier that no pallet holds may be refused as incomplete after that, until \
-            it is fetched again",
+            as it would with no taint, so \"forklift scope fetch\" widens only what the base of the bay it runs in \
+            and the pallets' heads reach; after that, a head no pallet holds, whether fetched earlier or left by a \
+            pallet's move or removal, may be refused as incomplete",
             lost
         ),
         Ok(WarehouseMode::Full) => format!("{}; the warehouse is recorded as full, which keeps no fetch ledger", lost),
@@ -7911,9 +7911,9 @@ mod tests {
         let cases: &[(Option<WarehouseMode>, bool, &str)] = &[
             (Some(WarehouseMode::Sparse), true, "the fetch ledger \"fetched-heads\" is gone; the warehouse is \
                 recorded as sparse, and Forklift reads a missing fetch ledger as an empty one, as it would with no \
-                taint, so \"forklift scope fetch\" widens only what this bay's base and the pallets' heads reach; a \
-                head fetched earlier that no pallet holds may be refused as incomplete after that, until it is fetched \
-                again"),
+                taint, so \"forklift scope fetch\" widens only what the base of the bay it runs in and the pallets' \
+                heads reach; after that, a head no pallet holds, whether fetched earlier or left by a pallet's move or \
+                removal, may be refused as incomplete"),
             (Some(WarehouseMode::Full), true, "the fetch ledger \"fetched-heads\" is gone; the warehouse is \
                 recorded as full, which keeps no fetch ledger"),
             (Some(WarehouseMode::Cache), true, "the fetch ledger \"fetched-heads\" is gone; the warehouse is \
