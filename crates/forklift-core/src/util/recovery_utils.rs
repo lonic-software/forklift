@@ -1864,7 +1864,7 @@ impl CheckoutRecord {
     fn name(self) -> &'static str {
         match self {
             CheckoutRecord::Position => "position",
-            CheckoutRecord::Scope => "scope",
+            CheckoutRecord::Scope => scope_utils::FILE_NAME_BAY_SCOPE,
         }
     }
 }
@@ -6817,7 +6817,7 @@ mod tests {
             VanishedClass::LoadMarker => "load marker".to_string(),
             VanishedClass::Position => "position".to_string(),
             VanishedClass::PositionCopy => "position copy".to_string(),
-            VanishedClass::Scope => "scope".to_string(),
+            VanishedClass::Scope => "checkout scope".to_string(),
             VanishedClass::ScopeCopy => "scope copy".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
@@ -6850,7 +6850,7 @@ mod tests {
             ("inventory/incomplete-load".into(), "load marker"),
             ("position".into(), "position"),
             ("position-copy".into(), "position copy"),
-            ("scope".into(), "scope"),
+            (scope_utils::FILE_NAME_BAY_SCOPE.into(), "checkout scope"),
             ("scope-copy".into(), "scope copy"),
             ("consolidation".into(), "kept: the consolidation state"),
             ("consolidation-copy".into(), "kept: the consolidation state's copy"),
@@ -6860,7 +6860,7 @@ mod tests {
             ("bays/main/inventory/incomplete-load".into(), "load marker"),
             ("bays/main/position".into(), "position"),
             ("bays/main/position-copy".into(), "position copy"),
-            ("bays/main/scope".into(), "scope"),
+            ("bays/main/scope".into(), "checkout scope"),
             ("bays/main/scope-copy".into(), "scope copy"),
             ("bays/main/consolidation".into(), "kept: a bay's consolidation state"),
             ("bays/main/consolidation-copy".into(), "kept: a bay's consolidation state's copy"),
@@ -7351,13 +7351,13 @@ mod tests {
         // (the path, the mode marked (`None`: no mark), what stands at the scope file beside a
         // copy, the note)
         let cases: &[(&str, Option<WarehouseMode>, Beside, &str)] = &[
-            ("scope", Some(WarehouseMode::Full), Beside::Nothing, "the scope of the warehouse's own working tree \
-                (\"scope\") is gone; in a warehouse that is not sparse, that working tree records no scope"),
+            (scope_utils::FILE_NAME_BAY_SCOPE, Some(WarehouseMode::Full), Beside::Nothing, "the scope of the warehouse's own working tree \
+                (\"{scope}\") is gone; in a warehouse that is not sparse, that working tree records no scope"),
             ("scope-copy", Some(WarehouseMode::Cache), Beside::Nothing, "the copy of the scope of the warehouse's own \
                 working tree (\"scope-copy\") is gone; in a warehouse that is not sparse, that working tree records no scope"),
-            ("scope", Some(WarehouseMode::Sparse), Beside::Nothing, "the scope of the warehouse's own working tree \
-                (\"scope\") is lost; the way out is \"forklift heal\" run in that working tree"),
-            ("scope", None, Beside::Nothing, "the scope of the warehouse's own working tree (\"scope\") is lost, and \
+            (scope_utils::FILE_NAME_BAY_SCOPE, Some(WarehouseMode::Sparse), Beside::Nothing, "the scope of the warehouse's own working tree \
+                (\"{scope}\") is lost; the way out is \"forklift heal\" run in that working tree"),
+            (scope_utils::FILE_NAME_BAY_SCOPE, None, Beside::Nothing, "the scope of the warehouse's own working tree (\"{scope}\") is lost, and \
                 the warehouse's mode does not read ({mode}); the way out is \"forklift heal\" run in that working tree"),
             ("scope-copy", Some(WarehouseMode::Sparse), Beside::Reads, "the copy of the scope of the warehouse's own \
                 working tree (\"scope-copy\") is gone, and the scope file beside it parses; the way out is \"forklift \
@@ -7393,7 +7393,7 @@ mod tests {
             let mode_error = crate::util::warehouse_utils::warehouse_mode().err().unwrap_or_default();
 
             // What stands beside the copy is set up before the taint, which refuses the writes.
-            let scope_file = forklift.join(Path::new(relative).with_file_name("scope"));
+            let scope_file = forklift.join(Path::new(relative).with_file_name(scope_utils::FILE_NAME_BAY_SCOPE));
             std::fs::create_dir_all(scope_file.parent().unwrap()).unwrap();
             match beside {
                 Beside::Nothing => {}
@@ -7416,7 +7416,8 @@ mod tests {
             let outcome = run_heal().unwrap_or_else(|error| panic!("{}: {}", relative, error));
             let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
             assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
-            let note = note.replace("{mode}", mode_error.trim_end_matches('.')).replace("{damaged}", &damaged);
+            let note = note.replace("{mode}", mode_error.trim_end_matches('.')).replace("{damaged}", &damaged)
+                .replace("{scope}", scope_utils::FILE_NAME_BAY_SCOPE);
             assert!(outcome.notes.contains(&note), "{}: {:?}", relative, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
 
