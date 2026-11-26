@@ -1757,8 +1757,9 @@ enum VanishedClass {
     Keepsake,
     /// An incomplete-load marker (`inventory/incomplete-load`, or a bay's), gone since the taint
     /// was recorded. A load records its start in a batch whose failed sync taints the whole
-    /// visible prefix, so a shard that batch published is recorded beside it, and a directory
-    /// load publishes no shard after its marker's batch fails. A load's withdrawal of its start
+    /// visible prefix. A single-file load's shard rides that same batch, so it is recorded beside
+    /// the marker; a directory load's batch holds no shard, and the load publishes none after it
+    /// fails. A load's withdrawal of its start
     /// (`load_guard_utils::withdraw_start`) writes on its own, but only over a marker that already
     /// stands, or removes it. A rewrite over a marker that stood leaves the old one standing when
     /// undone, and every other way it goes is its set emptying. No command but heal runs while

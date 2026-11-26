@@ -161,9 +161,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   and every command that records anything refused with it. A name that matches an object the
   store holds is still settled before this, as before. A lost incomplete-load marker
   (`.forklift/inventory/incomplete-load`, or a bay's) is cleared with a note once its absence is
-  made durable: a missing marker records no unfinished load, as it does with no taint, so a load
-  that failed before the heal is run again. Before, it kept heal refusing, and every command that
-  records anything refused with it.
+  made durable: a missing marker records no unfinished load, as it does with no taint, so run a
+  load that failed before the heal again yourself. Before, it kept heal refusing, and every
+  command that records anything refused with it.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
