@@ -2928,7 +2928,7 @@ fn reraise_storage_panic_when(error: tokio::task::JoinError, reraise: bool) -> t
 /// has to dispose of in one of two ways: a request's caller raises it again once it has settled
 /// too ([`StorageFailure::raise`]); work no request awaits says it was reported and nothing more
 /// ([`StorageFailure::reported`]). Which caller does which is pinned by
-/// `request_awaited_storage_work_raises_and_other_work_reports`.
+/// `storage_wrappers_are_named_where_this_test_pins_them`.
 #[must_use = "a request's caller raises it (`raise`); work no request awaits marks it `reported`"]
 struct StorageFailure(Option<tokio::task::JoinError>);
 
@@ -13377,37 +13377,50 @@ mod tests {
 
         // syn leaves a macro's tokens unparsed, so a call inside `format!` would go unseen. Its
         // arguments are read as expressions where they parse as a comma-separated list, as every
-        // formatting and logging macro's do; one whose do not is not read.
+        // formatting and logging macro's do. One whose do not (`tokio::select!`) has every
+        // identifier in its tokens recorded as a name, so nothing in it goes unseen: a method
+        // there is recorded under its bare name, not `.<name>`.
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
             type Args = syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>;
 
-            if let Ok(args) = mac.parse_body_with(Args::parse_terminated) {
-                let mut inner = NamedBy { within: self.within.clone(), names: std::mem::take(&mut self.names) };
+            match mac.parse_body_with(Args::parse_terminated) {
+                Ok(args) => {
+                    let mut inner = NamedBy { within: self.within.clone(), names: std::mem::take(&mut self.names) };
 
-                for arg in &args {
-                    syn::visit::Visit::visit_expr(&mut inner, arg);
+                    for arg in &args {
+                        syn::visit::Visit::visit_expr(&mut inner, arg);
+                    }
+                    self.names = inner.names;
                 }
-                self.names = inner.names;
+                Err(_) => {
+                    for word in identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone())) {
+                        self.record(word);
+                    }
+                }
             }
             syn::visit::visit_macro(self, mac);
         }
     }
 
-    /// Storage work a request awaits raises a debug build's panic again, and work no request awaits
-    /// reports it: which function spawns storage work, and through which wrapper, is a literal
-    /// here, so a new site is an edit to this test that has to choose. Every route handler's storage
-    /// call goes through a request wrapper, or a raw task its handler raises; no handler reaches
-    /// the background wrapper; every Heavy handler raises its permit task's panic; and every
-    /// redaction apply's failure is raised by a request's caller or marked reported by a run. The
-    /// scan reads names, not order: that a raise comes after its settling is the behavioural
-    /// tests' (`a_debug_build_raises_…`). Storage work run inline in a handler needs no wrapper: a
-    /// panic there unwinds the request's task as it is.
+    /// Which function names each storage wrapper is a literal here, so a new site of one is an
+    /// edit to this test that has to choose between them: the functions naming `spawn_blocking`,
+    /// `scoped_storage_task` and the background `blocking`, none of the last a route handler; the
+    /// request wrappers named by handlers only; `reraise_storage_panic` named by every Heavy
+    /// handler; and a redaction apply's failure disposed of (`raise` or `reported`) by every
+    /// caller of `apply_discharging`. Macro tokens are read too.
     ///
-    /// Reverts: a handler on `blocking` → the disjointness fails; a bare `spawn_blocking` in a
+    /// It pins names, not flow, and proves no absence of masking: a task boundary between a
+    /// handler and its wrapper (a `tokio::spawn` whose `JoinError` the handler answers, a helper
+    /// in between) passes it. That a raise comes after its settling is the behavioural tests'
+    /// (`a_debug_build_raises_…`).
+    ///
+    /// Reverts: a handler on `blocking` → its literal set fails; a bare `spawn_blocking` in a
     /// handler → the `spawn_blocking` set fails; a redaction round that drops the apply's failure
-    /// with `_` → the apply's callers are not all disposed of → red.
+    /// with `_` → the `.reported` set fails; macro arguments unread → the Heavy handlers' raise is
+    /// unseen → red; `blocking` named only inside a `tokio::select!` in a handler → its literal set
+    /// fails.
     #[test]
-    fn request_awaited_storage_work_raises_and_other_work_reports() {
+    fn storage_wrappers_are_named_where_this_test_pins_them() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
         let file = syn::parse_file(&source).unwrap();
         let handlers: BTreeSet<String> = route_handlers(&file).into_values().collect();
