@@ -141,7 +141,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   ref whose name looks like an object path (such as `pallets/ab/cd`) is now cleared as a ref once
   its removal is made durable, where before it was taken for a missing object. A lost meta pallet
   ref or meta-copy file whose name looks like an object, a shard (`data`), a pack, an index or a
-  signature file is now kept, so heal refuses where it used to clear it. A lost keepsake under
+  signature file is now kept, so heal refuses where it used to clear it. A lost meta pallet ref
+  (`.forklift/meta/<name>`) beside a copy that still holds a head is cleared once its absence is
+  made durable, and heal's pass after the recovery rebuilds the ref from that copy, or says why it
+  cannot. Before, such a ref that heal could not rebuild ahead of the recovery kept heal refusing
+  with no recovery for it. Beside a copy that is lost too, holds no head or is not a file, it is
+  kept, and the refusal says which. A lost keepsake under
   `.forklift/removed-refs`, whatever its name, is cleared with a note once its absence is made
   durable, as long as the ref it was taken from still stands: the `heal --remove-ref` that was
   writing it stopped before it removed the ref. Before, a plainly named one kept heal refusing,
