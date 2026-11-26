@@ -242,6 +242,7 @@ pub(crate) enum VanishedDisposition {
     Shard,
     Ref,
     MetaCopy,
+    Keepsake,
 }
 
 /// One kind of root-relative path a taint record may name.
@@ -282,7 +283,7 @@ use VanishedDisposition as Disposition;
 /// fails [`assert_declared`] in a debug build the first time a test writes it.
 static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "a pallet ref", disposition: Some(Disposition::Ref), pattern: &[Is("pallets"), Names] },
-    TaintShape { description: "a removed ref's keepsake", disposition: None, pattern: &[Is("removed-refs"), Names] },
+    TaintShape { description: "a removed ref's keepsake", disposition: Some(Disposition::Keepsake), pattern: &[Is("removed-refs"), Names] },
     TaintShape { description: "a meta pallet ref", disposition: None, pattern: &[Is("meta"), Name] },
     TaintShape { description: "a meta pallet ref's copy", disposition: Some(Disposition::MetaCopy), pattern: &[Is("meta-copy"), MetaPalletName] },
     TaintShape { description: "a copy of a ref that is no meta pallet's", disposition: None, pattern: &[Is("meta-copy"), Name] },
