@@ -88,12 +88,13 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 **Schema 61** (current): the `undo_unfinished` error code exists (exit 72). `stack` and `park`
 refuse with it while an undo of the stack that completed a consolidation or pick has stopped
 before putting the merge back: the bay stands where it stood before that stack, and no merge is in
-progress yet. So do the commands that move the bay to another pallet or head, or start a merge:
-`pallet create`, `deliver`, `lower`, `shift`, `consolidate`, and the merges `haul` and `lift`
-start. The `next_step` is `forklift undo`, which finishes
-the stopped undo. Before, the stack went through as an ordinary parcel, the park went through, and
-`pallet create`, `deliver` and a fast-forward `lower` went through and left the undo unable to
-finish.
+progress yet. So do `pallet create`, `deliver`, `lower` and `shift`, which would move the bay to
+another pallet or head. The `next_step` is `forklift undo`, which finishes the stopped undo. A merge
+that `consolidate`, `haul` or `lift` starts there is refused too, but usually first as a dirty bay,
+since the merge's output is uncommitted. Before, the stack went through as an ordinary parcel, the
+park went through, and `pallet create`, `deliver` and a fast-forward `lower` went through and left
+the undo unable to finish. With a pallet delete journaled after the stopped undo, none of them
+refuses.
 
 **Schema 60**: a metadata pallet's ref whose file is missing while its copy
 (`.forklift/meta-copy/<name>`) stands is refused as `ref_damaged` (exit 53) wherever it is read,

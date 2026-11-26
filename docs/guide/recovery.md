@@ -41,9 +41,8 @@ To throw away edits on purpose, `forklift restore` previews what it would discar
 
 An undo of the `stack` that completed a consolidation or pick stopped before it finished: the bay
 stands where it stood before that stack, but the merge is not in progress again yet. `stack`,
-`park` and the commands that would move the bay to another pallet or head, or start a merge
-(`pallet create`, `deliver`, `lower`, `shift`, `consolidate`, and the merges `haul` and `lift`
-start), refuse, and nothing was changed. Run `forklift undo` again: it finishes the undo and puts
+`park`, and `pallet create`, `deliver`, `lower` and `shift`, which would move the bay, refuse, and
+leave the bay where it stands. Run `forklift undo` again: it finishes the undo and puts
 the merge back in progress, with the merge's output still in your files. The next `stack`
 completes it as before, keeping the second parent or the picked parcel's author. To make an
 ordinary parcel of the files instead, run `forklift abort --keep-files` once the merge is back.

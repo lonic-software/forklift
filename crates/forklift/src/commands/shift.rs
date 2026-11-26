@@ -187,7 +187,7 @@ pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
         ));
     }
 
-    journal_utils::refuse_over_an_unfinished_undo("changed")?;
+    journal_utils::refuse_over_an_unfinished_undo("The bay was not moved.")?;
 
     Ok(())
 }

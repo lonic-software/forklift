@@ -507,7 +507,7 @@ refusal_codes! {
     /// finished: the bay stands where it stood before the undone operation, but the consolidation
     /// or pick that operation completed is not in progress again yet, so the stack would record the
     /// merge's output as an ordinary parcel, the park would take that output away, and the move
-    /// would leave the undo unable to resume. Nothing was changed; the next step is
+    /// would leave the undo unable to resume. The bay was not moved; the next step is
     /// `forklift undo`, which finishes the stopped undo.
     UndoUnfinished => "undo_unfinished",
 

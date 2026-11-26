@@ -1389,6 +1389,10 @@ fn a_lower_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
     assert_eq!(refused.status.code(), Some(72), "{}{}", stdout(&refused), stderr(&refused));
     let error = serde_json::from_str::<serde_json::Value>(&stdout(&refused)).unwrap()["error"].clone();
     assert_eq!((error["code"].as_str(), error["next_step"].as_str()), (Some("undo_unfinished"), Some("forklift undo")), "{}", error);
+    // The lower has already synced trust and the meta pallets by the time it refuses, so its
+    // message claims only that the bay was not moved.
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("The bay was not moved.") && !message.contains("Nothing was"), "{}", message);
     assert_eq!(std::fs::read_to_string(area.path("b/.forklift/position")).unwrap(), position, "the bay stays where it was");
     assert_eq!(area.read_file("b/f.txt"), "resolved\n");
     assert_eq!(area.read_file("b/g.txt"), "g\n");
