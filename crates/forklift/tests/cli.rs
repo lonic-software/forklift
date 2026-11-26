@@ -11760,11 +11760,11 @@ fn a_stopped_undo_of_a_consolidation(name: &str) -> TestWarehouse {
 }
 
 /// Asserts `refused` is the `undo_unfinished` refusal (run with `--json`), naming the undo.
-fn assert_undo_unfinished(refused: &Output, verb: &str) {
+fn assert_undo_unfinished(refused: &Output, not_done: &str) {
     assert_eq!(refused.status.code(), Some(72), "{}{}", stdout(refused), stderr(refused));
     let error = json(refused)["error"].clone();
     assert_eq!((error["code"].as_str(), error["next_step"].as_str()), (Some("undo_unfinished"), Some("forklift undo")), "{}", error);
-    assert!(error["message"].as_str().unwrap().contains(&format!("Nothing was {}.", verb)), "{}", error);
+    assert!(error["message"].as_str().unwrap().contains(not_done), "{}", error);
 }
 
 /// The latest parcel's history entry.
@@ -11795,7 +11795,7 @@ fn a_stack_over_a_stopped_undo_of_a_pick_names_the_undo() {
     let (warehouse, _) = a_stopped_undo_of_a_pick("stack-over-stopped-undo-pick");
     let main_head = pallet_head_hash(&warehouse, "main");
 
-    assert_undo_unfinished(&warehouse.run(&["--json", "stack", "-m", "restacked"]), "stacked");
+    assert_undo_unfinished(&warehouse.run(&["--json", "stack", "-m", "restacked"]), "Nothing was stacked.");
     assert_eq!(pallet_head_hash(&warehouse, "main"), main_head, "nothing was stacked");
 
     assert_success(&warehouse.run(&["undo"]));
@@ -11816,7 +11816,7 @@ fn a_stack_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
     let warehouse = a_stopped_undo_of_a_consolidation("stack-over-stopped-undo-consolidation");
     let main_head = pallet_head_hash(&warehouse, "main");
 
-    assert_undo_unfinished(&warehouse.run(&["--json", "stack", "-m", "restacked"]), "stacked");
+    assert_undo_unfinished(&warehouse.run(&["--json", "stack", "-m", "restacked"]), "Nothing was stacked.");
     assert_eq!(pallet_head_hash(&warehouse, "main"), main_head, "nothing was stacked");
 
     assert_success(&warehouse.run(&["undo"]));
@@ -11835,7 +11835,7 @@ fn a_stack_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
 fn a_park_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
     let warehouse = a_stopped_undo_of_a_consolidation("park-over-stopped-undo");
 
-    assert_undo_unfinished(&warehouse.run(&["--json", "park"]), "parked");
+    assert_undo_unfinished(&warehouse.run(&["--json", "park"]), "Nothing was parked.");
     assert_eq!(std::fs::read_to_string(warehouse.root.join("f.txt")).unwrap(), "resolved\n", "the merged output stays");
 
     assert_success(&warehouse.run(&["undo"]));
@@ -11905,6 +11905,42 @@ fn a_stack_over_a_stopped_undo_of_a_moved_pallet_is_behind() {
 
     let refused = warehouse.run(&["--json", "stack", "-m", "restacked"]);
     assert_eq!(json(&refused)["error"]["code"], "behind", "{}{}", stdout(&refused), stderr(&refused));
+}
+
+// A command that moves the bay to another pallet over the same stopped undo would leave the undo
+// unable to resume, since it puts the merge back only on the pallet and head it left, and a stack
+// on the new pallet would record the merge's output as an ordinary parcel. Each is refused, naming
+// the undo, and changes neither the bay's position nor any pallet; the undo then finishes and the
+// stack after it has both parents. `pallet create` with no revision journals nothing and checks no
+// files, so it went through before; the others went through or were refused over the dirty files,
+// naming a park the stopped undo refuses too. Both `pallet create` rows stop at pallet create's own
+// call, before the revision arm reaches `shift_to`'s; `shift other` is the row that pins that one.
+//
+// Revert: drop the refusal from refuse_mid_merge → every row goes through or is refused otherwise.
+#[test]
+fn a_pallet_switch_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
+    let rows: [&[&str]; 4] = [
+        &["pallet", "create", "fresh"],
+        &["pallet", "create", "fresh", "spare"],
+        &["deliver", "spare", "-m", "over"],
+        &["shift", "other"],
+    ];
+
+    for (index, command) in rows.into_iter().enumerate() {
+        let warehouse = a_stopped_undo_of_a_consolidation(&format!("switch-over-stopped-undo-{}", index));
+        let pallets = |warehouse: &TestWarehouse| ["main", "other", "spare", "fresh"].map(|pallet|
+            std::fs::read_to_string(warehouse.root.join(".forklift/pallets").join(pallet)).ok());
+        let (position, heads) = (std::fs::read_to_string(position_path(&warehouse, None)).unwrap(), pallets(&warehouse));
+
+        let refused = warehouse.run(&[&["--json"][..], command].concat());
+        assert_undo_unfinished(&refused, "The bay was not moved.");
+        assert_eq!(std::fs::read_to_string(position_path(&warehouse, None)).unwrap(), position, "{:?} left the bay where it was", command);
+        assert_eq!(pallets(&warehouse), heads, "{:?} changed no pallet", command);
+
+        assert_success(&warehouse.run(&["undo"]));
+        assert_success(&warehouse.run(&["stack", "-m", "restacked"]));
+        assert_eq!(top_parent_count(&warehouse), 2, "{:?}: {}", command, top_history_entry(&warehouse));
+    }
 }
 
 // Journaling is best-effort: a journal that does not parse refuses nothing here.
