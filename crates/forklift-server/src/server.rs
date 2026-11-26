@@ -2562,6 +2562,10 @@ fn office_lookup_test_checkpoint(_identifier: &str) {}
 /// The key [`REF_WRITE_TEST_SEAMS`] arms `PUT /v1/trust` under: no pallet name holds a `/`.
 const TRUST_WRITE_SEAM: &str = "/v1/trust";
 
+/// The key [`REF_WRITE_TEST_SEAMS`] arms a redaction apply's storage task under, at its start
+/// ([`apply_redactions`]): no pallet name holds a `/`.
+const APPLY_SEAM: &str = "/apply";
+
 /// How many times a ref update decides at most: a further attempt runs only when the write found
 /// that the office or the trust anchor its decision consumed moved meanwhile.
 const REF_UPDATE_ATTEMPTS: u32 = 3;
@@ -2595,6 +2599,17 @@ fn ref_write_test_checkpoint(name: &str) {
 
 #[cfg(not(test))]
 fn ref_write_test_checkpoint(_name: &str) {}
+
+/// Test seam: a ref update for the armed pallet name runs the closure armed as `<name>/owed` once
+/// the write owes its apply, just before it lands: a window no decision-time arm reaches. No
+/// pallet name holds a `/`, so the key meets no other arm.
+#[cfg(test)]
+fn ref_write_owed_test_checkpoint(name: &str) {
+    ref_write_test_checkpoint(&format!("{}/owed", name));
+}
+
+#[cfg(not(test))]
+fn ref_write_owed_test_checkpoint(_name: &str) {}
 
 /// Test counter: the decisions each ref update made, by warehouse forklift root and pallet name.
 #[cfg(test)]
@@ -2841,25 +2856,93 @@ fn resolve_handle(state: &AppState,
 /// Run blocking storage work on the blocking pool, inside the warehouse's storage-root
 /// scope. The scope is thread-local and the closure runs synchronously on one blocking
 /// thread, so it can never leak into another request.
+///
+/// A task that did not finish, a panic included, comes back as an internal error in every build:
+/// this is for work no request awaits, whose caller logs a failure and keeps its own state
+/// straight. A request's handler uses [`request_blocking`] instead.
 async fn blocking<T: Send + 'static>(
     warehouse: Arc<WarehouseHandle>,
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
-    blocking_unscoped(move || {
+    scoped_storage_task(warehouse, work).await.unwrap_or_else(|error| Err(storage_task_failed(&error)))
+}
+
+/// [`blocking`] for a request's handler: a debug build raises a panic of the work again on the
+/// awaiting task ([`reraise_storage_panic`]), so a test driving the handler fails on it.
+async fn request_blocking<T: Send + 'static>(
+    warehouse: Arc<WarehouseHandle>,
+    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
+) -> Result<T, HandlerError> {
+    scoped_storage_task(warehouse, work).await
+        .unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
+}
+
+/// [`request_blocking`] outside any warehouse's scope — for work on the server's folders
+/// themselves, such as creating a warehouse.
+async fn request_blocking_unscoped<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
+) -> Result<T, HandlerError> {
+    tokio::task::spawn_blocking(work).await
+        .unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
+}
+
+/// Run blocking storage work inside the warehouse's scope, as [`blocking`] does, handing back a
+/// task that did not finish as it is, for a caller that has state to settle before it reports it
+/// or raises it again.
+async fn scoped_storage_task<T: Send + 'static>(
+    warehouse: Arc<WarehouseHandle>,
+    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
+) -> Result<Result<T, HandlerError>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
         let _scope = StorageRootScope::enter(&warehouse.root);
 
         work()
     }).await
 }
 
-/// Run blocking work on the blocking pool outside any warehouse's scope — for work on the server's
-/// folders themselves, such as creating a warehouse.
-async fn blocking_unscoped<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
-) -> Result<T, HandlerError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| internal(format!("A storage task failed: {}", e)))?
+/// The internal error a storage task that did not finish is reported as.
+fn storage_task_failed(error: &tokio::task::JoinError) -> HandlerError {
+    internal(format!("A storage task failed: {}", error))
+}
+
+/// What a request's storage task that did not finish leaves for its caller to report. A debug build
+/// raises a panic again on the caller's task instead: a reply would let a test that expects any
+/// failure pass over it, the debug build's undeclared-taint-shape assertion included. A release
+/// build reports it, so one request's panic never takes the server down. Only a request's task
+/// calls it: a panic raised in a task nobody awaits is lost, and the state that task keeps is left
+/// unsettled.
+fn reraise_storage_panic(error: tokio::task::JoinError) -> tokio::task::JoinError {
+    reraise_storage_panic_when(error, cfg!(debug_assertions))
+}
+
+/// [`reraise_storage_panic`], raising the panic again when `reraise` holds.
+fn reraise_storage_panic_when(error: tokio::task::JoinError, reraise: bool) -> tokio::task::JoinError {
+    if reraise && error.is_panic() {
+        std::panic::resume_unwind(error.into_panic());
+    }
+
+    error
+}
+
+/// A storage task that failed after its failure was settled and reported, which its caller still
+/// has to dispose of in one of two ways: a request's caller raises it again once it has settled
+/// too ([`StorageFailure::raise`]); work no request awaits says it was reported and nothing more
+/// ([`StorageFailure::reported`]). Which caller does which is pinned by
+/// `storage_wrappers_are_named_where_this_test_pins_them`.
+#[must_use = "a request's caller raises it (`raise`); work no request awaits marks it `reported`"]
+struct StorageFailure(Option<tokio::task::JoinError>);
+
+impl StorageFailure {
+    /// Raise a panic again ([`reraise_storage_panic`]): in a debug build. Anything else was
+    /// already reported.
+    fn raise(self) {
+        if let Some(error) = self.0 {
+            let _ = reraise_storage_panic(error);
+        }
+    }
+
+    /// Dispose of it where no request awaits the work: it was reported where it was settled.
+    fn reported(self) {}
 }
 
 /// What a warehouse creation found.
@@ -3034,7 +3117,7 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
     }
 
     let (base, create_id) = (base.clone(), id.clone());
-    let result = blocking_unscoped(move || create_warehouse(&base, &create_id)).await;
+    let result = request_blocking_unscoped(move || create_warehouse(&base, &create_id)).await;
 
     match result {
         Ok(creation) => {
@@ -3071,7 +3154,7 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         let mut pallets = std::collections::BTreeMap::new();
 
         // Both namespaces travel in one map, keyed by the qualified reference form: user
@@ -3133,7 +3216,7 @@ async fn post_missing(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         // A chunk an owed deletion withholds is missing here, as `GET` answers it: a lift naming
         // it uploads it. Content the host withholds is never missing, held or not: this head
         // takes none of it, and its ref writes tolerate its absence.
@@ -3205,7 +3288,7 @@ async fn post_holds(State(state): State<Arc<AppState>>,
         return Json(HoldsResponse { holds }).into_response();
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         let _permit = permit;
         let head = match pallet_utils::get_pallet_head_in(pallet_ref.namespace, &pallet_ref.name).map_err(internal)? {
             Some(head) => Some(head),
@@ -3254,7 +3337,7 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         let (applied, withheld) = (read_applied()?, read_withheld()?);
 
         // A redacted hash refuses the lift: the client checks its history against its own
@@ -3344,13 +3427,13 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = permit.spawn(blocking(warehouse, move || {
+    let result = permit.spawn(request_blocking(warehouse, move || {
         let removed = withholding::removed().map_err(internal)?;
         let withheld = withheld_among(&gate, &removed, &request.hashes)?;
         let hashes: Vec<String> = request.hashes.into_iter().filter(|hash| !withheld.contains(hash)).collect();
 
         partial_bundle(&hashes)
-    })).await.unwrap_or_else(|e| Err(internal(format!("A batch fetch failed: {}", e))));
+    })).await.unwrap_or_else(|e| Err(internal(format!("A batch fetch failed: {}", reraise_storage_panic(e)))));
 
     match result {
         Ok(bytes) => (
@@ -3403,7 +3486,7 @@ async fn get_object(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         let (applied, withheld) = (read_applied()?, read_withheld()?);
         refuse_removed(&applied, &withheld, &hash)?;
 
@@ -3442,7 +3525,7 @@ async fn put_object(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         require_uploader(&principal)?;
 
         // An upload that checked before a redaction applied, or before its host withheld it, and
@@ -3482,7 +3565,7 @@ async fn put_withheld_recipe(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         require_uploader(&principal)?;
 
         let digest = withholding::recipe_digest(&hash, &body).map_err(unprocessable)?;
@@ -3509,7 +3592,7 @@ async fn get_signature(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         sign_utils::load_raw_parcel_signature(&hash).map_err(internal)
     }).await;
 
@@ -3541,7 +3624,7 @@ async fn put_signature(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
-    let result = blocking(warehouse, move || {
+    let result = request_blocking(warehouse, move || {
         require_uploader(&principal)?;
 
         let existed = sign_utils::load_raw_parcel_signature(&hash).map_err(internal)?;
@@ -3591,7 +3674,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
     };
 
     let counted = RefWriteCounted::start(&warehouse);
-    let result = permit.spawn(blocking(Arc::clone(&warehouse), move || {
+    let result = permit.spawn(request_blocking(Arc::clone(&warehouse), move || {
         let _counted = counted;
 
         match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
@@ -3707,7 +3790,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 Ok(Some(event))
             }
         }
-    })).await.unwrap_or_else(|e| Err(internal(format!("A trust install failed: {}", e))));
+    })).await.unwrap_or_else(|e| Err(internal(format!("A trust install failed: {}", reraise_storage_panic(e)))));
 
     match result {
         Ok(Some(mut event)) => {
@@ -3765,7 +3848,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     // Whether the write reached the point where it may land, and so owes an apply.
     let took = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let took_owe = Arc::clone(&took);
-    let write = blocking(Arc::clone(&warehouse), move || {
+    let write = scoped_storage_task(Arc::clone(&warehouse), move || {
         let counted = counted;
         // A meta pallet arrives as `@office`. The server routes by *namespace*, never by a
         // hard-coded name (DESIGN.html §3.3).
@@ -4016,6 +4099,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // Owed from before the write may land until it returns; its apply discharges it.
             took_owe.store(true, std::sync::atomic::Ordering::SeqCst);
             let owed = counted.0.owe_apply();
+            ref_write_owed_test_checkpoint(&name);
             let written = pallet_utils::update_pallet_head_verified(
                 namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified,
                 request.tombstone.as_deref()
@@ -4066,7 +4150,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         let state = Arc::clone(&state);
         async move {
             match write.await {
-                Ok(events) => {
+                Ok(Ok(events)) => {
                     for event in events {
                         emit_event(&state, event);
                     }
@@ -4074,9 +4158,11 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     after_ref_write(&state, warehouse).await;
                     Ok(())
                 }
-                Err(error) => {
+                failed => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
-                    Err(error)
+                    // Raised again only now, once the apply the write took is asked for again.
+                    failed.unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
+                        .map(|_| ())
                 }
             }
         }
@@ -4085,7 +4171,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     match settled {
         Ok(Ok(())) => StatusCode::OK.into_response(),
         Ok(Err(error)) => error_response(error),
-        Err(error) => error_response(internal(format!("A ref write failed: {}", error))),
+        Err(error) => error_response(internal(format!("A ref write failed: {}", reraise_storage_panic(error)))),
     }
 }
 
@@ -4136,7 +4222,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     // Whether the write reached the point where it may land, and so owes an apply.
     let took = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let took_owe = Arc::clone(&took);
-    let deletion = blocking(Arc::clone(&warehouse), move || {
+    let deletion = scoped_storage_task(Arc::clone(&warehouse), move || {
         let counted = counted;
         if pallet_ref.namespace == pallet_utils::PalletNamespace::Meta {
             return Err(unprocessable(format!(
@@ -4261,19 +4347,21 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
         let state = Arc::clone(&state);
         async move {
             match deletion.await {
-                Ok(Some(event)) => {
+                Ok(Ok(Some(event))) => {
                     emit_event(&state, event);
 
                     after_ref_write(&state, warehouse).await;
                     Ok(())
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     Ok(())
                 }
-                Err(error) => {
+                failed => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
-                    Err(error)
+                    // Raised again only now, once the apply the deletion took is asked for again.
+                    failed.unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
+                        .map(|_| ())
                 }
             }
         }
@@ -4282,7 +4370,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     match settled {
         Ok(Ok(())) => StatusCode::OK.into_response(),
         Ok(Err(error)) => error_response(error),
-        Err(error) => error_response(internal(format!("A pallet deletion failed: {}", error))),
+        Err(error) => error_response(internal(format!("A pallet deletion failed: {}", reraise_storage_panic(error)))),
     }
 }
 
@@ -4298,7 +4386,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
 /// stays owed, so no content is served until the run's retry or a later write's apply discharges
 /// it.
 async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
-    let (applied, apply) = apply_discharging(&warehouse).await;
+    let (applied, apply, failed) = apply_discharging(&warehouse).await;
 
     if applied {
         cut_bundle_downloads(&warehouse);
@@ -4312,6 +4400,9 @@ async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>)
     }
 
     run_redactions(Arc::clone(state), warehouse);
+
+    // Raised again only now, with the run that retries the apply already started.
+    failed.raise();
 }
 
 /// What follows a ref write request here that moved no ref, answered with an error or as already
@@ -4326,7 +4417,7 @@ async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseH
         return;
     }
 
-    let (applied, apply) = apply_discharging(&warehouse).await;
+    let (applied, apply, failed) = apply_discharging(&warehouse).await;
 
     if applied {
         cut_bundle_downloads(&warehouse);
@@ -4341,6 +4432,9 @@ async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseH
     if applied || warehouse.apply_owed() || warehouse.rebuild_after_drain.load(std::sync::atomic::Ordering::SeqCst) {
         run_redactions(Arc::clone(state), warehouse);
     }
+
+    // Raised again only now, with the run that retries the apply already started.
+    failed.raise();
 }
 
 /// How long the redaction deleter waits for a drained warehouse's requests to end before it gives
@@ -4775,7 +4869,9 @@ async fn redaction_round(state: &Arc<AppState>, warehouse: &Arc<WarehouseHandle>
     let applied = match warehouse.apply_owed() {
         false => false,
         true => {
-            let (applied, apply) = apply_discharging(warehouse).await;
+            // No request awaits this run, so a failed storage task is not raised again here.
+            let (applied, apply, failed) = apply_discharging(warehouse).await;
+            failed.reported();
 
             // Still owed: a later round retries it.
             if let Err(error) = apply {
@@ -5051,8 +5147,14 @@ async fn retake_store_access(warehouse: &Arc<WarehouseHandle>) {
 /// * `Ok(ApplyOutcome)`  - What it applied, and whether it decided every redaction.
 /// * `Err(HandlerError)` - The redactions, the applied record or the configuration could not be
 ///                         read, or the apply could not be written.
-async fn apply_redactions(warehouse: Arc<WarehouseHandle>) -> Result<ApplyOutcome, HandlerError> {
-    blocking(warehouse, || {
+/// * `Err(JoinError)`    - The storage task itself failed: the caller decides whether a panic is
+///                         raised again ([`apply_discharging`]).
+async fn apply_redactions(
+    warehouse: Arc<WarehouseHandle>
+) -> Result<Result<ApplyOutcome, HandlerError>, tokio::task::JoinError> {
+    scoped_storage_task(warehouse, || {
+        ref_write_test_checkpoint(APPLY_SEAM);
+
         let before = read_applied()?;
         let read = redaction_utils::read_redactions().map_err(internal)?;
 
@@ -5098,13 +5200,23 @@ struct ApplyOutcome {
 /// applied.
 ///
 /// # Returns
-/// Whether it applied a redaction, and the error that left the applies owed, if one did.
-async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<(), String>) {
+/// Whether it applied a redaction; the error that left the applies owed, if one did; and the
+/// apply's storage task, when it failed, which is settled here like any failed apply and handed
+/// back for a request's caller to raise again once that caller has settled too
+/// ([`StorageFailure`]).
+async fn apply_discharging(
+    warehouse: &Arc<WarehouseHandle>
+) -> (bool, Result<(), String>, StorageFailure) {
     use std::sync::atomic::Ordering;
 
     let owed = warehouse.dischargeable();
 
-    let outcome = match apply_redactions(Arc::clone(warehouse)).await {
+    let (outcome, failed) = match apply_redactions(Arc::clone(warehouse)).await {
+        Ok(outcome) => (outcome, StorageFailure(None)),
+        Err(error) => (Err(storage_task_failed(&error)), StorageFailure(Some(error))),
+    };
+
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err((_, error)) => {
             let damage = is_damage(&error).then(|| error.clone());
@@ -5115,7 +5227,7 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
                 warehouse.applies_wake.notify_waiters();
             }
 
-            return (false, Err(error));
+            return (false, Err(error), failed);
         }
     };
 
@@ -5123,13 +5235,13 @@ async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<()
     *warehouse.apply_damage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
     if let Some(why) = outcome.undecided {
-        return (outcome.applied, Err(why));
+        return (outcome.applied, Err(why), StorageFailure(None));
     }
 
     warehouse.applies_discharged.fetch_max(owed, Ordering::SeqCst);
     warehouse.applies_wake.notify_waiters();
 
-    (outcome.applied, Ok(()))
+    (outcome.applied, Ok(()), StorageFailure(None))
 }
 
 /// Wait, up to [`APPLY_WAIT`], until no apply is owed for `warehouse` (see
@@ -7022,6 +7134,190 @@ mod tests {
         let status = status_line(&mut stream).await;
 
         assert!(status.contains(" 200 "), "{status}");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // A storage task that panics
+    // ---------------------------------------------------------------------------------
+
+    /// The JoinError of a blocking task that panicked with `message`.
+    async fn panicked_task(message: &'static str) -> tokio::task::JoinError {
+        tokio::task::spawn_blocking::<_, ()>(move || panic!("{}", message)).await
+            .expect_err("the task panicked")
+    }
+
+    /// Asked to, a storage task's panic is raised again with its own payload; not asked to, it is
+    /// handed back as the error the caller reports. A task that was cancelled has no panic to raise,
+    /// so it is handed back either way.
+    ///
+    /// Revert: drop the `reraise` test → the reported arm raises; drop the `is_panic` test → the
+    /// cancelled task raises tokio's own panic instead of coming back.
+    #[tokio::test]
+    async fn a_storage_task_panic_is_raised_again_only_when_asked() {
+        let reported = reraise_storage_panic_when(panicked_task("planted storage panic").await, false);
+        assert!(reported.is_panic(), "{reported}");
+
+        let error = panicked_task("planted storage panic").await;
+        let raised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reraise_storage_panic_when(error, true)))
+            .expect_err("the panic is raised again");
+        assert_eq!(raised.downcast_ref::<String>().map(String::as_str), Some("planted storage panic"));
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = cancelled.await.expect_err("the task was cancelled");
+        let handed_back = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reraise_storage_panic_when(cancelled, true)))
+            .expect("a cancelled task raises nothing");
+        assert!(handed_back.is_cancelled(), "{handed_back}");
+    }
+
+    /// The payload a task that panicked with a literal message raised, when it was that message.
+    fn literal_payload(raised: Box<dyn std::any::Any + Send>) -> Option<&'static str> {
+        raised.downcast_ref::<&'static str>().copied()
+    }
+
+    /// In a debug build, a panic in a request's storage work fails the request's own task with the
+    /// work's own payload, so a test driving a handler fails on it rather than reading an
+    /// internal-error reply.
+    ///
+    /// Revert: report every storage panic (`reraise_storage_panic_when(error, false)`) → the call
+    /// returns an internal error → "the storage panic is raised again" fails; raise a new panic
+    /// naming the JoinError instead of resuming → the payload is a `String` → the payload
+    /// assertion fails.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_debug_build_raises_a_storage_panic_on_the_requests_task() {
+        let unscoped = tokio::spawn(request_blocking_unscoped(|| -> Result<(), HandlerError> { panic!("planted storage panic") }));
+        let raised = unscoped.await.expect_err("the unscoped storage panic is raised again");
+        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+
+        let root = scratch_dir("storage-panic-scoped");
+        let warehouse = Arc::new(WarehouseHandle::new(root.clone()));
+        let scoped = tokio::spawn(request_blocking(warehouse, || -> Result<(), HandlerError> { panic!("planted storage panic") }));
+        let raised = scoped.await.expect_err("the scoped storage panic is raised again");
+        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// Work no request awaits gets a storage panic back as an internal error in every build, so its
+    /// caller logs it and keeps its own state straight.
+    ///
+    /// Revert: raise it again in `blocking` (`storage_task_failed(&reraise_storage_panic(error))`) →
+    /// the awaiting task panics → "a background caller gets an error back" fails.
+    #[tokio::test]
+    async fn work_no_request_awaits_gets_a_storage_panic_back_as_an_error() {
+        let root = scratch_dir("storage-panic-background");
+        let warehouse = Arc::new(WarehouseHandle::new(root.clone()));
+        let background = tokio::spawn(blocking(warehouse, || -> Result<(), HandlerError> { panic!("planted storage panic") }));
+        let (status, message) = background.await.expect("a background caller gets an error back")
+            .expect_err("the panic is an error");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(message.starts_with("A storage task failed: ") && message.contains("planted storage panic"), "{message}");
+
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// Push `pushed` with `seam` armed to panic in its warehouse, and return the request's task's
+    /// failure, the warehouse and the state. `observe` runs at the seam, before the panic.
+    #[cfg(debug_assertions)]
+    async fn push_with_a_planted_panic(
+        fixture: &HeavyFixture,
+        seam: &str,
+        observe: impl Fn(&WarehouseHandle) + Send + 'static,
+    ) -> (tokio::task::JoinError, Arc<WarehouseHandle>, Arc<AppState>) {
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let _seam = arm_write_seam(&fixture.root, seam, {
+            let handle = Arc::clone(&handle);
+            move || {
+                observe(&handle);
+                panic!("planted storage panic")
+            }
+        });
+
+        let push = tokio::spawn({
+            let state = Arc::clone(&state);
+            let pushed = fixture.pushed.clone();
+            async move {
+                post_ref_update(
+                    State(state), Extension(Principal::Open), Path(ref_update_params("pushed")),
+                    Json(RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None }),
+                ).await.into_response()
+            }
+        });
+        let raised = push.await.expect_err("the storage panic is raised again");
+
+        (raised, handle, state)
+    }
+
+    /// Wait, up to five seconds, until no redaction run is running for `handle`; a run is marked
+    /// running before it is spawned ([`run_redactions`]), so one asked for has started by then.
+    async fn redactions_settled(handle: &WarehouseHandle) {
+        for _ in 0..500 {
+            if !handle.redacting.load(Ordering::SeqCst) {
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("the redaction run did not end");
+    }
+
+    /// In a debug build, a storage panic in the redaction apply a landed write's answer waits for
+    /// reaches the request's task too; and only once the run that retries the apply is started, so
+    /// the warehouse is open to content again once that run ends.
+    ///
+    /// Revert: hand the apply's task back without raising it (`failed.reported()` in
+    /// `after_ref_write`) → the push answers 200 → "the storage panic is raised again" fails; raise
+    /// it before `run_redactions` → no run retries the apply → the last assertion fails.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_debug_build_raises_a_writes_apply_panic_once_its_retry_is_started() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let closed_at_the_panic = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::clone(&closed_at_the_panic);
+        let (raised, handle, state) = push_with_a_planted_panic(&fixture, APPLY_SEAM, move |handle| {
+            closed.store(usize::from(handle.applies_closed()) + 1, Ordering::SeqCst);
+        }).await;
+
+        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+        assert!(fixture.changed(HeavyRoute::RefUpdate), "the push landed before its apply");
+        assert_eq!(closed_at_the_panic.load(Ordering::SeqCst), 2, "the write's apply was owed when it panicked");
+        redactions_settled(&handle).await;
+        assert!(!handle.applies_closed(), "the run started before the panic was raised applied what the write owed");
+
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
+    }
+
+    /// In a debug build, a Heavy ref write's storage panic reaches the request's own task too, though
+    /// the write runs in the permit's task; and only once the apply the write owed is settled, as a
+    /// failed write's is, so the warehouse does not stay closed to content.
+    ///
+    /// Revert: report the permit task's panic (`internal(format!("A ref write failed: {}", error))`)
+    /// → the request answers 500 → "the storage panic is raised again" fails; raise it before
+    /// `after_failed_ref_write` → the apply stays owed → the last assertion fails.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_debug_build_raises_a_ref_writes_storage_panic_once_its_apply_is_settled() {
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let closed_at_the_panic = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::clone(&closed_at_the_panic);
+        let (raised, handle, state) = push_with_a_planted_panic(&fixture, "pushed/owed", move |handle| {
+            closed.store(usize::from(handle.applies_closed()) + 1, Ordering::SeqCst);
+        }).await;
+
+        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+        assert!(!fixture.changed(HeavyRoute::RefUpdate), "the push did not land");
+        assert_eq!(closed_at_the_panic.load(Ordering::SeqCst), 2, "the write owed its apply when it panicked");
+        assert!(!handle.applies_closed(), "the apply the write owed was settled before the panic was raised");
+
+        redactions_settled(&handle).await;
+        drop((handle, state));
+        let _ = forklift_core::util::file_utils::remove_dir_all(&fixture.root);
     }
 
     // ---------------------------------------------------------------------------------
@@ -9227,7 +9523,7 @@ mod tests {
 
         drop(handle.owe_apply());
         let writing = handle.owe_apply();
-        let (_, applied) = apply_discharging(&handle).await;
+        let (_, applied, _) = apply_discharging(&handle).await;
         applied.unwrap();
         assert!(handle.applies_closed(), "the write in flight is still owed");
 
@@ -13004,6 +13300,161 @@ mod tests {
         let expected: BTreeSet<String> = ["delete_ref", "post_objects_batch", "post_ref_update", "put_trust"]
             .map(str::to_string).into();
         assert_eq!(heavy, expected, "the Heavy routes");
+    }
+
+    /// The functions outside tests in server.rs that name each path or method: a path's last
+    /// segment (a call, or a function passed by name), `tokio::spawn` under that key whatever the
+    /// path spells between, and a method call under `.<name>`.
+    #[derive(Default)]
+    struct NamedBy {
+        within: Vec<String>,
+        names: BTreeMap<String, BTreeSet<String>>,
+    }
+
+    impl NamedBy {
+        fn of(file: &syn::File) -> Self {
+            let mut named = NamedBy::default();
+            syn::visit::Visit::visit_file(&mut named, file);
+            named
+        }
+
+        fn record(&mut self, name: String) {
+            let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
+            self.names.entry(name).or_default().insert(within);
+        }
+
+        fn by(&self, name: &str) -> BTreeSet<String> {
+            self.names.get(name).cloned().unwrap_or_default()
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for NamedBy {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !is_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !is_test_only(&item.attrs) {
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            let segments: Vec<String> = path.path.segments.iter().map(|segment| segment.ident.to_string()).collect();
+
+            if let Some(last) = segments.last() {
+                let name = match segments.first().is_some_and(|first| first == "tokio") && last == "spawn" {
+                    true => "tokio::spawn".to_string(),
+                    false => last.clone(),
+                };
+                self.record(name);
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.record(format!(".{}", call.method));
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        // syn leaves a macro's tokens unparsed, so a call inside `format!` would go unseen. Its
+        // arguments are read as expressions where they parse as a comma-separated list, as every
+        // formatting and logging macro's do. One whose do not (`tokio::select!`) has every
+        // identifier in its tokens recorded as a name, so nothing in it goes unseen: a method
+        // there is recorded under its bare name, not `.<name>`.
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            type Args = syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>;
+
+            match mac.parse_body_with(Args::parse_terminated) {
+                Ok(args) => {
+                    let mut inner = NamedBy { within: self.within.clone(), names: std::mem::take(&mut self.names) };
+
+                    for arg in &args {
+                        syn::visit::Visit::visit_expr(&mut inner, arg);
+                    }
+                    self.names = inner.names;
+                }
+                Err(_) => {
+                    for word in identifiers(syn::buffer::TokenBuffer::new2(mac.tokens.clone())) {
+                        self.record(word);
+                    }
+                }
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    /// Which function names each storage wrapper is a literal here, so a new site of one is an
+    /// edit to this test that has to choose between them: the functions naming `spawn_blocking`,
+    /// `scoped_storage_task` and the background `blocking`, none of the last a route handler; the
+    /// request wrappers named by handlers only; `reraise_storage_panic` named by every Heavy
+    /// handler; and a redaction apply's failure disposed of (`raise` or `reported`) by every
+    /// caller of `apply_discharging`. Macro tokens are read too.
+    ///
+    /// It pins names, not flow, and proves no absence of masking: a task boundary between a
+    /// handler and its wrapper (a `tokio::spawn` whose `JoinError` the handler answers, a helper
+    /// in between) passes it. That a raise comes after its settling is the behavioural tests'
+    /// (`a_debug_build_raises_…`).
+    ///
+    /// Reverts: a handler on `blocking` → its literal set fails; a bare `spawn_blocking` in a
+    /// handler → the `spawn_blocking` set fails; a redaction round that drops the apply's failure
+    /// with `_` → the `.reported` set fails; arguments that parse left unvisited (the fallback is
+    /// not reached for them) → the Heavy handlers' raise inside `format!` is unseen → red;
+    /// `blocking` named only inside a `tokio::select!` in a handler → its literal set fails; with
+    /// the unparsed-macro fallback removed as well, the same plant passes unseen.
+    #[test]
+    fn storage_wrappers_are_named_where_this_test_pins_them() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let file = syn::parse_file(&source).unwrap();
+        let handlers: BTreeSet<String> = route_handlers(&file).into_values().collect();
+        let named = NamedBy::of(&file);
+        let set = |names: &[&str]| -> BTreeSet<String> { names.iter().map(|name| name.to_string()).collect() };
+
+        assert_eq!(named.by("spawn_blocking"), set(&[
+            "delete_applied_content", "request_blocking_unscoped", "retake_store_access", "run_rebuild",
+            "scoped_storage_task",
+        ]), "the functions spawning blocking work");
+        assert_eq!(named.by("scoped_storage_task"), set(&[
+            "apply_redactions", "blocking", "delete_ref", "post_ref_update", "request_blocking",
+        ]), "the functions taking a storage task's raw result");
+        assert_eq!(named.by("blocking"), set(&["delete_applied_content", "start_serving", "watch_withheld"]),
+            "the functions reporting a storage task's panic");
+        assert!(named.by("blocking").is_disjoint(&handlers), "no route handler reports a storage panic");
+
+        let request_wrapped: BTreeSet<String> = named.by("request_blocking").union(&named.by("request_blocking_unscoped")).cloned().collect();
+        assert!(!request_wrapped.is_empty() && request_wrapped.is_subset(&handlers),
+            "only route handlers raise through a request wrapper: {request_wrapped:?}");
+
+        let heavy: BTreeSet<String> = set(&["delete_ref", "post_objects_batch", "post_ref_update", "put_trust"]);
+        assert!(heavy.is_subset(&named.by("reraise_storage_panic")), "every Heavy handler raises its permit task's panic");
+
+        // A redaction apply's failure: raised where a write's answer waits for it, reported where
+        // a run's does, and dropped nowhere.
+        assert_eq!(named.by("apply_redactions"), set(&["apply_discharging"]));
+        assert_eq!(named.by(".raise"), set(&["after_failed_ref_write", "after_ref_write"]));
+        assert_eq!(named.by(".reported"), set(&["redaction_round"]));
+        let disposed: BTreeSet<String> = named.by(".raise").union(&named.by(".reported")).cloned().collect();
+        assert_eq!(named.by("apply_discharging"), disposed, "every apply's caller disposes of its failure");
+        let raising_callers: BTreeSet<String> = named.by("after_ref_write").union(&named.by("after_failed_ref_write")).cloned().collect();
+        assert!(raising_callers.is_subset(&handlers), "only route handlers await an apply they raise: {raising_callers:?}");
     }
 
     /// `serve`'s capacity: a set value is used as given; zero, and more than the semaphore can
