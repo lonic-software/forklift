@@ -731,21 +731,39 @@ async fn resolve_the_rest(
                     }
                 }
             }
-            // The removal that was keeping the bytes in it stopped before it removed the ref, so
-            // the absence is the visible state and is made durable, as a removed ref's is.
-            VanishedClass::Keepsake => match sync_nearest_ancestor(root, relative) {
-                Ok(()) => {
-                    refs_resolved.push(relative.to_string_lossy().into_owned());
-                    vanished_notes.push(format!(
-                        "the removed ref's keepsake \"{}\" is gone; the removal that was keeping a \
-                        ref's bytes in it stopped before it removed the ref",
+            // The removal that was keeping a ref's bytes in it stopped before it removed the ref.
+            // While that ref stands, it holds the bytes, so the absence is the visible state and
+            // is made durable, as a removed ref's is. Beside no standing ref, the record stays:
+            // the bytes may be in neither file.
+            VanishedClass::Keepsake => match keepsake_ref_standing(relative) {
+                Ok(Some(pallet)) => match sync_nearest_ancestor(root, relative) {
+                    Ok(()) => {
+                        refs_resolved.push(relative.to_string_lossy().into_owned());
+                        vanished_notes.push(format!(
+                            "the keepsake \"{}\" of pallet \"{}\"'s ref is gone; the removal that was \
+                            keeping the ref's bytes in it stopped before it removed the ref, which still stands",
+                            relative.to_string_lossy(), pallet
+                        ));
+                    }
+                    Err(error) => {
+                        remainder.insert(relative.clone());
+                        dangling_lines.push(format!(
+                            "a lost keepsake of pallet \"{}\"'s ref whose loss could not be made durable: \"{}\" ({})",
+                            pallet, relative.to_string_lossy(), error
+                        ));
+                    }
+                },
+                Ok(None) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost keepsake of a pallet's ref, beside no ref of the pallet it names: \"{}\"",
                         relative.to_string_lossy()
                     ));
                 }
                 Err(error) => {
                     remainder.insert(relative.clone());
                     dangling_lines.push(format!(
-                        "a lost removed ref's keepsake whose loss could not be made durable: \"{}\" ({})",
+                        "a lost keepsake of a pallet's ref, whose ref cannot be read: \"{}\" ({})",
                         relative.to_string_lossy(), error
                     ));
                 }
@@ -1627,10 +1645,11 @@ enum VanishedClass {
     ///
     /// [`META_PALLET_NAMES`]: crate::util::meta_tree::META_PALLET_NAMES
     MetaCopy(&'static str),
-    /// A file `heal --remove-ref` was keeping a removed ref's bytes in (`removed-refs/<…>`), gone
-    /// since the taint was recorded. Its writer records that taint only when the keepsake's
-    /// folder sync fails, and that failure stops the removal before it removes the ref
-    /// (`pallet_utils::remove_damaged_ref`).
+    /// A file `heal --remove-ref` was keeping a ref's bytes in (`removed-refs/<…>`), gone since
+    /// the taint was recorded. Every recorder of that taint starts from a removal whose keepsake
+    /// failed its folder sync: the keep itself, then heal's restage of it or a torn rescan
+    /// carrying it. That failure stops the removal before it removes the ref
+    /// (`pallet_utils::remove_damaged_ref`), and the standing taint refuses a later removal.
     Keepsake,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
@@ -1667,6 +1686,41 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
+}
+
+/// The user pallet whose ref a keepsake at `relative` (`removed-refs/<…>`) was taken from, when
+/// that ref still stands as a file: the name the keepsake's path encodes (`%2F` for `/`), whole
+/// or without a numbered slot's `.<n>`, since a slot can be either pallet's (`ref_heal`'s
+/// `kept_path`). `None` when no such ref stands, or the name is no pallet's; a state that cannot
+/// be read is an error, never taken for either answer.
+fn keepsake_ref_standing(relative: &Path) -> Result<Option<String>, String> {
+    let encoded: Vec<String> = relative.components().skip(1)
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let whole = encoded.join("/").replace("%2F", "/");
+
+    let mut names = vec![whole.clone()];
+    if let Some((stem, slot)) = whole.rsplit_once('.') {
+        if !stem.is_empty() && !slot.is_empty() && slot.bytes().all(|byte| byte.is_ascii_digit()) {
+            names.push(stem.to_string());
+        }
+    }
+
+    for name in names {
+        if pallet_utils::validate_pallet_name(&name).is_err() {
+            continue;
+        }
+
+        let path = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::User, &name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(name)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("\"{}\": {}", path.to_string_lossy(), error)),
+        }
+    }
+
+    Ok(None)
 }
 
 /// Sync the nearest directory above `relative` (under `root`) that still exists: a removed nested
@@ -6574,12 +6628,76 @@ mod tests {
         let outcome = run_heal().expect("a lost keepsake is resolved, so heal clears");
         let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
         assert_eq!(resolved, ["removed-refs/side".to_string()], "{:?}", outcome);
-        assert!(outcome.notes.contains(&"the removed ref's keepsake \"removed-refs/side\" is gone; the removal that was \
-            keeping a ref's bytes in it stopped before it removed the ref".to_string()), "{:?}", outcome.notes);
+        assert!(outcome.notes.contains(&"the keepsake \"removed-refs/side\" of pallet \"side\"'s ref is gone; the removal \
+            that was keeping the ref's bytes in it stopped before it removed the ref, which still stands".to_string()),
+            "{:?}", outcome.notes);
         assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
         assert_eq!(std::fs::read(&reference).unwrap(), unreadable, "heal leaves the ref as it stands");
 
         crate::util::file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// A lost keepsake is resolved only beside a standing ref of the pallet its path names, whole
+    /// or without a numbered slot; beside none, the bytes may be in neither file, so the record
+    /// stays and heal refuses.
+    ///
+    /// Revert: resolve without asking `keepsake_ref_standing` → the no-ref rows clear → red.
+    /// Revert: drop the slot-less candidate → "side.1" beside "side" refuses → red. Revert: drop
+    /// the `%2F` decoding → "team%2Fx" refuses → red.
+    #[test]
+    fn heal_resolves_a_lost_keepsake_only_beside_a_standing_ref_it_names() {
+        use crate::globals::StorageRootScope;
+
+        // (keepsake, the pallet whose ref stands, the pallet the note names; None: heal refuses)
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("removed-refs/side.1", Some("side"), Some("side")),
+            ("removed-refs/side.1", Some("side.1"), Some("side.1")),
+            ("removed-refs/team%2Fx", Some("team/x"), Some("team/x")),
+            ("removed-refs/side", None, None),
+            ("removed-refs/side.1", Some("other"), None),
+            ("removed-refs/side", Some("side.1"), None),
+        ];
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        for (n, &(keepsake, standing, named)) in cases.iter().enumerate() {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-keepsake-{}-{}-{}", n, std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            if let Some(pallet) = standing {
+                let reference = pallet_utils::get_pallet_ref_path(pallet_utils::PalletNamespace::User, pallet);
+                std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+                std::fs::write(&reference, [0u8; 16]).unwrap();
+            }
+            plant_complete_taint(&forklift, &[keepsake]);
+
+            let recorded = match (run_heal(), named) {
+                (Ok(outcome), Some(pallet)) => {
+                    let expected = format!("the keepsake \"{}\" of pallet \"{}\"'s ref is gone; ", keepsake, pallet);
+                    assert!(outcome.notes.iter().any(|note| note.starts_with(&expected)), "{}: {:?}", keepsake, outcome.notes);
+                    taint_utils::read_taints(&forklift).unwrap().recorded
+                }
+                (Err(error), None) => {
+                    assert_durability_taint(&error, &[&format!(
+                        "a lost keepsake of a pallet's ref, beside no ref of the pallet it names: \"{}\"", keepsake
+                    )]);
+                    let recorded = taint_utils::read_taints(&forklift).unwrap().recorded;
+                    assert_eq!(recorded, [PathBuf::from(keepsake)].into_iter().collect(), "{}: the record stays", keepsake);
+                    BTreeSet::new()
+                }
+                (result, _) => panic!("{} beside {:?}: {:?}", keepsake, standing, result.map(|outcome| outcome.notes)),
+            };
+            assert!(recorded.is_empty(), "{}: nothing else may remain recorded: {:?}", keepsake, recorded);
+
+            drop(_scope);
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
     }
 
     #[test]

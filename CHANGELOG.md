@@ -142,10 +142,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   its removal is made durable, where before it was taken for a missing object. A lost meta pallet
   ref or meta-copy file whose name looks like an object, a shard (`data`), a pack, an index or a
   signature file is now kept, so heal refuses where it used to clear it. A lost keepsake under
-  `.forklift/removed-refs`, whatever its name, is cleared once its absence is made durable, with a
-  note: the `heal --remove-ref` that was writing it stopped before it removed the ref. Before, a
-  plainly named one kept every command refused. A name that matches an object the store holds is
-  still settled before this, as before.
+  `.forklift/removed-refs`, whatever its name, is cleared with a note once its absence is made
+  durable, as long as the ref it was taken from still stands: the `heal --remove-ref` that was
+  writing it stopped before it removed the ref. Before, a plainly named one kept heal refusing,
+  and every command that records anything refused with it. A name that matches an object the
+  store holds is still settled before this, as before.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
