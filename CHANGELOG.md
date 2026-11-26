@@ -206,6 +206,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   A lost undo journal (`.forklift/journal.json`, or a bay's) is now cleared the same way. It reads
   as an empty journal, as a missing journal does with no taint, and its note says that undo finds
   nothing to undo there and that it keeps no deleted pallet's head. Before, it kept heal refusing.
+  A lost bay path record (`.forklift/bays/<name>/path`) is now cleared the same way. The bay reads
+  as one that records no directory, as it does with no taint. While the bay's state folder
+  stands, the note names `forklift bay remove <name>`, or the deletion to make by hand where no
+  command line spells the name. Before, it kept heal refusing.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
