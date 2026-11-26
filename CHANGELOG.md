@@ -142,11 +142,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   its removal is made durable, where before it was taken for a missing object. A lost meta pallet
   ref or meta-copy file whose name looks like an object, a shard (`data`), a pack, an index or a
   signature file is now kept, so heal refuses where it used to clear it. A lost meta pallet ref
-  (`.forklift/meta/<name>`) beside a copy that still holds a head is cleared once its absence is
-  made durable, and heal's pass after the recovery rebuilds the ref from that copy, or says why it
-  cannot. Before, such a ref that heal could not rebuild ahead of the recovery kept heal refusing
-  with no recovery for it. Beside a copy that is lost too, holds no head or is not a file, it is
-  kept, and the refusal says which. A lost keepsake under
+  (`.forklift/meta/<name>`) is now settled too, once its absence is made durable. With no copy
+  beside it, which is what a meta pallet's failed first write leaves after a power loss, heal
+  clears it with a note naming the lost write, and the pallet reads as never written, as it
+  already did. Run the write again. For the office pallet beside the trust file's anchor, the note
+  names the unborn office's way back instead, and a trust file that cannot be read keeps it. Beside
+  a copy that still holds a head, heal's pass after the recovery rebuilds the ref from that copy,
+  or says why it cannot. Before, every such ref kept heal refusing with no recovery for it, and
+  every command that records anything refused with it. Beside any other copy (one that holds no
+  head, is not a file or cannot be read) it is kept, and the refusal says which. A lost keepsake under
   `.forklift/removed-refs`, whatever its name, is cleared with a note once its absence is made
   durable, as long as the ref it was taken from still stands: the `heal --remove-ref` that was
   writing it stopped before it removed the ref. Before, a plainly named one kept heal refusing,

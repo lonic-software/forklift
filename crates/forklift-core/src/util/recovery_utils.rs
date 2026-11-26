@@ -725,13 +725,47 @@ async fn resolve_the_rest(
             // A ref lost beside a copy holding a head reads as lost, on every run, as on a
             // warehouse with no taint: every read of it refuses it as damaged, and the meta pass
             // after the recovery rebuilds it from the copy, or says why not. So the record is
-            // resolved here, its absence made durable. Beside any other copy, the record stays:
-            // the pallet would read as never written, and nothing else would say its ref is lost.
+            // resolved here, its absence made durable. Beside no copy at all, the pallet reads as
+            // unborn, as it would on a warehouse with no taint: the write that recorded the ref
+            // was a first one whose folder sync failed, which refused the copy's write after it
+            // and returned that failure, and a power loss undid the ref. Resolved with a note
+            // naming the lost write, which keeping would only stop from being run again. The
+            // office beside the trust file's anchor is refused unborn by every reader, so its
+            // note names that state's way back, and an anchor that cannot be read keeps the
+            // record. Beside a copy that stands and holds no head, the record stays.
             VanishedClass::MetaRef(name) => {
+                let copy_path = pallet_utils::get_meta_copy_path(name);
                 let copy = format!("{}/{}", pallet_utils::FOLDER_NAME_META_COPY_ROOT, name);
-                match meta_partner_lacks_head(&pallet_utils::get_meta_copy_path(name)) {
-                    None => match sync_nearest_ancestor(root, relative) {
-                        Ok(()) => refs_resolved.push(relative.to_string_lossy().into_owned()),
+                let unborn = matches!(pallet_utils::read_file_state(&copy_path), Ok(pallet_utils::MetaCopyState::Absent));
+                let note = match unborn {
+                    false => Ok(None),
+                    true if name == crate::util::office_utils::OFFICE_PALLET_NAME => {
+                        match crate::util::office_utils::read_trust_anchor_in(crate::util::office_utils::TrustReadMode::Checked) {
+                            Ok(Some(_)) => Ok(Some(format!(
+                                "the first write of meta pallet \"{}\" did not survive a power loss (\"{}\" is gone, and so is its \
+                                copy), and the trust file holds this warehouse's anchor, so the office pallet reads as unborn. {}",
+                                name, relative.to_string_lossy(), crate::util::office_utils::office_unborn_step()
+                            ))),
+                            Ok(None) => Ok(Some(lost_meta_birth_note(name, relative))),
+                            Err(error) => Err(format!(
+                                "a lost meta pallet ref whose copy is lost too, beside a trust file that cannot be read: \"{}\" ({})",
+                                relative.to_string_lossy(), error.trim_end_matches('.')
+                            )),
+                        }
+                    }
+                    true => Ok(Some(lost_meta_birth_note(name, relative))),
+                };
+                let lacks = match unborn { true => None, false => meta_partner_lacks_head(&copy_path) };
+                match (note, lacks) {
+                    (Err(line), _) => {
+                        remainder.insert(relative.clone());
+                        dangling_lines.push(line);
+                    }
+                    (Ok(note), None) => match sync_nearest_ancestor(root, relative) {
+                        Ok(()) => {
+                            refs_resolved.push(relative.to_string_lossy().into_owned());
+                            vanished_notes.extend(note);
+                        }
                         Err(error) => {
                             remainder.insert(relative.clone());
                             dangling_lines.push(format!(
@@ -740,7 +774,7 @@ async fn resolve_the_rest(
                             ));
                         }
                     },
-                    Some(why) => {
+                    (Ok(_), Some(why)) => {
                         remainder.insert(relative.clone());
                         dangling_lines.push(format!(
                             "a lost meta pallet ref whose copy (\"{}\") {}: \"{}\"",
@@ -1656,10 +1690,12 @@ enum VanishedClass {
     /// A user pallet's ref, removed since the taint was recorded (a delete whose directory sync
     /// failed, or a later delete of the same pallet).
     Ref,
-    /// A meta pallet's ref (`meta/<name>`), gone since the taint was recorded: a first write whose
-    /// folder sync failed, then a power loss that undid the ref's birth. That write writes the copy
-    /// once the ref reads back at its head, so the copy can outlive the ref. The meta pallet's name,
-    /// one of [`META_PALLET_NAMES`]: a path of any other name under `meta/` is undisposed.
+    /// A meta pallet's ref (`meta/<name>`), gone since the taint was recorded: a ref write that
+    /// created the file, whose folder sync failed, then a power loss that undid its birth. A first
+    /// write of the pallet leaves its copy unwritten too, the copy's write refused by the taint the
+    /// failed sync recorded. Heal's own rebuild of a lost ref from its copy writes while the taint
+    /// stands, so there the copy outlives the ref. The meta pallet's name, one of
+    /// [`META_PALLET_NAMES`]: a path of any other name under `meta/` is undisposed.
     ///
     /// [`META_PALLET_NAMES`]: crate::util::meta_tree::META_PALLET_NAMES
     MetaRef(&'static str),
@@ -1718,6 +1754,16 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
 fn meta_pallet_name(relative: &Path) -> Option<&'static str> {
     let name = relative.file_name()?;
     crate::util::meta_tree::META_PALLET_NAMES.iter().copied().find(|known| std::ffi::OsStr::new(known) == name)
+}
+
+/// The note for meta pallet `name`'s first write, recorded at `relative`, that a power loss undid
+/// along with its copy: the pallet reads as never written, and the write is the user's to run again.
+fn lost_meta_birth_note(name: &str, relative: &Path) -> String {
+    format!(
+        "the first write of meta pallet \"{}\" did not survive a power loss (\"{}\" is gone, and so is its copy), so the \
+        pallet reads as never written; that write had failed, and whatever it recorded has to be recorded again",
+        name, relative.to_string_lossy()
+    )
 }
 
 /// Why the file at `path`, the other record of a meta pallet's head beside one that vanished,
@@ -6778,36 +6824,49 @@ mod tests {
         }
     }
 
-    /// A meta pallet's first write whose folder sync failed, then a power loss that undid the
-    /// ref's birth: the taint records `meta/<name>`, and the copy the write set after the ref read
-    /// back may stand. Beside a copy that is a file holding a head, the record resolves, while the
-    /// ref still reads as lost (the meta pass after the recovery rebuilds it from the copy). Beside
-    /// any other copy the record stays, the line naming why. A name in the meta folder that is no
-    /// meta pallet's is kept, as heal has no recovery for it.
+    /// A meta pallet ref recorded by a taint and gone: a ref write that created the file, whose
+    /// folder sync failed, then a power loss. Beside a copy that is a file holding a head (heal's
+    /// own rebuild from the copy), the record resolves with no note, while the ref still reads as
+    /// lost (the meta pass after the recovery rebuilds it from the copy). Beside no copy (a first
+    /// write, whose copy's write the taint refused), the pallet reads as unborn and the record
+    /// resolves with a note naming the lost write; for the office beside the trust file's anchor
+    /// the note names the unborn office's way back, and beside a trust file that does not read the
+    /// record stays. Beside a copy that stands and holds no head the record stays, the line naming
+    /// why. A name in the meta folder that is no meta pallet's is kept.
     ///
     /// Revert: the meta ref shape's disposition back to `None` → the head row refuses → red.
-    /// Revert: resolve without asking `meta_partner_lacks_head` → the absent row clears → red.
+    /// Revert: resolve without asking `meta_partner_lacks_head` → the no-head row clears → red.
+    /// Revert: keep a lost first write (`unborn` always false) → the absent row refuses → red.
+    /// Revert: skip the trust read for the office → the unreadable-trust row clears → red.
     #[test]
-    fn heal_resolves_a_lost_meta_ref_only_beside_a_copy_holding_a_head() {
+    fn heal_resolves_a_lost_meta_ref_beside_a_copy_holding_a_head_or_beside_none() {
         use crate::globals::StorageRootScope;
 
         enum CopyIs { Head, Absent, NoHead, Folder }
         use CopyIs::{Absent, Folder, Head, NoHead};
+        enum Trust { Missing, Anchor, Damaged }
+        use Trust::{Anchor, Damaged, Missing};
+        enum Expect { Rebuilt, Note(&'static str), Kept(&'static str) }
+        use Expect::{Kept, Note, Rebuilt};
 
+        const ANCHOR: &str = "version = 1\ngenesis = \"genesis-hash\"\nenabled_at = 1\nboundary = []\n";
         let head = "c".repeat(64);
-        // (recorded path, what stands at meta-copy/tags, the refusal's line; None: heal clears)
-        let cases: &[(&str, CopyIs, Option<&str>)] = &[
-            ("meta/tags", Head, None),
-            ("meta/tags", Absent, Some("a lost meta pallet ref whose copy (\"meta-copy/tags\") is lost too: \"meta/tags\"")),
-            ("meta/tags", NoHead, Some("a lost meta pallet ref whose copy (\"meta-copy/tags\") does not hold a head either: \"meta/tags\"")),
-            ("meta/tags", Folder, Some("a lost meta pallet ref whose copy (\"meta-copy/tags\") is not a file: \"meta/tags\"")),
-            ("meta/data", Head, Some("\"meta/data\" (a ref in the meta folder that is no meta pallet's) is gone, and heal has no recovery for it")),
+        // (pallet, recorded path, what stands at its copy, the trust file, what heal does)
+        let cases: &[(&str, &str, CopyIs, Trust, Expect)] = &[
+            ("tags", "meta/tags", Head, Missing, Rebuilt),
+            ("tags", "meta/tags", Absent, Missing, Note("the first write of meta pallet \"tags\" did not survive a power loss (\"meta/tags\" is gone, and so is its copy), so the pallet reads as never written; that write had failed, and whatever it recorded has to be recorded again")),
+            ("tags", "meta/tags", NoHead, Missing, Kept("a lost meta pallet ref whose copy (\"meta-copy/tags\") does not hold a head either: \"meta/tags\"")),
+            ("tags", "meta/tags", Folder, Missing, Kept("a lost meta pallet ref whose copy (\"meta-copy/tags\") is not a file: \"meta/tags\"")),
+            ("office", "meta/office", Absent, Missing, Note("the first write of meta pallet \"office\" did not survive a power loss (\"meta/office\" is gone, and so is its copy), so the pallet reads as never written")),
+            ("office", "meta/office", Absent, Anchor, Note("the first write of meta pallet \"office\" did not survive a power loss (\"meta/office\" is gone, and so is its copy), and the trust file holds this warehouse's anchor, so the office pallet reads as unborn. ")),
+            ("office", "meta/office", Absent, Damaged, Kept("a lost meta pallet ref whose copy is lost too, beside a trust file that cannot be read: \"meta/office\" (")),
+            ("tags", "meta/data", Head, Missing, Kept("\"meta/data\" (a ref in the meta folder that is no meta pallet's) is gone, and heal has no recovery for it")),
         ];
 
         let _serial = lock_activation();
         taint_utils::activate();
 
-        for (n, (recorded, copy, line)) in cases.iter().enumerate() {
+        for (n, (pallet, recorded, copy, trust, expect)) in cases.iter().enumerate() {
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             let root = std::env::temp_dir()
                 .join(format!("forklift-recovery-utils-meta-ref-{}-{}-{}", n, std::process::id(), nanos));
@@ -6816,7 +6875,7 @@ mod tests {
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
             let forklift = forklift_root();
 
-            let copy_path = pallet_utils::get_meta_copy_path("tags");
+            let copy_path = pallet_utils::get_meta_copy_path(pallet);
             std::fs::create_dir_all(copy_path.parent().unwrap()).unwrap();
             match copy {
                 Head => std::fs::write(&copy_path, format!("{}\n", head)).unwrap(),
@@ -6824,19 +6883,35 @@ mod tests {
                 NoHead => std::fs::write(&copy_path, b"not a hash").unwrap(),
                 Folder => std::fs::create_dir(&copy_path).unwrap(),
             }
+            match trust {
+                Missing => {}
+                Anchor => std::fs::write(forklift.join(crate::util::office_utils::FILE_NAME_TRUST), ANCHOR).unwrap(),
+                Damaged => std::fs::write(forklift.join(crate::util::office_utils::FILE_NAME_TRUST), "not a trust file").unwrap(),
+            }
             plant_complete_taint(&forklift, &[recorded]);
 
-            match (run_heal(), line) {
-                (Ok(outcome), None) => {
+            match (run_heal(), expect) {
+                (Ok(outcome), Rebuilt | Note(_)) => {
                     let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
                     assert_eq!(resolved, [recorded.to_string()], "row {}: {:?}", n, outcome);
                     assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "row {}: nothing may remain recorded", n);
-                    let read = pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::Meta, "tags")
-                        .expect_err("the ref still reads as lost");
-                    assert!(read.contains("is lost") && read.contains("its copy (\""), "row {}: {}", n, read);
-                    assert_eq!(std::fs::read(&copy_path).unwrap(), format!("{}\n", head).into_bytes(), "row {}: the copy is left", n);
+                    let named: Vec<&String> = outcome.notes.iter().filter(|note| note.contains(recorded)).collect();
+                    match expect {
+                        Note(note) => {
+                            assert_eq!(named.len(), 1, "row {}: one note names the lost write: {:?}", n, outcome.notes);
+                            assert!(named[0].replace('\\', "/").contains(note), "row {}: {}", n, named[0]);
+                            assert_eq!(pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::Meta, pallet), Ok(None), "row {}: unborn", n);
+                        }
+                        _ => {
+                            assert!(named.is_empty(), "row {}: no note: {:?}", n, outcome.notes);
+                            let read = pallet_utils::get_pallet_head_in(pallet_utils::PalletNamespace::Meta, pallet)
+                                .expect_err("the ref still reads as lost");
+                            assert!(read.contains("is lost") && read.contains("its copy (\""), "row {}: {}", n, read);
+                            assert_eq!(std::fs::read(&copy_path).unwrap(), format!("{}\n", head).into_bytes(), "row {}: the copy is left", n);
+                        }
+                    }
                 }
-                (Err(error), Some(line)) => {
+                (Err(error), Kept(line)) => {
                     assert_durability_taint(&error, &[line]);
                     assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
                         [PathBuf::from(recorded)].into_iter().collect(), "row {}: the record stays", n);
