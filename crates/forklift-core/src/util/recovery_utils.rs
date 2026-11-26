@@ -249,7 +249,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
-    audit_utils, bay_utils, checkout_scope_heal, fanout_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, merge_state_heal, merge_utils, mirror_utils, object_utils,
+    audit_utils, bay_utils, checkout_scope_heal, cherry_pick_utils, fanout_utils, file_utils, haul_utils, heal_utils, inventory_utils, load_guard_utils, merge_state_heal, merge_utils, mirror_utils, object_utils,
     office_utils, operation_utils, pack_utils, pallet_utils, park_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     signature_table, taint_utils, tombstone_utils,
 };
@@ -1840,10 +1840,12 @@ enum VanishedClass {
     /// skeleton missing beside a state is refused as damaged
     /// (`merge_utils::OutOfScopeSkeleton::read_required`), taint or none, so keeping the record
     /// would guard nothing the absence does not already settle, and it stands before the marker's
-    /// recovery, which waits for the taint.
+    /// recovery, which waits for the taint. A checkout's pick state (`cherry-pick`, or a bay's) is
+    /// the same: its writes run under the pick's operation marker (`pick` raises it first) or are
+    /// that undo, and a missing one reads as no pick in progress (`cherry_pick_utils::read_state_in`).
     MergeRecord,
-    /// The copy of a consolidation state or skeleton, gone since the taint was recorded. Only heal
-    /// reads a copy, to write a damaged record back (`merge_state_heal::repair`).
+    /// The copy of a consolidation state, skeleton or pick state, gone since the taint was
+    /// recorded. Only heal reads a copy, to write a damaged record back (`merge_state_heal::repair`).
     MergeRecordCopy,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
@@ -2060,19 +2062,21 @@ fn lost_checkout_record_note(lost: &LostCheckoutRecord) -> String {
     )
 }
 
-/// A record of a consolidation in progress whose loss heal resolves with a note.
+/// A record of a consolidation or pick in progress whose loss heal resolves with a note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConsolidationRecord {
+enum InProgressRecord {
     State,
     Skeleton,
+    Pick,
 }
 
-impl ConsolidationRecord {
+impl InProgressRecord {
     /// The record in a sentence.
     fn what(self) -> &'static str {
         match self {
-            ConsolidationRecord::State => "consolidation state",
-            ConsolidationRecord::Skeleton => "consolidation skeleton",
+            InProgressRecord::State => "consolidation state",
+            InProgressRecord::Skeleton => "consolidation skeleton",
+            InProgressRecord::Pick => "pick state",
         }
     }
 }
@@ -2090,7 +2094,7 @@ enum Step {
 /// A resolved [`VanishedClass::MergeRecord`] or [`VanishedClass::MergeRecordCopy`]: the record,
 /// whether it is the copy, and whose it is, read from its path.
 struct LostMergeRecord {
-    record: ConsolidationRecord,
+    record: InProgressRecord,
     copy: bool,
     /// The bay's name, or `None` for the warehouse's own working tree.
     bay: Option<String>,
@@ -2106,11 +2110,14 @@ impl LostMergeRecord {
             _ => None,
         };
         let last = names.last().map(String::as_str);
-        let record = match last == Some(merge_utils::FILE_NAME_SKELETON) || last == Some(merge_utils::FILE_NAME_SKELETON_COPY) {
-            true => ConsolidationRecord::Skeleton,
-            false => ConsolidationRecord::State,
+        let (record, copy) = match last.unwrap_or_default() {
+            merge_utils::FILE_NAME_SKELETON => (InProgressRecord::Skeleton, false),
+            merge_utils::FILE_NAME_SKELETON_COPY => (InProgressRecord::Skeleton, true),
+            merge_utils::FILE_NAME_CONSOLIDATION_COPY => (InProgressRecord::State, true),
+            cherry_pick_utils::FILE_NAME_CHERRY_PICK => (InProgressRecord::Pick, false),
+            cherry_pick_utils::FILE_NAME_CHERRY_PICK_COPY => (InProgressRecord::Pick, true),
+            _ => (InProgressRecord::State, false),
         };
-        let copy = last == Some(merge_utils::FILE_NAME_CONSOLIDATION_COPY) || last == Some(merge_utils::FILE_NAME_SKELETON_COPY);
 
         LostMergeRecord { record, copy, bay, path: names.join("/") }
     }
@@ -2148,22 +2155,31 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
         false => None,
     };
 
+    // A lost state's tail: heal run there where a marker stands in another checkout, nothing where
+    // one stands in this checkout (its recovery follows), else the command that failed, run again.
+    let state_tail = |marker: Option<String>| match (marker, marker_stands) {
+        (Some(marker), _) => format!("; {}", marker),
+        (None, true) => String::new(),
+        (None, false) => "; if a command that records one failed there before this heal, run it again".to_string(),
+    };
+
     match lost.record {
-        ConsolidationRecord::State => {
+        InProgressRecord::State => {
             // `merge_utils::state_present` counts a skeleton alone as a consolidation in progress. The
             // note says what stands as heal reads it here; a marker's recovery may change it after.
             let reads = match std::fs::symlink_metadata(dir.join(merge_utils::FILE_NAME_SKELETON)).is_ok() {
                 true => "a consolidation skeleton still stands beside it",
                 false => "that checkout reads as having no consolidation in progress, as it would with no taint",
             };
-            let tail = match (marker, marker_stands) {
-                (Some(marker), _) => format!("; {}", marker),
-                (None, true) => String::new(),
-                (None, false) => "; if a command that records one failed there before this heal, run it again".to_string(),
-            };
-            format!("the {} of {} (\"{}\") is gone; {}{}", record, which, path, reads, tail)
+            format!("the {} of {} (\"{}\") is gone; {}{}", record, which, path, reads, state_tail(marker))
         }
-        ConsolidationRecord::Skeleton => {
+        // A missing pick state reads as no pick in progress (`cherry_pick_utils::read_state_in`).
+        InProgressRecord::Pick => format!(
+            "the {} of {} (\"{}\") is gone; that checkout reads as having no pick in progress, as it would with no \
+            taint{}",
+            record, which, path, state_tail(marker)
+        ),
+        InProgressRecord::Skeleton => {
             // The way out where no marker stands: the step for the record the refusal over this
             // state names. A state that does not read is judged first, a usable one's skeleton next.
             let state = dir.join(merge_utils::FILE_NAME_CONSOLIDATION);
@@ -7087,10 +7103,10 @@ mod tests {
             ("bays/main/consolidation-skeleton-copy".into(), "merge record copy"),
             ("bays/main/journal.json".into(), "kept: a bay's journal"),
             ("bays/main/path".into(), "kept: a bay's path record"),
-            ("bays/main/cherry-pick".into(), "kept: a bay's cherry-pick state"),
-            ("bays/main/cherry-pick-copy".into(), "kept: a bay's cherry-pick state's copy"),
-            ("cherry-pick".into(), "kept: the cherry-pick state"),
-            ("cherry-pick-copy".into(), "kept: the cherry-pick state's copy"),
+            ("bays/main/cherry-pick".into(), "merge record"),
+            ("bays/main/cherry-pick-copy".into(), "merge record copy"),
+            ("cherry-pick".into(), "merge record"),
+            ("cherry-pick-copy".into(), "merge record copy"),
             ("config/fetch-scope".into(), "kept: the fetch scope"),
             ("fetched-heads".into(), "kept: the fetch ledger"),
             ("held-heads".into(), "kept: the held-heads record"),
@@ -7687,22 +7703,30 @@ mod tests {
         }
     }
 
-    /// A bay's consolidation record write fails a folder sync and taints what it was writing: the
-    /// copy, which goes first, or the record after it. A power loss then undoes that file. Heal,
-    /// run from the warehouse's own working tree, resolves the lost record with a note. Where the
-    /// absence cannot be made durable, the record stays and heal refuses.
+    /// A bay's consolidation or pick record write fails a folder sync and taints what it was
+    /// writing: the copy, which goes first, or the record after it. A power loss then undoes that
+    /// file. Heal, run from the warehouse's own working tree, resolves the lost record with a note.
+    /// Where the absence cannot be made durable, the record stays and heal refuses.
     ///
-    /// Revert: the consolidation shapes' disposition back to `None` → heal refuses → red. Revert:
-    /// resolve without `sync_nearest_ancestor` → the failing-sync heal clears → red.
+    /// Revert: the consolidation or pick shapes' disposition back to `None` → heal refuses → red.
+    /// Revert: resolve without `sync_nearest_ancestor` → the failing-sync heal clears → red.
     #[test]
     #[cfg(unix)]
-    fn heal_resolves_a_lost_bay_consolidation_record_once_its_absence_is_durable() {
+    fn heal_resolves_a_lost_bay_merge_record_once_its_absence_is_durable() {
         use crate::globals::StorageRootScope;
         use crate::util::file_utils::SyncDirFaultGuard;
 
         // (the record's name, the syncs of the state folder that pass before the one that fails,
-        // the path recorded, whether heal can make its absence durable, the note)
+        // the path recorded, whether heal can make its absence durable, the note, or the refusal's
+        // line where it cannot)
         let cases: &[(&str, usize, &str, bool, &str)] = &[
+            ("cherry-pick", 0, "bays/b/cherry-pick-copy", true, "the copy of the pick state of bay \"b\" \
+                (\"bays/b/cherry-pick-copy\") is gone; only heal reads a copy, to write a damaged record back"),
+            ("cherry-pick", 1, "bays/b/cherry-pick", true, "the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
+                gone; that checkout reads as having no pick in progress, as it would with no taint; if a command that \
+                records one failed there before this heal, run it again"),
+            ("cherry-pick", 1, "bays/b/cherry-pick", false, "a lost pick state or copy whose loss could not be made \
+                durable: \"bays/b/cherry-pick\""),
             ("consolidation", 0, "bays/b/consolidation-copy", true, "the copy of the consolidation state of bay \"b\" \
                 (\"bays/b/consolidation-copy\") is gone; only heal reads a copy, to write a damaged record back"),
             ("consolidation", 1, "bays/b/consolidation", true, "the consolidation state of bay \"b\" \
@@ -7710,7 +7734,8 @@ mod tests {
                 would with no taint; if a command that records one failed there before this heal, run it again"),
             ("consolidation-skeleton", 1, "bays/b/consolidation-skeleton", true, "the consolidation skeleton of bay \
                 \"b\" (\"bays/b/consolidation-skeleton\") is gone, and no consolidation state stands beside it"),
-            ("consolidation", 1, "bays/b/consolidation", false, ""),
+            ("consolidation", 1, "bays/b/consolidation", false, "a lost consolidation state or copy whose loss could \
+                not be made durable: \"bays/b/consolidation\""),
         ];
 
         for (name, passed, relative, durable, note) in cases {
@@ -7740,9 +7765,7 @@ mod tests {
             if !durable {
                 let _fault = SyncDirFaultGuard::failing_exactly(&folder);
                 let error = run_heal().expect_err("an absence that cannot be made durable is kept");
-                assert_durability_taint(&error, &[
-                    "a lost consolidation state or copy whose loss could not be made durable: \"bays/b/consolidation\"",
-                ]);
+                assert_durability_taint(&error, &[*note]);
                 assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
                     [PathBuf::from(relative)].into_iter().collect(), "the record stays");
                 crate::util::file_utils::remove_dir_all(&root).ok();
@@ -7759,9 +7782,9 @@ mod tests {
         }
     }
 
-    /// A lost path of each consolidation shape is resolved with the note for its checkout. A lost
-    /// state's note says whether a skeleton still stands beside it, and a lost skeleton's what the
-    /// state beside it reads. For a checkout other than the one heal runs in, the note names heal run
+    /// A lost path of each consolidation or pick shape is resolved with the note for its checkout. A
+    /// lost state's note says whether a skeleton still stands beside it, a lost skeleton's what the
+    /// state beside it reads, and a lost pick state's that no pick reads as in progress. For a checkout other than the one heal runs in, the note names heal run
     /// there where an operation marker stands, and beside a lost skeleton the step the refusal over
     /// that state names; for the one heal runs in, which these tests run in, it names neither.
     ///
@@ -7771,7 +7794,7 @@ mod tests {
     /// skeleton not read → the rows beside one say none stands → red. Revert: heal named beside
     /// every state → the rows naming abort are red; abort named beside every state → the copy row.
     #[test]
-    fn heal_resolves_a_lost_consolidation_record_of_each_shape() {
+    fn heal_resolves_a_lost_merge_record_of_each_shape() {
         use crate::globals::StorageRootScope;
         use crate::model::tree_item::TreeItem;
 
@@ -7803,6 +7826,7 @@ mod tests {
 
         const RUN_AGAIN: &str = "if a command that records one failed there before this heal, run it again";
         const NO_TAINT: &str = "that checkout reads as having no consolidation in progress, as it would with no taint";
+        const NO_PICK: &str = "that checkout reads as having no pick in progress, as it would with no taint";
         const BAY_HEAL: &str = "the way out is \"forklift heal\" run in the bay's working directory";
         const BAY_ABORT: &str = "the way out is \"forklift abort\" run in the bay's working directory";
         const BAY_ABORT_KEEPING: &str = "the way out is \"forklift abort --keep-files\" run in the bay's working directory";
@@ -7864,6 +7888,18 @@ mod tests {
             ("bays/b/consolidation-skeleton", Beside::Marker, format!("the consolidation skeleton of bay \"b\" \
                 (\"bays/b/consolidation-skeleton\") is gone, and no consolidation state stands beside it; an interrupted \
                 operation's marker stands in that checkout, and {}", BAY_HEAL)),
+            ("cherry-pick", Beside::Nothing, format!("the pick state of the warehouse's own working tree \
+                (\"cherry-pick\") is gone; {}; {}", NO_PICK, RUN_AGAIN)),
+            ("cherry-pick", Beside::Marker, format!("the pick state of the warehouse's own working tree \
+                (\"cherry-pick\") is gone; {}", NO_PICK)),
+            ("bays/b/cherry-pick", Beside::Nothing, format!("the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
+                gone; {}; {}", NO_PICK, RUN_AGAIN)),
+            ("bays/b/cherry-pick", Beside::Marker, format!("the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
+                gone; {}; an interrupted operation's marker stands in that checkout, and {}", NO_PICK, BAY_HEAL)),
+            ("cherry-pick-copy", Beside::Nothing, "the copy of the pick state of the warehouse's own working tree \
+                (\"cherry-pick-copy\") is gone; only heal reads a copy, to write a damaged record back".to_string()),
+            ("bays/b/cherry-pick-copy", Beside::Marker, "the copy of the pick state of bay \"b\" \
+                (\"bays/b/cherry-pick-copy\") is gone; only heal reads a copy, to write a damaged record back".to_string()),
         ];
 
         for (relative, beside, note) in cases {
