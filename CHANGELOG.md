@@ -141,7 +141,20 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   ref whose name looks like an object path (such as `pallets/ab/cd`) is now cleared as a ref once
   its removal is made durable, where before it was taken for a missing object. A lost meta pallet
   ref or meta-copy file whose name looks like an object, a shard (`data`), a pack, an index or a
-  signature file is now kept, so heal refuses where it used to clear it. A lost keepsake under
+  signature file is now kept, so heal refuses where it used to clear it. A meta pallet's lost
+  ref (`.forklift/meta/<name>`, for one of the meta pallets) is now settled too, once its absence
+  is made durable. With its copy gone too (a failed first write and a power loss leave this),
+  heal clears it, and the copy's record if the taint holds one, with a note saying both are
+  gone: the pallet reads as never written, as it already did, so a write that just failed can
+  be run again, and any history it had is not reachable from there. Heal cannot tell which
+  write it was. For the office pallet beside the trust file's anchor, the note names the unborn
+  office's way back instead, and trust state heal does not accept keeps the ref. The redactions
+  pallet's lost ref and copy are still kept. Beside a copy that still holds a head, heal
+  rebuilds the ref from that copy, in its pass before the recovery or, where that pass leaves
+  it, in its pass after, or says why it cannot. Before, every such ref kept heal refusing with
+  no recovery for it, and every command that records anything refused with it. Beside any other
+  copy (one that holds no head, is not a file or cannot be read) it is kept, and the refusal
+  says which. A lost keepsake under
   `.forklift/removed-refs`, whatever its name, is cleared with a note once its absence is made
   durable, as long as the ref it was taken from still stands: the `heal --remove-ref` that was
   writing it stopped before it removed the ref. Before, a plainly named one kept heal refusing,

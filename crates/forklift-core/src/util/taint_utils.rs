@@ -241,6 +241,7 @@ pub(crate) enum VanishedDisposition {
     SignatureTable,
     Shard,
     Ref,
+    MetaRef,
     MetaCopy,
     Keepsake,
 }
@@ -284,7 +285,8 @@ use VanishedDisposition as Disposition;
 static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "a pallet ref", disposition: Some(Disposition::Ref), pattern: &[Is("pallets"), Names] },
     TaintShape { description: "a removed ref's keepsake", disposition: Some(Disposition::Keepsake), pattern: &[Is("removed-refs"), Names] },
-    TaintShape { description: "a meta pallet ref", disposition: None, pattern: &[Is("meta"), Name] },
+    TaintShape { description: "a meta pallet ref", disposition: Some(Disposition::MetaRef), pattern: &[Is("meta"), MetaPalletName] },
+    TaintShape { description: "a ref in the meta folder that is no meta pallet's", disposition: None, pattern: &[Is("meta"), Name] },
     TaintShape { description: "a meta pallet ref's copy", disposition: Some(Disposition::MetaCopy), pattern: &[Is("meta-copy"), MetaPalletName] },
     TaintShape { description: "a copy of a ref that is no meta pallet's", disposition: None, pattern: &[Is("meta-copy"), Name] },
 

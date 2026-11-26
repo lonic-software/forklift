@@ -2392,32 +2392,42 @@ fn link_file(target: &Path, link: &Path) -> bool {
 /// resolves in the taint recovery, and the meta pass after it sets the copy to the ref's bytes;
 /// where the store does not give that head, the copy is left, the pass says why, and the run
 /// refuses the head as lost, as on a warehouse with no taint. A ref gone beside its copy is
-/// rebuilt from the copy before the recovery. A copy gone beside a ref that is gone, damaged or
-/// not a file is more than one fault, and the taint stands.
+/// rebuilt from the copy before the recovery. A ref gone with its copy gone too (here an
+/// established pallet's, whose history is not reachable after it) resolves with a note that names
+/// no cause, the pallet reading as never written, as with no taint, whether the taint recorded
+/// the ref or both files. A copy gone beside a ref that is damaged or not a file, or a ref gone
+/// beside a copy that holds no head, is more than one fault, and the taint stands.
 // Mutations: file a vanished copy as unrecognized again → "copy" red (the run refuses, the
 // taint stands); resolve a vanished copy whatever its ref holds → "copy-ref-damaged" red (the
 // taint clears); read the ref through a link → "copy-ref-link" red (the taint clears); judge
-// the ref's head against the store in the recovery → "copy-head-absent" red (the taint stands).
+// the ref's head against the store in the recovery → "copy-head-absent" red (the taint stands);
+// resolve a vanished ref whatever its copy holds → "ref-copy-damaged" red (the taint clears);
+// keep a vanished ref beside no copy → "pair-gone" red (the run refuses); keep a vanished copy
+// beside no ref → "both" red (the run refuses).
 #[test]
 fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
-    for case in ["copy", "ref", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
+    for case in ["copy", "ref", "pair-gone", "ref-copy-damaged", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
         let area = Area::new(&format!("meta-vanished-{}", case));
         let (root, _, second) = tagged(&area);
         let (copy, reference) = (meta_copy_path(&root, "tags"), meta_path(&root, "tags"));
         let absent = format!("{}{}", if second.starts_with('0') { '1' } else { '0' }, &second[1..]);
-        let recorded: &[&str] = match case {
-            "copy" | "copy-ref-damaged" | "copy-head-absent" | "copy-ref-link" => &["meta-copy/tags"],
-            "ref" => &["meta/tags"],
-            _ => &["meta/tags", "meta-copy/tags"],
+        let recorded: Vec<&str> = match case {
+            "copy" | "copy-ref-damaged" | "copy-head-absent" | "copy-ref-link" => vec!["meta-copy/tags"],
+            "ref" | "pair-gone" | "ref-copy-damaged" => vec!["meta/tags"],
+            _ => vec!["meta/tags", "meta-copy/tags"],
         };
         let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(recorded.iter().map(|path| path.to_string()))).unwrap();
-        if case != "ref" {
+        if !case.starts_with("ref") {
             forklift_core::util::file_utils::remove_file(&copy).unwrap();
         }
         match case {
-            "ref" | "both" => forklift_core::util::file_utils::remove_file(&reference).unwrap(),
+            "ref" | "both" | "pair-gone" => forklift_core::util::file_utils::remove_file(&reference).unwrap(),
+            "ref-copy-damaged" => {
+                forklift_core::util::file_utils::remove_file(&reference).unwrap();
+                std::fs::write(&copy, b"not a hash").unwrap();
+            }
             "copy-ref-damaged" => std::fs::write(&reference, b"not a hash").unwrap(),
             // A well-formed head the store does not hold: the copy mend would not set the copy to it.
             "copy-head-absent" => std::fs::write(&reference, format!("{}\n", absent)).unwrap(),
@@ -2452,13 +2462,28 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
                 let note = format!("the ref's head {} is not in the store, so the copy was not set to it", absent);
                 assert!(said.contains(&note), "{}: the meta pass says why the copy was not set ({}): {}", case, note, said);
             }
+            // Whichever of the two files the taint recorded, both gone settle alike, with one note.
+            "pair-gone" | "both" => {
+                assert!(output.status.success(), "{}: {}", case, said);
+                assert!(!taint_left, "{}: the taint clears: {}", case, said);
+                assert_eq!(meta_head(&root, "tags"), None, "{}: the pallet reads as never written: {}", case, said);
+                assert!(!copy.exists(), "{}: no copy is written: {}", case, said);
+                let note = "the ref of meta pallet \\\"tags\\\" (\\\"meta/tags\\\") and its copy are both gone, so the pallet reads as never written";
+                assert_eq!(said.matches(note).count(), 1, "{}: heal says once what is gone and how it reads ({}): {}", case, note, said);
+            }
+            "ref-copy-damaged" => {
+                assert!(!output.status.success(), "{}: {}", case, said);
+                assert!(taint_left, "{}: the taint stands: {}", case, said);
+                let line = "a lost meta pallet ref whose copy (\\\"meta-copy/tags\\\") does not hold a head either: \\\"meta/tags\\\"";
+                assert!(said.contains(line), "{}: the refusal says why the ref is not resolved ({}): {}", case, line, said);
+            }
             _ => {
                 assert!(!output.status.success(), "{}: {}", case, said);
                 assert!(taint_left, "{}: the taint stands: {}", case, said);
                 let why = match case {
-                    "copy-ref-damaged" => "does not hold a head either".to_string(),
-                    "copy-ref-link" => "is not a file".to_string(),
-                    _ => "is lost too".to_string(),
+                    "copy-ref-damaged" => "does not hold a head either",
+                    "copy-ref-link" => "is not a file",
+                    _ => unreachable!("{}", case),
                 };
                 let line = format!("a lost meta pallet ref copy whose ref (\\\"meta/tags\\\") {}: \\\"meta-copy/tags\\\"", why);
                 assert!(said.contains(&line), "{}: the refusal says why the copy is not resolved ({}): {}", case, line, said);
