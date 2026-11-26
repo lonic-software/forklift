@@ -3568,13 +3568,13 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
     }
 
     let gate = Arc::clone(&warehouse);
-    let result = permit.spawn(request_blocking(warehouse, move || {
+    let result = permit.run("A batch fetch failed", request_blocking(warehouse, move || {
         let removed = withholding::removed().map_err(internal)?;
         let withheld = withheld_among(&gate, &removed, &request.hashes)?;
         let hashes: Vec<String> = request.hashes.into_iter().filter(|hash| !withheld.contains(hash)).collect();
 
         partial_bundle(&hashes)
-    })).await.unwrap_or_else(|e| Err(internal(format!("A batch fetch failed: {}", reraise_storage_panic(e)))));
+    })).await;
 
     match result {
         Ok(bytes) => (
@@ -3815,7 +3815,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
     };
 
     let counted = RefWriteCounted::start(&warehouse);
-    let result = permit.spawn(request_blocking(Arc::clone(&warehouse), move || {
+    let result = permit.run("A trust install failed", request_blocking(Arc::clone(&warehouse), move || {
         let _counted = counted;
 
         match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
@@ -3931,7 +3931,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 Ok(Some(event))
             }
         }
-    })).await.unwrap_or_else(|e| Err(internal(format!("A trust install failed: {}", reraise_storage_panic(e)))));
+    })).await;
 
     match result {
         Ok(Some(mut event)) => {
@@ -4287,7 +4287,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     // The write and what follows it run apart from the request, so a client that hangs up never
     // leaves an apply the write owed undischarged and unasked for. The permit goes with them, so
     // the Heavy slot stays taken until the apply the write answers after is done.
-    let settled = permit.spawn({
+    let settled = permit.run("A ref write failed", {
         let state = Arc::clone(&state);
         async move {
             match write.await {
@@ -4310,9 +4310,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     }).await;
 
     match settled {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(error)) => error_response(error),
-        Err(error) => error_response(internal(format!("A ref write failed: {}", reraise_storage_panic(error)))),
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => error_response(error),
     }
 }
 
@@ -4484,7 +4483,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     });
 
     // Apart from the request, with its permit, as a ref update's is ([`post_ref_update`]).
-    let settled = permit.spawn({
+    let settled = permit.run("A pallet deletion failed", {
         let state = Arc::clone(&state);
         async move {
             match deletion.await {
@@ -4509,9 +4508,8 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     }).await;
 
     match settled {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(error)) => error_response(error),
-        Err(error) => error_response(internal(format!("A pallet deletion failed: {}", reraise_storage_panic(error)))),
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => error_response(error),
     }
 }
 
@@ -4684,29 +4682,46 @@ fn heavy_capacity_when(max_heavy_requests: Option<u32>,
     }
 }
 
-/// One of the server's Heavy permits ([`acquire_heavy`]). Its only use is [`HeavyPermit::spawn`],
+/// One of the server's Heavy permits ([`acquire_heavy`]). Its only use is [`HeavyPermit::run`],
 /// which moves it into the task that runs the work, so the slot is freed when the work ends. A
 /// permit held by the request's own future would be freed when a client hangs up, while the work
 /// it started kept running on the blocking pool.
-#[must_use = "a Heavy permit admits work only through HeavyPermit::spawn"]
+#[must_use = "a Heavy permit admits work only through HeavyPermit::run"]
 struct HeavyPermit {
     /// Held, never read: dropping it is what frees the slot.
     _held: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl HeavyPermit {
-    /// Run `work` as its own task, holding this permit until the work ends. Dropping the returned
-    /// handle detaches the task, which keeps running and keeps the permit.
-    fn spawn<F>(self, work: F) -> tokio::task::JoinHandle<F::Output>
-    where
-        F: std::future::Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
+    /// Run `work` as its own task, holding this permit until the work ends, and answer with what
+    /// it returned. A task that did not finish is the request's to raise or report, as a storage
+    /// task's is ([`reraise_storage_panic`]): a debug build raises its panic again on the awaiting
+    /// task, and a release build answers an internal error that starts with `failed`. Dropping the
+    /// returned future, as a client hanging up does, detaches the task, which keeps running and
+    /// keeps the permit. Its failure then reaches no request: a debug build's storage panic raised
+    /// in it is dropped by tokio and aborts the process ([`StoragePanic`]), which is meant, since a
+    /// debug build's storage panic is a bug whose loss should be loud.
+    async fn run<T: Send + 'static>(
+        self,
+        failed: &str,
+        work: impl std::future::Future<Output = Result<T, HandlerError>> + Send + 'static
+    ) -> Result<T, HandlerError> {
+        self.run_when(failed, work, cfg!(debug_assertions)).await
+    }
+
+    /// [`HeavyPermit::run`], raising the panic of a task that did not finish again when `reraise`
+    /// holds.
+    async fn run_when<T: Send + 'static>(
+        self,
+        failed: &str,
+        work: impl std::future::Future<Output = Result<T, HandlerError>> + Send + 'static,
+        reraise: bool
+    ) -> Result<T, HandlerError> {
         tokio::spawn(async move {
             let _permit = self;
 
             work.await
-        })
+        }).await.unwrap_or_else(|error| Err(internal(format!("{}: {}", failed, reraise_storage_panic_when(error, reraise)))))
     }
 }
 
@@ -7315,6 +7330,50 @@ mod tests {
         assert!(handed_back.is_cancelled(), "{handed_back}");
     }
 
+    /// A Heavy permit of a cap of one, for driving [`HeavyPermit::run`] directly.
+    async fn lone_heavy_permit() -> HeavyPermit {
+        HeavyPermit { _held: Arc::new(tokio::sync::Semaphore::new(1)).acquire_owned().await.unwrap() }
+    }
+
+    /// Heavy work whose task panics with a literal message.
+    async fn planted_heavy_panic() -> Result<(), HandlerError> {
+        panic!("planted heavy panic")
+    }
+
+    /// What a Heavy permit's task answers is the request's answer: work that finished, with what
+    /// it returned; a panic, asked to, raised again on the awaiting task with its own payload, and
+    /// not asked to, an internal error that starts with what the caller named. This is each Heavy
+    /// handler's last arm, `delete_ref`'s included.
+    ///
+    /// Revert: never raise (`reraise_storage_panic_when(error, false)` in `run_when`) → the raised
+    /// arm returns an error → "the panic is raised again" fails; always raise → the reported arm
+    /// panics; format a fixed label for `failed`, or leave the task's error out → the message
+    /// assertion fails; a debug build's `run` passing `false` → "a debug build's run raises the
+    /// panic" fails. That a release build's `run` passes `false` is the cfg gate's, read in review:
+    /// the suites run debug builds only.
+    #[tokio::test]
+    async fn a_heavy_permits_task_panic_is_raised_on_the_request_only_when_asked() {
+        let finished = lone_heavy_permit().await.run_when("A planted Heavy request failed", async { Ok::<_, HandlerError>(7) }, true).await;
+        assert_eq!(finished, Ok(7));
+
+        let (status, message) = lone_heavy_permit().await.run_when("A planted Heavy request failed", planted_heavy_panic(), false).await
+            .expect_err("the panic is an error");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(message.starts_with("A planted Heavy request failed: ") && message.contains("planted heavy panic"), "{message}");
+
+        let raising = tokio::spawn(lone_heavy_permit().await.run_when("A planted Heavy request failed", planted_heavy_panic(), true));
+        let raised = raising.await.expect_err("the panic is raised again").into_panic();
+        assert_eq!(raised.downcast_ref::<&'static str>().copied(), Some("planted heavy panic"));
+
+        // A debug build's `run` asks to, for any panic of its task, a storage panic or not.
+        #[cfg(debug_assertions)]
+        {
+            let running = tokio::spawn(lone_heavy_permit().await.run("A planted Heavy request failed", planted_heavy_panic()));
+            let raised = running.await.expect_err("a debug build's run raises the panic").into_panic();
+            assert_eq!(raised.downcast_ref::<&'static str>().copied(), Some("planted heavy panic"));
+        }
+    }
+
     /// The literal message a storage task's panic was raised with, read through the
     /// [`StoragePanic`] a storage wrapper tags it as, which ends disarmed here; `None` when the
     /// payload is no such panic. A test that catches a storage panic itself, with no request
@@ -7659,8 +7718,9 @@ mod tests {
     /// the write runs in the permit's task; and only once the apply the write owed is settled, as a
     /// failed write's is, so the warehouse does not stay closed to content.
     ///
-    /// Revert: report the permit task's panic (`internal(format!("A ref write failed: {}", error))`)
-    /// → the request answers 500 → "the storage panic is raised again" fails; raise it before
+    /// Revert: report the permit task's panic (`reraise_storage_panic_when(error, false)` in
+    /// [`HeavyPermit::run_when`]) → its armed [`StoragePanic`] is dropped → the test binary aborts,
+    /// naming the planted message on stderr; raise it before
     /// `after_failed_ref_write` → the apply stays owed → the last assertion fails.
     #[cfg(debug_assertions)]
     #[tokio::test]
@@ -13368,12 +13428,12 @@ mod tests {
     }
 
     /// Every function in non-test source that names `acquire_heavy`, by the function it is in.
-    /// With them, every such function that calls `.spawn` on a binding named `permit`.
+    /// With them, every such function that calls `.run` on a binding named `permit`.
     #[derive(Default)]
     struct HeavyCallers {
         within: Vec<String>,
         found: BTreeSet<String>,
-        spawning: BTreeSet<String>,
+        running: BTreeSet<String>,
     }
 
     impl HeavyCallers {
@@ -13419,10 +13479,10 @@ mod tests {
         }
 
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            if call.method == "spawn"
+            if call.method == "run"
                 && matches!(&*call.receiver, syn::Expr::Path(path) if path.path.is_ident("permit"))
             {
-                self.spawning.insert(self.within.last().cloned().unwrap_or_else(|| "<item>".to_string()));
+                self.running.insert(self.within.last().cloned().unwrap_or_else(|| "<item>".to_string()));
             }
             syn::visit::visit_expr_method_call(self, call);
         }
@@ -13632,10 +13692,10 @@ mod tests {
 
     /// The cost class each route declares matches its handler: a route is `Heavy` exactly when its
     /// handler calls `acquire_heavy`, and nothing but a Heavy route's handler calls it. Each of them
-    /// also hands a binding named `permit` to `.spawn`, the one use [`HeavyPermit`] has, so its
+    /// also calls `.run` on a binding named `permit`, the one use [`HeavyPermit`] has, so its
     /// work runs with the permit inside. The scan reads server.rs alone: `acquire_heavy` is private
     /// to it, so no other file can call it. It checks that the calls are there, not where they sit
-    /// or that the spawned permit is the one acquired; the capacity, drain and hang-up tests do.
+    /// or that the running permit is the one acquired; the capacity, drain and hang-up tests do.
     ///
     /// Reverts: mark `delete_ref` Light → red; drop `acquire_heavy` from a Heavy handler → red;
     /// call it from a Light one → red; run a Heavy handler's work with `tokio::spawn`, keeping the
@@ -13656,7 +13716,7 @@ mod tests {
             .collect();
 
         assert_eq!(heavy, callers.found, "Heavy routes' handlers (left), functions calling acquire_heavy (right)");
-        assert_eq!(callers.found, callers.spawning, "functions calling acquire_heavy (left), functions spawning on `permit` (right)");
+        assert_eq!(callers.found, callers.running, "functions calling acquire_heavy (left), functions running on `permit` (right)");
 
         // A literal, not read from ROUTES: making a route Heavy or Light is an edit here too.
         let expected: BTreeSet<String> = ["delete_ref", "post_objects_batch", "post_ref_update", "put_trust"]
@@ -13767,8 +13827,9 @@ mod tests {
     /// Which function names each storage wrapper is a literal here, so a new site of one is an
     /// edit to this test that has to choose between them: the functions naming `spawn_blocking`,
     /// `scoped_storage_task` and the background `blocking`, none of the last a route handler; the
-    /// request wrappers named by handlers only; `reraise_storage_panic` named by every Heavy
-    /// handler; and a redaction apply's failure disposed of (`raise` or `reported`) by every
+    /// request wrappers named by handlers only; `reraise_storage_panic` named only by
+    /// `reported_request_failure`, and its `_when` only by it and [`HeavyPermit::run_when`], so no
+    /// handler answers a task's failure itself; and a redaction apply's failure disposed of (`raise` or `reported`) by every
     /// caller of `apply_discharging`. Macro tokens are read too.
     ///
     /// It pins names, not flow, and proves no absence of masking: a task boundary between a
@@ -13781,7 +13842,9 @@ mod tests {
     /// Reverts: a handler on `blocking` → its literal set fails; a bare `spawn_blocking` in a
     /// handler → the `spawn_blocking` set fails; a redaction round that drops the apply's failure
     /// with `_` → the `.reported` set fails; arguments that parse left unvisited (the fallback is
-    /// not reached for them) → the Heavy handlers' raise inside `format!` is unseen → red;
+    /// not reached for them) → `run_when`'s raise inside `format!` is unseen → red; a handler
+    /// raising a `JoinError` itself, or `run_when` formatting one without raising → a raising set
+    /// fails;
     /// `blocking` named only inside a `tokio::select!` in a handler → its literal set fails; with
     /// the unparsed-macro fallback removed as well, the same plant passes unseen; a helper that
     /// formats and disarms a storage panic on a handler's path → the two disarm/format sets fail.
@@ -13808,8 +13871,10 @@ mod tests {
         assert!(!request_wrapped.is_empty() && request_wrapped.is_subset(&handlers),
             "only route handlers raise through a request wrapper: {request_wrapped:?}");
 
-        let heavy: BTreeSet<String> = set(&["delete_ref", "post_objects_batch", "post_ref_update", "put_trust"]);
-        assert!(heavy.is_subset(&named.by("reraise_storage_panic")), "every Heavy handler raises its permit task's panic");
+        assert_eq!(named.by("reraise_storage_panic"), set(&["reported_request_failure"]),
+            "the functions raising a request's storage task's panic");
+        assert_eq!(named.by("reraise_storage_panic_when"), set(&["reraise_storage_panic", "run_when"]),
+            "the functions raising a request's task's panic: a storage task's and a Heavy permit's");
 
         // A redaction apply's failure: raised where a write's answer waits for it, reported where
         // a run's does, and dropped nowhere.
