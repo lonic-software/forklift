@@ -177,11 +177,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   which left a working directory redirecting to a bay that no longer exists. A lost checkout scope
   (`.forklift/scope`, or a bay's) or a lost scope copy is cleared the same way, with a note. Heal
   still mends the scope of the checkout it runs in from its copy first, as before. For a scope,
-  the note names the ways out as it does for a position; for the checkout heal runs in, that is
-  `forklift heal --scope`. For a copy, it says what the scope file beside it is, judged as heal
-  judges it. Beside one that can be used, the way out is `forklift heal` run in that checkout.
-  Beside one a newer Forklift wrote, it is that Forklift. Beside any other, the note names the
-  ways out a lost scope has. In a warehouse that is not sparse, a lost scope or copy of its own
+  the note names the ways out as it does for a position. For a copy, it says what the scope file
+  beside it is, judged as heal judges it. Beside one that can be used, the way out is
+  `forklift heal` run in that checkout; for the checkout heal runs in, the note says instead that
+  the next write of that scope writes the copy again. Beside one a newer Forklift wrote, the way
+  out is that Forklift. Beside any other, the note names the ways out a lost scope has, which for
+  the checkout heal runs in is `forklift heal --scope`. In a warehouse that is not sparse, a lost scope or copy of its own
   working tree is said to be the state that working tree keeps, since it records no scope, unless
   a scope file stands there, which the note says to delete. A bay's scope, and a sparse
   warehouse's own, stays lost, and its readers still refuse it. Before, any of these kept heal
