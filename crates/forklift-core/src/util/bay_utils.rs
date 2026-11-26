@@ -503,6 +503,31 @@ pub fn bay_state_dir(name: &str) -> PathBuf {
     forklift_root().join(FOLDER_NAME_BAYS_ROOT).join(name)
 }
 
+/// The deletions `forklift bay remove` performs for the bay `name`, as steps to take by hand: the
+/// `.forklift` entry in its working directory, only while that entry still redirects to this bay
+/// ([`remove_bay_redirect`] leaves one that does not), then the bay's state folder, in that order,
+/// since the state is what tells the entry is this bay's. `directory` is the bay's record of its
+/// working directory as [`read_bay_path`] gives it. The text starts with a lowercase verb, for the
+/// caller's sentence.
+pub fn manual_removal_steps(name: &str, directory: &Result<Option<PathBuf>, String>) -> String {
+    let state = bay_state_dir(name);
+    let state = std::path::absolute(&state).unwrap_or(state);
+    let state = state.to_string_lossy();
+
+    match directory {
+        Ok(None) => format!("delete the folder \"{}\"", state),
+        Ok(Some(directory)) => format!(
+            "delete the \".forklift\" entry in \"{}\" if it still redirects to this bay, then the folder \"{}\"",
+            directory.to_string_lossy(), state
+        ),
+        Err(_) => format!(
+            "delete the \".forklift\" entry in the bay's working directory if it still redirects to this bay, then the \
+            folder \"{}\"",
+            state
+        ),
+    }
+}
+
 /// Whether a bay of the given name exists (its state folder is present).
 pub fn does_bay_exist(name: &str) -> bool {
     bay_state_dir(name).is_dir()

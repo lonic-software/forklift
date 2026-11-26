@@ -294,9 +294,10 @@ fn invalid_bay_folder(name: &str, error: &str) -> String {
             "The bay folder \"{}\" does not hold a valid bay: {}. Remove it with \"{}\".",
             folder.to_string_lossy(), error, command
         ),
+        // No command line reaches it: the deletions `bay remove` would make, by hand.
         None => format!(
-            "The bay folder \"{}\" does not hold a valid bay: {}. Remove that folder by hand.",
-            folder.to_string_lossy(), error
+            "The bay folder \"{}\" does not hold a valid bay: {}. To remove the bay by hand, {}.",
+            folder.to_string_lossy(), error, bay_utils::manual_removal_steps(name, &bay_utils::read_bay_path(name))
         ),
     }
 }
@@ -317,9 +318,7 @@ fn remove(name: &str) -> Result<(), String> {
     // cannot be read refuses: removing the state alone would leave that directory redirecting
     // to a bay that no longer exists.
     let bay_dir = bay_utils::read_bay_path(name).map_err(|e| format!(
-        "{} To remove the bay by hand, delete the \".forklift\" folder in its working directory and \
-        the folder \"{}\".",
-        e, bay_utils::bay_state_dir(name).to_string_lossy()
+        "{} To remove the bay by hand, {}.", e, bay_utils::manual_removal_steps(name, &Err(e.clone()))
     ))?;
 
     // Drop the bay's `.forklift` folder so the directory is no longer a bay (a working tree that

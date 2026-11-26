@@ -7517,7 +7517,9 @@ fn a_bay_whose_path_file_cannot_be_read_is_neither_listed_blank_nor_half_removed
     // Removing it refuses, naming the way out, and leaves both the state and the redirect.
     let removed = warehouse.run(&["bay", "remove", "feature"]);
     assert!(!removed.status.success());
-    assert!(stderr(&removed).contains("To remove the bay by hand"), "{}", stderr(&removed));
+    // The redirect goes first, and only while it is this bay's, as `bay remove` itself would.
+    assert!(stderr(&removed).contains("To remove the bay by hand, delete the \".forklift\" entry in the bay's working \
+        directory if it still redirects to this bay, then the folder \""), "{}", stderr(&removed));
     assert!(warehouse.root.join(".forklift/bays/feature").is_dir());
     assert!(bay_dir.join(".forklift").join("redirect").is_file());
 }
@@ -9851,7 +9853,7 @@ fn a_dash_led_bay_folder_is_removable_as_the_listing_prints() {
             let message = stderr(&listed);
             let windows_dotted = cfg!(windows) && name.contains('.');
             if windows_dotted {
-                assert!(message.contains("Remove that folder by hand"), "{}", message);
+                assert!(message.contains("To remove the bay by hand, delete the folder \""), "{}", message);
                 let guarded = format!("forklift bay remove -- {}", name);
                 let out = run(&warehouse, &guarded);
                 if label.ends_with("PowerShell") {
