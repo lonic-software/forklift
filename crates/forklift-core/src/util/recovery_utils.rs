@@ -940,6 +940,22 @@ async fn resolve_the_rest(
                     ));
                 }
             },
+            // A gone fetch ledger reads as an empty one, as it does with no taint (see
+            // `VanishedClass::FetchLedger`), so its absence is made durable and the record
+            // resolved, with a note saying what the warehouse's mode makes of it.
+            VanishedClass::FetchLedger => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => {
+                    refs_resolved.push(relative.to_string_lossy().replace('\\', "/"));
+                    vanished_notes.push(lost_fetch_ledger_note(relative));
+                }
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost fetch ledger whose loss could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy().replace('\\', "/"), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1660,7 +1676,7 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
             | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy | Disposition::Scope
             | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy | Disposition::Journal
-            | Disposition::BayPath | Disposition::FetchScope)
+            | Disposition::BayPath | Disposition::FetchScope | Disposition::FetchLedger)
             | None => false,
     }
 }
@@ -1940,6 +1956,16 @@ enum VanishedClass {
     /// this is reached only where the file went missing after that pass, or the recovery ran
     /// without it.
     FetchScope,
+    /// A sparse warehouse's fetched-heads ledger (`fetched-heads`), gone since the taint was
+    /// recorded. It is written only where the fetch scope is not full, by a scoped fetch and by a
+    /// ref write or removal leaving a head no ref reaches (`fetch_ledger::record_fetch`), and
+    /// pruned by `scope fetch` (`fetch_ledger::write_ledger`); no command removes it, and no heal
+    /// pass rebuilds it. Its reader takes a missing one as empty (`fetch_ledger::read_ledger`),
+    /// taint or none, and a full or cache warehouse never holds one. What an empty ledger gives up
+    /// is `scope fetch` walking the heads it recorded; a head written to a ref has its closure
+    /// verified at the fetch scope then (`pallet_utils::verify_new_head`). So keeping the record
+    /// would guard nothing the absence does not already settle.
+    FetchLedger,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -1982,6 +2008,7 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::BayPath => relative.parent().and_then(Path::file_name).and_then(|name| name.to_str())
             .map(|name| VanishedClass::BayPath(name.to_string())),
         Disposition::FetchScope => Some(VanishedClass::FetchScope),
+        Disposition::FetchLedger => Some(VanishedClass::FetchLedger),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
@@ -2215,6 +2242,30 @@ fn lost_fetch_scope_note(relative: &Path) -> String {
         Ok(WarehouseMode::Cache) => format!("{}; the warehouse is recorded as a cache, which keeps no fetch scope", lost),
         Err(error) => format!(
             "{}, and the warehouse's mode, which says whether it needs one, does not read ({})",
+            lost, error.trim_end_matches('.')
+        ),
+    }
+}
+
+/// The note for a resolved [`VanishedClass::FetchLedger`]: what the mode the warehouse marker
+/// records makes of the absence.
+fn lost_fetch_ledger_note(relative: &Path) -> String {
+    use crate::util::warehouse_utils::{self, WarehouseMode};
+
+    let lost = format!("the fetch ledger \"{}\" is gone", relative.to_string_lossy().replace('\\', "/"));
+
+    match warehouse_utils::warehouse_mode() {
+        Ok(WarehouseMode::Sparse) => format!(
+            "{}; the warehouse is recorded as sparse, and Forklift reads a missing fetch ledger as an empty one, \
+            as it would with no taint, so \"forklift scope fetch\" widens only what the base of the bay it runs in \
+            and the pallets' heads reach; after that, a head no pallet holds, whether fetched earlier or left by a \
+            pallet's move or removal, may be refused as incomplete",
+            lost
+        ),
+        Ok(WarehouseMode::Full) => format!("{}; the warehouse is recorded as full, which keeps no fetch ledger", lost),
+        Ok(WarehouseMode::Cache) => format!("{}; the warehouse is recorded as a cache, which keeps no fetch ledger", lost),
+        Err(error) => format!(
+            "{}, and the warehouse's mode, which says whether it keeps one, does not read ({})",
             lost, error.trim_end_matches('.')
         ),
     }
@@ -7246,6 +7297,7 @@ mod tests {
             VanishedClass::Journal => "journal".to_string(),
             VanishedClass::BayPath(name) => format!("bay path {}", name),
             VanishedClass::FetchScope => "fetch scope".to_string(),
+            VanishedClass::FetchLedger => "fetch ledger".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -7300,7 +7352,7 @@ mod tests {
             ("cherry-pick".into(), "merge record"),
             ("cherry-pick-copy".into(), "merge record copy"),
             ("config/fetch-scope".into(), "fetch scope"),
-            ("fetched-heads".into(), "kept: the fetch ledger"),
+            ("fetched-heads".into(), "fetch ledger"),
             ("held-heads".into(), "kept: the held-heads record"),
             ("mirror-roots".into(), "kept: the mirror roots record"),
             ("served".into(), "kept: the served record"),
@@ -7833,6 +7885,93 @@ mod tests {
                 "{:?}: {:?}", mode, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
             assert!(!forklift.join(relative).exists(), "{:?}: heal writes no fetch scope back", mode);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost fetch ledger is resolved with a note saying what the warehouse's mode makes of it. In
+    /// a sparse warehouse it is lost as a write loses it: `record_fetch`'s birth write fails its
+    /// folder sync, which taints it, and a power loss then undoes the birth. A full or cache
+    /// warehouse keeps none; a warehouse whose mode does not read is said so. Where the absence
+    /// cannot be made durable, the record stays and heal refuses.
+    ///
+    /// Revert: the shape's disposition back to `None` → every row refuses → red. Revert: resolve
+    /// without `sync_nearest_ancestor` → the failing-sync row clears → red. Revert: the note not
+    /// read from the mode → the rows' notes agree where the test expects them to differ → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_fetch_ledger_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::SyncDirFaultGuard;
+        use crate::util::warehouse_utils::{self, WarehouseMode};
+
+        // (the mode the marker records, or none; whether the absence can be made durable; the note,
+        // or the refusal's line where it cannot)
+        let cases: &[(Option<WarehouseMode>, bool, &str)] = &[
+            (Some(WarehouseMode::Sparse), true, "the fetch ledger \"fetched-heads\" is gone; the warehouse is \
+                recorded as sparse, and Forklift reads a missing fetch ledger as an empty one, as it would with no \
+                taint, so \"forklift scope fetch\" widens only what the base of the bay it runs in and the pallets' \
+                heads reach; after that, a head no pallet holds, whether fetched earlier or left by a pallet's move or \
+                removal, may be refused as incomplete"),
+            (Some(WarehouseMode::Full), true, "the fetch ledger \"fetched-heads\" is gone; the warehouse is \
+                recorded as full, which keeps no fetch ledger"),
+            (Some(WarehouseMode::Cache), true, "the fetch ledger \"fetched-heads\" is gone; the warehouse is \
+                recorded as a cache, which keeps no fetch ledger"),
+            (None, true, "the fetch ledger \"fetched-heads\" is gone, and the warehouse's mode, which says \
+                whether it keeps one, does not read ("),
+            (Some(WarehouseMode::Sparse), false, "a lost fetch ledger whose loss could not be made durable: \
+                \"fetched-heads\""),
+        ];
+
+        for (mode, durable, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-fetch-ledger-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            if let Some(mode) = mode {
+                warehouse_utils::mark_for_test(*mode);
+            }
+            let forklift = forklift_root();
+            let relative = "fetched-heads";
+
+            if *mode == Some(WarehouseMode::Sparse) {
+                let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
+                let _fault = SyncDirFaultGuard::failing_exactly(&forklift);
+                crate::util::fetch_ledger::record_fetch(&lock, &"a".repeat(64), "main")
+                    .expect_err("a ledger write whose folder sync fails fails");
+                drop(_fault);
+                drop(lock);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the ledger alone is recorded");
+            } else {
+                plant_complete_taint(&forklift, &[relative]);
+            }
+            let _ = crate::util::file_utils::remove_file(&forklift.join(relative));
+            assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+            if !*durable {
+                // Once: the forklift root is also the folder heal's own record writes sync.
+                let _fault = SyncDirFaultGuard::failing_exactly_once(&forklift);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[*note]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{:?}: a lost fetch ledger is resolved: {}", mode, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative], "{:?}: {:?}", mode, outcome);
+            assert!(outcome.notes.iter().any(|said| said.starts_with(note) && (mode.is_none() || said == note)),
+                "{:?}: {:?}", mode, outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            assert!(!forklift.join(relative).exists(), "{:?}: heal writes no fetch ledger back", mode);
 
             crate::util::file_utils::remove_dir_all(&root).ok();
         }
