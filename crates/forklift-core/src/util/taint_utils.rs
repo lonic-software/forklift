@@ -251,6 +251,7 @@ pub(crate) enum VanishedDisposition {
     ScopeCopy,
     MergeRecord,
     MergeRecordCopy,
+    Journal,
 }
 
 /// One kind of root-relative path a taint record may name.
@@ -314,7 +315,7 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "the consolidation state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("consolidation-copy")] },
     TaintShape { description: "the consolidation skeleton", disposition: Some(Disposition::MergeRecord), pattern: &[Is("consolidation-skeleton")] },
     TaintShape { description: "the consolidation skeleton's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("consolidation-skeleton-copy")] },
-    TaintShape { description: "the journal", disposition: None, pattern: &[Is("journal.json")] },
+    TaintShape { description: "the journal", disposition: Some(Disposition::Journal), pattern: &[Is("journal.json")] },
 
     TaintShape { description: "a bay's incomplete-load marker", disposition: Some(Disposition::LoadMarker), pattern: &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")] },
     TaintShape { description: "a bay's checkout position", disposition: Some(Disposition::Position), pattern: &[Is("bays"), Name, Is("position")] },
@@ -325,7 +326,7 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "a bay's consolidation state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("consolidation-copy")] },
     TaintShape { description: "a bay's consolidation skeleton", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("consolidation-skeleton")] },
     TaintShape { description: "a bay's consolidation skeleton's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("consolidation-skeleton-copy")] },
-    TaintShape { description: "a bay's journal", disposition: None, pattern: &[Is("bays"), Name, Is("journal.json")] },
+    TaintShape { description: "a bay's journal", disposition: Some(Disposition::Journal), pattern: &[Is("bays"), Name, Is("journal.json")] },
     TaintShape { description: "a bay's path record", disposition: None, pattern: &[Is("bays"), Name, Is("path")] },
     TaintShape { description: "a bay's cherry-pick state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("cherry-pick")] },
     TaintShape { description: "a bay's cherry-pick state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("cherry-pick-copy")] },
