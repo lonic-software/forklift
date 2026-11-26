@@ -850,6 +850,22 @@ async fn resolve_the_rest(
                     ));
                 }
             },
+            // A lost position is refused by its readers, taint or none (see `VanishedClass::Position`),
+            // and no copy is a state its writer leaves: each absence is made durable and the record
+            // resolved, with a note naming the way out, which nothing else will say once it is.
+            VanishedClass::Position | VanishedClass::PositionCopy => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => {
+                    refs_resolved.push(relative.to_string_lossy().into_owned());
+                    vanished_notes.push(lost_position_note(relative));
+                }
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost checkout position or copy whose loss could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy(), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1568,7 +1584,7 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         Some(Disposition::SignatureTable | Disposition::Shard) => listed.contains(relative),
         // A loose signature sidecar is skipped by the loose walk (`walk_loose_object_paths`).
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
-            | Disposition::LoadMarker) | None => false,
+            | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy) | None => false,
     }
 }
 
@@ -1766,6 +1782,18 @@ enum VanishedClass {
     /// the taint stands (`heal_utils::heal_if_tainted`). So a gone marker is read as every reader
     /// reads one: no unfinished load is recorded.
     LoadMarker,
+    /// A checkout's position (`position`, or a bay's), gone since the taint was recorded. A
+    /// missing position is refused as damaged by its readers (`pallet_utils::read_position_in`),
+    /// taint or none, so keeping the record would guard nothing the absence does not already stop.
+    /// Heal mends the position of the checkout it runs in before the taint recovery
+    /// (`position_heal::repair`), so the one found gone here is another checkout's: one that heal
+    /// run there mends, or a bay whose creation stopped before its position was durable, which
+    /// `forklift bay remove` drops once the taint no longer refuses it.
+    Position,
+    /// The copy of a checkout's position, gone since the taint was recorded. No copy is a state
+    /// its writer leaves on purpose: `pallet_utils::write_position_in` removes a copy it cannot
+    /// write, and `pallet_utils::read_position_copy_in` reads a missing one as witnessing nothing.
+    PositionCopy,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -1798,9 +1826,45 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::MetaCopy => meta_pallet_name(relative).map(VanishedClass::MetaCopy),
         Disposition::Keepsake => Some(VanishedClass::Keepsake),
         Disposition::LoadMarker => Some(VanishedClass::LoadMarker),
+        Disposition::Position => Some(VanishedClass::Position),
+        Disposition::PositionCopy => Some(VanishedClass::PositionCopy),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
+}
+
+/// The note for a resolved [`VanishedClass::Position`] or [`VanishedClass::PositionCopy`] at
+/// `relative` (`position`, `position-copy`, or a bay's under `bays/<name>/`), naming the checkout
+/// it belongs to and what that checkout reads now.
+fn lost_position_note(relative: &Path) -> String {
+    let names: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+    let bay = match names.as_slice() {
+        [bays, name, _] if bays == crate::globals::FOLDER_NAME_BAYS_ROOT => Some(name.as_str()),
+        _ => None,
+    };
+    let (which, there) = match bay {
+        Some(name) => (format!("bay \"{}\"", name), "that bay's directory"),
+        None => ("the warehouse's own working tree".to_string(), "that working tree"),
+    };
+    let path = names.join("/");
+
+    match names.last().map(String::as_str) == Some(pallet_utils::FILE_NAME_POSITION_COPY) {
+        true => format!(
+            "the copy of the position of {} (\"{}\") is gone; the next write of that position, or \"forklift \
+            heal\" run in {}, writes it again",
+            which, path, there
+        ),
+        false => {
+            let unfinished = bay.map(|name| match bay_utils::remove_command(name) {
+                Some(command) => format!(", or \"{}\" if its creation never finished", command),
+                None => ", or remove the bay if its creation never finished".to_string(),
+            });
+            format!(
+                "the position of {} (\"{}\") is lost; run \"forklift heal\" in {} to repair it{}",
+                which, path, there, unfinished.unwrap_or_default()
+            )
+        }
+    }
 }
 
 /// The meta pallet `relative`'s final name is, one of [`META_PALLET_NAMES`], or `None`.
@@ -6633,6 +6697,8 @@ mod tests {
             VanishedClass::MetaCopy(name) => format!("meta copy {}", name),
             VanishedClass::Keepsake => "keepsake".to_string(),
             VanishedClass::LoadMarker => "load marker".to_string(),
+            VanishedClass::Position => "position".to_string(),
+            VanishedClass::PositionCopy => "position copy".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -6662,8 +6728,8 @@ mod tests {
             ("removed-refs/side+2".into(), "keepsake"),
             ("meta-copy/main".into(), "kept: a copy of a ref that is no meta pallet's"),
             ("inventory/incomplete-load".into(), "load marker"),
-            ("position".into(), "kept: the checkout position"),
-            ("position-copy".into(), "kept: the checkout position's copy"),
+            ("position".into(), "position"),
+            ("position-copy".into(), "position copy"),
             ("scope".into(), "kept: the checkout scope"),
             ("scope-copy".into(), "kept: the checkout scope's copy"),
             ("consolidation".into(), "kept: the consolidation state"),
@@ -6672,8 +6738,8 @@ mod tests {
             ("consolidation-skeleton-copy".into(), "kept: the consolidation skeleton's copy"),
             ("journal.json".into(), "kept: the journal"),
             ("bays/main/inventory/incomplete-load".into(), "load marker"),
-            ("bays/main/position".into(), "kept: a bay's checkout position"),
-            ("bays/main/position-copy".into(), "kept: a bay's checkout position's copy"),
+            ("bays/main/position".into(), "position"),
+            ("bays/main/position-copy".into(), "position copy"),
             ("bays/main/scope".into(), "kept: a bay's checkout scope"),
             ("bays/main/scope-copy".into(), "kept: a bay's checkout scope's copy"),
             ("bays/main/consolidation".into(), "kept: a bay's consolidation state"),
@@ -6918,6 +6984,116 @@ mod tests {
             let outcome = run_heal().unwrap_or_else(|error| panic!("{}: {}", relative, error));
             let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
             assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A bay's first position write fails its folder sync and taints the position. A power loss
+    /// then undoes its birth. Heal, run from the warehouse's own working tree, resolves the lost
+    /// position with a note naming the way out. Where the absence cannot be made durable, the
+    /// record stays and heal refuses.
+    ///
+    /// Revert: the position shapes' disposition back to `None` → heal refuses → red. Revert:
+    /// resolve without `sync_nearest_ancestor` → the failing-sync heal clears → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_bay_position_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        for durable in [true, false] {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-position-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            let folder = bay_utils::bay_state_dir("b");
+            std::fs::create_dir_all(&folder).unwrap();
+            {
+                let _fault = SyncDirFaultGuard::failing_exactly(&folder);
+                pallet_utils::write_position_in(&folder, &pallet_utils::BayPosition::new("b", None))
+                    .expect_err("a position write whose folder sync fails fails");
+            }
+            assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                [PathBuf::from("bays/b/position")].into_iter().collect(), "the position alone is recorded");
+
+            crate::util::file_utils::remove_file(folder.join(pallet_utils::FILE_NAME_POSITION)).unwrap();
+
+            if !durable {
+                let _fault = SyncDirFaultGuard::failing_exactly(&folder);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[
+                    "a lost checkout position or copy whose loss could not be made durable: \"bays/b/position\"",
+                ]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from("bays/b/position")].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().expect("a lost position is resolved, so heal clears");
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, ["bays/b/position".to_string()], "{:?}", outcome);
+            assert!(outcome.notes.contains(&"the position of bay \"b\" (\"bays/b/position\") is lost; run \"forklift heal\" \
+                in that bay's directory to repair it, or \"forklift bay remove b\" if its creation never finished"
+                .to_string()), "{:?}", outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            pallet_utils::read_position_in(&folder).expect_err("the lost position is still refused by its readers");
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost path of each position shape, the warehouse's own and a bay's, position and copy, is
+    /// resolved with the note for its checkout.
+    ///
+    /// Revert: the copy shapes' disposition back to `None` → their rows refuse → red. Revert: the
+    /// root position's row named by a bay → its note differs → red.
+    #[test]
+    fn heal_resolves_a_lost_position_or_copy_of_each_shape() {
+        use crate::globals::StorageRootScope;
+
+        let cases: &[(&str, &str)] = &[
+            ("position", "the position of the warehouse's own working tree (\"position\") is lost; run \"forklift heal\" \
+                in that working tree to repair it"),
+            ("position-copy", "the copy of the position of the warehouse's own working tree (\"position-copy\") is gone; \
+                the next write of that position, or \"forklift heal\" run in that working tree, writes it again"),
+            ("bays/b/position", "the position of bay \"b\" (\"bays/b/position\") is lost; run \"forklift heal\" in that \
+                bay's directory to repair it, or \"forklift bay remove b\" if its creation never finished"),
+            ("bays/b/position-copy", "the copy of the position of bay \"b\" (\"bays/b/position-copy\") is gone; the next \
+                write of that position, or \"forklift heal\" run in that bay's directory, writes it again"),
+            // A name no command line can spell names no command.
+            ("bays/it's/position", "the position of bay \"it's\" (\"bays/it's/position\") is lost; run \"forklift heal\" \
+                in that bay's directory to repair it, or remove the bay if its creation never finished"),
+        ];
+
+        for (relative, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-position-shape-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            plant_complete_taint(&forklift, &[relative]);
+            assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{}: {}", relative, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
+            assert!(outcome.notes.contains(&note.to_string()), "{}: {:?}", relative, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
 
             crate::util::file_utils::remove_dir_all(&root).ok();

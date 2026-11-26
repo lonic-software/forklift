@@ -245,6 +245,8 @@ pub(crate) enum VanishedDisposition {
     MetaCopy,
     Keepsake,
     LoadMarker,
+    Position,
+    PositionCopy,
 }
 
 /// One kind of root-relative path a taint record may name.
@@ -300,8 +302,8 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "a bay's staged inventory shard", disposition: Some(Disposition::Shard), pattern: &[Is("bays"), Name, Is("inventory"), Names, Is("data")] },
 
     TaintShape { description: "the incomplete-load marker", disposition: Some(Disposition::LoadMarker), pattern: &[Is("inventory"), Is("incomplete-load")] },
-    TaintShape { description: "the checkout position", disposition: None, pattern: &[Is("position")] },
-    TaintShape { description: "the checkout position's copy", disposition: None, pattern: &[Is("position-copy")] },
+    TaintShape { description: "the checkout position", disposition: Some(Disposition::Position), pattern: &[Is("position")] },
+    TaintShape { description: "the checkout position's copy", disposition: Some(Disposition::PositionCopy), pattern: &[Is("position-copy")] },
     TaintShape { description: "the checkout scope", disposition: None, pattern: &[Is("scope")] },
     TaintShape { description: "the checkout scope's copy", disposition: None, pattern: &[Is("scope-copy")] },
     TaintShape { description: "the consolidation state", disposition: None, pattern: &[Is("consolidation")] },
@@ -311,8 +313,8 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "the journal", disposition: None, pattern: &[Is("journal.json")] },
 
     TaintShape { description: "a bay's incomplete-load marker", disposition: Some(Disposition::LoadMarker), pattern: &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")] },
-    TaintShape { description: "a bay's checkout position", disposition: None, pattern: &[Is("bays"), Name, Is("position")] },
-    TaintShape { description: "a bay's checkout position's copy", disposition: None, pattern: &[Is("bays"), Name, Is("position-copy")] },
+    TaintShape { description: "a bay's checkout position", disposition: Some(Disposition::Position), pattern: &[Is("bays"), Name, Is("position")] },
+    TaintShape { description: "a bay's checkout position's copy", disposition: Some(Disposition::PositionCopy), pattern: &[Is("bays"), Name, Is("position-copy")] },
     TaintShape { description: "a bay's checkout scope", disposition: None, pattern: &[Is("bays"), Name, Is("scope")] },
     TaintShape { description: "a bay's checkout scope's copy", disposition: None, pattern: &[Is("bays"), Name, Is("scope-copy")] },
     TaintShape { description: "a bay's consolidation state", disposition: None, pattern: &[Is("bays"), Name, Is("consolidation")] },
