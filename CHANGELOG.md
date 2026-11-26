@@ -147,13 +147,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   both are gone: the pallet reads as never written, as it already did, so a write that just
   failed can be run again, and any history it had is not reachable from there. Heal cannot tell
   which write it was. For the office pallet beside the trust file's anchor, the note names the
-  unborn office's way back instead. Where the record of applied redactions says the redactions
-  pallet was written, the ref is kept, as it is when that record or the trust state cannot be
-  read. Beside
-  a copy that still holds a head, heal's pass after the recovery rebuilds the ref from that copy,
-  or says why it cannot. Before, every such ref kept heal refusing with no recovery for it, and
-  every command that records anything refused with it. Beside any other copy (one that holds no
-  head, is not a file or cannot be read) it is kept, and the refusal says which. A lost keepsake under
+  unborn office's way back instead, and trust state heal does not accept keeps the ref. The
+  redactions pallet's lost ref and copy are still kept. Beside a copy that still holds a head,
+  heal's pass after the recovery rebuilds the ref from that copy, or says why it cannot. Before,
+  every such ref kept heal refusing with no recovery for it, and every command that records
+  anything refused with it. Beside any other copy (one that holds no head, is not a file or
+  cannot be read) it is kept, and the refusal says which. A lost keepsake under
   `.forklift/removed-refs`, whatever its name, is cleared with a note once its absence is made
   durable, as long as the ref it was taken from still stands: the `heal --remove-ref` that was
   writing it stopped before it removed the ref. Before, a plainly named one kept heal refusing,

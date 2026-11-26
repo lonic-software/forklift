@@ -725,11 +725,10 @@ async fn resolve_the_rest(
             // A ref lost beside a copy holding a head reads as lost, on every run, as on a
             // warehouse with no taint: every read of it refuses it as damaged, and the meta pass
             // after the recovery rebuilds it from the copy, or says why not. So the record is
-            // resolved here, its absence made durable. Beside no copy at all, what the pallet
-            // reads as is what it would read as with no taint, so the record resolves with a note
-            // saying so, unless a record beside them says the pallet was written
-            // (`lost_meta_pair`). Nothing here says why the two are gone. Beside a copy that
-            // stands and holds no head, the record stays.
+            // resolved here, its absence made durable. Beside no copy at all, each meta pallet
+            // settles as `meta_lost_pair` says: most resolve with a note saying how the pallet
+            // now reads, and nothing here says why the two are gone. Beside a copy that stands
+            // and holds no head, the record stays.
             VanishedClass::MetaRef(name) => {
                 let copy_path = pallet_utils::get_meta_copy_path(name);
                 let copy = format!("{}/{}", pallet_utils::FOLDER_NAME_META_COPY_ROOT, name);
@@ -1735,32 +1734,34 @@ fn meta_pallet_name(relative: &Path) -> Option<&'static str> {
     crate::util::meta_tree::META_PALLET_NAMES.iter().copied().find(|known| std::ffi::OsStr::new(known) == name)
 }
 
-/// What, beside a meta pallet's ref and its copy, can say the pallet was written.
+/// How a meta pallet's ref settles when it and its copy are both gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BornWitness {
-    /// Nothing: with both gone, the pallet reads as never written, as with no taint.
-    Nothing,
-    /// The trust file's anchor, beside which the office pallet reads as unborn, and every reader
-    /// that checks the office refuses it. An anchor does not say the office was written: an
-    /// enrollment stopped between its writes leaves the same state.
-    TrustAnchor,
-    /// The record of applied redactions, which only grows, and only from cells on `@redactions`:
-    /// one that is not empty says the pallet was written.
-    AppliedRedactions,
+enum LostPair {
+    /// Resolved: the pallet reads as never written, as it would with no taint.
+    Resolve,
+    /// Resolved, the note naming the office's way back where the trust file holds an anchor:
+    /// beside one, every reader that checks the office refuses it unborn. An anchor does not say
+    /// the office was written, since an enrollment stopped between its writes leaves the same
+    /// state, so it chooses the note only.
+    OfficeStep,
+    /// Kept. For `@redactions`, reading as never written drops what its cells refuse, and no
+    /// record heal can read settles whether it was written: the record of applied redactions
+    /// reads empty when it is lost too, and heal rebuilds a damaged one before this runs.
+    Keep,
 }
 
-/// The [`BornWitness`] of meta pallet `name`, or `None` for a name that is no meta pallet's.
-/// Every name in [`META_PALLET_NAMES`] has one (a test iterates them).
+/// The [`LostPair`] settling of meta pallet `name`, or `None` for a name that is no meta
+/// pallet's. Every name in [`META_PALLET_NAMES`] has one (a test iterates them).
 ///
 /// [`META_PALLET_NAMES`]: crate::util::meta_tree::META_PALLET_NAMES
-fn meta_born_witness(name: &str) -> Option<BornWitness> {
+fn meta_lost_pair(name: &str) -> Option<LostPair> {
     match name {
-        crate::util::office_utils::OFFICE_PALLET_NAME => Some(BornWitness::TrustAnchor),
-        crate::util::redaction_utils::REDACTIONS_PALLET_NAME => Some(BornWitness::AppliedRedactions),
+        crate::util::office_utils::OFFICE_PALLET_NAME => Some(LostPair::OfficeStep),
+        crate::util::redaction_utils::REDACTIONS_PALLET_NAME => Some(LostPair::Keep),
         crate::util::manifest_utils::MANIFEST_PALLET_NAME
         | crate::util::haul_utils::HAUL_PALLET_NAME
         | crate::util::tag_utils::TAGS_PALLET_NAME
-        | crate::util::kv_utils::KV_PALLET_NAME => Some(BornWitness::Nothing),
+        | crate::util::kv_utils::KV_PALLET_NAME => Some(LostPair::Resolve),
         _ => None,
     }
 }
@@ -1768,8 +1769,7 @@ fn meta_born_witness(name: &str) -> Option<BornWitness> {
 /// How a vanished ref of meta pallet `name`, recorded at `relative`, settles when its copy is
 /// gone too: `Ok` with the note for a record that resolves, `Err` with the line for one that
 /// stays. It says nothing of why the two are gone, which nothing here can tell: a failed first
-/// write and an established pallet that lost both read alike. A record that says the pallet was
-/// written keeps it, and so does one that does not read.
+/// write and an established pallet that lost both read alike.
 fn lost_meta_pair(name: &str, relative: &Path) -> Result<String, String> {
     let relative = relative.to_string_lossy();
     let gone = format!("the ref of meta pallet \"{}\" (\"{}\") and its copy are both gone", name, relative);
@@ -1778,29 +1778,23 @@ fn lost_meta_pair(name: &str, relative: &Path) -> Result<String, String> {
         write again. Any history it had is not reachable from here",
         gone
     );
-    let unread = |what: &str, error: String| format!(
-        "a lost meta pallet ref whose copy is lost too, beside {} that does not read: \"{}\" ({})",
-        what, relative, error.trim_end_matches('.')
-    );
-    match meta_born_witness(name) {
-        Some(BornWitness::Nothing) => Ok(never_written()),
-        Some(BornWitness::TrustAnchor) => match crate::util::office_utils::read_trust_anchor_in(crate::util::office_utils::TrustReadMode::Checked) {
+    match meta_lost_pair(name) {
+        Some(LostPair::Resolve) => Ok(never_written()),
+        Some(LostPair::OfficeStep) => match crate::util::office_utils::read_trust_anchor_in(crate::util::office_utils::TrustReadMode::Checked) {
             Ok(Some(_)) => Ok(format!(
                 "{}, beside the trust file's anchor, so the office pallet reads as unborn. {}",
                 gone, crate::util::office_utils::office_unborn_step()
             )),
             Ok(None) => Ok(never_written()),
-            Err(error) => Err(unread("trust state", error)),
-        },
-        Some(BornWitness::AppliedRedactions) => match crate::util::applied_redactions::read_applied() {
-            Ok(applied) if applied.is_empty() => Ok(never_written()),
-            Ok(_) => Err(format!(
-                "a lost meta pallet ref whose copy is lost too, beside the record of applied redactions (\"{}\"), which \
-                says the pallet was written: \"{}\"",
-                crate::util::applied_redactions::FILE_NAME_APPLIED, relative
+            Err(error) => Err(format!(
+                "a lost meta pallet ref whose copy is lost too, beside trust state heal does not accept: \"{}\" ({})",
+                relative, error.trim_end_matches('.')
             )),
-            Err(error) => Err(unread("a record of applied redactions", error)),
         },
+        Some(LostPair::Keep) => Err(format!(
+            "a lost meta pallet ref whose copy is lost too, a loss heal does not settle for this pallet: \"{}\"",
+            relative
+        )),
         None => Err(format!("a lost ref in the meta folder that is no meta pallet's: \"{}\"", relative)),
     }
 }
@@ -6863,17 +6857,16 @@ mod tests {
         }
     }
 
-    /// Every meta pallet has its born witness named, so a new meta pallet cannot resolve a lost
-    /// ref and copy without someone deciding what beside them says it was written; and a name
-    /// that is no meta pallet's has none.
+    /// Every meta pallet names how a lost ref and copy settle, so a new meta pallet cannot
+    /// resolve one without someone deciding it; and a name that is no meta pallet's has none.
     #[test]
-    fn every_meta_pallet_names_its_born_witness() {
+    fn every_meta_pallet_names_how_a_lost_pair_settles() {
         for name in crate::util::meta_tree::META_PALLET_NAMES {
-            assert!(meta_born_witness(name).is_some(), "meta pallet \"{}\" has no born witness", name);
+            assert!(meta_lost_pair(name).is_some(), "meta pallet \"{}\" names no settling of a lost pair", name);
         }
-        assert_eq!(meta_born_witness(crate::util::office_utils::OFFICE_PALLET_NAME), Some(BornWitness::TrustAnchor));
-        assert_eq!(meta_born_witness(crate::util::redaction_utils::REDACTIONS_PALLET_NAME), Some(BornWitness::AppliedRedactions));
-        assert_eq!(meta_born_witness("main"), None);
+        assert_eq!(meta_lost_pair(crate::util::office_utils::OFFICE_PALLET_NAME), Some(LostPair::OfficeStep));
+        assert_eq!(meta_lost_pair(crate::util::redaction_utils::REDACTIONS_PALLET_NAME), Some(LostPair::Keep));
+        assert_eq!(meta_lost_pair("main"), None);
     }
 
     /// A meta pallet ref recorded by a taint and gone: a ref write that created the file, whose
@@ -6882,16 +6875,16 @@ mod tests {
     /// lost (the meta pass after the recovery rebuilds it from the copy). Beside no copy, the
     /// pallet reads as never written and the record resolves with a note that says so and names
     /// no cause; for the office beside the trust file's anchor the note names the unborn office's
-    /// way back. A record beside them that says the pallet was written (applied redactions), or
-    /// that does not read (trust state, applied redactions), keeps the record. Beside a copy that
-    /// stands and holds no head the record stays, the line naming why. A name in the meta folder
-    /// that is no meta pallet's is kept.
+    /// way back, and trust state heal does not accept keeps the record. The redactions pallet's
+    /// lost pair is kept, even beside a record of applied redactions that reads empty. Beside a
+    /// copy that stands and holds no head the record stays, the line naming why. A name in the
+    /// meta folder that is no meta pallet's is kept.
     ///
     /// Revert: the meta ref shape's disposition back to `None` → the head row refuses → red.
     /// Revert: resolve without asking `meta_partner_lacks_head` → the no-head row clears → red.
-    /// Revert: keep a lost pair (`lost_meta_pair` always `Err`) → the absent row refuses → red.
-    /// Revert: skip the trust read for the office → the unreadable-trust row clears → red.
-    /// Revert: skip the applied record for redactions → the applied row clears → red.
+    /// Revert: keep a lost pair (`Resolve` → `Err`) → the absent row refuses → red.
+    /// Revert: skip the trust read for the office → the unaccepted-trust row clears → red.
+    /// Revert: resolve the redactions pallet's pair (`Keep` → `Resolve`) → its rows clear → red.
     #[test]
     fn heal_resolves_a_lost_meta_ref_beside_a_copy_holding_a_head_or_beside_none() {
         use crate::globals::StorageRootScope;
@@ -6900,8 +6893,8 @@ mod tests {
 
         enum CopyIs { Head, Absent, NoHead, Folder }
         use CopyIs::{Absent, Folder, Head, NoHead};
-        enum Beside { Nothing, Anchor, DamagedTrust, Applied, DamagedApplied }
-        use Beside::{Anchor, Applied, DamagedApplied, DamagedTrust, Nothing};
+        enum Beside { Nothing, Anchor, DamagedTrust, EmptyApplied }
+        use Beside::{Anchor, DamagedTrust, EmptyApplied, Nothing};
         enum Expect { Rebuilt, Note(&'static str), Kept(&'static str) }
         use Expect::{Kept, Note, Rebuilt};
 
@@ -6915,12 +6908,10 @@ mod tests {
             ("tags", "meta/tags", Folder, Nothing, Kept("a lost meta pallet ref whose copy (\"meta-copy/tags\") is not a file: \"meta/tags\"")),
             (OFFICE, "meta/office", Absent, Nothing, Note("(\"meta/office\") and its copy are both gone, so the pallet reads as never written")),
             (OFFICE, "meta/office", Absent, Anchor, Note("(\"meta/office\") and its copy are both gone, beside the trust file's anchor, so the office pallet reads as unborn. ")),
-            (OFFICE, "meta/office", Absent, DamagedTrust, Kept("a lost meta pallet ref whose copy is lost too, beside trust state that does not read: \"meta/office\" (")),
-            (REDACTIONS, "meta/redactions", Absent, Nothing, Note("(\"meta/redactions\") and its copy are both gone, so the pallet reads as never written")),
-            (REDACTIONS, "meta/redactions", Absent, Applied, Kept("a lost meta pallet ref whose copy is lost too, beside the record of applied redactions (\"redactions-applied\"), which says the pallet was written: \"meta/redactions\"")),
-            (REDACTIONS, "meta/redactions", Absent, DamagedApplied, Kept("a lost meta pallet ref whose copy is lost too, beside a record of applied redactions that does not read: \"meta/redactions\" (")),
-            // The applied record speaks only for the redactions pallet.
-            ("tags", "meta/tags", Absent, Applied, Note("(\"meta/tags\") and its copy are both gone, so the pallet reads as never written")),
+            (OFFICE, "meta/office", Absent, DamagedTrust, Kept("a lost meta pallet ref whose copy is lost too, beside trust state heal does not accept: \"meta/office\" (")),
+            (REDACTIONS, "meta/redactions", Absent, Nothing, Kept("a lost meta pallet ref whose copy is lost too, a loss heal does not settle for this pallet: \"meta/redactions\"")),
+            // A record of applied redactions that reads empty does not say the pallet was never written.
+            (REDACTIONS, "meta/redactions", Absent, EmptyApplied, Kept("a lost meta pallet ref whose copy is lost too, a loss heal does not settle for this pallet: \"meta/redactions\"")),
             ("tags", "meta/data", Head, Nothing, Kept("\"meta/data\" (a ref in the meta folder that is no meta pallet's) is gone, and heal has no recovery for it")),
         ];
 
@@ -6944,15 +6935,12 @@ mod tests {
                 NoHead => std::fs::write(&copy_path, b"not a hash").unwrap(),
                 Folder => std::fs::create_dir(&copy_path).unwrap(),
             }
-            let applied = forklift.join(crate::util::applied_redactions::FILE_NAME_APPLIED);
             match beside {
                 Nothing => {}
                 Anchor => std::fs::write(forklift.join(crate::util::office_utils::FILE_NAME_TRUST), ANCHOR).unwrap(),
                 DamagedTrust => std::fs::write(forklift.join(crate::util::office_utils::FILE_NAME_TRUST), "not a trust file").unwrap(),
-                Applied => std::fs::write(&applied, crate::util::record_utils::with_digest(
-                    format!("/forklift-redactions-applied 2\n{}\n", "d".repeat(64)).into_bytes())).unwrap(),
-                DamagedApplied => std::fs::write(&applied, crate::util::record_utils::with_digest(
-                    b"/forklift-redactions-applied 99\n".to_vec())).unwrap(),
+                EmptyApplied => std::fs::write(forklift.join("redactions-applied"),
+                    crate::util::record_utils::with_digest(b"/forklift-redactions-applied 2\n".to_vec())).unwrap(),
             }
             plant_complete_taint(&forklift, &[recorded]);
 
