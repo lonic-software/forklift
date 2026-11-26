@@ -7405,7 +7405,8 @@ mod tests {
             ("unvouched-heads".into(), "kept: the unvouched-heads record"),
             ("trust".into(), "kept: the trust anchor"),
             ("trust-copy".into(), "kept: the trust anchor's copy"),
-            ("bundles/latest".into(), "kept: the latest bundle's name"),
+            // No write records the latest bundle: its publish syncs without a taint.
+            ("bundles/latest".into(), "unrecognized"),
             // Matched as the ref or keepsake it is, where the unanchored checks took it for an
             // object, a shard, a signature or a pack.
             ("pallets/data".into(), "ref"),

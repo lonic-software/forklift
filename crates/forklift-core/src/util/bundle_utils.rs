@@ -142,8 +142,11 @@ pub fn discard_bundle_download() -> Result<(), String> {
 }
 
 /// Publish the current warehouse's imported bundle download as its own latest bundle, which
-/// `forklift serve` hands out as it is. The rename is made durable like any other rename into the
-/// store: a folder sync that fails records a taint instead of leaving it unproven.
+/// `forklift serve` hands out as it is. A folder sync that fails fails the publish, as it fails a
+/// build, and records no taint: the publish's only caller is a clone, which that failure leaves
+/// unfinished. Every other command refuses an unfinished clone (`franchise_utils::gate`), and the
+/// clone's resume clears its taint records (`franchise_utils::prepare_resume`), so a recorded
+/// taint would never reach heal.
 pub fn publish_bundle_download() -> Result<(), String> {
     let download = get_bundle_download_path();
     let latest = get_latest_bundle_path();
@@ -153,7 +156,7 @@ pub fn publish_bundle_download() -> Result<(), String> {
     ))?;
 
     match latest.parent() {
-        Some(parent) => file_utils::sync_dir_or_taint(parent, &[&latest]),
+        Some(parent) => file_utils::sync_dir(parent),
         None => Ok(()),
     }
 }
@@ -1546,6 +1549,36 @@ mod tests {
     thread_local! {
         /// Run once right before a build takes the ref lock to publish.
         pub(super) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    }
+
+    /// A clone's publish whose folder sync fails fails, and records no taint, with taint
+    /// recording active as it is in a clone. The positive half shows the sync fault engaged: the
+    /// publish fails, and the bundle stands renamed into place.
+    ///
+    /// Revert: publish through `sync_dir_or_taint` again → the write names a path no taint shape
+    /// declares → the debug-build assertion panics → red. Revert that and declare the shape again
+    /// → the taint is recorded → the no-taint assertion → red.
+    #[test]
+    #[cfg(unix)]
+    fn a_publish_whose_folder_sync_fails_fails_and_records_no_taint() {
+        use crate::util::file_utils::SyncDirFaultGuard;
+        use crate::util::taint_utils;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+        let _scratch = Scratch::new("publish-no-taint");
+        let latest = get_latest_bundle_path();
+        let bundles = latest.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&bundles).unwrap();
+        std::fs::write(get_bundle_download_path(), b"bundle").unwrap();
+
+        {
+            let _fault = SyncDirFaultGuard::failing_exactly(&bundles);
+            publish_bundle_download().expect_err("a publish whose folder sync fails fails");
+        }
+        assert_eq!(std::fs::read(&latest).unwrap(), b"bundle", "the bundle was renamed into place");
+        let taints = taint_utils::read_taints(&crate::globals::forklift_root()).unwrap();
+        assert!(taints.recorded.is_empty() && !taints.torn, "no taint is recorded: {:?}", taints.recorded);
     }
 
     // Revert: drop the plan's redacted skip → the bundle carries the redacted blob; drop the

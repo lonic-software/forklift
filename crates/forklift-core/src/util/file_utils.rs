@@ -9548,7 +9548,6 @@ mod tests {
             ("forklift-core/src/util/file_utils.rs", "sync_dir_or_taint", "sync_result_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "sync_result_or_taint"),
             // The funnel's callers.
-            ("forklift-core/src/util/bundle_utils.rs", "publish_bundle_download", "sync_dir_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_or_taint"),
             ("forklift-core/src/util/object_utils.rs", "store_object_stream", "sync_dir_or_taint"),
