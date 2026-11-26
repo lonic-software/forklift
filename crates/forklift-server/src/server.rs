@@ -1363,14 +1363,19 @@ fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
         root.nest(SINGLE_PROTOCOL_PREFIX, protocol)
     };
 
-    app.layer(body_limit)
+    let app = app.layer(body_limit)
         // Objects travel uncompressed on the wire by format (the hash covers the
         // uncompressed form, §4.4), so transport compression is nearly free wins;
         // bundle/batch responses are already zstd streams and mark themselves
         // `content-encoding: identity`, which the layer respects.
         .layer(tower_http::compression::CompressionLayer::new())
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state)
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    // Outermost, so a storage panic a request raises ends here whatever layer it came through.
+    #[cfg(debug_assertions)]
+    let app = app.layer(middleware::from_fn(storage_panic_boundary));
+
+    app.with_state(state)
 }
 
 /// The authentication layer: refuse the request from its headers alone, or pass it on with its
@@ -2864,7 +2869,12 @@ async fn blocking<T: Send + 'static>(
     warehouse: Arc<WarehouseHandle>,
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
-    scoped_storage_task(warehouse, work).await.unwrap_or_else(|error| Err(storage_task_failed(&error)))
+    scoped_storage_task(warehouse, work).await.unwrap_or_else(|error| {
+        let (failure, panic) = storage_task_failed(error);
+        drop(panic.map(disarm_storage_panic));
+
+        Err(failure)
+    })
 }
 
 /// [`blocking`] for a request's handler: a debug build raises a panic of the work again on the
@@ -2873,8 +2883,7 @@ async fn request_blocking<T: Send + 'static>(
     warehouse: Arc<WarehouseHandle>,
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
-    scoped_storage_task(warehouse, work).await
-        .unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
+    scoped_storage_task(warehouse, work).await.unwrap_or_else(|error| Err(reported_request_failure(error)))
 }
 
 /// [`request_blocking`] outside any warehouse's scope — for work on the server's folders
@@ -2882,8 +2891,17 @@ async fn request_blocking<T: Send + 'static>(
 async fn request_blocking_unscoped<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, HandlerError> + Send + 'static
 ) -> Result<T, HandlerError> {
-    tokio::task::spawn_blocking(work).await
-        .unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
+    tokio::task::spawn_blocking(move || tag_storage_panic(work)).await
+        .unwrap_or_else(|error| Err(reported_request_failure(error)))
+}
+
+/// The error a request's storage task that did not finish is answered with, once a debug build
+/// has raised its panic again ([`reraise_storage_panic`]). What is left of the panic, a release
+/// build's, is reported in the error.
+fn reported_request_failure(error: tokio::task::JoinError) -> HandlerError {
+    let (failure, _reported) = storage_task_failed(reraise_storage_panic(error));
+
+    failure
 }
 
 /// Run blocking storage work inside the warehouse's scope, as [`blocking`] does, handing back a
@@ -2896,21 +2914,140 @@ async fn scoped_storage_task<T: Send + 'static>(
     tokio::task::spawn_blocking(move || {
         let _scope = StorageRootScope::enter(&warehouse.root);
 
-        work()
+        tag_storage_panic(work)
     }).await
 }
 
-/// The internal error a storage task that did not finish is reported as.
-fn storage_task_failed(error: &tokio::task::JoinError) -> HandlerError {
-    internal(format!("A storage task failed: {}", error))
+/// What a panic raises: the value `resume_unwind` carries and a `JoinError` hands back.
+type PanicPayload = Box<dyn std::any::Any + Send>;
+
+/// Run a storage task's work. A debug build raises a panic of it again as a [`StoragePanic`], so
+/// one dropped unraised and unreported ends the process; a release build runs it as it is.
+fn tag_storage_panic<T>(work: impl FnOnce() -> T) -> T {
+    #[cfg(debug_assertions)]
+    {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok(done) => done,
+            Err(payload) => std::panic::resume_unwind(Box::new(StoragePanic(Some(payload)))),
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        work()
+    }
+}
+
+/// A debug build's storage task panic, holding the payload it was raised with. It has to end at a
+/// request's boundary ([`storage_panic_boundary`]) or a disposition of work no request awaits
+/// ([`disarm_storage_panic`]): dropped holding its payload anywhere else while a runtime is
+/// current, it was lost, so a reply may have hidden it, and it aborts the process. With no runtime
+/// current it does nothing. That is where a panic raised to a thread's top is dropped, which is
+/// reported there already, and also where a `JoinError` carried out of a `block_on` would be,
+/// which is then not caught.
+#[cfg(debug_assertions)]
+struct StoragePanic(Option<PanicPayload>);
+
+#[cfg(debug_assertions)]
+impl Drop for StoragePanic {
+    fn drop(&mut self) {
+        use std::io::Write;
+
+        let Some(payload) = &self.0 else { return };
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        // Straight to stderr: a test's captured output is never shown for a process that aborts.
+        let _ = writeln!(
+            std::io::stderr(),
+            "A storage task's panic was dropped, neither raised again nor reported: {}",
+            panic_message(payload.as_ref()).unwrap_or("(a payload that is not a message)"),
+        );
+        std::process::abort();
+    }
+}
+
+/// The message a panic was raised with, when its payload is one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload.downcast_ref::<&'static str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+}
+
+/// The message a storage task's panic was raised with, through its [`StoragePanic`] in a debug
+/// build.
+fn storage_panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    #[cfg(debug_assertions)]
+    if let Some(StoragePanic(Some(inner))) = payload.downcast_ref::<StoragePanic>() {
+        return panic_message(inner.as_ref());
+    }
+
+    panic_message(payload)
+}
+
+/// The payload a panic was raised with, a [`StoragePanic`]'s taken out of it so that it drops
+/// as any payload does. For a panic that ends where it is caught or resumed as itself.
+fn disarm_storage_panic(payload: PanicPayload) -> PanicPayload {
+    #[cfg(debug_assertions)]
+    let payload = match payload.downcast::<StoragePanic>() {
+        Ok(mut tagged) => tagged.0.take().unwrap_or_else(|| Box::new(())),
+        Err(other) => other,
+    };
+
+    payload
+}
+
+/// A request's boundary, outermost in [`router`] in a debug build: a [`StoragePanic`] unwinding
+/// out of the request is resumed as its own payload, so it ends there with no reply, as any
+/// panic of a request does.
+#[cfg(debug_assertions)]
+fn storage_panic_boundary(request: Request, next: Next) -> StoragePanicBoundary {
+    StoragePanicBoundary(Box::pin(next.run(request)))
+}
+
+/// [`storage_panic_boundary`]'s future: the request's, polled under `catch_unwind`.
+#[cfg(debug_assertions)]
+struct StoragePanicBoundary(std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>);
+
+#[cfg(debug_assertions)]
+impl std::future::Future for StoragePanicBoundary {
+    type Output = Response;
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, context: &mut std::task::Context<'_>) -> std::task::Poll<Response> {
+        let request = self.0.as_mut();
+
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.poll(context))) {
+            Ok(poll) => poll,
+            Err(payload) => std::panic::resume_unwind(disarm_storage_panic(payload)),
+        }
+    }
+}
+
+/// The internal error a storage task that did not finish is reported as, naming the message its
+/// panic was raised with, and that panic, for the caller to raise again or dispose of.
+fn storage_task_failed(error: tokio::task::JoinError) -> (HandlerError, Option<PanicPayload>) {
+    let failed = error.to_string();
+
+    if !error.is_panic() {
+        return (internal(format!("A storage task failed: {}", failed)), None);
+    }
+
+    let payload = error.into_panic();
+    // A JoinError names a payload's message only when the payload is the message itself.
+    let failed = match (panic_message(payload.as_ref()), storage_panic_message(payload.as_ref())) {
+        (None, Some(message)) => format!("{} with message {:?}", failed, message),
+        _ => failed,
+    };
+
+    (internal(format!("A storage task failed: {}", failed)), Some(payload))
 }
 
 /// What a request's storage task that did not finish leaves for its caller to report. A debug build
 /// raises a panic again on the caller's task instead: a reply would let a test that expects any
 /// failure pass over it, the debug build's undeclared-taint-shape assertion included. A release
 /// build reports it, so one request's panic never takes the server down. Only a request's task
-/// calls it: a panic raised in a task nobody awaits is lost, and the state that task keeps is left
-/// unsettled.
+/// calls it: a panic raised in a task nobody awaits is lost (a debug build's [`StoragePanic`]
+/// aborts the process when tokio drops it), and the state that task keeps is left unsettled.
 fn reraise_storage_panic(error: tokio::task::JoinError) -> tokio::task::JoinError {
     reraise_storage_panic_when(error, cfg!(debug_assertions))
 }
@@ -2930,19 +3067,23 @@ fn reraise_storage_panic_when(error: tokio::task::JoinError, reraise: bool) -> t
 /// ([`StorageFailure::reported`]). Which caller does which is pinned by
 /// `storage_wrappers_are_named_where_this_test_pins_them`.
 #[must_use = "a request's caller raises it (`raise`); work no request awaits marks it `reported`"]
-struct StorageFailure(Option<tokio::task::JoinError>);
+struct StorageFailure(Option<PanicPayload>);
 
 impl StorageFailure {
-    /// Raise a panic again ([`reraise_storage_panic`]): in a debug build. Anything else was
-    /// already reported.
+    /// Raise its panic again, as [`reraise_storage_panic`] does: in a debug build. A release build's
+    /// was already reported.
     fn raise(self) {
-        if let Some(error) = self.0 {
-            let _ = reraise_storage_panic(error);
+        if let Some(payload) = self.0 {
+            if cfg!(debug_assertions) {
+                std::panic::resume_unwind(payload);
+            }
         }
     }
 
     /// Dispose of it where no request awaits the work: it was reported where it was settled.
-    fn reported(self) {}
+    fn reported(self) {
+        drop(self.0.map(disarm_storage_panic));
+    }
 }
 
 /// What a warehouse creation found.
@@ -4161,7 +4302,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 failed => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     // Raised again only now, once the apply the write took is asked for again.
-                    failed.unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
+                    failed.unwrap_or_else(|error| Err(reported_request_failure(error)))
                         .map(|_| ())
                 }
             }
@@ -4360,7 +4501,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                 failed => {
                     after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     // Raised again only now, once the apply the deletion took is asked for again.
-                    failed.unwrap_or_else(|error| Err(storage_task_failed(&reraise_storage_panic(error))))
+                    failed.unwrap_or_else(|error| Err(reported_request_failure(error)))
                         .map(|_| ())
                 }
             }
@@ -5213,7 +5354,11 @@ async fn apply_discharging(
 
     let (outcome, failed) = match apply_redactions(Arc::clone(warehouse)).await {
         Ok(outcome) => (outcome, StorageFailure(None)),
-        Err(error) => (Err(storage_task_failed(&error)), StorageFailure(Some(error))),
+        Err(error) => {
+            let (failure, panic) = storage_task_failed(error);
+
+            (Err(failure), StorageFailure(panic))
+        }
     };
 
     let outcome = match outcome {
@@ -7170,52 +7315,269 @@ mod tests {
         assert!(handed_back.is_cancelled(), "{handed_back}");
     }
 
-    /// The payload a task that panicked with a literal message raised, when it was that message.
-    fn literal_payload(raised: Box<dyn std::any::Any + Send>) -> Option<&'static str> {
-        raised.downcast_ref::<&'static str>().copied()
+    /// The literal message a storage task's panic was raised with, read through the
+    /// [`StoragePanic`] a storage wrapper tags it as, which ends disarmed here; `None` when the
+    /// payload is no such panic. A test that catches a storage panic itself, with no request
+    /// boundary ([`storage_panic_boundary`]) to end it, ends it through this: dropped armed, it
+    /// aborts the test binary.
+    #[cfg(debug_assertions)]
+    fn storage_panic_literal(raised: PanicPayload) -> Option<&'static str> {
+        let mut tagged = raised.downcast::<StoragePanic>().ok()?;
+
+        tagged.0.take()?.downcast_ref::<&'static str>().copied()
     }
 
     /// In a debug build, a panic in a request's storage work fails the request's own task with the
-    /// work's own payload, so a test driving a handler fails on it rather than reading an
-    /// internal-error reply.
+    /// work's own payload, tagged as a storage panic by either wrapper, so a test driving a handler
+    /// fails on it rather than reading an internal-error reply.
     ///
     /// Revert: report every storage panic (`reraise_storage_panic_when(error, false)`) → the call
     /// returns an internal error → "the storage panic is raised again" fails; raise a new panic
     /// naming the JoinError instead of resuming → the payload is a `String` → the payload
-    /// assertion fails.
+    /// assertion fails; run either wrapper's work untagged (`work()` for `tag_storage_panic(work)`)
+    /// → that payload is no `StoragePanic` → its payload assertion fails.
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn a_debug_build_raises_a_storage_panic_on_the_requests_task() {
         let unscoped = tokio::spawn(request_blocking_unscoped(|| -> Result<(), HandlerError> { panic!("planted storage panic") }));
         let raised = unscoped.await.expect_err("the unscoped storage panic is raised again");
-        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+        assert_eq!(storage_panic_literal(raised.into_panic()), Some("planted storage panic"));
 
         let root = scratch_dir("storage-panic-scoped");
         let warehouse = Arc::new(WarehouseHandle::new(root.clone()));
         let scoped = tokio::spawn(request_blocking(warehouse, || -> Result<(), HandlerError> { panic!("planted storage panic") }));
         let raised = scoped.await.expect_err("the scoped storage panic is raised again");
-        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+        assert_eq!(storage_panic_literal(raised.into_panic()), Some("planted storage panic"));
 
         let _ = forklift_core::util::file_utils::remove_dir_all(&root);
     }
 
     /// Work no request awaits gets a storage panic back as an internal error in every build, so its
-    /// caller logs it and keeps its own state straight.
+    /// caller logs it and keeps its own state straight; the error names the panic's message, as a
+    /// failed redaction apply's does.
     ///
-    /// Revert: raise it again in `blocking` (`storage_task_failed(&reraise_storage_panic(error))`) →
-    /// the awaiting task panics → "a background caller gets an error back" fails.
+    /// Revert: raise it again in `blocking` (`Err(reported_request_failure(error))`) → the awaiting
+    /// task panics → "a background caller gets an error back" fails; format the JoinError alone
+    /// (`(None, Some(message))` arm dropped from `storage_task_failed`) → a tagged panic's message
+    /// is not named → both message assertions fail.
     #[tokio::test]
     async fn work_no_request_awaits_gets_a_storage_panic_back_as_an_error() {
         let root = scratch_dir("storage-panic-background");
         let warehouse = Arc::new(WarehouseHandle::new(root.clone()));
-        let background = tokio::spawn(blocking(warehouse, || -> Result<(), HandlerError> { panic!("planted storage panic") }));
+        let background = tokio::spawn(blocking(Arc::clone(&warehouse), || -> Result<(), HandlerError> { panic!("planted storage panic") }));
         let (status, message) = background.await.expect("a background caller gets an error back")
             .expect_err("the panic is an error");
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(message.starts_with("A storage task failed: ") && message.contains("planted storage panic"), "{message}");
 
+        let _seam = arm_write_seam(&root, APPLY_SEAM, || panic!("planted storage panic"));
+        let (applied, apply, failed) = apply_discharging(&warehouse).await;
+        drop(failed.0.map(disarm_storage_panic));
+        let message = apply.expect_err("the apply failed");
+
+        assert!(!applied);
+        assert!(message.starts_with("A storage task failed: ") && message.contains("planted storage panic"), "{message}");
+
         let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// What a child process of a test runs, set by [`run_child_test`]: a child test does nothing
+    /// without it.
+    #[cfg(debug_assertions)]
+    const STORAGE_PANIC_CHILD: &str = "FORKLIFT_TEST_STORAGE_PANIC_CHILD";
+
+    /// Run this binary's ignored test `name` of this module in a child process, with output
+    /// capture left on, so a line that reaches its stderr was written past the capture. Fails
+    /// unless the child started that one test: a filter matching none exits 0.
+    #[cfg(debug_assertions)]
+    fn run_child_test(name: &str) -> std::process::Output {
+        let (_, module) = module_path!().split_once("::").unwrap();
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("{module}::{name}"), "--exact", "--ignored", "--test-threads=1"])
+            .env(STORAGE_PANIC_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+
+        assert!(stdout.contains("running 1 test\n"), "the child ran {name}: {stdout}");
+
+        child
+    }
+
+    /// Whether a child process ended on an abort: on Unix, killed by SIGABRT; on Windows, the
+    /// status `std::process::abort`'s fast fail exits with (`STATUS_STACK_BUFFER_OVERRUN`). A panic
+    /// (exit 101) or a clean exit is neither.
+    #[cfg(debug_assertions)]
+    fn aborted(status: &std::process::ExitStatus) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            status.signal() == Some(6)
+        }
+
+        #[cfg(windows)]
+        {
+            status.code() == Some(0xC000_0409_u32 as i32)
+        }
+    }
+
+    /// The line a storage panic dropped armed writes before it aborts.
+    #[cfg(debug_assertions)]
+    const LOST_STORAGE_PANIC_LINE: &str = "A storage task's panic was dropped, neither raised again nor reported: planted storage panic";
+
+    /// In a debug build, a storage panic a reply swallows ends the process: the shape a name scan
+    /// passes, an inner task that raises it again and an outer one that answers its `JoinError`.
+    /// The line naming the panic reaches stderr though the child's output is captured.
+    ///
+    /// Revert: panic in the `StoragePanic` drop in place of the abort → the child exits 101 → "the
+    /// child aborted" fails; write the line with `eprintln!` → it is captured → the stderr
+    /// assertion fails.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_storage_panic_a_reply_swallows_aborts_the_process() {
+        let child = run_child_test("child_swallows_a_storage_panic_into_a_reply");
+        let stderr = String::from_utf8_lossy(&child.stderr);
+
+        assert!(aborted(&child.status), "the child aborted: {:?}\n{stderr}", child.status);
+        assert!(stderr.contains(LOST_STORAGE_PANIC_LINE), "{stderr}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[ignore = "the child of a_storage_panic_a_reply_swallows_aborts_the_process"]
+    async fn child_swallows_a_storage_panic_into_a_reply() {
+        if std::env::var_os(STORAGE_PANIC_CHILD).is_none() {
+            return;
+        }
+
+        let inner = tokio::spawn(request_blocking_unscoped(|| -> Result<(), HandlerError> { panic!("planted storage panic") }));
+        let error = inner.await.expect_err("the storage panic is raised again");
+        let (status, _) = internal(format!("A request failed: {}", error));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// In a debug build, a storage panic a request served through [`router`] raises ends at the
+    /// request's boundary, with no reply and no abort.
+    ///
+    /// Revert: drop the boundary layer from `router` → the connection task drops it armed → the
+    /// child aborts → "the child exited cleanly" fails.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_storage_panic_a_request_raises_ends_at_the_requests_boundary() {
+        let child = run_child_test("child_serves_a_storage_panic_through_the_router");
+
+        assert!(child.status.success(), "the child exited cleanly: {:?}\n{}\n{}", child.status,
+            String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[ignore = "the child of a_storage_panic_a_request_raises_ends_at_the_requests_boundary"]
+    async fn child_serves_a_storage_panic_through_the_router() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if std::env::var_os(STORAGE_PANIC_CHILD).is_none() {
+            return;
+        }
+
+        let fixture = HeavyFixture::new(HeavyRoute::RefUpdate);
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = heavy_capped_state(fixture.root.clone(), &heavy, std::time::Duration::from_secs(30));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let _seam = arm_write_seam(&fixture.root, "pushed/owed", {
+            let fired = Arc::clone(&fired);
+            move || {
+                fired.fetch_add(1, Ordering::SeqCst);
+                panic!("planted storage panic")
+            }
+        });
+        let addr = serve_router(state, 1 << 20).await;
+
+        let body = serde_json::to_vec(&RefUpdateRequest { old_head: None, new_head: fixture.pushed.clone(), tombstone: None }).unwrap();
+        let mut stream = send_head(addr, "POST", "/v1/pallets/pushed", None, body.len()).await;
+        stream.write_all(&body).await.unwrap();
+        let mut received = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut received)).await;
+
+        assert!(read.is_ok(), "the connection was not closed");
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "the push reached its planted panic");
+        assert!(received.is_empty(), "a reply: {}", String::from_utf8_lossy(&received));
+
+        // An armed drop after the connection closed would abort within this.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    /// In a debug build, a redaction run's storage panic, reported where no request awaits it, ends
+    /// there with no abort.
+    ///
+    /// Revert: leave it armed in `reported` (`fn reported(self) {}`, so the payload drops as it
+    /// is) → the child aborts → "the child exited cleanly" fails.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_redaction_runs_reported_storage_panic_ends_there() {
+        let child = run_child_test("child_reports_a_redaction_rounds_storage_panic");
+
+        assert!(child.status.success(), "the child exited cleanly: {:?}\n{}\n{}", child.status,
+            String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[ignore = "the child of a_redaction_runs_reported_storage_panic_ends_there"]
+    async fn child_reports_a_redaction_rounds_storage_panic() {
+        if std::env::var_os(STORAGE_PANIC_CHILD).is_none() {
+            return;
+        }
+
+        let root = scratch_dir("storage-panic-round");
+        let state = Arc::new(single_mode_state(root.clone()));
+        let warehouse = resolve_handle(&state, &PathParams::new()).unwrap();
+        drop(warehouse.owe_apply());
+        assert!(warehouse.apply_owed(), "an apply is owed, so the round runs one");
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let _seam = arm_write_seam(&root, APPLY_SEAM, {
+            let fired = Arc::clone(&fired);
+            move || {
+                fired.fetch_add(1, Ordering::SeqCst);
+                panic!("planted storage panic")
+            }
+        });
+        let _ = redaction_round(&state, &warehouse).await;
+
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "the round's apply reached its planted panic");
+
+        let _ = forklift_core::util::file_utils::remove_dir_all(&root);
+    }
+
+    /// In a debug build, a storage panic a test raises to its top fails it as a panic, with no
+    /// abort: dropped outside every runtime, it was not lost.
+    ///
+    /// Revert: abort whether or not a runtime is current (the `try_current` test dropped) → the
+    /// child aborts → "the child failed as a panic" fails.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_storage_panic_raised_to_a_tests_top_fails_it_without_an_abort() {
+        let child = run_child_test("child_raises_a_storage_panic_to_its_top");
+        let stderr = String::from_utf8_lossy(&child.stderr);
+
+        assert_eq!(child.status.code(), Some(101), "the child failed as a panic: {:?}\n{stderr}", child.status);
+        assert!(!stderr.contains(LOST_STORAGE_PANIC_LINE), "{stderr}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[ignore = "the child of a_storage_panic_raised_to_a_tests_top_fails_it_without_an_abort"]
+    async fn child_raises_a_storage_panic_to_its_top() {
+        if std::env::var_os(STORAGE_PANIC_CHILD).is_none() {
+            return;
+        }
+
+        let _ = request_blocking_unscoped(|| -> Result<(), HandlerError> { panic!("planted storage panic") }).await;
     }
 
     /// Push `pushed` with `seam` armed to panic in its warehouse, and return the request's task's
@@ -7283,7 +7645,7 @@ mod tests {
             closed.store(usize::from(handle.applies_closed()) + 1, Ordering::SeqCst);
         }).await;
 
-        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+        assert_eq!(storage_panic_literal(raised.into_panic()), Some("planted storage panic"));
         assert!(fixture.changed(HeavyRoute::RefUpdate), "the push landed before its apply");
         assert_eq!(closed_at_the_panic.load(Ordering::SeqCst), 2, "the write's apply was owed when it panicked");
         redactions_settled(&handle).await;
@@ -7310,7 +7672,7 @@ mod tests {
             closed.store(usize::from(handle.applies_closed()) + 1, Ordering::SeqCst);
         }).await;
 
-        assert_eq!(literal_payload(raised.into_panic()), Some("planted storage panic"));
+        assert_eq!(storage_panic_literal(raised.into_panic()), Some("planted storage panic"));
         assert!(!fixture.changed(HeavyRoute::RefUpdate), "the push did not land");
         assert_eq!(closed_at_the_panic.load(Ordering::SeqCst), 2, "the write owed its apply when it panicked");
         assert!(!handle.applies_closed(), "the apply the write owed was settled before the panic was raised");
@@ -13411,15 +13773,18 @@ mod tests {
     ///
     /// It pins names, not flow, and proves no absence of masking: a task boundary between a
     /// handler and its wrapper (a `tokio::spawn` whose `JoinError` the handler answers, a helper
-    /// in between) passes it. That a raise comes after its settling is the behavioural tests'
-    /// (`a_debug_build_raises_…`).
+    /// in between) passes it. A debug build's [`StoragePanic`] catches that shape at run time
+    /// instead, when the swallowed panic is dropped still armed (`a_storage_panic_a_reply_swallows_…`);
+    /// what may disarm one, or format a storage task's failure, is pinned here. That a raise comes
+    /// after its settling is the behavioural tests' (`a_debug_build_raises_…`).
     ///
     /// Reverts: a handler on `blocking` → its literal set fails; a bare `spawn_blocking` in a
     /// handler → the `spawn_blocking` set fails; a redaction round that drops the apply's failure
     /// with `_` → the `.reported` set fails; arguments that parse left unvisited (the fallback is
     /// not reached for them) → the Heavy handlers' raise inside `format!` is unseen → red;
     /// `blocking` named only inside a `tokio::select!` in a handler → its literal set fails; with
-    /// the unparsed-macro fallback removed as well, the same plant passes unseen.
+    /// the unparsed-macro fallback removed as well, the same plant passes unseen; a helper that
+    /// formats and disarms a storage panic on a handler's path → the two disarm/format sets fail.
     #[test]
     fn storage_wrappers_are_named_where_this_test_pins_them() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
@@ -13455,6 +13820,13 @@ mod tests {
         assert_eq!(named.by("apply_discharging"), disposed, "every apply's caller disposes of its failure");
         let raising_callers: BTreeSet<String> = named.by("after_ref_write").union(&named.by("after_failed_ref_write")).cloned().collect();
         assert!(raising_callers.is_subset(&handlers), "only route handlers await an apply they raise: {raising_callers:?}");
+
+        // A storage panic disarmed only at a request's boundary (its future's `poll`) and by the
+        // background dispositions; formatted only where it is then raised or disposed of.
+        assert_eq!(named.by("disarm_storage_panic"), set(&["blocking", "poll", "reported"]),
+            "the functions disarming a storage panic");
+        assert_eq!(named.by("storage_task_failed"), set(&["apply_discharging", "blocking", "reported_request_failure"]),
+            "the functions formatting a storage task's failure");
     }
 
     /// `serve`'s capacity: a set value is used as given; zero, and more than the semaphore can
