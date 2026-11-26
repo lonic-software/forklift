@@ -831,6 +831,25 @@ async fn resolve_the_rest(
                     ));
                 }
             },
+            // A gone marker reads as recording no unfinished load, here as with no taint (see
+            // `VanishedClass::LoadMarker`), so its absence is made durable and the record resolved.
+            VanishedClass::LoadMarker => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => {
+                    refs_resolved.push(relative.to_string_lossy().into_owned());
+                    vanished_notes.push(format!(
+                        "the incomplete-load marker \"{}\" is gone; it reads as recording no unfinished \
+                        load, as it would with no taint; if a load failed before this heal, run it again",
+                        relative.to_string_lossy()
+                    ));
+                }
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost incomplete-load marker whose loss could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy(), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1548,7 +1567,8 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         Some(Disposition::Loose | Disposition::PackData | Disposition::PackIndex) => true,
         Some(Disposition::SignatureTable | Disposition::Shard) => listed.contains(relative),
         // A loose signature sidecar is skipped by the loose walk (`walk_loose_object_paths`).
-        Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake) | None => false,
+        Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
+            | Disposition::LoadMarker) | None => false,
     }
 }
 
@@ -1735,6 +1755,17 @@ enum VanishedClass {
     /// carrying it. That failure stops the removal before it removes the ref
     /// (`pallet_utils::remove_damaged_ref`), and the standing taint refuses a later removal.
     Keepsake,
+    /// An incomplete-load marker (`inventory/incomplete-load`, or a bay's), gone since the taint
+    /// was recorded. A load records its start in a batch whose failed sync taints the whole
+    /// visible prefix. A single-file load's shard rides that same batch, so it is recorded beside
+    /// the marker; a directory load's batch holds no shard, and the load publishes none after it
+    /// fails. A load's withdrawal of its start
+    /// (`load_guard_utils::withdraw_start`) writes on its own, but only over a marker that already
+    /// stands, or removes it. A rewrite over a marker that stood leaves the old one standing when
+    /// undone, and every other way it goes is its set emptying. No command but heal runs while
+    /// the taint stands (`heal_utils::heal_if_tainted`). So a gone marker is read as every reader
+    /// reads one: no unfinished load is recorded.
+    LoadMarker,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -1766,6 +1797,7 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::MetaRef => meta_pallet_name(relative).map(VanishedClass::MetaRef),
         Disposition::MetaCopy => meta_pallet_name(relative).map(VanishedClass::MetaCopy),
         Disposition::Keepsake => Some(VanishedClass::Keepsake),
+        Disposition::LoadMarker => Some(VanishedClass::LoadMarker),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
@@ -6600,6 +6632,7 @@ mod tests {
             VanishedClass::MetaRef(name) => format!("meta ref {}", name),
             VanishedClass::MetaCopy(name) => format!("meta copy {}", name),
             VanishedClass::Keepsake => "keepsake".to_string(),
+            VanishedClass::LoadMarker => "load marker".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -6628,7 +6661,7 @@ mod tests {
             ("removed-refs/side".into(), "keepsake"),
             ("removed-refs/side+2".into(), "keepsake"),
             ("meta-copy/main".into(), "kept: a copy of a ref that is no meta pallet's"),
-            ("inventory/incomplete-load".into(), "kept: the incomplete-load marker"),
+            ("inventory/incomplete-load".into(), "load marker"),
             ("position".into(), "kept: the checkout position"),
             ("position-copy".into(), "kept: the checkout position's copy"),
             ("scope".into(), "kept: the checkout scope"),
@@ -6638,7 +6671,7 @@ mod tests {
             ("consolidation-skeleton".into(), "kept: the consolidation skeleton"),
             ("consolidation-skeleton-copy".into(), "kept: the consolidation skeleton's copy"),
             ("journal.json".into(), "kept: the journal"),
-            ("bays/main/inventory/incomplete-load".into(), "kept: a bay's incomplete-load marker"),
+            ("bays/main/inventory/incomplete-load".into(), "load marker"),
             ("bays/main/position".into(), "kept: a bay's checkout position"),
             ("bays/main/position-copy".into(), "kept: a bay's checkout position's copy"),
             ("bays/main/scope".into(), "kept: a bay's checkout scope"),
@@ -6795,6 +6828,100 @@ mod tests {
         assert_eq!(std::fs::read(&reference).unwrap(), unreadable, "heal leaves the ref as it stands");
 
         crate::util::file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// A load's first barrier, holding its start marker, fails its folder syncs and taints the
+    /// marker. A power loss then undoes the marker's birth. Heal resolves the lost marker with a
+    /// note and clears, and nothing reads as an unfinished load. Where the absence cannot be made
+    /// durable, the record stays and heal refuses.
+    ///
+    /// Revert: the marker shapes' disposition back to `None` → heal refuses → red. Revert: resolve
+    /// without `sync_nearest_ancestor` → the failing-sync heal clears → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_load_marker_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::{DirSyncFaultGuard, SyncDirFaultGuard};
+
+        for durable in [true, false] {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-load-marker-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            let marker = load_guard_utils::marker_path();
+            let folder = marker.parent().unwrap().to_path_buf();
+            {
+                let batch = file_utils::WriteBatch::new();
+                load_guard_utils::stage_start_marker(&batch, "src").unwrap();
+                let _fault = DirSyncFaultGuard::failing_exactly(&folder);
+                batch.finish().expect_err("a barrier whose folder sync fails fails");
+            }
+            assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                [PathBuf::from("inventory/incomplete-load")].into_iter().collect(), "the marker alone is recorded");
+
+            crate::util::file_utils::remove_file(&marker).unwrap();
+
+            if !durable {
+                let _fault = SyncDirFaultGuard::failing_exactly(&folder);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[
+                    "a lost incomplete-load marker whose loss could not be made durable: \"inventory/incomplete-load\"",
+                ]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from("inventory/incomplete-load")].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().expect("a lost load marker is resolved, so heal clears");
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, ["inventory/incomplete-load".to_string()], "{:?}", outcome);
+            assert!(outcome.notes.contains(&"the incomplete-load marker \"inventory/incomplete-load\" is gone; it reads \
+                as recording no unfinished load, as it would with no taint; if a load failed before this heal, run it again"
+                .to_string()), "{:?}", outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            load_guard_utils::check_no_incomplete_load().expect("no unfinished load is recorded");
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost path of either load marker shape, a warehouse's or a bay's, is resolved.
+    ///
+    /// Revert: the bay shape's disposition back to `None` → its row refuses → red.
+    #[test]
+    fn heal_resolves_a_lost_load_marker_of_either_shape() {
+        use crate::globals::StorageRootScope;
+
+        for relative in ["inventory/incomplete-load", "bays/main/inventory/incomplete-load"] {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-marker-shape-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            plant_complete_taint(&forklift, &[relative]);
+            assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{}: {}", relative, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
     }
 
     /// A lost keepsake is resolved only beside a ref file of the one pallet whose slot its name
