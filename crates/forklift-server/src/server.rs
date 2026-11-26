@@ -13416,9 +13416,10 @@ mod tests {
     ///
     /// Reverts: a handler on `blocking` → its literal set fails; a bare `spawn_blocking` in a
     /// handler → the `spawn_blocking` set fails; a redaction round that drops the apply's failure
-    /// with `_` → the `.reported` set fails; macro arguments unread → the Heavy handlers' raise is
-    /// unseen → red; `blocking` named only inside a `tokio::select!` in a handler → its literal set
-    /// fails.
+    /// with `_` → the `.reported` set fails; arguments that parse left unvisited (the fallback is
+    /// not reached for them) → the Heavy handlers' raise inside `format!` is unseen → red;
+    /// `blocking` named only inside a `tokio::select!` in a handler → its literal set fails; with
+    /// the unparsed-macro fallback removed as well, the same plant passes unseen.
     #[test]
     fn storage_wrappers_are_named_where_this_test_pins_them() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
