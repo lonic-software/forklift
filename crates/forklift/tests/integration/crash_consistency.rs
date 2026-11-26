@@ -1310,6 +1310,9 @@ fn a_bay_add_stopped_before_its_tainted_path_record_is_healed_then_removed() {
         let said = format!("{}{}", String::from_utf8_lossy(&healed.stdout), String::from_utf8_lossy(&healed.stderr));
         assert!(healed.status.success(), "heal after a stop at rename {at}: {said}");
         assert!(said.contains("the way out is \"forklift bay remove b\""), "stopped at rename {at}: {said}");
+        let left: Vec<_> = std::fs::read_dir(&taint).unwrap().collect();
+        assert!(left.is_empty(), "stopped at rename {at}: heal leaves nothing recorded: {left:?}");
+        assert!(state.join("operation").exists(), "stopped at rename {at}: the bay's creation marker still stands");
 
         let removed = area.run(&["bay", "remove", "b"]);
         assert!(removed.status.success(), "bay remove after a stop at rename {at}: {}", String::from_utf8_lossy(&removed.stderr));

@@ -913,14 +913,14 @@ async fn resolve_the_rest(
             // resolved, with a note naming the way out where the bay is still listed.
             VanishedClass::BayPath(name) => match sync_nearest_ancestor(root, relative) {
                 Ok(()) => {
-                    refs_resolved.push(relative.to_string_lossy().into_owned());
+                    refs_resolved.push(relative.to_string_lossy().replace('\\', "/"));
                     vanished_notes.push(lost_bay_path_note(&name, relative));
                 }
                 Err(error) => {
                     remainder.insert(relative.clone());
                     dangling_lines.push(format!(
                         "a lost bay path record whose loss could not be made durable: \"{}\" ({})",
-                        relative.to_string_lossy(), error
+                        relative.to_string_lossy().replace('\\', "/"), error
                     ));
                 }
             },
@@ -2133,24 +2133,32 @@ fn lost_checkout_record_note(lost: &LostCheckoutRecord) -> String {
 /// The note for a resolved [`VanishedClass::BayPath`]: what heal reads of the bay's state folder.
 /// Where it stands, the bay reads as one that records no directory, and `bay remove` is the way
 /// out (by hand where no command line spells the name); where it went with the record, no such
-/// bay stands, and none is needed.
+/// bay stands, and none is needed; where the entry is a link or a file, it is no bay's folder.
 ///
-/// The folder is read directly, not through `bay_utils::is_listed_bay`, which refuses some names
-/// whose folders stand (one ending in "." or a space): those are the names removed by hand.
+/// The entry is found by listing the bays folder and matching the name byte for byte, as
+/// `bay_utils::is_listed_bay` does, so a path that resolves to another entry (a name ending in "."
+/// on Windows names its stem's folder) is never read for it. `is_listed_bay` itself is not used:
+/// it refuses names ending in "." or a space whose folders stand, and those are removed by hand.
 fn lost_bay_path_note(name: &str, relative: &Path) -> String {
     let lost = format!(
         "the path record of bay \"{}\" (\"{}\") is gone", name, relative.to_string_lossy().replace('\\', "/")
     );
     let state = bay_utils::bay_state_dir(name);
+    let shown = std::path::absolute(&state).unwrap_or_else(|_| state.clone());
 
-    match std::fs::symlink_metadata(&state) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    match bay_state_entry(name) {
+        Ok(None) => {
             format!("{}, and so is the bay's state folder: no bay of that name stands, as it would with no taint", lost)
         }
-        Err(e) => format!(
-            "{}, and the bay's state folder \"{}\" does not read ({})", lost, state.to_string_lossy(), e
+        Ok(Some(false)) => format!(
+            "{}, and \"{}\" is a link or a file, not a bay's state folder, so no bay of that name stands; delete it by \
+            hand to drop it",
+            lost, shown.to_string_lossy()
         ),
-        Ok(_) => {
+        Err(error) => format!(
+            "{}, and the bay's state folder \"{}\" does not read ({})", lost, shown.to_string_lossy(), error.trim_end_matches('.')
+        ),
+        Ok(Some(true)) => {
             let reads = format!("{}; the bay reads as one that records no directory, as it would with no taint", lost);
             match bay_utils::remove_command(name) {
                 Some(command) => format!("{}; the way out is \"{}\"", reads, command),
@@ -2158,6 +2166,26 @@ fn lost_bay_path_note(name: &str, relative: &Path) -> String {
             }
         }
     }
+}
+
+/// The bays folder's entry named exactly `name`: `None` when there is none, else whether it is a
+/// real folder rather than a link or a file.
+fn bay_state_entry(name: &str) -> Result<Option<bool>, String> {
+    let folder = forklift_root().join(crate::globals::FOLDER_NAME_BAYS_ROOT);
+
+    match std::fs::symlink_metadata(&folder) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        _ => {}
+    }
+    for entry in file_utils::read_directory(&folder)? {
+        let entry = entry.map_err(|e| format!("Error while reading a bay entry: {}", e))?;
+
+        if entry.file_name() == std::ffi::OsStr::new(name) {
+            return Ok(Some(file_utils::get_symlink_metadata_for_path(&entry.path())?.is_dir()));
+        }
+    }
+
+    Ok(None)
 }
 
 /// A record of a consolidation or pick in progress whose loss heal resolves with a note.
@@ -7547,7 +7575,9 @@ mod tests {
     ///
     /// Revert: the shape's disposition back to `None` → every row refuses → red. Revert: resolve
     /// without `sync_nearest_ancestor` → the failing-sync row clears → red. Revert: the folder
-    /// not read → the folder-gone row's note differs → red.
+    /// not read → the folder-gone row's note differs → red. Revert: the entry read by its path, not
+    /// matched in the listing → on a volume that folds case, the case-sibling row's note differs →
+    /// red.
     #[test]
     #[cfg(unix)]
     fn heal_resolves_a_lost_bay_path_record_once_its_absence_is_durable() {
@@ -7555,7 +7585,7 @@ mod tests {
         use crate::util::file_utils::SyncDirFaultGuard;
 
         #[derive(Clone, Copy, PartialEq)]
-        enum Row { Listed, FolderGone, Undurable }
+        enum Row { Listed, FolderGone, CaseSibling, Undurable }
 
         // (the bay, the row, the note, or the refusal's line where heal cannot make the absence
         // durable); `{state}` stands for the bay's state folder, absolute.
@@ -7571,6 +7601,10 @@ mod tests {
                 \"{state}\""),
             ("b", Row::FolderGone, "the path record of bay \"b\" (\"bays/b/path\") is gone, and so is the bay's state \
                 folder: no bay of that name stands, as it would with no taint"),
+            // The folder went, and "B" stands beside it: on a volume that folds case a path read
+            // of "bays/b" finds "B", which is another bay's.
+            ("b", Row::CaseSibling, "the path record of bay \"b\" (\"bays/b/path\") is gone, and so is the bay's \
+                state folder: no bay of that name stands, as it would with no taint"),
             ("b", Row::Undurable, "a lost bay path record whose loss could not be made durable: \"bays/b/path\""),
         ];
 
@@ -7601,6 +7635,10 @@ mod tests {
 
             match row {
                 Row::FolderGone => crate::util::file_utils::remove_dir_all(&folder).unwrap(),
+                Row::CaseSibling => {
+                    crate::util::file_utils::remove_dir_all(&folder).unwrap();
+                    std::fs::create_dir_all(bay_utils::bay_state_dir("B")).unwrap();
+                }
                 _ => { let _ = crate::util::file_utils::remove_file(&forklift.join(&relative)); }
             }
             assert!(!forklift.join(&relative).exists(), "sanity: the recorded path is gone");
@@ -7623,6 +7661,42 @@ mod tests {
             assert!(outcome.notes.contains(&note), "{}: {:?}", relative, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
             assert_eq!(bay_utils::read_bay_path(name).unwrap(), None, "{}: the bay records no directory", relative);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A link or a file standing where a bay's state folder would be is said as no bay's folder,
+    /// never given `bay remove`, which refuses both. Heal itself refuses a path under either as
+    /// unreadable before any vanished disposition, so the note is called directly here.
+    ///
+    /// Revert: a link or a file taken for the folder → the note names `bay remove` → red.
+    #[test]
+    #[cfg(unix)]
+    fn a_lost_bay_path_note_says_a_link_or_file_is_no_bay_folder() {
+        use crate::globals::StorageRootScope;
+
+        for link in [true, false] {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-bay-path-entry-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join("bays")).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            let folder = bay_utils::bay_state_dir("b");
+            match link {
+                true => {
+                    std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+                    std::os::unix::fs::symlink(root.join("elsewhere"), &folder).unwrap();
+                }
+                false => std::fs::write(&folder, b"not a folder").unwrap(),
+            }
+
+            let state = std::path::absolute(&folder).unwrap();
+            assert_eq!(lost_bay_path_note("b", Path::new("bays/b/path")), format!(
+                "the path record of bay \"b\" (\"bays/b/path\") is gone, and \"{}\" is a link or a file, not a bay's \
+                state folder, so no bay of that name stands; delete it by hand to drop it",
+                state.to_string_lossy()
+            ), "link: {}", link);
 
             crate::util::file_utils::remove_dir_all(&root).ok();
         }
