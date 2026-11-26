@@ -144,7 +144,7 @@ pub fn discard_bundle_download() -> Result<(), String> {
 /// Publish the current warehouse's imported bundle download as its own latest bundle, which
 /// `forklift serve` hands out as it is. A folder sync that fails fails the publish, as it fails a
 /// build, and records no taint: the publish's only caller is a clone, which that failure leaves
-/// unfinished. Every command refuses an unfinished clone (`franchise_utils::gate`), and the
+/// unfinished. Every other command refuses an unfinished clone (`franchise_utils::gate`), and the
 /// clone's resume clears its taint records (`franchise_utils::prepare_resume`), so a recorded
 /// taint would never reach heal.
 pub fn publish_bundle_download() -> Result<(), String> {
@@ -1556,7 +1556,8 @@ mod tests {
     /// publish fails, and the bundle stands renamed into place.
     ///
     /// Revert: publish through `sync_dir_or_taint` again → the write names a path no taint shape
-    /// declares → the debug-build assertion panics → red.
+    /// declares → the debug-build assertion panics → red. Revert that and declare the shape again
+    /// → the taint is recorded → the no-taint assertion → red.
     #[test]
     #[cfg(unix)]
     fn a_publish_whose_folder_sync_fails_fails_and_records_no_taint() {
