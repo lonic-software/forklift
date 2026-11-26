@@ -29,7 +29,7 @@ use crate::util::redaction_utils::{self, HeadHolder, Redaction, RedactionsRead};
 use crate::util::{config_utils, file_utils, object_utils, record_utils, scope_utils};
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
-const FILE_NAME_APPLIED: &str = "redactions-applied";
+pub(crate) const FILE_NAME_APPLIED: &str = "redactions-applied";
 const APPLIED_RECORD: &str = "redactions-applied";
 const APPLIED_VERSION: u32 = 2;
 
