@@ -1835,35 +1835,54 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
 
 /// The note for a resolved [`VanishedClass::Position`] or [`VanishedClass::PositionCopy`] at
 /// `relative` (`position`, `position-copy`, or a bay's under `bays/<name>/`), naming the checkout
-/// it belongs to and what that checkout reads now.
+/// it belongs to and, for a position, the way out its bay's state leaves.
 fn lost_position_note(relative: &Path) -> String {
     let names: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
     let bay = match names.as_slice() {
         [bays, name, _] if bays == crate::globals::FOLDER_NAME_BAYS_ROOT => Some(name.as_str()),
         _ => None,
     };
-    let (which, there) = match bay {
-        Some(name) => (format!("bay \"{}\"", name), "that bay's directory"),
-        None => ("the warehouse's own working tree".to_string(), "that working tree"),
+    let which = match bay {
+        Some(name) => format!("bay \"{}\"", name),
+        None => "the warehouse's own working tree".to_string(),
     };
     let path = names.join("/");
 
-    match names.last().map(String::as_str) == Some(pallet_utils::FILE_NAME_POSITION_COPY) {
-        true => format!(
-            "the copy of the position of {} (\"{}\") is gone; the next write of that position, or \"forklift \
-            heal\" run in {}, writes it again",
-            which, path, there
+    if names.last().map(String::as_str) == Some(pallet_utils::FILE_NAME_POSITION_COPY) {
+        return format!(
+            "the copy of the position of {} (\"{}\") is gone; the next write of that position writes it again",
+            which, path
+        );
+    }
+
+    let Some(name) = bay else {
+        return format!("the position of {} (\"{}\") is lost; run \"forklift heal\" in that working tree to repair it", which, path);
+    };
+
+    let remove = || match bay_utils::remove_command(name) {
+        Some(command) => format!("\"{}\"", command),
+        None => "\"forklift bay remove\" for that bay".to_string(),
+    };
+    let lost = format!("the position of {} (\"{}\") is lost", which, path);
+
+    // The bay's own state decides the way out, as `bay remove` reads it: a bay with no state
+    // folder is not listed, so no bay command reaches it; one that records no directory has no
+    // checkout to run heal in (`bay add` writes the position before the path record), and removing
+    // it drops only its state; one that records a directory is repaired there, or removed. An
+    // unreadable record refuses removal with the steps to do it by hand.
+    if !bay_utils::does_bay_exist(name) {
+        return format!("{}, and so is the bay's state folder, so the warehouse lists no such bay", lost);
+    }
+    match bay_utils::read_bay_path(name) {
+        Ok(None) => format!("{}; the bay records no directory to repair it in, so {} drops it", lost, remove()),
+        Ok(Some(directory)) => format!(
+            "{}; run \"forklift heal\" in the bay's directory \"{}\" to repair it, or {} to drop the bay",
+            lost, directory.to_string_lossy(), remove()
         ),
-        false => {
-            let unfinished = bay.map(|name| match bay_utils::remove_command(name) {
-                Some(command) => format!(", or \"{}\" if its creation never finished", command),
-                None => ", or remove the bay if its creation never finished".to_string(),
-            });
-            format!(
-                "the position of {} (\"{}\") is lost; run \"forklift heal\" in {} to repair it{}",
-                which, path, there, unfinished.unwrap_or_default()
-            )
-        }
+        Err(error) => format!(
+            "{}; the bay's directory record does not read either ({}), so {} names how to remove the bay by hand",
+            lost, error.trim_end_matches('.'), remove()
+        ),
     }
 }
 
@@ -7042,9 +7061,8 @@ mod tests {
             let outcome = run_heal().expect("a lost position is resolved, so heal clears");
             let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
             assert_eq!(resolved, ["bays/b/position".to_string()], "{:?}", outcome);
-            assert!(outcome.notes.contains(&"the position of bay \"b\" (\"bays/b/position\") is lost; run \"forklift heal\" \
-                in that bay's directory to repair it, or \"forklift bay remove b\" if its creation never finished"
-                .to_string()), "{:?}", outcome.notes);
+            assert!(outcome.notes.contains(&"the position of bay \"b\" (\"bays/b/position\") is lost; the bay records no \
+                directory to repair it in, so \"forklift bay remove b\" drops it".to_string()), "{:?}", outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
             pallet_utils::read_position_in(&folder).expect_err("the lost position is still refused by its readers");
 
@@ -7053,29 +7071,41 @@ mod tests {
     }
 
     /// A lost path of each position shape, the warehouse's own and a bay's, position and copy, is
-    /// resolved with the note for its checkout.
+    /// resolved with the note for its checkout; a bay's position note names the way out its state
+    /// leaves: none with no state folder, removal with no directory record, heal in the recorded
+    /// directory or removal, and removal's own steps by hand with an unreadable record.
     ///
     /// Revert: any of the four shapes' disposition back to `None` → its row refuses → red. Revert:
-    /// a bay's path named as the warehouse's own working tree → its note differs → red.
+    /// a bay's path named as the warehouse's own working tree → its note differs → red. Revert: the
+    /// bay's directory record not read → the recorded-directory row's note differs → red.
     #[test]
     fn heal_resolves_a_lost_position_or_copy_of_each_shape() {
         use crate::globals::StorageRootScope;
 
-        let cases: &[(&str, &str)] = &[
-            ("position", "the position of the warehouse's own working tree (\"position\") is lost; run \"forklift heal\" \
-                in that working tree to repair it"),
-            ("position-copy", "the copy of the position of the warehouse's own working tree (\"position-copy\") is gone; \
-                the next write of that position, or \"forklift heal\" run in that working tree, writes it again"),
-            ("bays/b/position", "the position of bay \"b\" (\"bays/b/position\") is lost; run \"forklift heal\" in that \
-                bay's directory to repair it, or \"forklift bay remove b\" if its creation never finished"),
-            ("bays/b/position-copy", "the copy of the position of bay \"b\" (\"bays/b/position-copy\") is gone; the next \
-                write of that position, or \"forklift heal\" run in that bay's directory, writes it again"),
-            // A name no command line can spell names no command.
-            ("bays/it's/position", "the position of bay \"it's\" (\"bays/it's/position\") is lost; run \"forklift heal\" \
-                in that bay's directory to repair it, or remove the bay if its creation never finished"),
+        #[derive(Clone, Copy)]
+        enum Bay { Absent, NoPath, Path, Unreadable }
+
+        let cases: &[(&str, Bay, &str)] = &[
+            ("position", Bay::Absent, "the position of the warehouse's own working tree (\"position\") is lost; run \
+                \"forklift heal\" in that working tree to repair it"),
+            ("position-copy", Bay::Absent, "the copy of the position of the warehouse's own working tree \
+                (\"position-copy\") is gone; the next write of that position writes it again"),
+            ("bays/b/position-copy", Bay::Path, "the copy of the position of bay \"b\" (\"bays/b/position-copy\") is gone; \
+                the next write of that position writes it again"),
+            ("bays/b/position", Bay::Absent, "the position of bay \"b\" (\"bays/b/position\") is lost, and so is the bay's \
+                state folder, so the warehouse lists no such bay"),
+            ("bays/b/position", Bay::NoPath, "the position of bay \"b\" (\"bays/b/position\") is lost; the bay records no \
+                directory to repair it in, so \"forklift bay remove b\" drops it"),
+            ("bays/b/position", Bay::Path, "the position of bay \"b\" (\"bays/b/position\") is lost; run \"forklift heal\" \
+                in the bay's directory \"/elsewhere/b-dir\" to repair it, or \"forklift bay remove b\" to drop the bay"),
+            ("bays/b/position", Bay::Unreadable, "the position of bay \"b\" (\"bays/b/position\") is lost; the bay's \
+                directory record does not read either ("),
+            // A name no command line can spell names no command line.
+            ("bays/it's/position", Bay::NoPath, "the position of bay \"it's\" (\"bays/it's/position\") is lost; the bay \
+                records no directory to repair it in, so \"forklift bay remove\" for that bay drops it"),
         ];
 
-        for (relative, note) in cases {
+        for (relative, bay, note) in cases {
             let _serial = lock_activation();
             taint_utils::activate();
 
@@ -7087,13 +7117,31 @@ mod tests {
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
             let forklift = forklift_root();
 
+            // The bay's state is set up before the taint, which refuses the writes.
+            let name = relative.split('/').nth(1).unwrap_or_default();
+            match bay {
+                Bay::Absent => {}
+                Bay::NoPath => std::fs::create_dir_all(bay_utils::bay_state_dir(name)).unwrap(),
+                Bay::Path => bay_utils::write_bay_path(name, Path::new("/elsewhere/b-dir")).unwrap(),
+                Bay::Unreadable => {
+                    std::fs::create_dir_all(bay_utils::bay_state_dir(name)).unwrap();
+                    std::fs::write(bay_utils::bay_state_dir(name).join("path"), b"not a record").unwrap();
+                }
+            }
             plant_complete_taint(&forklift, &[relative]);
             assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
 
             let outcome = run_heal().unwrap_or_else(|error| panic!("{}: {}", relative, error));
             let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
             assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
-            assert!(outcome.notes.contains(&note.to_string()), "{}: {:?}", relative, outcome.notes);
+            // An unreadable record's note carries its read error, which names a temporary path.
+            let found = match bay {
+                Bay::Unreadable => outcome.notes.iter().any(|line| line.starts_with(*note)
+                    && line.contains("The bay path file \"")
+                    && line.ends_with("), so \"forklift bay remove b\" names how to remove the bay by hand")),
+                _ => outcome.notes.contains(&note.to_string()),
+            };
+            assert!(found, "{}: {:?}", relative, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
 
             crate::util::file_utils::remove_dir_all(&root).ok();

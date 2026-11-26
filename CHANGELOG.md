@@ -163,10 +163,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   (`.forklift/inventory/incomplete-load`, or a bay's) is cleared with a note once its absence is
   made durable: a missing marker records no unfinished load, as it does with no taint, so run a
   load that failed before the heal again yourself. Before, it kept heal refusing, and every
-  command that records anything refused with it. A lost checkout position heal does not rebuild
-  (`.forklift/position`, or a bay's: another checkout's than the one heal runs in), or a lost
-  position copy, is cleared the same way, with a note. For a position, the note says to run `forklift heal` in that checkout,
-  or `forklift bay remove` for a bay whose creation never finished. For a copy, it says the next
+  command that records anything refused with it. A lost position of a checkout other than the one
+  heal runs in (`.forklift/position`, or a bay's), or a lost position copy, is cleared the same
+  way, with a note. For a position, the note says where to run `forklift heal` to repair it, or
+  names `forklift bay remove` for a bay that records no directory. For a copy, it says the next
   position write writes it again. The position stays lost, and its readers still refuse it.
   Before, it kept heal refusing, so a bay whose first position write was lost could not even be
   removed.
