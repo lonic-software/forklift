@@ -46,6 +46,10 @@ the merge back in progress, with the merge's output still in your files. The nex
 completes it as before, keeping the second parent or the picked parcel's author. To make an
 ordinary parcel of the files instead, run `forklift abort --keep-files` once the merge is back.
 
+This refusal is not given once a pallet delete has been journaled after the stopped undo. Then the
+next `undo` brings the deleted pallet back first, and a `stack` goes through as an ordinary parcel.
+To keep the merge, run `forklift undo` twice before stacking.
+
 ## Interrupted and locked
 
 ### `warehouse_locked` (exit 6), `store_locked` (exit 6), `serve_locked` (exit 6)
