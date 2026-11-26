@@ -2402,17 +2402,17 @@ fn link_file(target: &Path, link: &Path) -> bool {
 // taint clears); read the ref through a link → "copy-ref-link" red (the taint clears); judge
 // the ref's head against the store in the recovery → "copy-head-absent" red (the taint stands);
 // resolve a vanished ref whatever its copy holds → "ref-copy-damaged" red (the taint clears);
-// keep a vanished ref beside no copy → "ref-and-copy" red (the run refuses).
+// keep a vanished ref beside no copy → "pair-gone" red (the run refuses).
 #[test]
 fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() {
-    for case in ["copy", "ref", "ref-and-copy", "ref-copy-damaged", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
+    for case in ["copy", "ref", "pair-gone", "ref-copy-damaged", "copy-ref-damaged", "copy-head-absent", "copy-ref-link", "both"] {
         let area = Area::new(&format!("meta-vanished-{}", case));
         let (root, _, second) = tagged(&area);
         let (copy, reference) = (meta_copy_path(&root, "tags"), meta_path(&root, "tags"));
         let absent = format!("{}{}", if second.starts_with('0') { '1' } else { '0' }, &second[1..]);
         let recorded: Vec<&str> = match case {
             "copy" | "copy-ref-damaged" | "copy-head-absent" | "copy-ref-link" => vec!["meta-copy/tags"],
-            "ref" | "ref-and-copy" | "ref-copy-damaged" => vec!["meta/tags"],
+            "ref" | "pair-gone" | "ref-copy-damaged" => vec!["meta/tags"],
             _ => vec!["meta/tags", "meta-copy/tags"],
         };
         let dir = forklift_core::util::taint_utils::taint_dir_path_under(&root);
@@ -2422,7 +2422,7 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
             forklift_core::util::file_utils::remove_file(&copy).unwrap();
         }
         match case {
-            "ref" | "both" | "ref-and-copy" => forklift_core::util::file_utils::remove_file(&reference).unwrap(),
+            "ref" | "both" | "pair-gone" => forklift_core::util::file_utils::remove_file(&reference).unwrap(),
             "ref-copy-damaged" => {
                 forklift_core::util::file_utils::remove_file(&reference).unwrap();
                 std::fs::write(&copy, b"not a hash").unwrap();
@@ -2461,7 +2461,7 @@ fn a_vanished_meta_file_in_a_taint_resolves_when_the_other_one_holds_the_head() 
                 let note = format!("the ref's head {} is not in the store, so the copy was not set to it", absent);
                 assert!(said.contains(&note), "{}: the meta pass says why the copy was not set ({}): {}", case, note, said);
             }
-            "ref-and-copy" => {
+            "pair-gone" => {
                 assert!(output.status.success(), "{}: {}", case, said);
                 assert!(!taint_left, "{}: the taint clears: {}", case, said);
                 assert_eq!(meta_head(&root, "tags"), None, "{}: the pallet reads as never written: {}", case, said);
