@@ -300,6 +300,8 @@ fn the_census_matcher_reads_its_patterns() {
     assert!(!census_matches("{bay}consolidation", "bays/consolidation"));
     assert!(census_matches("**/<name>.tmp~<pid>-<n>", "pallets/main.tmp~12-0"));
     assert!(census_matches("**/<name>.tmp~<pid>-<n>/**", "a/b/c.tmp~1-2/lock"));
+    assert!(census_matches("removed-refs/<name>+<n>", "removed-refs/side+1"));
+    assert!(!census_matches("removed-refs/<name>+<n>", "removed-refs/side.1"));
     assert!(census_matches("mirror.git/**", "mirror.git/"));
     assert!(census_matches("mirror.git/**", "mirror.git/refs/heads/main"));
 }

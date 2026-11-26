@@ -1405,17 +1405,40 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
     Ok(Removed { pallet: pallet.to_string(), kept: kept.to_string_lossy().into_owned() })
 }
 
-/// The first free path under the removed-refs folder for bytes removed from `pallet`'s ref. A
-/// pallet's numbered slot can be another pallet's own (`a.1` is pallet `a`'s second and pallet
-/// `a.1`'s first), so only a free one is taken.
+/// The first free path under the removed-refs folder for bytes removed from `pallet`'s ref:
+/// [`kept_name`]'s slots in order.
 fn kept_path(pallet: &str) -> std::path::PathBuf {
     let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
-    let stem = pallet.replace('/', "%2F");
-    (0..).map(|n| folder.join(match n { 0 => stem.clone(), n => format!("{}.{}", stem, n) }))
+    (0..).map(|n| folder.join(kept_name(pallet, n)))
         // A slot whose state cannot be read is taken as free, and keeping the bytes there then
         // refuses it ([`pallet_utils`]'s keep reads it back), so it is never written over.
         .find(|path| std::fs::symlink_metadata(path).is_err())
         .expect("an unbounded range always yields a free name")
+}
+
+/// The name of `pallet`'s keepsake slot `slot` in the removed-refs folder: the pallet's name
+/// with `/` as `%2F`, then `+<slot>` for every slot after the first. `%` and `+` are outside the
+/// pallet-name grammar, so every name is one pallet's slot ([`kept_pallet`] reads it back).
+pub(crate) fn kept_name(pallet: &str, slot: usize) -> String {
+    let stem = pallet.replace('/', "%2F");
+    match slot { 0 => stem, n => format!("{}+{}", stem, n) }
+}
+
+/// The pallet whose keepsake slot `name` is, or `None` when [`kept_name`] gives it for no
+/// pallet's slot.
+pub(crate) fn kept_pallet(name: &str) -> Option<String> {
+    let (stem, slot) = match name.rsplit_once('+') {
+        Some((stem, digits)) => match digits.parse::<usize>() {
+            Ok(slot) if slot > 0 => (stem, slot),
+            _ => return None,
+        },
+        None => (name, 0),
+    };
+    let pallet = stem.replace("%2F", "/");
+
+    // Reading back only what the encoder writes leaves no second spelling of a slot (`+01`, a
+    // lowercase `%2f`) to be taken for one.
+    (pallet_utils::validate_pallet_name(&pallet).is_ok() && kept_name(&pallet, slot) == name).then_some(pallet)
 }
 
 /// The step that lets a later heal judge meta ref `refused` again, among the refusals `all` of

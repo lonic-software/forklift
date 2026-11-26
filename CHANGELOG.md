@@ -139,10 +139,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   kind and says only that, as in `"held-heads" (the held-heads record) is gone, and heal has no
   recovery for it`, where before it called the file a shape heal does not recognize. A lost pallet
   ref whose name looks like an object path (such as `pallets/ab/cd`) is now cleared as a ref once
-  its removal is made durable, where before it was taken for a missing object. A lost removed-ref
-  keepsake, meta pallet ref or meta-copy file whose name looks like an object, a shard (`data`), a
-  pack, an index or a signature file is now kept, so heal refuses where it used to clear it. A name
-  that matches an object the store holds is still settled before this, as before.
+  its removal is made durable, where before it was taken for a missing object. A lost meta pallet
+  ref or meta-copy file whose name looks like an object, a shard (`data`), a pack, an index or a
+  signature file is now kept, so heal refuses where it used to clear it. A lost keepsake under
+  `.forklift/removed-refs`, whatever its name, is cleared with a note once its absence is made
+  durable, as long as the ref it was taken from still stands: the `heal --remove-ref` that was
+  writing it stopped before it removed the ref. Before, a plainly named one kept heal refusing,
+  and every command that records anything refused with it. A name that matches an object the
+  store holds is still settled before this, as before.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
@@ -422,7 +426,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   names nothing, or records the pallet as deleted, `heal` changes nothing, exits 53 and lists every
   head it found; `heal --ref <pallet>=<parcel>` then sets the ref, and `heal --remove-ref <pallet>`
   drops an unreadable ref that nothing names a head for, keeping its bytes under
-  `.forklift/removed-refs`. A lost ref that no checkout stands on is not found.
+  `.forklift/removed-refs` (as `<pallet>`, and a later removal of the same pallet as
+  `<pallet>+1`, `<pallet>+2`, …, with `/` written `%2F`). A lost ref that no checkout stands on is not found.
 
 - **Losing the warehouse marker no longer loses the warehouse.** `.forklift/warehouse` now ends
   in a digest of its own bytes and is kept twice, beside `.forklift/warehouse-copy`, each written

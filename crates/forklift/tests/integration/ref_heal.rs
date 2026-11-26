@@ -497,17 +497,18 @@ fn remove_ref_drops_only_an_unreadable_ref_nothing_names() {
     assert_eq!(std::fs::read(&kept).unwrap(), zeros);
     assert!(!ref_path(&root, "side").exists());
 
-    // A numbered slot holding the same bytes may be another pallet's (here a pallet "side.1"'s
-    // removal), so a second removal of "side" keeps its bytes in a free one.
+    // A taken slot is never written over, even one holding the same bytes, so a later removal of
+    // "side" keeps its bytes in the next free one; a pallet "side.1"'s keepsake is no slot of it.
     let removed_refs = root.join(".forklift").join("removed-refs");
     std::fs::write(removed_refs.join("side"), b"other").unwrap();
+    std::fs::write(removed_refs.join("side+1"), &zeros).unwrap();
     std::fs::write(removed_refs.join("side.1"), &zeros).unwrap();
     std::fs::write(ref_path(&root, "side"), &zeros).unwrap();
     let output = area.run_ok(&root, &["--json", "heal", "--remove-ref", "side"]);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let kept = value["data"]["refs_removed"][0]["kept"].as_str().unwrap().to_string();
-    assert!(kept.ends_with("side.2"), "{}", value);
-    assert_eq!(std::fs::read(removed_refs.join("side.2")).unwrap(), zeros);
+    assert!(kept.ends_with("side+2"), "{}", value);
+    assert_eq!(std::fs::read(removed_refs.join("side+2")).unwrap(), zeros);
 
     // Nothing is left to heal.
     healed(&area, &root);
