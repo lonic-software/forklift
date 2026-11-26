@@ -1984,14 +1984,16 @@ enum VanishedClass {
     FetchLedger,
     /// The git mirror's roots record (`mirror-roots`), gone since the taint was recorded. It is
     /// written only by `git mirror` and a lift's mirror trigger: rebuilt from the exported refs
-    /// when it does not parse, written with each pallet's root before its push, and put back
-    /// after a takedown refusal (`mirror_utils::write_mirror_roots`, `update_mirror_roots`,
-    /// `put_back_mirror_roots`, `put_back_owed_roots`); no command removes it, and no heal pass
-    /// writes it. Its reader takes a missing one as empty (`mirror_utils::read_mirror_roots`),
-    /// taint or none, which is also the state deleting an unparseable one leaves, the step its
-    /// refusal names. What an empty record gives up is gc holding the parcels it named, until a
-    /// mirror run records each pallet it exports again. So keeping the record would guard
-    /// nothing the absence does not already settle.
+    /// when it cannot be read, written with each pallet's root before its push, put back after a
+    /// takedown refusal, and pruned to the configured pallets by a run's last write
+    /// (`mirror_utils::write_mirror_roots`, `update_mirror_roots`, `put_back_mirror_roots`,
+    /// `put_back_owed_roots`); no command removes it, and no heal pass writes it. Its reader takes
+    /// a missing one as empty (`mirror_utils::read_mirror_roots`), taint or none, which is also
+    /// the state deleting an unreadable one leaves, the step its refusal names. What an empty
+    /// record gives up is keeping the parcels it named from gc, until a mirror run records the
+    /// root of each pallet it leaves exported. Keeping the taint would hold them only by keeping
+    /// gc refused: the record reads the same either way, and no write puts it back while the
+    /// taint stands (the ordinary write is refused, and a missing record is not rebuilt).
     MirrorRoots,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
@@ -2304,8 +2306,8 @@ fn lost_fetch_ledger_note(relative: &Path) -> String {
 fn lost_mirror_roots_note(relative: &Path) -> String {
     format!(
         "the git mirror's roots record \"{}\" is gone; Forklift reads a missing one as an empty one, as it \
-        would with no taint, so gc no longer holds the history it named, and each later export of a pallet to \
-        the git mirror records that pallet's root again",
+        would with no taint, so the record no longer keeps the history it named from gc, and a later mirror run \
+        records the root of each pallet it leaves exported",
         relative.to_string_lossy().replace('\\', "/")
     )
 }
@@ -8032,8 +8034,8 @@ mod tests {
         // (whether the absence can be made durable; the note, or the refusal's line where it cannot)
         let cases: &[(bool, &str)] = &[
             (true, "the git mirror's roots record \"mirror-roots\" is gone; Forklift reads a missing one as an \
-                empty one, as it would with no taint, so gc no longer holds the history it named, and each later \
-                export of a pallet to the git mirror records that pallet's root again"),
+                empty one, as it would with no taint, so the record no longer keeps the history it named from gc, \
+                and a later mirror run records the root of each pallet it leaves exported"),
             (false, "a lost mirror roots record whose loss could not be made durable: \"mirror-roots\""),
         ];
 

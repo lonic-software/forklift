@@ -220,9 +220,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   heads reach, so a head no pallet holds, whether fetched earlier or left by a pallet's move or
   removal, may afterwards be refused as incomplete. Before, it kept heal refusing.
   A lost git mirror roots record (`.forklift/mirror-roots`) is now cleared the same way. It reads
-  as an empty record, as a missing one does with no taint, so gc no longer holds the history it
-  named, and each later export of a pallet to the git mirror records that pallet's root again.
-  Before, it kept heal refusing.
+  as an empty record, as a missing one does with no taint, so it no longer keeps the history it
+  named from gc, and a later mirror run records the root of each pallet it leaves exported.
+  Before, it kept heal refusing, even after the record was deleted as its own refusal advises.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
