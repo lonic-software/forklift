@@ -4698,7 +4698,9 @@ impl HeavyPermit {
     /// task's is ([`reraise_storage_panic`]): a debug build raises its panic again on the awaiting
     /// task, and a release build answers an internal error that starts with `failed`. Dropping the
     /// returned future, as a client hanging up does, detaches the task, which keeps running and
-    /// keeps the permit.
+    /// keeps the permit. Its failure then reaches no request: a debug build's storage panic raised
+    /// in it is dropped by tokio and aborts the process ([`StoragePanic`]), which is meant, since a
+    /// debug build's storage panic is a bug whose loss should be loud.
     async fn run<T: Send + 'static>(
         self,
         failed: &str,
@@ -7345,7 +7347,10 @@ mod tests {
     ///
     /// Revert: never raise (`reraise_storage_panic_when(error, false)` in `run_when`) → the raised
     /// arm returns an error → "the panic is raised again" fails; always raise → the reported arm
-    /// panics; format a fixed label for `failed` → the message assertion fails.
+    /// panics; format a fixed label for `failed`, or leave the task's error out → the message
+    /// assertion fails; a debug build's `run` passing `false` → "a debug build's run raises the
+    /// panic" fails. That a release build's `run` passes `false` is the cfg gate's, read in review:
+    /// the suites run debug builds only.
     #[tokio::test]
     async fn a_heavy_permits_task_panic_is_raised_on_the_request_only_when_asked() {
         let finished = lone_heavy_permit().await.run_when("A planted Heavy request failed", async { Ok::<_, HandlerError>(7) }, true).await;
@@ -7354,11 +7359,19 @@ mod tests {
         let (status, message) = lone_heavy_permit().await.run_when("A planted Heavy request failed", planted_heavy_panic(), false).await
             .expect_err("the panic is an error");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(message.starts_with("A planted Heavy request failed: "), "{message}");
+        assert!(message.starts_with("A planted Heavy request failed: ") && message.contains("planted heavy panic"), "{message}");
 
         let raising = tokio::spawn(lone_heavy_permit().await.run_when("A planted Heavy request failed", planted_heavy_panic(), true));
         let raised = raising.await.expect_err("the panic is raised again").into_panic();
         assert_eq!(raised.downcast_ref::<&'static str>().copied(), Some("planted heavy panic"));
+
+        // A debug build's `run` asks to, for any panic of its task, a storage panic or not.
+        #[cfg(debug_assertions)]
+        {
+            let running = tokio::spawn(lone_heavy_permit().await.run("A planted Heavy request failed", planted_heavy_panic()));
+            let raised = running.await.expect_err("a debug build's run raises the panic").into_panic();
+            assert_eq!(raised.downcast_ref::<&'static str>().copied(), Some("planted heavy panic"));
+        }
     }
 
     /// The literal message a storage task's panic was raised with, read through the
@@ -7705,8 +7718,9 @@ mod tests {
     /// the write runs in the permit's task; and only once the apply the write owed is settled, as a
     /// failed write's is, so the warehouse does not stay closed to content.
     ///
-    /// Revert: report the permit task's panic (`internal(format!("A ref write failed: {}", error))`)
-    /// → the request answers 500 → "the storage panic is raised again" fails; raise it before
+    /// Revert: report the permit task's panic (`reraise_storage_panic_when(error, false)` in
+    /// [`HeavyPermit::run_when`]) → its armed [`StoragePanic`] is dropped → the test binary aborts,
+    /// naming the planted message on stderr; raise it before
     /// `after_failed_ref_write` → the apply stays owed → the last assertion fails.
     #[cfg(debug_assertions)]
     #[tokio::test]
@@ -13813,9 +13827,9 @@ mod tests {
     /// Which function names each storage wrapper is a literal here, so a new site of one is an
     /// edit to this test that has to choose between them: the functions naming `spawn_blocking`,
     /// `scoped_storage_task` and the background `blocking`, none of the last a route handler; the
-    /// request wrappers named by handlers only; `reraise_storage_panic` and its `_when` named only
-    /// where the request wrappers and [`HeavyPermit::run`] raise, so no handler answers a task's
-    /// failure itself; and a redaction apply's failure disposed of (`raise` or `reported`) by every
+    /// request wrappers named by handlers only; `reraise_storage_panic` named only by
+    /// `reported_request_failure`, and its `_when` only by it and [`HeavyPermit::run_when`], so no
+    /// handler answers a task's failure itself; and a redaction apply's failure disposed of (`raise` or `reported`) by every
     /// caller of `apply_discharging`. Macro tokens are read too.
     ///
     /// It pins names, not flow, and proves no absence of masking: a task boundary between a
