@@ -346,6 +346,7 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "the unvouched-heads record", disposition: None, pattern: &[Is("unvouched-heads")] },
     TaintShape { description: "the trust anchor", disposition: None, pattern: &[Is("trust")] },
     TaintShape { description: "the trust anchor's copy", disposition: None, pattern: &[Is("trust-copy")] },
+    TaintShape { description: "the latest bundle's name", disposition: None, pattern: &[Is("bundles"), Is("latest")] },
 ];
 
 /// The declared shape of a root-relative path, or `None` for a path no entry of the registry
