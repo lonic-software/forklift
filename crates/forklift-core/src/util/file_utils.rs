@@ -883,8 +883,13 @@ fn injected_sync_dir_fault(folder: &Path) -> Option<String> {
     SYNC_DIR_FAULT.with(|f| {
         let mut f = f.borrow_mut();
         f.attempted.push(folder.to_path_buf());
-        // A limited guard fails only its first matches; an unlimited one fails every match.
-        let fails = f.fails(folder) && SYNC_DIR_FAULTS_LEFT.with(|left| match left.get() {
+        // A delayed guard lets its first matches through; a limited one fails only its first
+        // failing matches; an unlimited one fails every match.
+        let passes = || SYNC_DIR_MATCHES_TO_PASS.with(|pass| match pass.get() {
+            0 => false,
+            n => { pass.set(n - 1); true }
+        });
+        let fails = f.fails(folder) && !passes() && SYNC_DIR_FAULTS_LEFT.with(|left| match left.get() {
             None => true,
             Some(0) => false,
             Some(n) => { left.set(Some(n - 1)); true }
@@ -909,6 +914,10 @@ thread_local! {
     /// How many more matches [`SYNC_DIR_FAULT`] fails, when it is limited
     /// ([`SyncDirFaultGuard::failing_exactly_once`]); `None` fails every match.
     static SYNC_DIR_FAULTS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+
+    /// How many more matches [`SYNC_DIR_FAULT`] lets through before it fails one
+    /// ([`SyncDirFaultGuard::failing_exactly_after`]).
+    static SYNC_DIR_MATCHES_TO_PASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// RAII scope for [`SYNC_DIR_FAULT`]: both construction and `Drop` reset this thread's state, so
@@ -963,11 +972,20 @@ impl SyncDirFaultGuard {
         SYNC_DIR_FAULTS_LEFT.with(|left| left.set(Some(1)));
         guard
     }
+
+    /// Record every directory, let the first `passed` syncs of `dir` itself succeed, and fail
+    /// every later one: a fault in a step that syncs `dir` after an earlier step already has.
+    pub(crate) fn failing_exactly_after(dir: &Path, passed: usize) -> Self {
+        let guard = Self::failing_exactly(dir);
+        SYNC_DIR_MATCHES_TO_PASS.with(|pass| pass.set(passed));
+        guard
+    }
 }
 
 #[cfg(test)]
 impl Drop for SyncDirFaultGuard {
     fn drop(&mut self) {
+        SYNC_DIR_MATCHES_TO_PASS.with(|pass| pass.set(0));
         SYNC_DIR_FAULTS_LEFT.with(|left| left.set(None));
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
     }
