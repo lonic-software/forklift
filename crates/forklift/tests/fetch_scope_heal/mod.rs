@@ -80,6 +80,29 @@ fn heal_rebuilds_a_lost_or_damaged_fetch_scope_from_the_checkouts() {
     }
 }
 
+/// A fetch scope that is tainted and then lost, as a power loss leaves a birth write whose folder
+/// sync failed, is rebuilt by heal before its taint recovery, which then finds it standing and
+/// clears the taint: heal exits 0 with nothing left recorded, and `load` works.
+///
+/// Revert: drop `scope_heal::repair` from heal → the taint recovery finds the file gone and the
+/// next `load` refuses it as missing → red.
+#[test]
+fn heal_rebuilds_a_tainted_lost_fetch_scope_and_clears_its_taint() {
+    let area = TestArea::new("fetch-scope-heal-tainted");
+    let _server = sparse_with_docs(&area);
+    let original = written_fetch_scope(&area);
+
+    plant_taint(&area, "sparse", &["config/fetch-scope"]);
+    forklift_core::util::file_utils::remove_file(area.path(FETCH_SCOPE)).unwrap();
+
+    let healed = area.forklift("sparse", &["--json", "heal"]);
+    assert_success(&healed);
+    assert_eq!(json_of(&healed)["data"]["fetch_scope_rebuilt"]["scope"], serde_json::json!(["docs", "src/api"]), "{}", stdout(&healed));
+    assert!(recorded_taint_paths(&area, "sparse").is_empty(), "nothing stays recorded: {}", stdout(&healed));
+    assert_eq!(written_fetch_scope(&area), original, "the clone's own bytes are back");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+}
+
 /// A main tree narrowed below what was fetched rebuilds a narrower fetch scope, and the report
 /// says what that leaves unchecked and how to add a path back.
 ///
