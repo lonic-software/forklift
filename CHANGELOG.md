@@ -889,6 +889,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A `heal` that refuses still says what it noted about the records it settled.** When one run
+  settles some recorded paths and refuses over the rest, it drops the settled ones from the taint,
+  so a later `heal` never mentions them again. Their notes, such as a lost signature, or a lost
+  metadata ref and what to do if a write to it just failed, used to be dropped with them; the
+  refusal now carries them as `Note:` lines. The same holds for what a torn taint's rescan notes
+  before it refuses.
 - **`heal` no longer clears a torn durability taint over a lost ref or record.** When a taint
   record was torn, `heal` rebuilt it from the object store alone and dropped every other path the
   record still named, such as a pallet ref, the trust anchor or the held-heads record, so the

@@ -327,11 +327,18 @@ pub struct RunRefused {
     /// other refusal. While one of these refs stays unread, no run's walk is complete. The list
     /// is not filtered against the refs a torn or unread taint holds ([`crate::util::ref_heal::TaintHold`]).
     pub kept_by_unread_refs: Vec<String>,
+    /// The notes the run gathered, when it refused at or after rewriting the taint to its
+    /// remainder (the rewrite failing included, since it can fail after removing records): the
+    /// records they speak of may be gone from the taint, so no later run says them. An ordinary
+    /// run's are the notes [`HealOutcome::notes`] would hold, pack warnings aside (those go in the
+    /// refusal's message); a torn rescan's are its walk's notes, without the summary a clearing
+    /// rescan gives. Empty for a refusal before the rewrite.
+    pub notes: Vec<String>,
 }
 
 impl From<CoreError> for RunRefused {
     fn from(error: CoreError) -> RunRefused {
-        RunRefused { error, kept_by_unread_refs: Vec::new() }
+        RunRefused { error, kept_by_unread_refs: Vec::new(), notes: Vec::new() }
     }
 }
 
@@ -1162,17 +1169,22 @@ async fn resolve_the_rest(
     // *never* reach here with `remainder` empty — `roots_incomplete` above forces every hash the
     // walk could not positively clear into `remainder`, and a walk with no targets returns before
     // reading any source, so a non-empty `incomplete_reasons` always implies a non-empty `remainder`,
-    // i.e. the `Err` branch below. `notes` (the `Ok`-only outcome) therefore never needs the
-    // degraded-source notes folded in here; the `Err` branch passes them to `dangling_refusal`
-    // instead, since that is the only branch a degraded run can actually take.
+    // i.e. the `Err` branch below. `notes` therefore never needs the degraded-source notes folded
+    // in here; the `Err` branch passes them to `dangling_refusal` instead, since that is the only
+    // branch a degraded run can actually take. Both branches carry `notes`: by then
+    // `resolve_taints` has rewritten the taint to the remainder, so a record a note speaks of is
+    // gone from it, and no later run says that note.
 
     // `resolve_taints` owns the gate too now (DESIGN.html §3.1.1): it derives the clear/set
     // decision from what is actually left standing in the taint directory once this rewrite
     // lands, not from `remainder` alone — a mid-run store failure elsewhere in this same call
     // (the heal-driven refetch just above, fully awaited) can leave a fresh taint file standing
     // even when `remainder` itself comes back empty, and that fresh file must keep the gate set.
-    taint_utils::resolve_taints(root, &remainder, taint_files)
-        .map_err(|e| sync_failure_refusal(root, &e))?;
+    // A failure here can come after the rewrite removed the records the notes speak of, so that
+    // refusal carries them too.
+    if let Err(error) = taint_utils::resolve_taints(root, &remainder, taint_files) {
+        return Err(RunRefused { error: sync_failure_refusal(root, &error), kept_by_unread_refs: Vec::new(), notes });
+    }
 
     if remainder.is_empty() {
         Ok(HealOutcome {
@@ -1184,7 +1196,7 @@ async fn resolve_the_rest(
         })
     } else {
         let kept_by_unread_refs = if kept_for_an_incomplete_walk { walk.unread_refs } else { Vec::new() };
-        Err(RunRefused { error: dangling_refusal(root, &dangling_lines, &incomplete_reasons), kept_by_unread_refs })
+        Err(RunRefused { error: dangling_refusal(root, &dangling_lines, &incomplete_reasons), kept_by_unread_refs, notes })
     }
 }
 
@@ -1438,6 +1450,8 @@ fn rescan_torn_taint(
         return Err(RunRefused {
             error: torn_rescan_degraded_refusal(root, restaged.len(), &incomplete_reasons),
             kept_by_unread_refs: walk.unread_refs,
+            // The torn record stands as it was: nothing this run settled has left it.
+            notes: Vec::new(),
         });
     }
 
@@ -1455,8 +1469,30 @@ fn rescan_torn_taint(
     // going through the shared primitive means a future change here never has to re-derive that
     // reasoning on its own. Replaced only now, at the very end — see this function's own doc
     // comment on crash-safety.
-    taint_utils::resolve_taints(root, &remainder, old_files)
-        .map_err(|e| sync_failure_refusal(root, &e))?;
+    //
+    // What the walk found that never holds the taint open is said whether the rescan clears or
+    // refuses, and also when the replacement fails, which can come after the torn record is
+    // gone: once it is, no later rescan says it. See `resolve_the_rest`'s identical fold-in for
+    // why each is a note, never a reason to hold the taint open.
+    let mut walk_notes: Vec<String> = Vec::new();
+    for hash in &walk.never_held_pins {
+        walk_notes.push(never_held_pin_note(hash));
+    }
+    for (name, subject, gap) in &walk.never_held_tags {
+        walk_notes.push(never_held_tag_note(name, subject, gap));
+    }
+    if let Some(error) = &walk.tags_unread {
+        walk_notes.push(tags_unread_note(error));
+    }
+    if walk.redacted_absent > 0 {
+        walk_notes.push(redacted_absent_note(walk.redacted_absent));
+    }
+    if walk.unavailable_absent > 0 {
+        walk_notes.push(unavailable_absent_note(walk.unavailable_absent));
+    }
+    if let Err(error) = taint_utils::resolve_taints(root, &remainder, old_files) {
+        return Err(RunRefused { error: sync_failure_refusal(root, &error), kept_by_unread_refs: Vec::new(), notes: walk_notes });
+    }
 
     if remainder.is_empty() {
         report("torn durability taint: rescan complete, nothing left dangling — cleared.".to_string());
@@ -1474,23 +1510,7 @@ fn rescan_torn_taint(
             listed here to keep this report readable",
             loose_count, packs_count, shards_count, carried.len(), restaged.len(),
         )];
-        // F6, PR #120 round 2 — see `resolve_the_rest`'s identical fold-in for why this is a note,
-        // never a reason to hold the taint open.
-        for hash in &walk.never_held_pins {
-            notes.push(never_held_pin_note(hash));
-        }
-        for (name, subject, gap) in &walk.never_held_tags {
-            notes.push(never_held_tag_note(name, subject, gap));
-        }
-        if let Some(error) = &walk.tags_unread {
-            notes.push(tags_unread_note(error));
-        }
-        if walk.redacted_absent > 0 {
-            notes.push(redacted_absent_note(walk.redacted_absent));
-        }
-        if walk.unavailable_absent > 0 {
-            notes.push(unavailable_absent_note(walk.unavailable_absent));
-        }
+        notes.extend(walk_notes);
 
         Ok(HealOutcome {
             was_tainted: true,
@@ -1504,7 +1524,7 @@ fn rescan_torn_taint(
             "torn durability taint: rescan complete — {} reference(s) remain dangling.",
             dangling_lines.len()
         ));
-        Err(torn_rescan_dangling_refusal(root, &dangling_lines).into())
+        Err(RunRefused { error: torn_rescan_dangling_refusal(root, &dangling_lines), kept_by_unread_refs: Vec::new(), notes: walk_notes })
     }
 }
 
@@ -7458,6 +7478,76 @@ mod tests {
         crate::util::file_utils::remove_dir_all(&root).ok();
     }
 
+    /// FORK-617: a torn rescan that replaces the torn record with a remainder and refuses still
+    /// carries what its walk noted, since the torn record it would otherwise rescan is gone. So
+    /// does one whose replacement fails on the taint folder's second sync, the one after it
+    /// removed the torn record (unix only: a folder sync is a no-op elsewhere).
+    ///
+    /// Revert: refuse with no notes in `rescan_torn_taint`'s dangling refusal → the first case is
+    /// red; drop them from its replacement-failure refusal → the second case is red.
+    #[test]
+    fn a_refusing_torn_rescan_carries_its_walk_notes() {
+        let cases: &[(&str, bool)] = &[("dangling", false), #[cfg(unix)] ("sync-fails", true)];
+        for &(case, sync_fails) in cases {
+            a_refusing_torn_rescan_carries_its_walk_notes_case(case, sync_fails);
+        }
+    }
+
+    fn a_refusing_torn_rescan_carries_its_walk_notes_case(case: &str, sync_fails: bool) {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+        use crate::util::gc_utils::tests::store_tree;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-torn-refusal-notes-{}-{}", case, std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        let forklift = forklift_root();
+
+        let redacted = "2".repeat(64);
+        let tree = store_tree(&[("leak.env", &redacted, DirEntryType::Normal)]);
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree, parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        parcel.store().unwrap();
+        pallet_utils::tests::update_pallet_head_unverified("main", None, &parcel.hash, &pallet_utils::RefPreconditions::NONE)
+            .unwrap();
+        crate::util::applied_redactions::apply_for_test(&[&redacted]);
+
+        // The torn record still names a held-heads record that is gone: the rescan keeps it.
+        plant_torn_taint(&forklift, &["held-heads"]);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let refused = {
+            // The first sync of the taint folder is the remainder's own; the second is the one
+            // after the torn record's removal.
+            let _fault = sync_fails.then(|| file_utils::SyncDirFaultGuard::failing_exactly_after(&forklift.join("taint"), 1));
+            runtime.block_on(run(None)).expect_err("the rescan refuses")
+        };
+
+        match sync_fails {
+            false => assert_durability_taint(&refused.error, &["still unresolved", "held-heads"]),
+            true => assert_durability_taint(&refused.error, &["making it durable"]),
+        }
+        assert!(
+            refused.notes.iter().any(|note| note.starts_with(
+                "1 object(s) that redactions applied in this warehouse name are absent"
+            )),
+            "{}: the refusal must carry the walk's redaction note: {:?}", case, refused.notes
+        );
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        assert!(!state.torn, "{}: the torn record is replaced by the remainder", case);
+        assert_eq!(state.recorded, [PathBuf::from("held-heads")].into_iter().collect(), "{}", case);
+
+        crate::util::file_utils::remove_dir_all(&root).ok();
+    }
+
     /// Finding 2 (round 1, PR #120) falsifier: a trust boundary can legitimately name a head this
     /// store never actually fetched (`office enroll`/`office revoke` snapshot a remote's or a
     /// revoker's *declared* heads by hash, not by pulling their history first) — so a torn
@@ -10549,6 +10639,48 @@ mod tests {
         assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "no taint may stand");
 
         crate::util::file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// FORK-617: a run that resolves one record with a note and keeps another refuses carrying the
+    /// note, since the rewrite has already dropped the resolved record and no later run sees it.
+    /// So does a run whose rewrite fails on the taint folder's second sync, the one after it
+    /// removed the old record (unix only: a folder sync is a no-op elsewhere).
+    ///
+    /// Revert: refuse with no notes in `resolve_the_rest`'s dangling refusal → the first case is
+    /// red; drop them from its rewrite-failure refusal → the second case is red.
+    #[test]
+    fn a_refusing_heal_carries_the_notes_of_what_it_resolved() {
+        let cases: &[(&str, bool)] = &[("dangling", false), #[cfg(unix)] ("sync-fails", true)];
+        for &(case, sync_fails) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+            let (root, _scope) = enter_signature_heal_root(&format!("refusal-notes-{}", case));
+            let forklift = forklift_root();
+
+            let hash = "e1".repeat(32);
+            let sidecar = format!("objects/{}/{}.sig", &hash[..2], &hash[2..]);
+            let kept = "something/unexpected.txt";
+            plant_complete_taint(&forklift, &[&sidecar, kept]);
+
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let refused = {
+                // The first sync of the taint folder is the remainder's own; the second is the
+                // one after the old record's removal.
+                let _fault = sync_fails.then(|| file_utils::SyncDirFaultGuard::failing_exactly_after(&forklift.join("taint"), 1));
+                runtime.block_on(run(None)).expect_err("heal refuses")
+            };
+
+            match sync_fails {
+                false => assert_durability_taint(&refused.error, &[kept]),
+                true => assert_durability_taint(&refused.error, &["making it durable"]),
+            }
+            assert!(refused.notes.iter().any(|note| note.contains(&format!("parcel {}'s signature", hash)) && note.contains("lost locally")),
+                "{}: the refusal must carry the resolved sidecar's note: {:?}", case, refused.notes);
+            assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded, [PathBuf::from(kept)].into_iter().collect(),
+                "{}: the sidecar's record is resolved and gone; only the unrecognized path stays", case);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
     }
 
     /// A recorded path that is a link, even a dangling one, is never read through: heal refuses,
