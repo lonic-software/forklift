@@ -1832,17 +1832,22 @@ enum VanishedClass {
     /// the checkout heal runs in can still be found gone here, where that pass left it so.
     ScopeCopy,
     /// A checkout's consolidation state or out-of-scope skeleton (`consolidation`,
-    /// `consolidation-skeleton`, or a bay's), gone since the taint was recorded. Every write of
-    /// either runs under the merge's operation marker (`consolidate::merge_head_into_current`
+    /// `consolidation-skeleton`, or a bay's), gone since the taint was recorded. A command's write
+    /// of either runs under the merge's operation marker (`consolidate::merge_head_into_current`
     /// raises it first), or is an undo putting a consolidation back (`journal_utils::restore_refs`),
-    /// which a retry of that undo resumes; every other change of either is a clear. A missing state
+    /// which a retry of that undo resumes; every other change of either by a command is a clear.
+    /// Heal also writes a damaged record back from its copy, with no marker
+    /// (`merge_state_heal::repair`); an absence after that write is lost reads the same as an
+    /// interrupted clear, which removes the record before its copy, and heal never writes an
+    /// absent record back (`merge_state_heal`'s module rule), so it is treated as one. A missing state
     /// reads as no consolidation in progress (`merge_utils::read_consolidation_state_in`), and a
     /// skeleton missing beside a state is refused as damaged
     /// (`merge_utils::OutOfScopeSkeleton::read_required`), taint or none, so keeping the record
     /// would guard nothing the absence does not already settle, and it stands before the marker's
     /// recovery, which waits for the taint. A checkout's pick state (`cherry-pick`, or a bay's) is
-    /// the same: its writes run under the pick's operation marker (`pick` raises it first) or are
-    /// that undo, and a missing one reads as no pick in progress (`cherry_pick_utils::read_state_in`).
+    /// the same: a command's write of one runs under the pick's operation marker (`pick` raises it
+    /// first) or is that undo, heal writes one back as above, and a missing one reads as no pick in
+    /// progress (`cherry_pick_utils::read_state_in`).
     MergeRecord,
     /// The copy of a consolidation state, skeleton or pick state, gone since the taint was
     /// recorded. Only heal reads a copy, to write a damaged record back (`merge_state_heal::repair`).
@@ -2156,11 +2161,15 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
     };
 
     // A lost state's tail: heal run there where a marker stands in another checkout, nothing where
-    // one stands in this checkout (its recovery follows), else the command that failed, run again.
-    let state_tail = |marker: Option<String>| match (marker, marker_stands) {
+    // one stands in this checkout (its recovery follows), else the commands that record one, run
+    // again if they failed (`who`, or any such command where it is `None`).
+    let state_tail = |marker: Option<String>, who: Option<&str>| match (marker, marker_stands) {
         (Some(marker), _) => format!("; {}", marker),
         (None, true) => String::new(),
-        (None, false) => "; if a command that records one failed there before this heal, run it again".to_string(),
+        (None, false) => format!(
+            "; if {} that records one failed there before this heal, run it again",
+            who.unwrap_or("a command")
+        ),
     };
 
     match lost.record {
@@ -2171,13 +2180,16 @@ fn lost_merge_record_note(lost: &LostMergeRecord) -> String {
                 true => "a consolidation skeleton still stands beside it",
                 false => "that checkout reads as having no consolidation in progress, as it would with no taint",
             };
-            format!("the {} of {} (\"{}\") is gone; {}{}", record, which, path, reads, state_tail(marker))
+            format!("the {} of {} (\"{}\") is gone; {}{}", record, which, path, reads, state_tail(marker, None))
         }
-        // A missing pick state reads as no pick in progress (`cherry_pick_utils::read_state_in`).
+        // A missing pick state reads as no pick in progress (`cherry_pick_utils::read_state_in`). Two
+        // commands record one: the pick itself, and an undo of the stack that completed one
+        // (`journal_utils::restore_refs`). Heal also writes one back from its copy
+        // (`merge_state_heal::repair`), but an absence is never written back, so it is not named.
         InProgressRecord::Pick => format!(
             "the {} of {} (\"{}\") is gone; that checkout reads as having no pick in progress, as it would with no \
             taint{}",
-            record, which, path, state_tail(marker)
+            record, which, path, state_tail(marker, Some("a \"forklift pick\" or \"forklift undo\""))
         ),
         InProgressRecord::Skeleton => {
             // The way out where no marker stands: the step for the record the refusal over this
@@ -7723,8 +7735,8 @@ mod tests {
             ("cherry-pick", 0, "bays/b/cherry-pick-copy", true, "the copy of the pick state of bay \"b\" \
                 (\"bays/b/cherry-pick-copy\") is gone; only heal reads a copy, to write a damaged record back"),
             ("cherry-pick", 1, "bays/b/cherry-pick", true, "the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
-                gone; that checkout reads as having no pick in progress, as it would with no taint; if a command that \
-                records one failed there before this heal, run it again"),
+                gone; that checkout reads as having no pick in progress, as it would with no taint; if a \"forklift \
+                pick\" or \"forklift undo\" that records one failed there before this heal, run it again"),
             ("cherry-pick", 1, "bays/b/cherry-pick", false, "a lost pick state or copy whose loss could not be made \
                 durable: \"bays/b/cherry-pick\""),
             ("consolidation", 0, "bays/b/consolidation-copy", true, "the copy of the consolidation state of bay \"b\" \
@@ -7827,6 +7839,8 @@ mod tests {
         const RUN_AGAIN: &str = "if a command that records one failed there before this heal, run it again";
         const NO_TAINT: &str = "that checkout reads as having no consolidation in progress, as it would with no taint";
         const NO_PICK: &str = "that checkout reads as having no pick in progress, as it would with no taint";
+        const RUN_PICK_AGAIN: &str = "if a \"forklift pick\" or \"forklift undo\" that records one failed there before \
+            this heal, run it again";
         const BAY_HEAL: &str = "the way out is \"forklift heal\" run in the bay's working directory";
         const BAY_ABORT: &str = "the way out is \"forklift abort\" run in the bay's working directory";
         const BAY_ABORT_KEEPING: &str = "the way out is \"forklift abort --keep-files\" run in the bay's working directory";
@@ -7889,11 +7903,11 @@ mod tests {
                 (\"bays/b/consolidation-skeleton\") is gone, and no consolidation state stands beside it; an interrupted \
                 operation's marker stands in that checkout, and {}", BAY_HEAL)),
             ("cherry-pick", Beside::Nothing, format!("the pick state of the warehouse's own working tree \
-                (\"cherry-pick\") is gone; {}; {}", NO_PICK, RUN_AGAIN)),
+                (\"cherry-pick\") is gone; {}; {}", NO_PICK, RUN_PICK_AGAIN)),
             ("cherry-pick", Beside::Marker, format!("the pick state of the warehouse's own working tree \
                 (\"cherry-pick\") is gone; {}", NO_PICK)),
             ("bays/b/cherry-pick", Beside::Nothing, format!("the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
-                gone; {}; {}", NO_PICK, RUN_AGAIN)),
+                gone; {}; {}", NO_PICK, RUN_PICK_AGAIN)),
             ("bays/b/cherry-pick", Beside::Marker, format!("the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
                 gone; {}; an interrupted operation's marker stands in that checkout, and {}", NO_PICK, BAY_HEAL)),
             ("cherry-pick-copy", Beside::Nothing, "the copy of the pick state of the warehouse's own working tree \
