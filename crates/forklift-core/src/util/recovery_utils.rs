@@ -1937,7 +1937,8 @@ enum VanishedClass {
     /// checkouts' scopes, and is what a full or cache warehouse holds, taint or none, so keeping
     /// the record would guard nothing the absence does not already settle. Heal rebuilds a missing
     /// one before the taint recovery (`scope_heal::repair`), or refuses, so in a sparse warehouse
-    /// this is reached only where that pass did not run.
+    /// this is reached only where the file went missing after that pass, or the recovery ran
+    /// without it.
     FetchScope,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
