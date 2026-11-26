@@ -924,6 +924,22 @@ async fn resolve_the_rest(
                     ));
                 }
             },
+            // A gone fetch scope reads as its readers read it with no taint (see
+            // `VanishedClass::FetchScope`), so its absence is made durable and the record resolved,
+            // with a note saying what the warehouse's mode makes of it.
+            VanishedClass::FetchScope => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => {
+                    refs_resolved.push(relative.to_string_lossy().replace('\\', "/"));
+                    vanished_notes.push(lost_fetch_scope_note(relative));
+                }
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost fetch scope whose loss could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy().replace('\\', "/"), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1644,7 +1660,7 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
             | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy | Disposition::Scope
             | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy | Disposition::Journal
-            | Disposition::BayPath)
+            | Disposition::BayPath | Disposition::FetchScope)
             | None => false,
     }
 }
@@ -1912,6 +1928,18 @@ enum VanishedClass {
     /// bay's state with no redirect to remove, so keeping the record would guard nothing the
     /// absence does not already settle.
     BayPath(String),
+    /// A sparse warehouse's fetch scope (`config/fetch-scope`), gone since the taint was recorded.
+    /// It is written only in a sparse warehouse: first while the warehouse is prepared, before its
+    /// marker (`scope_utils::record_sparse_scopes`), then by `scope fetch`, `scope prune` and
+    /// heal's rebuild (`scope_utils::set_fetch_scope`, which refuses any other mode); no command
+    /// removes it. Read against the mode the marker records (`scope_utils::read_fetch_scope`), a
+    /// missing one is refused in a sparse warehouse, naming the heal that rebuilds it from the
+    /// checkouts' scopes, and is what a full or cache warehouse holds, taint or none, so keeping
+    /// the record would guard nothing the absence does not already settle. Heal rebuilds a missing
+    /// one before the taint recovery (`scope_heal::repair`), or refuses, so in a sparse warehouse
+    /// this is reached only where the file went missing after that pass, or the recovery ran
+    /// without it.
+    FetchScope,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -1953,6 +1981,7 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::Journal => Some(VanishedClass::Journal),
         Disposition::BayPath => relative.parent().and_then(Path::file_name).and_then(|name| name.to_str())
             .map(|name| VanishedClass::BayPath(name.to_string())),
+        Disposition::FetchScope => Some(VanishedClass::FetchScope),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
@@ -2165,6 +2194,29 @@ fn lost_bay_path_note(name: &str, relative: &Path) -> String {
                 None => format!("{}; the way out is by hand: {}", reads, bay_utils::manual_removal_steps(name, &Ok(None))),
             }
         }
+    }
+}
+
+/// The note for a resolved [`VanishedClass::FetchScope`]: what the mode the warehouse marker
+/// records makes of the absence.
+fn lost_fetch_scope_note(relative: &Path) -> String {
+    use crate::util::warehouse_utils::{self, WarehouseMode};
+
+    let lost = format!("the fetch scope \"{}\" is gone", relative.to_string_lossy().replace('\\', "/"));
+
+    match warehouse_utils::warehouse_mode() {
+        Ok(WarehouseMode::Sparse) => format!(
+            "{}; the warehouse is recorded as sparse, so Forklift refuses to use it until the fetch scope is \
+            rebuilt, as it would with no taint: run \"forklift heal\" again, which rebuilds it from the checkouts' \
+            scopes or says what stops it",
+            lost
+        ),
+        Ok(WarehouseMode::Full) => format!("{}; the warehouse is recorded as full, which keeps no fetch scope", lost),
+        Ok(WarehouseMode::Cache) => format!("{}; the warehouse is recorded as a cache, which keeps no fetch scope", lost),
+        Err(error) => format!(
+            "{}, and the warehouse's mode, which says whether it needs one, does not read ({})",
+            lost, error.trim_end_matches('.')
+        ),
     }
 }
 
@@ -7193,6 +7245,7 @@ mod tests {
             VanishedClass::MergeRecordCopy => "merge record copy".to_string(),
             VanishedClass::Journal => "journal".to_string(),
             VanishedClass::BayPath(name) => format!("bay path {}", name),
+            VanishedClass::FetchScope => "fetch scope".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -7246,7 +7299,7 @@ mod tests {
             ("bays/main/cherry-pick-copy".into(), "merge record copy"),
             ("cherry-pick".into(), "merge record"),
             ("cherry-pick-copy".into(), "merge record copy"),
-            ("config/fetch-scope".into(), "kept: the fetch scope"),
+            ("config/fetch-scope".into(), "fetch scope"),
             ("fetched-heads".into(), "kept: the fetch ledger"),
             ("held-heads".into(), "kept: the held-heads record"),
             ("mirror-roots".into(), "kept: the mirror roots record"),
@@ -7697,6 +7750,89 @@ mod tests {
                 state folder, so no bay of that name stands; delete it by hand to drop it",
                 state.to_string_lossy()
             ), "link: {}", link);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost fetch scope is resolved with a note saying what the warehouse's mode makes of it. In
+    /// a sparse warehouse it is lost as a write loses it: `set_fetch_scope`'s write fails its folder
+    /// sync, which taints it, and a power loss then undoes its birth; the note names heal, which
+    /// rebuilds it. A full or cache warehouse keeps none; a warehouse whose mode does not read is
+    /// said so. Where the absence cannot be made durable, the record stays and heal refuses.
+    ///
+    /// Revert: the shape's disposition back to `None` → every row refuses → red. Revert: resolve
+    /// without `sync_nearest_ancestor` → the failing-sync row clears → red. Revert: the note not
+    /// read from the mode → the rows' notes agree where the test expects them to differ → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_fetch_scope_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::SyncDirFaultGuard;
+        use crate::util::warehouse_utils::{self, WarehouseMode};
+
+        // (the mode the marker records, or none; whether the absence can be made durable; the note,
+        // or the refusal's line where it cannot)
+        let cases: &[(Option<WarehouseMode>, bool, &str)] = &[
+            (Some(WarehouseMode::Sparse), true, "the fetch scope \"config/fetch-scope\" is gone; the warehouse is \
+                recorded as sparse, so Forklift refuses to use it until the fetch scope is rebuilt, as it would with \
+                no taint: run \"forklift heal\" again, which rebuilds it from the checkouts' scopes or says what stops it"),
+            (Some(WarehouseMode::Full), true, "the fetch scope \"config/fetch-scope\" is gone; the warehouse is \
+                recorded as full, which keeps no fetch scope"),
+            (Some(WarehouseMode::Cache), true, "the fetch scope \"config/fetch-scope\" is gone; the warehouse is \
+                recorded as a cache, which keeps no fetch scope"),
+            (None, true, "the fetch scope \"config/fetch-scope\" is gone, and the warehouse's mode, which says \
+                whether it needs one, does not read ("),
+            (Some(WarehouseMode::Sparse), false, "a lost fetch scope whose loss could not be made durable: \
+                \"config/fetch-scope\""),
+        ];
+
+        for (mode, durable, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-fetch-scope-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            if let Some(mode) = mode {
+                warehouse_utils::mark_for_test(*mode);
+            }
+            let forklift = forklift_root();
+            let relative = "config/fetch-scope";
+            let config = scope_utils::fetch_scope_path().parent().unwrap().to_path_buf();
+            std::fs::create_dir_all(&config).unwrap();
+
+            if *mode == Some(WarehouseMode::Sparse) {
+                let _fault = SyncDirFaultGuard::failing_exactly(&config);
+                scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"]))
+                    .expect_err("a fetch scope write whose folder sync fails fails");
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the fetch scope alone is recorded");
+            } else {
+                plant_complete_taint(&forklift, &[relative]);
+            }
+            let _ = crate::util::file_utils::remove_file(&forklift.join(relative));
+            assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+            if !*durable {
+                let _fault = SyncDirFaultGuard::failing_exactly(&config);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[*note]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{:?}: a lost fetch scope is resolved: {}", mode, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative], "{:?}: {:?}", mode, outcome);
+            assert!(outcome.notes.iter().any(|said| said.starts_with(note) && (mode.is_none() || said == note)),
+                "{:?}: {:?}", mode, outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            assert!(!forklift.join(relative).exists(), "{:?}: heal writes no fetch scope back", mode);
 
             crate::util::file_utils::remove_dir_all(&root).ok();
         }

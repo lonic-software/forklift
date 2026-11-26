@@ -14327,6 +14327,29 @@ fn plant_taint(warehouse: &TestWarehouse, paths: &[&str]) {
     std::fs::write(dir.join("taint-1-0"), forklift_core::util::taint_utils::taint_file_bytes(paths)).unwrap();
 }
 
+/// A full warehouse keeps no fetch scope, so a taint naming one that is gone is resolved by heal
+/// with a note saying so, and the warehouse is usable again. The heal command rebuilds no fetch
+/// scope here, since only a sparse warehouse has one, so this reaches the vanished disposition.
+///
+/// Revert: the fetch-scope shape's disposition back to `None` → heal refuses with exit 21 → red.
+#[test]
+fn heal_clears_a_taint_naming_a_full_warehouses_lost_fetch_scope() {
+    let warehouse = TestWarehouse::new("durability-taint-lost-fetch-scope");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    plant_taint(&warehouse, &["config/fetch-scope"]);
+
+    let healed = warehouse.run(&["heal"]);
+    let said = format!("{}{}", stdout(&healed), stderr(&healed));
+    assert!(healed.status.success(), "heal resolves the lost fetch scope: {}", said);
+    assert!(said.contains("the fetch scope \"config/fetch-scope\" is gone; the warehouse is recorded as full, which keeps no fetch scope"),
+        "{}", said);
+    let left: Vec<_> = std::fs::read_dir(taint_dir_path(&warehouse)).map(|dir| dir.collect()).unwrap_or_default();
+    assert!(left.is_empty(), "nothing stays recorded: {:?}", left);
+    assert!(!warehouse.root.join(".forklift").join("config").join("fetch-scope").exists(), "heal writes no fetch scope");
+    assert_success(&warehouse.run(&["status"]));
+}
+
 #[test]
 fn a_tainted_root_exits_21_with_the_durability_taint_code() {
     // A taint the entry-heal cannot auto-heal (the recorded object never existed) must refuse
