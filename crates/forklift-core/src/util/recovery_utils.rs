@@ -1756,11 +1756,14 @@ enum VanishedClass {
     /// (`pallet_utils::remove_damaged_ref`), and the standing taint refuses a later removal.
     Keepsake,
     /// An incomplete-load marker (`inventory/incomplete-load`, or a bay's), gone since the taint
-    /// was recorded. Every write of it rides a batch whose failed sync taints the whole visible
-    /// prefix, so a shard that batch published is recorded beside it, and a directory load
-    /// publishes no shard after its marker's batch fails. A rewrite over a marker that stood
-    /// leaves the old one standing when undone, and every other way it goes is its set emptying.
-    /// So a gone marker is read as every reader reads one: no unfinished load is recorded.
+    /// was recorded. A load records its start in a batch whose failed sync taints the whole
+    /// visible prefix, so a shard that batch published is recorded beside it, and a directory
+    /// load publishes no shard after its marker's batch fails. A load's withdrawal of its start
+    /// (`load_guard_utils::withdraw_start`) writes on its own, but only over a marker that already
+    /// stands, or removes it. A rewrite over a marker that stood leaves the old one standing when
+    /// undone, and every other way it goes is its set emptying. No command but heal runs while
+    /// the taint stands (`heal_utils::heal_if_tainted`). So a gone marker is read as every reader
+    /// reads one: no unfinished load is recorded.
     LoadMarker,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
