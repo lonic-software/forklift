@@ -6891,7 +6891,8 @@ mod tests {
     /// A meta pallet ref or copy recorded by a taint and gone: a write that created the file, whose
     /// folder sync failed, then a power loss. Each row names which of the two was recorded and
     /// what stands at the other (its partner); the rows cover every partner state a fixture can
-    /// plant (a read that fails cannot be planted), for both kinds of record. Beside a partner
+    /// plant, for both kinds of record (one that cannot be read only on unix, and not as root,
+    /// which reads it anyway). Beside a partner
     /// that is a file holding a head, the record resolves with no note, the partner left (for a
     /// lost ref, it still reads as lost: the meta pass after the recovery rebuilds it from the
     /// copy). Beside no partner, the pallet reads as never written and the record resolves with a
@@ -6913,8 +6914,8 @@ mod tests {
         use crate::util::office_utils::OFFICE_PALLET_NAME as OFFICE;
         use crate::util::redaction_utils::REDACTIONS_PALLET_NAME as REDACTIONS;
 
-        enum CopyIs { Head, Absent, NoHead, Folder }
-        use CopyIs::{Absent, Folder, Head, NoHead};
+        enum CopyIs { Head, Absent, NoHead, Folder, Unreadable }
+        use CopyIs::{Absent, Folder, Head, NoHead, Unreadable};
         enum Beside { Nothing, Anchor, DamagedTrust }
         use Beside::{Anchor, DamagedTrust, Nothing};
         enum Expect { Rebuilt, Note(&'static str), Kept(&'static str) }
@@ -6943,6 +6944,9 @@ mod tests {
             (OFFICE, "meta-copy/office", Absent, Anchor, Note("(\"meta/office\") and its copy are both gone, beside the trust file's anchor, so the office pallet reads as unborn. ")),
             (OFFICE, "meta-copy/office", Absent, DamagedTrust, Kept("a lost meta pallet ref copy whose ref (\"meta/office\") is lost too, beside trust state heal does not accept (")),
             (REDACTIONS, "meta-copy/redactions", Absent, Nothing, Kept("a lost meta pallet ref copy whose ref (\"meta/redactions\") is lost too, a loss heal does not settle for this pallet: \"meta-copy/redactions\"")),
+            // A partner holding a head that cannot be read is no head heal may stand on.
+            ("tags", "meta/tags", Unreadable, Nothing, Kept("a lost meta pallet ref whose copy (\"meta-copy/tags\") cannot be read (")),
+            ("tags", "meta-copy/tags", Unreadable, Nothing, Kept("a lost meta pallet ref copy whose ref (\"meta/tags\") cannot be read (")),
         ];
 
         let _serial = lock_activation();
@@ -6969,6 +6973,15 @@ mod tests {
                 Absent => {}
                 NoHead => std::fs::write(&partner, b"not a hash").unwrap(),
                 Folder => std::fs::create_dir(&partner).unwrap(),
+                Unreadable => {
+                    std::fs::write(&partner, format!("{}\n", head)).unwrap();
+                    #[cfg(unix)]
+                    std::fs::set_permissions(&partner, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+                    if !cfg!(unix) || std::fs::read(&partner).is_ok() {
+                        eprintln!("row {}: skipped, no unreadable file can be made here", n);
+                        continue;
+                    }
+                }
             }
             match beside {
                 Nothing => {}
