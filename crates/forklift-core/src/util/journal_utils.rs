@@ -1052,7 +1052,8 @@ pub fn refuse_a_stack_over_an_unfinished_undo(verb: &str) -> Result<(), CoreErro
             "An undo of the last \"{}\" on pallet \"{}\" stopped before it finished: this bay stands \
             where it stood before that operation, but {} that the operation completed is not in \
             progress again yet. Nothing was {}. Running the undo again finishes it and puts {} back \
-            in progress; to make a plain parcel instead, abort the merge once it is back.",
+            in progress; to stack its files as an ordinary parcel instead, abort it with \
+            --keep-files once it is back.",
             entry.op, crate::error::sanitize(pallet), merge, verb, merge
         ),
         "forklift undo",

@@ -952,6 +952,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A stack no longer drops a merge an unfinished undo was putting back.** An undo of the `stack`
+  that completed a consolidation or pick, stopped after it moved the bay back and before it put the
+  merge back in progress, left a bay where the next `stack` recorded an ordinary parcel, losing the
+  second parent or the picked parcel's author, and where `park` took the merge's output away. Both
+  now refuse as `undo_unfinished` (exit 72), naming `forklift undo`, which finishes the undo
+  (`--json` schema 61).
 - **A `heal` that refuses still says what it noted about the records it settled.** When one run
   settles some recorded paths and refuses over the rest, it drops the settled ones from the taint,
   so a later `heal` never mentions them again. Their notes, such as a lost signature, or a lost
