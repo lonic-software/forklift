@@ -1115,13 +1115,13 @@ mod tests {
             stderr: b"warning: slow disk\nthread 'forklift-main' panicked at crates/x.rs:1:1:\nan undeclared taint shape\n".to_vec(), ..step(arguments, 101)
         };
         let documented = Outcome { failure: Some(crate::tool::Failure { code: "parcel_damaged".into(), message: "m".into(), next_step: None }), ..step(&["load", "."], 101) };
-        let killed = Outcome { exit: None, ..step(&["stack", "-m", "r"], 0) };
-        let readback = crate::faulted::HistoryReadback { export: step(&["export"], 0), records: vec![], parked: None, reads: vec![step(&["bay", "add"], 0), panicked(&["bay", "open"])] };
+        let killed = Outcome { exit: None, ..step(&["retried", "-m", "r"], 0) };
+        let readback = crate::faulted::HistoryReadback { export: step(&["export"], 0), records: vec![], parked: None, reads: vec![step(&["read", "made"], 0), panicked(&["read", "opened"])] };
         let faulted = crate::faulted::Faulted {
             scenario: "s".into(), name: "forklift".into(), warehouse: Warehouse::Client, kind: Kind::Truncate, target: "t".into(), grade: Grade::RefusedNoRemedy,
             evidence: Default::default(), recoverability: Default::default(),
             // The faulted command refused with its document, then the retry panicked.
-            steps: vec![documented, panicked(&["stack", "-m", "r"]), killed],
+            steps: vec![documented, panicked(&["retried", "-m", "r"]), killed],
             readbacks: vec![readback], probes: vec![], unextractable: vec![], unreached: None,
         };
         std::fs::write(out.join("crashed.json"), serde_json::to_string(&faulted).expect("serialized")).expect("written");
@@ -1131,8 +1131,8 @@ mod tests {
         let check = Completeness::crashes(&rows, &out);
         let panic = "with no failure document: thread 'forklift-main' panicked at crates/x.rs:1:1:";
         assert_eq!(check.missing, vec![
-            format!("crashed (details crashed.json#): [\"bay\", \"open\"] exited 101 {}", panic),
-            format!("crashed (details crashed.json#): [\"stack\", \"-m\", \"r\"] exited 101 {}", panic),
+            format!("crashed (details crashed.json#): [\"read\", \"opened\"] exited 101 {}", panic),
+            format!("crashed (details crashed.json#): [\"retried\", \"-m\", \"r\"] exited 101 {}", panic),
         ]);
         assert_eq!((check.subject, check.check.as_str(), &check.cell), (Some(Tool::Forklift), "commands ran without a crash", &Cell::Run));
         assert!(Report { completeness: vec![check], ..sample() }.failed(), "a crash fails the run");
