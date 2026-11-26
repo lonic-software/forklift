@@ -2859,7 +2859,24 @@ async fn blocking_unscoped<T: Send + 'static>(
 ) -> Result<T, HandlerError> {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|e| internal(format!("A storage task failed: {}", e)))?
+        .map_err(|e| internal(format!("A storage task failed: {}", reraise_storage_panic(e))))?
+}
+
+/// What a storage task that did not finish leaves for its caller to report. A debug build raises a
+/// panic again on the caller's task instead: a reply or a log line would let a test that expects
+/// any failure pass over it, the debug build's undeclared-taint-shape assertion included. A
+/// release build reports it, so one request's panic never takes the server down.
+fn reraise_storage_panic(error: tokio::task::JoinError) -> tokio::task::JoinError {
+    reraise_storage_panic_when(error, cfg!(debug_assertions))
+}
+
+/// [`reraise_storage_panic`], raising the panic again when `reraise` holds.
+fn reraise_storage_panic_when(error: tokio::task::JoinError, reraise: bool) -> tokio::task::JoinError {
+    if reraise && error.is_panic() {
+        std::panic::resume_unwind(error.into_panic());
+    }
+
+    error
 }
 
 /// What a warehouse creation found.
@@ -7022,6 +7039,53 @@ mod tests {
         let status = status_line(&mut stream).await;
 
         assert!(status.contains(" 200 "), "{status}");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // A storage task that panics
+    // ---------------------------------------------------------------------------------
+
+    /// The JoinError of a blocking task that panicked with `message`.
+    async fn panicked_task(message: &'static str) -> tokio::task::JoinError {
+        tokio::task::spawn_blocking::<_, ()>(move || panic!("{}", message)).await
+            .expect_err("the task panicked")
+    }
+
+    /// Asked to, a storage task's panic is raised again with its own payload; not asked to, it is
+    /// handed back as the error the caller reports. A task that was cancelled has no panic to raise,
+    /// so it is handed back either way.
+    ///
+    /// Revert: drop the `reraise` test → the reported arm raises; drop the `is_panic` test → the
+    /// cancelled task raises tokio's own panic instead of coming back.
+    #[tokio::test]
+    async fn a_storage_task_panic_is_raised_again_only_when_asked() {
+        let reported = reraise_storage_panic_when(panicked_task("planted storage panic").await, false);
+        assert!(reported.is_panic(), "{reported}");
+
+        let error = panicked_task("planted storage panic").await;
+        let raised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reraise_storage_panic_when(error, true)))
+            .expect_err("the panic is raised again");
+        assert_eq!(raised.downcast_ref::<String>().map(String::as_str), Some("planted storage panic"));
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = cancelled.await.expect_err("the task was cancelled");
+        let handed_back = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reraise_storage_panic_when(cancelled, true)))
+            .expect("a cancelled task raises nothing");
+        assert!(handed_back.is_cancelled(), "{handed_back}");
+    }
+
+    /// In a debug build, a panic in a request's storage work fails the request's own task, so a
+    /// test driving a handler fails on it rather than reading an internal-error reply. This is the
+    /// test the suite fails by when a debug assertion fires in server storage code.
+    ///
+    /// Revert: report every storage panic (`reraise_storage_panic_when(error, false)`) → the call
+    /// returns an internal error, and the test fails for not panicking.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "planted storage panic")]
+    async fn a_debug_build_raises_a_storage_panic_on_the_requests_task() {
+        let _ = blocking_unscoped(|| -> Result<(), HandlerError> { panic!("planted storage panic") }).await;
     }
 
     // ---------------------------------------------------------------------------------

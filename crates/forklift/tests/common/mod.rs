@@ -9,9 +9,10 @@ use std::process::Command;
 /// A child that panics is not caught here: this builds the command and runs nothing, so a test
 /// that asserts only that the command failed also passes on a panic, the debug build's
 /// undeclared-taint-shape assertion included. Every test that runs a child it expects to fail,
-/// through this or [`test_command`], is that uncovered case. So is any storage work run through
-/// `spawn_blocking` in `forklift-server` or `forklift-aws-lambda`, which turns a panic into an
-/// error reply before a child's exit could show it.
+/// through this or [`test_command`], is that uncovered case. So is a launched `forklift-server`:
+/// a debug build raises a request's storage panic again, but on a task of the server process, so
+/// the client sees only a dropped connection. The same work under `forklift-aws-lambda`'s
+/// `spawn_blocking` turns a panic into an error reply.
 pub fn forklift_command() -> Command {
     test_command(env!("CARGO_BIN_EXE_forklift"))
 }
