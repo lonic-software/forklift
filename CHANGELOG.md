@@ -221,7 +221,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   removal, may afterwards be refused as incomplete. Before, it kept heal refusing.
   A lost git mirror roots record (`.forklift/mirror-roots`) is now cleared the same way. It reads
   as an empty record, as a missing one does with no taint, so it no longer keeps the history it
-  named from gc, and a later mirror run records the root of each pallet it leaves exported.
+  named from gc, and a later mirror run records a root again only for a pallet it exports.
   Before, it kept heal refusing, even after the record was deleted as its own refusal advises.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the

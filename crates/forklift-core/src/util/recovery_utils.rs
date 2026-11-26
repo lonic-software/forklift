@@ -1990,10 +1990,13 @@ enum VanishedClass {
     /// `put_back_owed_roots`); no command removes it, and no heal pass writes it. Its reader takes
     /// a missing one as empty (`mirror_utils::read_mirror_roots`), taint or none, which is also
     /// the state deleting an unreadable one leaves, the step its refusal names. What an empty
-    /// record gives up is keeping the parcels it named from gc, until a mirror run records the
-    /// root of each pallet it leaves exported. Keeping the taint would hold them only by keeping
-    /// gc refused: the record reads the same either way, and no write puts it back while the
-    /// taint stands (the ordinary write is refused, and a missing record is not rebuilt).
+    /// record gives up is keeping the parcels it named from gc; a later mirror run records a root
+    /// only for a pallet it exports, so a pallet it skips or refuses before exporting stays
+    /// unrooted. Keeping the taint would hold them only by keeping gc refused: the record reads
+    /// the same either way, and nothing puts it back while the taint stands. The ordinary write is
+    /// refused, a missing record is not rebuilt, and a takedown's compensating put-backs write
+    /// only what the run loaded or recorded itself, so a lost entry comes back only for a pallet
+    /// the run exported.
     MirrorRoots,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
@@ -2307,7 +2310,7 @@ fn lost_mirror_roots_note(relative: &Path) -> String {
     format!(
         "the git mirror's roots record \"{}\" is gone; Forklift reads a missing one as an empty one, as it \
         would with no taint, so the record no longer keeps the history it named from gc, and a later mirror run \
-        records the root of each pallet it leaves exported",
+        records a root again only for a pallet it exports",
         relative.to_string_lossy().replace('\\', "/")
     )
 }
@@ -8035,7 +8038,7 @@ mod tests {
         let cases: &[(bool, &str)] = &[
             (true, "the git mirror's roots record \"mirror-roots\" is gone; Forklift reads a missing one as an \
                 empty one, as it would with no taint, so the record no longer keeps the history it named from gc, \
-                and a later mirror run records the root of each pallet it leaves exported"),
+                and a later mirror run records a root again only for a pallet it exports"),
             (false, "a lost mirror roots record whose loss could not be made durable: \"mirror-roots\""),
         ];
 
