@@ -6857,9 +6857,9 @@ mod tests {
             ("tags", "meta/tags", Absent, Missing, Note("the first write of meta pallet \"tags\" did not survive a power loss (\"meta/tags\" is gone, and so is its copy), so the pallet reads as never written; that write had failed, and whatever it recorded has to be recorded again")),
             ("tags", "meta/tags", NoHead, Missing, Kept("a lost meta pallet ref whose copy (\"meta-copy/tags\") does not hold a head either: \"meta/tags\"")),
             ("tags", "meta/tags", Folder, Missing, Kept("a lost meta pallet ref whose copy (\"meta-copy/tags\") is not a file: \"meta/tags\"")),
-            ("office", "meta/office", Absent, Missing, Note("the first write of meta pallet \"office\" did not survive a power loss (\"meta/office\" is gone, and so is its copy), so the pallet reads as never written")),
-            ("office", "meta/office", Absent, Anchor, Note("the first write of meta pallet \"office\" did not survive a power loss (\"meta/office\" is gone, and so is its copy), and the trust file holds this warehouse's anchor, so the office pallet reads as unborn. ")),
-            ("office", "meta/office", Absent, Damaged, Kept("a lost meta pallet ref whose copy is lost too, beside a trust file that cannot be read: \"meta/office\" (")),
+            (crate::util::office_utils::OFFICE_PALLET_NAME, "meta/office", Absent, Missing, Note("did not survive a power loss (\"meta/office\" is gone, and so is its copy), so the pallet reads as never written")),
+            (crate::util::office_utils::OFFICE_PALLET_NAME, "meta/office", Absent, Anchor, Note("did not survive a power loss (\"meta/office\" is gone, and so is its copy), and the trust file holds this warehouse's anchor, so the office pallet reads as unborn. ")),
+            (crate::util::office_utils::OFFICE_PALLET_NAME, "meta/office", Absent, Damaged, Kept("a lost meta pallet ref whose copy is lost too, beside a trust file that cannot be read: \"meta/office\" (")),
             ("tags", "meta/data", Head, Missing, Kept("\"meta/data\" (a ref in the meta folder that is no meta pallet's) is gone, and heal has no recovery for it")),
         ];
 
