@@ -214,6 +214,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   none, is now cleared the same way, with a note saying so. Before, it kept heal refusing. A
   sparse warehouse's lost fetch scope is still rebuilt by the same heal run, which then clears
   its taint.
+  A lost fetch ledger (`.forklift/fetched-heads`) is now cleared the same way. It reads as an
+  empty ledger, as a missing one does with no taint, and in a sparse warehouse its note says that
+  `forklift scope fetch` then widens only what the bay's base and the pallets' heads reach, so a
+  head fetched earlier that no pallet holds may be refused as incomplete until it is fetched
+  again. Before, it kept heal refusing.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens

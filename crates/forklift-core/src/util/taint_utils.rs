@@ -254,6 +254,7 @@ pub(crate) enum VanishedDisposition {
     Journal,
     BayPath,
     FetchScope,
+    FetchLedger,
 }
 
 /// One kind of root-relative path a taint record may name.
@@ -336,7 +337,7 @@ static TAINT_SHAPES: &[TaintShape] = &[
     TaintShape { description: "the cherry-pick state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("cherry-pick")] },
     TaintShape { description: "the cherry-pick state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("cherry-pick-copy")] },
     TaintShape { description: "the fetch scope", disposition: Some(Disposition::FetchScope), pattern: &[Is("config"), Is("fetch-scope")] },
-    TaintShape { description: "the fetch ledger", disposition: None, pattern: &[Is("fetched-heads")] },
+    TaintShape { description: "the fetch ledger", disposition: Some(Disposition::FetchLedger), pattern: &[Is("fetched-heads")] },
     TaintShape { description: "the held-heads record", disposition: None, pattern: &[Is("held-heads")] },
     TaintShape { description: "the mirror roots record", disposition: None, pattern: &[Is("mirror-roots")] },
     TaintShape { description: "the served record", disposition: None, pattern: &[Is("served")] },

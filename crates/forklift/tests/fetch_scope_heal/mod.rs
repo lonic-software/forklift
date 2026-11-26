@@ -103,6 +103,32 @@ fn heal_rebuilds_a_tainted_lost_fetch_scope_and_clears_its_taint() {
     assert_success(&area.forklift("sparse", &["load", "."]));
 }
 
+/// A sparse warehouse's fetch ledger that is tainted and then lost, as a power loss leaves a birth
+/// write whose folder sync failed, is resolved by heal with a note saying it reads as empty: no
+/// heal pass rebuilds the ledger, so this reaches the vanished disposition through the command.
+/// Heal exits 0 with nothing left recorded and writes no ledger back, and `load` works.
+///
+/// Revert: the fetch-ledger shape's disposition back to `None` → heal refuses with exit 21 → red.
+#[test]
+fn heal_clears_a_taint_naming_a_sparse_warehouses_lost_fetch_ledger() {
+    let area = TestArea::new("fetch-ledger-heal-tainted");
+    let _server = sparse_with_docs(&area);
+    let ledger = "sparse/.forklift/fetched-heads";
+    assert!(area.path(ledger).exists(), "sanity: the sparse clone recorded its fetch");
+
+    plant_taint(&area, "sparse", &["fetched-heads"]);
+    forklift_core::util::file_utils::remove_file(area.path(ledger)).unwrap();
+
+    let healed = area.forklift("sparse", &["heal"]);
+    let said = format!("{}{}", stdout(&healed), stderr(&healed));
+    assert_success(&healed);
+    assert!(said.contains("the fetch ledger \"fetched-heads\" is gone; the warehouse is recorded as sparse, and \
+        Forklift reads a missing fetch ledger as an empty one"), "{}", said);
+    assert!(recorded_taint_paths(&area, "sparse").is_empty(), "nothing stays recorded: {}", said);
+    assert!(!area.path(ledger).exists(), "heal writes no fetch ledger back");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+}
+
 /// A main tree narrowed below what was fetched rebuilds a narrower fetch scope, and the report
 /// says what that leaves unchecked and how to add a path back.
 ///

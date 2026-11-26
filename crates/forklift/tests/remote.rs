@@ -6429,7 +6429,8 @@ fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, S
 }
 
 // Revert: scope fetch skips the fetched-heads ledger → the remote head's src/web stays sealed, so the
-// pallet create makes a ref whose closure lacks it.
+// pallet create is refused as incomplete (the ref compare-and-set verifies the closure at the widened
+// scope; the test below pins that refusal).
 #[test]
 fn expand_fetches_the_widened_content_of_a_head_a_refused_lower_fetched() {
     let area = TestArea::new("sparse-expand-ledger");
