@@ -177,11 +177,14 @@ Besides the faults, every run checks its own completeness, and a gap fails the r
 - every route in the server's route table is answered through the proxy;
 - on Linux, every write the server makes falls in the write set declared for the route that was
   in flight;
-- no command recorded in the details of a Forklift row crashed, that is, exited 101 (a Rust panic)
-  with no failure document. This covers the steps, the readbacks and the harness's own probes. A
-  crash is never graded as an answer: a retry that panics claims nothing, as a lock refusal does,
-  so a row's grade alone would not show it. Each crash is listed with its row, the command and the
-  line that says it panicked. A row whose details cannot be read is listed too.
+- no command recorded in the details of a Forklift row panicked, that is, exited 101 with no
+  failure document. This covers the steps, the readbacks and the harness's own probes. A crash is
+  never graded as an answer: a retry that panics claims nothing, as a lock refusal does, so a row's
+  grade alone would not show it. Each crash is listed with its row, the command and the line that
+  says it panicked. A row whose details cannot be read is listed too. The check reads only rows'
+  details, so commands that belong to no row, such as a history build or a fidelity round trip,
+  are not checked. A crash that does not unwind is not seen either: an abort or a stack overflow
+  ends on a signal, which the harness records like a kill.
 
 The exemptions live in `crates/proof-load/src/bindings.rs`.
 

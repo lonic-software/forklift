@@ -1937,7 +1937,8 @@ mod tests {
     }
 
     /// A run given no tools still completes in-process: it returns its report and writes the
-    /// same report, which reads back. Its forklift checks include the crash check, run.
+    /// same report, which reads back. Its forklift checks include the crash check, not run, since
+    /// no forklift row was graded.
     ///
     /// Revert: drop the crash check from the run's completeness → it is not listed.
     #[test]
@@ -1948,7 +1949,7 @@ mod tests {
         assert_eq!(written.json(), report.json());
         assert_eq!(report.format, REPORT_FORMAT);
         let crash = report.completeness.iter().find(|check| check.check == "commands ran without a crash").expect("the crash check is listed");
-        assert_eq!((crash.subject, &crash.cell), (Some(Tool::Forklift), &Cell::Run));
+        assert_eq!((crash.subject, &crash.cell), (Some(Tool::Forklift), &Cell::not_run("no forklift row was graded")));
     }
 
     /// An `--only` that names no scenario is refused, not run as an empty run; one that names a

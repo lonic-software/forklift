@@ -381,40 +381,41 @@ impl Row {
         serde_json::from_value(steps.clone()).map_err(|error| format!("the steps in {} at `{}` cannot be read: {}", path.display(), pointer, error))
     }
 
-    /// Every command recorded anywhere in the object the row's details point at that crashed:
-    /// exited 101, the status a Rust program exits with when it panics, and left no failure
-    /// document. That covers the steps, the readbacks and the harness's probes alike, since each
-    /// is written as an object with `arguments`, `exit`, `stderr` and `failure`. Each is named by
-    /// its arguments and the line of its stderr that says it panicked (else its first line).
-    /// Refuses as [`Row::steps`] does.
-    pub fn crashed(&self, out: &std::path::Path) -> Result<Vec<String>, String> {
-        let (_, _, object) = self.details(out)?;
-        let mut crashed = Vec::new();
-        crashes_in(&object, &mut crashed);
-        Ok(crashed)
-    }
-
     /// The file `detail` names under `out`, its JSON pointer, and the object the pointer picks.
     fn details(&self, out: &std::path::Path) -> Result<(std::path::PathBuf, String, serde_json::Value), String> {
+        let (path, pointer) = self.located(out)?;
+        let mut value = read_details(&path)?;
+        let object = value.pointer_mut(pointer).map(serde_json::Value::take).ok_or_else(|| format!("{} holds nothing at `{}`", path.display(), pointer))?;
+        Ok((path, pointer.to_string(), object))
+    }
+
+    /// The file `detail` names under `out` and its JSON pointer, refusing a row with no details,
+    /// a `detail` without its `#`, and a file name that leaves `out`.
+    fn located(&self, out: &std::path::Path) -> Result<(std::path::PathBuf, &str), String> {
         let detail = self.detail.as_deref().ok_or("the run wrote no details for this row")?;
         let (file, pointer) = detail.split_once('#').ok_or_else(|| format!("the row's details `{}` name no JSON pointer", detail))?;
         let relative = std::path::Path::new(file);
         if file.is_empty() || !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
             return Err(format!("the row's details file `{}` is not a file name inside the run's folder", file));
         }
-        let path = out.join(relative);
-        let text = std::fs::read_to_string(&path).map_err(|error| format!("cannot read {}: {}", path.display(), error))?;
-        let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|error| format!("{} is not JSON: {}", path.display(), error))?;
-        let object = value.pointer_mut(pointer).map(serde_json::Value::take).ok_or_else(|| format!("{} holds nothing at `{}`", path.display(), pointer))?;
-        Ok((path, pointer.to_string(), object))
+        Ok((out.join(relative), pointer))
     }
 }
 
-/// The exit status of a Rust program that panicked.
+/// The JSON a details file at `path` holds.
+fn read_details(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("cannot read {}: {}", path.display(), error))?;
+    serde_json::from_str(&text).map_err(|error| format!("{} is not JSON: {}", path.display(), error))
+}
+
+/// The exit status of a Rust program whose panic unwound.
 const PANIC_EXIT: i64 = 101;
 
 /// Appends to `crashed` each command under `value` that exited [`PANIC_EXIT`] with no failure
-/// document. Within an object the fields are walked in key order, not in the order written.
+/// document: any object with `arguments` and `stderr` arrays, which is how the steps, the
+/// readbacks and the harness's probes are all written. Each is named by its arguments and the line
+/// of its stderr that says it panicked, else its first line. Within an object the fields are
+/// walked in key order, not in the order written.
 fn crashes_in(value: &serde_json::Value, crashed: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(object) => {
@@ -449,21 +450,43 @@ pub struct Completeness {
 }
 
 impl Completeness {
-    /// Whether forklift crashed anywhere the run recorded: every command in the details of each of
-    /// forklift's `rows` that [`Row::crashed`] finds, with the row it belongs to, and each row whose
-    /// details cannot be read, since what it ran cannot be checked. A crash is never graded as an
-    /// answer, so without this check a panic on a retry reads as a command that claimed nothing.
-    /// Git's rows are not read: git does not panic.
+    /// Whether a command in the details of any of forklift's `rows`, under `out`, panicked:
+    /// each one [`crashes_in`] finds, with the row it belongs to, and each row whose details
+    /// cannot be read, since what it ran cannot be checked. A crash is never graded as an answer,
+    /// so without this check a panic on a retry reads as a command that claimed nothing. Git's
+    /// rows are not read, and neither are commands recorded outside a row's details (a history
+    /// build, a baseline, a fidelity round trip). Not run when no forklift row was graded.
+    ///
+    /// Rows of one lane share a details file, one entry per point, so each file is parsed once
+    /// for all the rows that point into it, not once per row.
     pub fn crashes<'a>(rows: impl IntoIterator<Item = &'a Row>, out: &std::path::Path) -> Completeness {
+        let check = "commands ran without a crash".to_string();
         let mut missing = Vec::new();
+        let mut checked = false;
+        let unreadable = |row: &Row, error: String| format!("{} (details {}): its commands cannot be checked: {}", row.scenario, row.detail.as_deref().unwrap_or("none"), error);
+        let mut by_file: BTreeMap<std::path::PathBuf, Vec<(&Row, &str)>> = BTreeMap::new();
         for row in rows.into_iter().filter(|row| row.subject == Tool::Forklift) {
-            let detail = row.detail.as_deref().unwrap_or("none");
-            match row.crashed(out) {
-                Ok(crashed) => missing.extend(crashed.into_iter().map(|crash| format!("{} (details {}): {}", row.scenario, detail, crash))),
-                Err(error) => missing.push(format!("{} (details {}): its commands cannot be checked: {}", row.scenario, detail, error)),
+            checked = true;
+            match row.located(out) {
+                Ok((path, pointer)) => by_file.entry(path).or_default().push((row, pointer)),
+                Err(error) => missing.push(unreadable(row, error)),
             }
         }
-        Completeness { subject: Some(Tool::Forklift), check: "commands ran without a crash".to_string(), cell: Cell::Run, missing }
+        for (path, pointed) in by_file {
+            let value = read_details(&path);
+            for (row, pointer) in pointed {
+                match value.as_ref().map_err(String::clone).and_then(|value| value.pointer(pointer).ok_or_else(|| format!("{} holds nothing at `{}`", path.display(), pointer))) {
+                    Ok(object) => {
+                        let mut crashed = Vec::new();
+                        crashes_in(object, &mut crashed);
+                        missing.extend(crashed.into_iter().map(|crash| format!("{} (details {}): {}", row.scenario, row.detail.as_deref().unwrap_or("none"), crash)));
+                    }
+                    Err(error) => missing.push(unreadable(row, error)),
+                }
+            }
+        }
+        let cell = if checked { Cell::Run } else { Cell::not_run("no forklift row was graded") };
+        Completeness { subject: Some(Tool::Forklift), check, cell, missing }
     }
 
     /// The wall-clock budget: a run that took longer than `budget` fails, though every scenario
@@ -1105,7 +1128,9 @@ mod tests {
     /// A forklift row whose retry panicked fails the run through the crash check, which names the
     /// row, the command and the panic, and so does a panic in a readback's reads, written by
     /// `HistoryReadback`'s own serializer. A refusal with a failure document, a kill, a clean
-    /// row and a git row's panic name nothing; a row whose details cannot be read is named.
+    /// row and a git row's panic name nothing; a row whose details cannot be read is named. With
+    /// no forklift row the check is not run, and rows sharing a file are judged each at its own
+    /// pointer.
     ///
     /// Revert: in `crashes_in`, compare the exit with 1 in place of 101 → the panics are not named.
     #[test]
@@ -1137,7 +1162,13 @@ mod tests {
         assert_eq!((check.subject, check.check.as_str(), &check.cell), (Some(Tool::Forklift), "commands ran without a crash", &Cell::Run));
         assert!(Report { completeness: vec![check], ..sample() }.failed(), "a crash fails the run");
         let clean = Completeness::crashes(&rows[1..], &out);
-        assert_eq!(clean.missing, Vec::<String>::new());
+        assert_eq!((clean.missing.as_slice(), &clean.cell), (&[][..], &Cell::Run));
+        assert_eq!(Completeness::crashes(&rows[1..2], &out).cell, Cell::not_run("no forklift row was graded"), "git's row alone checks nothing");
+        // Two rows pointing into one file are each judged at their own pointer.
+        let point = |outcome: Outcome| serde_json::json!({"graded": {"steps": [outcome]}});
+        std::fs::write(out.join("points.json"), serde_json::json!({"killed": [point(step(&["heal"], 0)), point(panicked(&["retried"]))]}).to_string()).expect("written");
+        let points = [row(Tool::Forklift, "first", "points.json#/killed/0/graded"), row(Tool::Forklift, "second", "points.json#/killed/1/graded")];
+        assert_eq!(Completeness::crashes(&points, &out).missing, vec![format!("second (details points.json#/killed/1/graded): [\"retried\"] exited 101 {}", panic)]);
         assert!(!Report { completeness: vec![clean], ..sample() }.failed(), "the same report without the crash passes");
         let unread = Completeness::crashes(&[row(Tool::Forklift, "gone", "gone.json#")], &out);
         assert_eq!(unread.missing.len(), 1);
