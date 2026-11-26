@@ -165,11 +165,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   load that failed before the heal again yourself. Before, it kept heal refusing, and every
   command that records anything refused with it. A lost position of a checkout other than the one
   heal runs in (`.forklift/position`, or a bay's), or a lost position copy, is cleared the same
-  way, with a note. For a position, the note says where to run `forklift heal` to repair it, or
-  names `forklift bay remove` for a bay that records no directory. For a copy, it says the next
-  position write writes it again. The position stays lost, and its readers still refuse it.
-  Before, it kept heal refusing, so a bay whose first position write was lost could not even be
-  removed.
+  way, with a note. For a position, the note names the ways out: `forklift heal` run in that
+  checkout, or, for a bay, `forklift bay remove`, with the directory the bay records, if any.
+  For a copy, it says the next position write writes it again. The position stays lost, and its
+  readers still refuse it. Before, it kept heal refusing, so a bay whose first position write was
+  lost could not even be removed.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
