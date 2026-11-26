@@ -458,8 +458,11 @@ pub async fn handle_command(store_access: Option<&StoreAccessLock>,
             let kept = refused.kept_by_unread_refs;
             refs_left.borrow_mut().kept = kept.clone();
             // An interrupted operation waits for the taint (below), so the refusal says so: it
-            // is not the only thing left standing.
-            let mut error = changed_after(String::from(refused.error), &refs_rebuilt, &refs_removed, &ref_notes);
+            // is not the only thing left standing. What the recovery noted goes first, as in a
+            // report: the records it resolved before refusing are gone from the taint, so no
+            // later run notes them.
+            let notes: Vec<String> = refused.notes.iter().chain(&ref_notes).cloned().collect();
+            let mut error = changed_after(String::from(refused.error), &refs_rebuilt, &refs_removed, &notes);
             let damaged = ref_heal::detect(&mut Vec::new()).unwrap_or_default();
             for sentence in damaged_user_ref_sentences(&damaged, &kept) {
                 error = forklift_core::error::append_to_message(error, &sentence);

@@ -14460,6 +14460,35 @@ fn heal_reaches_a_tainted_root_and_clears_a_vanished_unreferenced_object() {
     assert_success(&warehouse.run(&["stack", "-m", "after heal"]));
 }
 
+/// FORK-617: a heal that resolves one record with a note and keeps another says the note in its
+/// refusal, once; the next heal, with that record gone from the taint, does not.
+///
+/// Revert: drop `refused.notes` from the refusal in `heal.rs` → the note is missing → red.
+#[test]
+fn a_refusing_heal_says_the_notes_of_what_it_resolved() {
+    let warehouse = TestWarehouse::new("heal-refusal-notes");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    let hash = "e2".repeat(32);
+    let sidecar = format!("{}.sig", loose_object_relative_path(&hash));
+    plant_taint(&warehouse, &[&sidecar, "something/unexpected.txt"]);
+    // Paths render with the platform's separator; compared with "/".
+    let note = format!("Note: the signature file \"{}\" is gone", sidecar);
+    let message_of = |output: &std::process::Output| json(output)["error"]["message"].as_str().unwrap().replace('\\', "/");
+
+    let first = warehouse.run(&["heal", "--json"]);
+    assert_eq!(first.status.code(), Some(21));
+    let message = message_of(&first);
+    assert_eq!(message.matches(&note).count(), 1, "the refusal says the resolved sidecar's note once: {}", message);
+    assert!(message.contains("something/unexpected.txt"), "{}", message);
+
+    let second = warehouse.run(&["heal", "--json"]);
+    assert_eq!(second.status.code(), Some(21));
+    let message = message_of(&second);
+    assert!(!message.contains(&note), "the sidecar's record is gone, so nothing says it again: {}", message);
+}
+
 #[test]
 fn heal_reports_a_vanished_but_referenced_object_and_everything_still_refuses() {
     let warehouse = TestWarehouse::new("heal-reports-referenced");
