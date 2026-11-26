@@ -1327,6 +1327,78 @@ fn a_lower_during_a_consolidation_is_refused() {
     assert!(!lowered.status.success() && stderr(&lowered).contains("A consolidation is in progress"), "{}", stderr(&lowered));
 }
 
+/// A lower over an undo that stopped before it put a consolidation back is refused, naming the
+/// undo. The bay stands on a parcel the remote's head descends from, and the merge's output touches
+/// nothing the remote changed, so the lower would fast-forward and carry that output onto the
+/// remote's head: the undo could then no longer resume, and the next stack would record the output
+/// as an ordinary parcel without the consolidation's second parent. After the refusal the undo
+/// finishes, and the stack has both parents.
+///
+/// Revert: drop the unfinished-undo refusal from refuse_mid_merge → the lower fast-forwards.
+#[test]
+fn a_lower_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
+    let area = TestArea::new("lower-over-stopped-undo");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/f.txt", "base\n");
+    area.write_file("a/g.txt", "g\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+
+    assert_success(&area.forklift("b", &["pallet", "create", "side"]));
+    area.write_file("b/f.txt", "side\n");
+    assert_success(&area.forklift("b", &["load", "f.txt"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "side"]));
+    assert_success(&area.forklift("b", &["shift", "main"]));
+    area.write_file("b/f.txt", "main\n");
+    assert_success(&area.forklift("b", &["load", "f.txt"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "main"]));
+    assert_success(&area.forklift("b", &["lift"]));
+
+    assert_success(&area.forklift("a", &["lower"]));
+    area.write_file("a/g.txt", "g2\n");
+    assert_success(&area.forklift("a", &["load", "g.txt"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "g2"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let consolidated = area.forklift("b", &["consolidate", "side"]);
+    assert!(area.path("b/.forklift/consolidation").exists(), "{}{}", stdout(&consolidated), stderr(&consolidated));
+    area.write_file("b/f.txt", "resolved\n");
+    assert_success(&area.forklift("b", &["load", "f.txt"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "resolved"]));
+
+    // The undo runs, then the bay is put back where an undo stopped before its merge state leaves
+    // it: the entry still journaled and marked, and no consolidation recorded.
+    let journal = area.path("b/.forklift/journal.json");
+    let stacked = std::fs::read_to_string(&journal).unwrap();
+    assert_success(&area.forklift("b", &["undo"]));
+    for name in ["consolidation", "consolidation-copy", "consolidation-skeleton", "consolidation-skeleton-copy"] {
+        let path = area.path(&format!("b/.forklift/{}", name));
+        if path.exists() {
+            forklift_core::util::file_utils::remove_file(&path).unwrap();
+        }
+    }
+    let at = stacked.rfind("\"undo_started\":false").expect("the journal has an unmarked entry");
+    std::fs::write(&journal, format!("{}\"undo_started\":true{}", &stacked[..at], &stacked[at + "\"undo_started\":false".len()..])).unwrap();
+    let position = std::fs::read_to_string(area.path("b/.forklift/position")).unwrap();
+
+    let refused = area.forklift("b", &["--json", "lower"]);
+    assert_eq!(refused.status.code(), Some(72), "{}{}", stdout(&refused), stderr(&refused));
+    let error = serde_json::from_str::<serde_json::Value>(&stdout(&refused)).unwrap()["error"].clone();
+    assert_eq!((error["code"].as_str(), error["next_step"].as_str()), (Some("undo_unfinished"), Some("forklift undo")), "{}", error);
+    assert_eq!(std::fs::read_to_string(area.path("b/.forklift/position")).unwrap(), position, "the bay stays where it was");
+    assert_eq!(area.read_file("b/f.txt"), "resolved\n");
+    assert_eq!(area.read_file("b/g.txt"), "g\n");
+
+    assert_success(&area.forklift("b", &["undo"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "restacked"]));
+    let history = serde_json::from_str::<serde_json::Value>(&stdout(&area.forklift("b", &["--json", "history"]))).unwrap();
+    assert_eq!(history["data"]["entries"][0]["parents"].as_array().map(Vec::len), Some(2), "{}", history);
+}
+
 // A bay whose pallet another bay already lowered to the remote's head is behind, not up to date.
 // Revert: lower's "up to date" check on the pallet's ref ahead of its currency check → it reports
 // up to date and the bay's files stay behind.

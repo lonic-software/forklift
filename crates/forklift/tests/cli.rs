@@ -11907,6 +11907,41 @@ fn a_stack_over_a_stopped_undo_of_a_moved_pallet_is_behind() {
     assert_eq!(json(&refused)["error"]["code"], "behind", "{}{}", stdout(&refused), stderr(&refused));
 }
 
+// A command that moves the bay to another pallet over the same stopped undo would leave the undo
+// unable to resume, since it puts the merge back only on the pallet and head it left, and a stack
+// on the new pallet would record the merge's output as an ordinary parcel. Each is refused, naming
+// the undo, and changes neither the bay's position nor any pallet; the undo then finishes and the
+// stack after it has both parents. `pallet create` with no revision journals nothing and checks no
+// files, so it went through before; the others went through or were refused over the dirty files,
+// naming a park the stopped undo refuses too.
+//
+// Revert: drop the refusal from refuse_mid_merge → every row goes through or is refused otherwise.
+#[test]
+fn a_pallet_switch_over_a_stopped_undo_of_a_consolidation_names_the_undo() {
+    let rows: [&[&str]; 4] = [
+        &["pallet", "create", "fresh"],
+        &["pallet", "create", "fresh", "spare"],
+        &["deliver", "spare", "-m", "over"],
+        &["shift", "other"],
+    ];
+
+    for (index, command) in rows.into_iter().enumerate() {
+        let warehouse = a_stopped_undo_of_a_consolidation(&format!("switch-over-stopped-undo-{}", index));
+        let pallets = |warehouse: &TestWarehouse| ["main", "other", "spare", "fresh"].map(|pallet|
+            std::fs::read_to_string(warehouse.root.join(".forklift/pallets").join(pallet)).ok());
+        let (position, heads) = (std::fs::read_to_string(position_path(&warehouse, None)).unwrap(), pallets(&warehouse));
+
+        let refused = warehouse.run(&[&["--json"][..], command].concat());
+        assert_undo_unfinished(&refused, "changed");
+        assert_eq!(std::fs::read_to_string(position_path(&warehouse, None)).unwrap(), position, "{:?} left the bay where it was", command);
+        assert_eq!(pallets(&warehouse), heads, "{:?} changed no pallet", command);
+
+        assert_success(&warehouse.run(&["undo"]));
+        assert_success(&warehouse.run(&["stack", "-m", "restacked"]));
+        assert_eq!(top_parent_count(&warehouse), 2, "{:?}: {}", command, top_history_entry(&warehouse));
+    }
+}
+
 // Journaling is best-effort: a journal that does not parse refuses nothing here.
 //
 // Revert: return the journal's read error → the stack fails on it.

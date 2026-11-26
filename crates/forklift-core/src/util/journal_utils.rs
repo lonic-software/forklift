@@ -992,12 +992,15 @@ fn is_resumable(entry: &JournalEntry, now: &BayState) -> Result<bool, String> {
     Ok(pallet_utils::get_pallet_head(&before.current_pallet)? == before.current_head)
 }
 
-/// Refuses a stack or a park (`verb` names it: "stacked", "parked") over an undo that stopped
-/// after it put the bay's position back and before it put back the consolidation or pick its
-/// entry records: a stack there would record the merge's output as an ordinary parcel, dropping
-/// the pick source's authorship or the merge parent, and a park would take the merged output
-/// away from under the merge state the undo then writes back. The refusal is `undo_unfinished`,
-/// and its next step resumes the undo. All of these must hold:
+/// Refuses a command (`verb` completes its "Nothing was …" sentence: "stacked", "parked",
+/// "changed") over an undo that stopped after it put the bay's position back and before it put
+/// back the consolidation or pick its entry records: a stack there would record the merge's
+/// output as an ordinary parcel, dropping the pick source's authorship or the merge parent; a park
+/// would take the merged output away from under the merge state the undo then writes back; and a
+/// command that moves the bay to another pallet or head (`shift::refuse_mid_merge`'s callers)
+/// leaves the undo unable to resume, since it puts the merge back only where the bay stood, so the
+/// next stack drops the merge the same way. The refusal is `undo_unfinished`, and its next step
+/// resumes the undo. All of these must hold:
 ///
 /// 1. the journal's latest entry, a pallet delete included, is marked as an undo started — with a
 ///    delete above it, the next undo restores that pallet first, which can refuse for good, so the
@@ -1009,14 +1012,14 @@ fn is_resumable(entry: &JournalEntry, now: &BayState) -> Result<bool, String> {
 ///    consolidation or pick is not yet the one `before` records: once it is, neither command loses
 ///    anything the undo would put back;
 /// 5. the current pallet's ref reads the entry's `before` or `after` head: moved on by another
-///    writer, the undo's put-back refuses the pallet as moved, and the stack's own refusal of a
-///    bay behind its pallet is the way out instead.
+///    writer, the undo's put-back refuses the pallet as moved, so the refusal would name an undo
+///    that cannot finish (a stack meets its own refusal of a bay behind its pallet instead).
 ///
 /// Journaling is best-effort, so a journal that cannot be read refuses nothing (undo reports it),
 /// and nor does a failed store or ref read in conditions 2, 3 and 5. A failed read of the bay's
 /// own state (its position or merge records, a consolidation's skeleton included) is returned as
 /// the command's error.
-pub fn refuse_a_stack_over_an_unfinished_undo(verb: &str) -> Result<(), CoreError> {
+pub fn refuse_over_an_unfinished_undo(verb: &str) -> Result<(), CoreError> {
     let Ok(Some(entry)) = peek() else { return Ok(()) };
 
     if !entry.undo_started {
@@ -3062,7 +3065,7 @@ mod tests {
             }
             in_journal(entry);
 
-            match refuse_a_stack_over_an_unfinished_undo("stacked") {
+            match refuse_over_an_unfinished_undo("stacked") {
                 Ok(()) => None,
                 Err(CoreError::Refusal { code, next_step, .. }) => Some((code, next_step)),
                 Err(other) => panic!("not a refusal: {}", other),

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use forklift_core::util::{alias_utils, cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, operation_utils, pallet_utils, shift_utils, stocktake_utils};
+use forklift_core::util::{alias_utils, cherry_pick_utils, file_utils, inventory_utils, journal_utils, merge_utils, object_utils, operation_utils, pallet_utils, shift_utils, stocktake_utils};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::{consolidate, merge_abort};
 use crate::output::{self, CommandOutput};
@@ -161,7 +161,10 @@ pub(crate) fn merge_in_progress() -> Result<bool, String> {
 }
 
 /// Refuse a switch of the current pallet while a consolidation or cherry-pick is in progress: it
-/// is completed on the pallet it started on (`stack` refuses it anywhere else).
+/// is completed on the pallet it started on (`stack` refuses it anywhere else). Also refused, as
+/// `undo_unfinished`, while an undo that is putting such a merge back has stopped before the merge
+/// state: the bay then holds the merge's output with no merge recorded, and moved elsewhere, the
+/// undo could no longer resume.
 ///
 /// # Arguments
 /// * `doing` - The switch, as a gerund for the message (e.g. "shifting").
@@ -183,6 +186,8 @@ pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
             doing
         ));
     }
+
+    journal_utils::refuse_over_an_unfinished_undo("changed")?;
 
     Ok(())
 }

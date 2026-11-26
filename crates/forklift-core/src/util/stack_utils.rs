@@ -246,7 +246,7 @@ pub async fn stack_parcel(description: Option<String>,
     // read here as a bay with no merge in progress, and the parcel would drop that merge. A caller
     // passing `expected_base` stacks a merge it has just started itself.
     if expected_base.is_none() {
-        journal_utils::refuse_a_stack_over_an_unfinished_undo("stacked")?;
+        journal_utils::refuse_over_an_unfinished_undo("stacked")?;
     }
 
     let consolidation = merge_utils::read_consolidation_state()?;

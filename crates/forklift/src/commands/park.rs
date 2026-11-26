@@ -51,7 +51,7 @@ pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), St
     // An undo that stopped before it put back the merge its operation completed leaves no merge
     // state for the gate below to see, but the merge's output is in the tree: parked, it would be
     // gone from under the merge state the resumed undo writes back.
-    journal_utils::refuse_a_stack_over_an_unfinished_undo("parked")?;
+    journal_utils::refuse_over_an_unfinished_undo("parked")?;
 
     // Parked, a merge's output would leave its state behind, for a later stack or abort to act on
     // a bay that no longer holds it.
