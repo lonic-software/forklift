@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use crate::error::{CoreError, RefusalCode};
 use crate::globals::bay_root;
 use crate::util::cherry_pick_utils::{self, CherryPickState};
 use crate::util::merge_utils::{self, ConsolidationState, OutOfScopeSkeleton};
@@ -989,6 +990,73 @@ fn is_resumable(entry: &JournalEntry, now: &BayState) -> Result<bool, String> {
     }
 
     Ok(pallet_utils::get_pallet_head(&before.current_pallet)? == before.current_head)
+}
+
+/// Refuses a stack or a park (`verb` names it: "stacked", "parked") over an undo that stopped
+/// after it put the bay's position back and before it put back the consolidation or pick its
+/// entry records: a stack there would record the merge's output as an ordinary parcel, dropping
+/// the pick source's authorship or the merge parent, and a park would take the merged output
+/// away from under the merge state the undo then writes back. The refusal is `undo_unfinished`,
+/// and its next step resumes the undo. All of these must hold:
+///
+/// 1. the journal's latest entry, a pallet delete included, is marked as an undo started — with a
+///    delete above it, the undo would first have to restore that pallet, which can refuse for good;
+/// 2. it is resumable ([`is_resumable`]);
+/// 3. its pick source, if it records one, is still in the store — the undo's own gate refuses it
+///    otherwise ([`check_undoable`]);
+/// 4. the bay's consolidation or pick is not yet the one the entry's `before` records: once it is,
+///    neither command loses anything the undo would put back;
+/// 5. the current pallet's ref reads the entry's `before` or `after` head: moved on by another
+///    writer, the undo's put-back refuses the pallet as moved, and the stack's own refusal of a
+///    bay behind its pallet is the way out instead.
+///
+/// Journaling is best-effort, so a journal that cannot be read refuses nothing (undo reports it),
+/// and nor does a failed store or ref read in conditions 3 and 5. A failed read of the bay's own
+/// state is returned: both commands read it themselves next.
+pub fn refuse_a_stack_over_an_unfinished_undo(verb: &str) -> Result<(), CoreError> {
+    let Ok(Some(entry)) = peek() else { return Ok(()) };
+
+    if !entry.undo_started {
+        return Ok(());
+    }
+
+    let now = BayState::read()?;
+
+    if !is_resumable(&entry, &now).unwrap_or(false)
+        || refuse_a_pick_without_its_source(&entry, true).is_err() {
+        return Ok(());
+    }
+
+    let before = entry.before.bay_state();
+
+    if now.consolidation == before.consolidation && now.cherry_pick == before.cherry_pick {
+        return Ok(());
+    }
+
+    let pallet = &entry.after.current_pallet;
+
+    match pallet_utils::get_pallet_head(pallet) {
+        Ok(head) if head.as_ref() == entry.before.head(pallet) || head.as_ref() == entry.after.head(pallet) => {},
+        _ => return Ok(()),
+    }
+
+    let merge = match (&entry.before.consolidation, &entry.before.cherry_pick) {
+        (Some(consolidation), _) => format!("the consolidation of \"{}\"", crate::error::sanitize(&consolidation.their_pallet)),
+        (None, Some(pick)) => format!("the pick of {}", pick.source),
+        (None, None) => "the merge state".to_string(),
+    };
+
+    Err(CoreError::refusal(
+        RefusalCode::UndoUnfinished,
+        format!(
+            "An undo of the last \"{}\" on pallet \"{}\" stopped before it finished: this bay stands \
+            where it stood before that operation, but {} that the operation completed is not in \
+            progress again yet. Nothing was {}. Running the undo again finishes it and puts {} back \
+            in progress; to make a plain parcel instead, abort the merge once it is back.",
+            entry.op, crate::error::sanitize(pallet), merge, verb, merge
+        ),
+        "forklift undo",
+    ))
 }
 
 /// Refuses, in a served warehouse, an undo whose put-back the ref core would refuse as moving a

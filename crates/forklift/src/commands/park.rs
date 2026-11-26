@@ -8,7 +8,7 @@ use forklift_core::util::shift_utils::{Applied, FileOp};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use serde::Serialize;
 use forklift_core::util::{
-    alias_utils, cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
+    alias_utils, cherry_pick_utils, config_utils, file_utils, inventory_utils, journal_utils, load_guard_utils, merge_utils, object_utils,
     operation_utils, pallet_utils, park_utils, redaction_utils, scope_utils, shift_utils, sign_utils, stack_utils,
     tree_utils,
 };
@@ -47,6 +47,11 @@ pub async fn park_changes(name: Option<&str>, paths: &[String]) -> Result<(), St
     // Parked parcels are parcels: once trust is established they are signed too.
     // Park writes no pallet head, so only the key is kept.
     let signing_key_id = stack_utils::resolve_signing_key(&operator)?.key_id().map(str::to_string);
+
+    // An undo that stopped before it put back the merge its operation completed leaves no merge
+    // state for the gate below to see, but the merge's output is in the tree: parked, it would be
+    // gone from under the merge state the resumed undo writes back.
+    journal_utils::refuse_a_stack_over_an_unfinished_undo("parked")?;
 
     // Parked, a merge's output would leave its state behind, for a later stack or abort to act on
     // a bay that no longer holds it.

@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 60;
+pub const SCHEMA_VERSION: u32 = 61;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -645,6 +645,9 @@ error_codes! {
 
     /// A parcel stacked after trust carries no signature.
     SignatureMissing,
+
+    /// An undo stopped before it put back the merge its operation completed; nothing was changed.
+    UndoUnfinished,
 }
 
 impl ErrorCode {
@@ -723,6 +726,7 @@ impl ErrorCode {
             ErrorCode::TrustDamaged => RefusalCode::TrustDamaged.as_str(),
             ErrorCode::SignatureDamaged => RefusalCode::SignatureDamaged.as_str(),
             ErrorCode::SignatureMissing => RefusalCode::SignatureMissing.as_str(),
+            ErrorCode::UndoUnfinished => RefusalCode::UndoUnfinished.as_str(),
         }
     }
 
@@ -804,6 +808,7 @@ impl ErrorCode {
             ErrorCode::TrustDamaged => 69,
             ErrorCode::SignatureDamaged => 70,
             ErrorCode::SignatureMissing => 71,
+            ErrorCode::UndoUnfinished => 72,
         }
     }
 
@@ -980,7 +985,9 @@ impl ErrorCode {
             ErrorCode::SignatureDamaged =>
                 "A parcel's stored signature, in its sidecar or a signature table, cannot be read, does not parse, or names a format version this Forklift does not read, so what signed the parcel cannot be told. Restore the warehouse's objects from a backup, or clone it again from a remote that holds the parcel",
             ErrorCode::SignatureMissing =>
-                "A parcel stacked after trust was established carries no signature. A lost signature and a stripped one look alike, so the warehouse may have been tampered with"
+                "A parcel stacked after trust was established carries no signature. A lost signature and a stripped one look alike, so the warehouse may have been tampered with",
+            ErrorCode::UndoUnfinished =>
+                "A stack or a park met an undo that stopped before it finished: the bay stands where it stood before the undone operation, but the consolidation or pick that operation completed is not in progress again yet. Nothing was changed; running undo again finishes it and puts the merge back in progress"
         }
     }
 
@@ -1061,6 +1068,7 @@ impl ErrorCode {
             RefusalCode::TrustDamaged => ErrorCode::TrustDamaged,
             RefusalCode::SignatureDamaged => ErrorCode::SignatureDamaged,
             RefusalCode::SignatureMissing => ErrorCode::SignatureMissing,
+            RefusalCode::UndoUnfinished => ErrorCode::UndoUnfinished,
         }
     }
 }
@@ -1725,6 +1733,7 @@ mod tests {
             (RefusalCode::TrustDamaged, "trust_damaged", 69),
             (RefusalCode::SignatureDamaged, "signature_damaged", 70),
             (RefusalCode::SignatureMissing, "signature_missing", 71),
+            (RefusalCode::UndoUnfinished, "undo_unfinished", 72),
             (RefusalCode::WarehouseLocked, "warehouse_locked", 6),
             (RefusalCode::StoreLocked, "store_locked", 6),
             (RefusalCode::ServeLocked, "serve_locked", 6),
