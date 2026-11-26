@@ -147,10 +147,6 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   writing it stopped before it removed the ref. Before, a plainly named one kept heal refusing,
   and every command that records anything refused with it. A name that matches an object the
   store holds is still settled before this, as before.
-- **`heal --remove-ref` numbers a pallet's later keepsakes `<name>+1`, `<name>+2`, …** under
-  `.forklift/removed-refs`, where it used `<name>.1`, a name that was also the first keepsake of a
-  pallet called `<name>.1`. Every keepsake's name now gives the one pallet it was taken from. A
-  keepsake kept before this under a `.<n>` name now reads as that dotted pallet's.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
@@ -430,7 +426,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   names nothing, or records the pallet as deleted, `heal` changes nothing, exits 53 and lists every
   head it found; `heal --ref <pallet>=<parcel>` then sets the ref, and `heal --remove-ref <pallet>`
   drops an unreadable ref that nothing names a head for, keeping its bytes under
-  `.forklift/removed-refs`. A lost ref that no checkout stands on is not found.
+  `.forklift/removed-refs` (as `<pallet>`, and a later removal of the same pallet as
+  `<pallet>+1`, `<pallet>+2`, …, with `/` written `%2F`). A lost ref that no checkout stands on is not found.
 
 - **Losing the warehouse marker no longer loses the warehouse.** `.forklift/warehouse` now ends
   in a digest of its own bytes and is kept twice, beside `.forklift/warehouse-copy`, each written
