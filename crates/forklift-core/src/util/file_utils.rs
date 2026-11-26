@@ -935,6 +935,7 @@ impl SyncDirFaultGuard {
     pub(crate) fn recording() -> Self {
         // Before arming: a panic here must leave nothing armed.
         let syncs = real_syncs();
+        reset_sync_dir_counters();
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
         SyncDirFaultGuard { _syncs: syncs }
     }
@@ -944,6 +945,7 @@ impl SyncDirFaultGuard {
     pub(crate) fn failing(needle: &str) -> Self {
         // Before arming: a panic here must leave nothing armed.
         let syncs = real_syncs();
+        reset_sync_dir_counters();
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
@@ -957,6 +959,7 @@ impl SyncDirFaultGuard {
     pub(crate) fn failing_exactly(dir: &Path) -> Self {
         // Before arming: a panic here must leave nothing armed.
         let syncs = real_syncs();
+        reset_sync_dir_counters();
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(dir.to_string_lossy().into_owned()),
@@ -982,11 +985,18 @@ impl SyncDirFaultGuard {
     }
 }
 
+/// Clears [`SYNC_DIR_FAULTS_LEFT`] and [`SYNC_DIR_MATCHES_TO_PASS`]: every [`SyncDirFaultGuard`]
+/// constructor does, before arming, and so does its `Drop`.
+#[cfg(test)]
+fn reset_sync_dir_counters() {
+    SYNC_DIR_MATCHES_TO_PASS.with(|pass| pass.set(0));
+    SYNC_DIR_FAULTS_LEFT.with(|left| left.set(None));
+}
+
 #[cfg(test)]
 impl Drop for SyncDirFaultGuard {
     fn drop(&mut self) {
-        SYNC_DIR_MATCHES_TO_PASS.with(|pass| pass.set(0));
-        SYNC_DIR_FAULTS_LEFT.with(|left| left.set(None));
+        reset_sync_dir_counters();
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
     }
 }
