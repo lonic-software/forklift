@@ -198,7 +198,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   skeleton, it names the step the refusal over that state names there: `forklift heal` where a
   copy can be written back, else `forklift abort` or `forklift abort --keep-files`. Before, any
   of these kept heal refusing, and an interrupted consolidation's own recovery, which waits for
-  heal's taint recovery, could never run.
+  heal's taint recovery, could never run. A lost pick state (`.forklift/cherry-pick`, or a
+  bay's), or its copy, is now cleared the same way: a lost state reads as no pick in progress,
+  and its note names the same ways out as a lost consolidation state's, except that where no
+  marker stands it names the one command whose failed write of one can be left there, a
+  `forklift undo` putting a pick back. Before, it kept heal refusing, and an interrupted pick's own recovery could never run.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
