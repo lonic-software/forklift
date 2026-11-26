@@ -34,7 +34,7 @@ use crate::util::shift_utils::{self, CarriedEntry, CarriedItem, FileOp, TreeProv
 use crate::util::{cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, park_utils, path_utils, record_utils};
 
 /// The name of the marker file in the bay-local state dir.
-const FILE_NAME_OPERATION: &str = "operation";
+pub(crate) const FILE_NAME_OPERATION: &str = "operation";
 
 /// The [`record_utils`] kind and version of the marker file.
 const OPERATION_RECORD: &str = "operation";

@@ -191,10 +191,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   or a bay's), or a lost copy of either, is cleared the same way, with a note. A lost state reads
   as no consolidation in progress, as it would without the loss, and where no interrupted
   operation's marker stands there, the note says to run again a command that failed there before
-  the heal. A lost skeleton's note says what the state beside it
-  reads. For a checkout other than the one heal runs in, the note names `forklift heal` run there
-  when an interrupted operation's marker stands there, or when a state stands beside a lost
-  skeleton. Before, any of these kept heal refusing, and an interrupted consolidation's own
+  the heal; where a skeleton still stands beside the lost state, the note says so. A lost
+  skeleton's note says what the state beside it reads, and, for a newer Forklift's state, that
+  the way out is that Forklift. For a checkout other than the one heal runs in, the note names
+  `forklift heal` run there when an interrupted operation's marker stands there; beside a lost
+  skeleton, it names the step the refusal over that state names there: `forklift heal` where a
+  copy can be written back, else `forklift abort` or `forklift abort --keep-files`. Before, any of these kept heal refusing, and an interrupted consolidation's own
   recovery, which waits for heal's taint recovery, could never run.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
