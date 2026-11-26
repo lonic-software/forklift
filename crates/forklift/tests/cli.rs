@@ -11774,12 +11774,20 @@ fn spike_619_stack_over_a_stopped_undo_of_a_consolidation() {
 
     stop_the_undo_before_its_merge_state(&warehouse, &stacked,
         &["consolidation", "consolidation-copy", "consolidation-skeleton", "consolidation-skeleton-copy"]);
+    assert!(!warehouse.root.join(".forklift/consolidation").exists());
+
+    let resume = std::env::var("SPIKE_619_RESUME").is_ok();
+    if resume {
+        assert_success(&warehouse.run(&["undo"]));
+        assert!(warehouse.root.join(".forklift/consolidation").exists(), "the resumed undo put the consolidation back");
+    }
 
     let restacked = warehouse.run(&["stack", "-m", "restacked"]);
     assert_success(&restacked);
     let history = json(&warehouse.run(&["--json", "history"]));
     let top = &history["data"]["entries"][0];
-    assert!(top["consolidates"].as_array().map_or(true, |parents| parents.is_empty()), "DEFECT: single-parent: {}", top);
+    assert_eq!(top["parents"].as_array().map_or(0, |parents| parents.len()), if resume { 2 } else { 1 },
+        "the merge parent is kept only after the resume: {}", top);
 }
 
 // A parcel with no description (a git commit imported with an empty message) is picked only with
