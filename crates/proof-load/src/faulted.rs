@@ -1048,7 +1048,8 @@ fn settled_by(last: Option<&Outcome>, settled: &HistoryReadback, faulted: Mark) 
 /// Whether `last`, the latest command run, answered and asked nothing further: it exited (a kill
 /// is no answer), and either succeeded or refused with a failure document naming no remedy and
 /// nothing unreadable as one, as a re-stack of a record already made is refused with nothing left
-/// to stack. A crash with no failure document is no answer, and neither is a refusal because
+/// to stack. A crash with no failure document is no answer (the run lists it on its own, through
+/// [`crate::report::Completeness::crashes`]), and neither is a refusal because
 /// another process still holds a lock: it says the command did not run, not what it would answer.
 fn answered(last: Option<&Outcome>) -> bool {
     last.is_some_and(|outcome| outcome.succeeded() || (outcome.exit.is_some() && outcome.failure.as_ref()

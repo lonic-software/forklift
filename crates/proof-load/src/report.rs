@@ -376,6 +376,26 @@ impl Row {
     /// Refuses a row with no details, a `detail` without its `#`, a file name that leaves `out`,
     /// and a file, pointer or steps that cannot be read, saying which.
     pub fn steps(&self, out: &std::path::Path) -> Result<Vec<Outcome>, String> {
+        let (path, pointer, object) = self.details(out)?;
+        let steps = object.get("steps").ok_or_else(|| format!("{} holds no steps at `{}`", path.display(), pointer))?;
+        serde_json::from_value(steps.clone()).map_err(|error| format!("the steps in {} at `{}` cannot be read: {}", path.display(), pointer, error))
+    }
+
+    /// Every command recorded anywhere in the object the row's details point at that crashed:
+    /// exited 101, the status a Rust program exits with when it panics, and left no failure
+    /// document. That covers the steps, the readbacks and the harness's probes alike, since each
+    /// is written as an object with `arguments`, `exit`, `stderr` and `failure`. Each is named by
+    /// its arguments and the line of its stderr that says it panicked (else its first line).
+    /// Refuses as [`Row::steps`] does.
+    pub fn crashed(&self, out: &std::path::Path) -> Result<Vec<String>, String> {
+        let (_, _, object) = self.details(out)?;
+        let mut crashed = Vec::new();
+        crashes_in(&object, &mut crashed);
+        Ok(crashed)
+    }
+
+    /// The file `detail` names under `out`, its JSON pointer, and the object the pointer picks.
+    fn details(&self, out: &std::path::Path) -> Result<(std::path::PathBuf, String, serde_json::Value), String> {
         let detail = self.detail.as_deref().ok_or("the run wrote no details for this row")?;
         let (file, pointer) = detail.split_once('#').ok_or_else(|| format!("the row's details `{}` name no JSON pointer", detail))?;
         let relative = std::path::Path::new(file);
@@ -384,10 +404,34 @@ impl Row {
         }
         let path = out.join(relative);
         let text = std::fs::read_to_string(&path).map_err(|error| format!("cannot read {}: {}", path.display(), error))?;
-        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| format!("{} is not JSON: {}", path.display(), error))?;
-        let object = value.pointer(pointer).ok_or_else(|| format!("{} holds nothing at `{}`", path.display(), pointer))?;
-        let steps = object.get("steps").ok_or_else(|| format!("{} holds no steps at `{}`", path.display(), pointer))?;
-        serde_json::from_value(steps.clone()).map_err(|error| format!("the steps in {} at `{}` cannot be read: {}", path.display(), pointer, error))
+        let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|error| format!("{} is not JSON: {}", path.display(), error))?;
+        let object = value.pointer_mut(pointer).map(serde_json::Value::take).ok_or_else(|| format!("{} holds nothing at `{}`", path.display(), pointer))?;
+        Ok((path, pointer.to_string(), object))
+    }
+}
+
+/// The exit status of a Rust program that panicked.
+const PANIC_EXIT: i64 = 101;
+
+/// Appends to `crashed` each command under `value` that exited [`PANIC_EXIT`] with no failure
+/// document. Within an object the fields are walked in key order, not in the order written.
+fn crashes_in(value: &serde_json::Value, crashed: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let command = object.get("arguments").and_then(serde_json::Value::as_array).zip(object.get("stderr").and_then(serde_json::Value::as_array));
+            if let Some((arguments, stderr)) = command {
+                if object.get("exit").and_then(serde_json::Value::as_i64) == Some(PANIC_EXIT) && object.get("failure").is_none_or(serde_json::Value::is_null) {
+                    let arguments: Vec<&str> = arguments.iter().filter_map(serde_json::Value::as_str).collect();
+                    let bytes: Vec<u8> = stderr.iter().filter_map(|byte| byte.as_u64().and_then(|byte| u8::try_from(byte).ok())).collect();
+                    let text = String::from_utf8_lossy(&bytes);
+                    let said = text.lines().find(|line| line.contains("panicked at")).or_else(|| text.lines().find(|line| !line.trim().is_empty())).unwrap_or("nothing on stderr");
+                    crashed.push(format!("{:?} exited {} with no failure document: {}", arguments, PANIC_EXIT, said.trim()));
+                }
+            }
+            object.values().for_each(|inner| crashes_in(inner, crashed));
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|inner| crashes_in(inner, crashed)),
+        _ => {}
     }
 }
 
@@ -405,6 +449,23 @@ pub struct Completeness {
 }
 
 impl Completeness {
+    /// Whether forklift crashed anywhere the run recorded: every command in the details of each of
+    /// forklift's `rows` that [`Row::crashed`] finds, with the row it belongs to, and each row whose
+    /// details cannot be read, since what it ran cannot be checked. A crash is never graded as an
+    /// answer, so without this check a panic on a retry reads as a command that claimed nothing.
+    /// Git's rows are not read: git does not panic.
+    pub fn crashes<'a>(rows: impl IntoIterator<Item = &'a Row>, out: &std::path::Path) -> Completeness {
+        let mut missing = Vec::new();
+        for row in rows.into_iter().filter(|row| row.subject == Tool::Forklift) {
+            let detail = row.detail.as_deref().unwrap_or("none");
+            match row.crashed(out) {
+                Ok(crashed) => missing.extend(crashed.into_iter().map(|crash| format!("{} (details {}): {}", row.scenario, detail, crash))),
+                Err(error) => missing.push(format!("{} (details {}): its commands cannot be checked: {}", row.scenario, detail, error)),
+            }
+        }
+        Completeness { subject: Some(Tool::Forklift), check: "commands ran without a crash".to_string(), cell: Cell::Run, missing }
+    }
+
     /// The wall-clock budget: a run that took longer than `budget` fails, though every scenario
     /// ran, so a slow scenario is noticed rather than dropped. No budget given is not run.
     pub fn budget(elapsed: std::time::Duration, budget: Option<std::time::Duration>) -> Completeness {
@@ -1039,6 +1100,48 @@ mod tests {
 
     fn row_at(detail: Option<&str>) -> Row {
         Row { subject: Tool::Forklift, detail: detail.map(str::to_string), ..sample().rows.remove(0) }
+    }
+
+    /// A forklift row whose retry panicked fails the run through the crash check, which names the
+    /// row, the command and the panic, and so does a panic in a readback's reads, written by
+    /// `HistoryReadback`'s own serializer. A refusal with a failure document, a kill, a clean
+    /// row and a git row's panic name nothing; a row whose details cannot be read is named.
+    ///
+    /// Revert: in `crashes_in`, compare the exit with 1 in place of 101 → the panics are not named.
+    #[test]
+    fn a_crash_anywhere_in_forklifts_details_fails_the_run() {
+        let out = folder("crash");
+        let panicked = |arguments: &[&str]| Outcome {
+            stderr: b"warning: slow disk\nthread 'forklift-main' panicked at crates/x.rs:1:1:\nan undeclared taint shape\n".to_vec(), ..step(arguments, 101)
+        };
+        let documented = Outcome { failure: Some(crate::tool::Failure { code: "parcel_damaged".into(), message: "m".into(), next_step: None }), ..step(&["load", "."], 101) };
+        let killed = Outcome { exit: None, ..step(&["stack", "-m", "r"], 0) };
+        let readback = crate::faulted::HistoryReadback { export: step(&["export"], 0), records: vec![], parked: None, reads: vec![step(&["bay", "add"], 0), panicked(&["bay", "open"])] };
+        let faulted = crate::faulted::Faulted {
+            scenario: "s".into(), name: "forklift".into(), warehouse: Warehouse::Client, kind: Kind::Truncate, target: "t".into(), grade: Grade::RefusedNoRemedy,
+            evidence: Default::default(), recoverability: Default::default(),
+            // The faulted command refused with its document, then the retry panicked.
+            steps: vec![documented, panicked(&["stack", "-m", "r"]), killed],
+            readbacks: vec![readback], probes: vec![], unextractable: vec![], unreached: None,
+        };
+        std::fs::write(out.join("crashed.json"), serde_json::to_string(&faulted).expect("serialized")).expect("written");
+        std::fs::write(out.join("clean.json"), serde_json::json!({"graded": {"steps": [step(&["heal"], 0), step(&["load", "."], 2)]}}).to_string()).expect("written");
+        let row = |subject: Tool, scenario: &str, detail: &str| Row { subject, scenario: scenario.into(), ..row_at(Some(detail)) };
+        let rows = [row(Tool::Forklift, "crashed", "crashed.json#"), row(Tool::Git, "git", "crashed.json#"), row(Tool::Forklift, "clean", "clean.json#/graded")];
+        let check = Completeness::crashes(&rows, &out);
+        let panic = "with no failure document: thread 'forklift-main' panicked at crates/x.rs:1:1:";
+        assert_eq!(check.missing, vec![
+            format!("crashed (details crashed.json#): [\"bay\", \"open\"] exited 101 {}", panic),
+            format!("crashed (details crashed.json#): [\"stack\", \"-m\", \"r\"] exited 101 {}", panic),
+        ]);
+        assert_eq!((check.subject, check.check.as_str(), &check.cell), (Some(Tool::Forklift), "commands ran without a crash", &Cell::Run));
+        assert!(Report { completeness: vec![check], ..sample() }.failed(), "a crash fails the run");
+        let clean = Completeness::crashes(&rows[1..], &out);
+        assert_eq!(clean.missing, Vec::<String>::new());
+        assert!(!Report { completeness: vec![clean], ..sample() }.failed(), "the same report without the crash passes");
+        let unread = Completeness::crashes(&[row(Tool::Forklift, "gone", "gone.json#")], &out);
+        assert_eq!(unread.missing.len(), 1);
+        assert!(unread.missing[0].starts_with("gone (details gone.json#): its commands cannot be checked: cannot read "), "{:?}", unread.missing);
     }
 
     /// A row's steps are the ones at its pointer, in its file under the run's folder: a details
