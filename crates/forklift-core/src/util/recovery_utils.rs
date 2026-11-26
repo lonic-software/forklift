@@ -956,6 +956,22 @@ async fn resolve_the_rest(
                     ));
                 }
             },
+            // A gone mirror roots record reads as an empty one, as it does with no taint (see
+            // `VanishedClass::MirrorRoots`), so its absence is made durable and the record
+            // resolved, with a note saying what the absence gives up.
+            VanishedClass::MirrorRoots => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => {
+                    refs_resolved.push(relative.to_string_lossy().replace('\\', "/"));
+                    vanished_notes.push(lost_mirror_roots_note(relative));
+                }
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost mirror roots record whose loss could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy().replace('\\', "/"), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1676,7 +1692,7 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
             | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy | Disposition::Scope
             | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy | Disposition::Journal
-            | Disposition::BayPath | Disposition::FetchScope | Disposition::FetchLedger)
+            | Disposition::BayPath | Disposition::FetchScope | Disposition::FetchLedger | Disposition::MirrorRoots)
             | None => false,
     }
 }
@@ -1966,6 +1982,22 @@ enum VanishedClass {
     /// verified at the fetch scope then (`pallet_utils::verify_new_head`). So keeping the record
     /// would guard nothing the absence does not already settle.
     FetchLedger,
+    /// The git mirror's roots record (`mirror-roots`), gone since the taint was recorded. It is
+    /// written only by `git mirror` and a lift's mirror trigger: rebuilt from the exported refs
+    /// when it cannot be read, written with each pallet's root before its push, put back after a
+    /// takedown refusal, and pruned to the configured pallets by a run's last write
+    /// (`mirror_utils::write_mirror_roots`, `update_mirror_roots`, `put_back_mirror_roots`,
+    /// `put_back_owed_roots`); no command removes it, and no heal pass writes it. Its reader takes
+    /// a missing one as empty (`mirror_utils::read_mirror_roots`), taint or none, which is also
+    /// the state deleting an unreadable one leaves, the step its refusal names. What an empty
+    /// record gives up is keeping the parcels it named from gc; a later mirror run records a root
+    /// only for a pallet it exports, so a pallet it skips or refuses before exporting stays
+    /// unrooted. Keeping the taint would hold them only by keeping gc refused: the record reads
+    /// the same either way, and nothing puts it back while the taint stands. The ordinary write is
+    /// refused, a missing record is not rebuilt, and a takedown's compensating put-backs write
+    /// only what the run loaded or recorded itself, so a lost entry comes back only for a pallet
+    /// the run exported.
+    MirrorRoots,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -2009,6 +2041,7 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
             .map(|name| VanishedClass::BayPath(name.to_string())),
         Disposition::FetchScope => Some(VanishedClass::FetchScope),
         Disposition::FetchLedger => Some(VanishedClass::FetchLedger),
+        Disposition::MirrorRoots => Some(VanishedClass::MirrorRoots),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
@@ -2269,6 +2302,17 @@ fn lost_fetch_ledger_note(relative: &Path) -> String {
             lost, error.trim_end_matches('.')
         ),
     }
+}
+
+/// The note for a resolved [`VanishedClass::MirrorRoots`]: what reading the record as empty gives
+/// up, and what records it again.
+fn lost_mirror_roots_note(relative: &Path) -> String {
+    format!(
+        "the git mirror's roots record \"{}\" is gone; Forklift reads a missing one as an empty one, as it \
+        would with no taint, so the record no longer keeps the history it named from gc, and a later mirror run \
+        records a root again only for a pallet it exports",
+        relative.to_string_lossy().replace('\\', "/")
+    )
 }
 
 /// The bays folder's entry named exactly `name`: `None` when there is none, else whether it is a
@@ -7298,6 +7342,7 @@ mod tests {
             VanishedClass::BayPath(name) => format!("bay path {}", name),
             VanishedClass::FetchScope => "fetch scope".to_string(),
             VanishedClass::FetchLedger => "fetch ledger".to_string(),
+            VanishedClass::MirrorRoots => "mirror roots".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -7354,7 +7399,7 @@ mod tests {
             ("config/fetch-scope".into(), "fetch scope"),
             ("fetched-heads".into(), "fetch ledger"),
             ("held-heads".into(), "kept: the held-heads record"),
-            ("mirror-roots".into(), "kept: the mirror roots record"),
+            ("mirror-roots".into(), "mirror roots"),
             ("served".into(), "kept: the served record"),
             ("tombstones".into(), "kept: the tombstones record"),
             ("unvouched-heads".into(), "kept: the unvouched-heads record"),
@@ -7972,6 +8017,72 @@ mod tests {
                 "{:?}: {:?}", mode, outcome.notes);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
             assert!(!forklift.join(relative).exists(), "{:?}: heal writes no fetch ledger back", mode);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost mirror roots record is resolved with a note. It is lost as a write loses it: the
+    /// record's birth write fails its folder sync, which taints it, and a power loss then undoes
+    /// the birth. Where the absence cannot be made durable, the record stays and heal refuses.
+    ///
+    /// Revert: the shape's disposition back to `None` → both rows refuse → red. Revert: resolve
+    /// without `sync_nearest_ancestor` → the failing-sync row clears → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_mirror_roots_record_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        // (whether the absence can be made durable; the note, or the refusal's line where it cannot)
+        let cases: &[(bool, &str)] = &[
+            (true, "the git mirror's roots record \"mirror-roots\" is gone; Forklift reads a missing one as an \
+                empty one, as it would with no taint, so the record no longer keeps the history it named from gc, \
+                and a later mirror run records a root again only for a pallet it exports"),
+            (false, "a lost mirror roots record whose loss could not be made durable: \"mirror-roots\""),
+        ];
+
+        for (durable, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-mirror-roots-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+            let relative = mirror_utils::FILE_NAME_MIRROR_ROOTS;
+
+            {
+                let _fault = SyncDirFaultGuard::failing_exactly(&forklift);
+                mirror_utils::write_mirror_roots(&[("main".to_string(), "a".repeat(64))].into())
+                    .expect_err("a record write whose folder sync fails fails");
+            }
+            assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                [PathBuf::from(relative)].into_iter().collect(), "the record alone is recorded");
+            let _ = crate::util::file_utils::remove_file(&forklift.join(relative));
+            assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+            if !*durable {
+                // Once: the forklift root is also the folder heal's own record writes sync.
+                let _fault = SyncDirFaultGuard::failing_exactly_once(&forklift);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[*note]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("a lost mirror roots record is resolved: {}", error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative], "{:?}", outcome);
+            assert!(outcome.notes.iter().any(|said| said == note), "{:?}", outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            assert!(!forklift.join(relative).exists(), "heal writes no mirror roots record back");
+            assert!(mirror_utils::read_mirror_roots().unwrap().is_empty(), "the record reads as an empty one");
 
             crate::util::file_utils::remove_dir_all(&root).ok();
         }
