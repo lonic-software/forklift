@@ -889,6 +889,25 @@ async fn resolve_the_rest(
                     }
                 }
             }
+            // A gone journal reads as an empty one, here as with no taint (see
+            // `VanishedClass::Journal`), so its absence is made durable and the record resolved.
+            VanishedClass::Journal => match sync_nearest_ancestor(root, relative) {
+                Ok(()) => {
+                    refs_resolved.push(relative.to_string_lossy().into_owned());
+                    vanished_notes.push(format!(
+                        "the undo journal \"{}\" is gone; it reads as an empty journal, as it would with \
+                        no taint: undo finds nothing to undo there, and it keeps no deleted pallet's head",
+                        relative.to_string_lossy()
+                    ));
+                }
+                Err(error) => {
+                    remainder.insert(relative.clone());
+                    dangling_lines.push(format!(
+                        "a lost undo journal whose loss could not be made durable: \"{}\" ({})",
+                        relative.to_string_lossy(), error
+                    ));
+                }
+            },
             VanishedClass::Shard => shard_vanished.push(relative.clone()),
             VanishedClass::PackData(stem) | VanishedClass::PackIndex(stem) => { pack_stems.insert(stem); }
             // A signature is never an object reference, so losing one can only lose that
@@ -1608,7 +1627,8 @@ fn rescan_walks_cover(relative: &Path, listed: &BTreeSet<PathBuf>) -> bool {
         // A loose signature sidecar is skipped by the loose walk (`walk_loose_object_paths`).
         Some(Disposition::Signature | Disposition::Ref | Disposition::MetaRef | Disposition::MetaCopy | Disposition::Keepsake
             | Disposition::LoadMarker | Disposition::Position | Disposition::PositionCopy | Disposition::Scope
-            | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy) | None => false,
+            | Disposition::ScopeCopy | Disposition::MergeRecord | Disposition::MergeRecordCopy | Disposition::Journal)
+            | None => false,
     }
 }
 
@@ -1853,6 +1873,18 @@ enum VanishedClass {
     /// The copy of a consolidation state, skeleton or pick state, gone since the taint was
     /// recorded. Only heal reads a copy, to write a damaged record back (`merge_state_heal::repair`).
     MergeRecordCopy,
+    /// A checkout's undo journal (`journal.json`, or a bay's), gone since the taint was recorded.
+    /// Every write of it replaces the file whole (`journal_utils::write_as`), and a replacement
+    /// undone by a power loss leaves the journal it replaced, so of its writes only one that
+    /// created the file can leave it gone. Besides those, `bay_utils::remove_bay_state` removes a
+    /// bay's journal with its folder, and a user may remove one, as the refusal of an unreadable
+    /// journal says to; either loses the same with no taint. Heal never writes it. A delete's
+    /// entry is appended before the ref is unlinked, and an append that fails stops the removal
+    /// (`pallet_utils::remove_pallet_head_in`), so a delete whose ref is gone is recorded in a
+    /// journal whose name is durable; an undo's start mark rewrites a journal that stands. A
+    /// missing journal reads as an empty one (`journal_utils::read_in`), taint or none, so keeping
+    /// the record would guard nothing the absence does not already settle.
+    Journal,
     /// A declared shape heal has no recovery for; the shape's description. Kept in the
     /// remainder, with a line saying only what is gone.
     Undisposed(&'static str),
@@ -1891,6 +1923,7 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
         Disposition::ScopeCopy => Some(VanishedClass::ScopeCopy),
         Disposition::MergeRecord => Some(VanishedClass::MergeRecord),
         Disposition::MergeRecordCopy => Some(VanishedClass::MergeRecordCopy),
+        Disposition::Journal => Some(VanishedClass::Journal),
     };
 
     class.unwrap_or(VanishedClass::Unrecognized)
@@ -2346,7 +2379,10 @@ fn keepsake_ref_standing(relative: &Path) -> Result<Option<String>, String> {
 /// pallet's emptied parent folders may be gone too, and the first surviving one holds the last
 /// entry the removal changed.
 fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
-    let mut dir = relative.parent();
+    // A top-level path's parent is the empty path. It is skipped, so the folder synced below is
+    // spelled exactly `root`, not `root` with a trailing separator: the same folder either way,
+    // but a sync fault or record keyed by the root's path matches only the first spelling.
+    let mut dir = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
 
     while let Some(candidate) = dir {
         let absolute = root.join(candidate);
@@ -2355,7 +2391,7 @@ fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
             return file_utils::sync_dir(&absolute);
         }
 
-        dir = candidate.parent();
+        dir = candidate.parent().filter(|parent| !parent.as_os_str().is_empty());
     }
 
     file_utils::sync_dir(root)
@@ -7068,6 +7104,7 @@ mod tests {
             VanishedClass::ScopeCopy => "scope copy".to_string(),
             VanishedClass::MergeRecord => "merge record".to_string(),
             VanishedClass::MergeRecordCopy => "merge record copy".to_string(),
+            VanishedClass::Journal => "journal".to_string(),
             VanishedClass::Undisposed(description) => format!("kept: {}", description),
             VanishedClass::Unrecognized => "unrecognized".to_string(),
         }
@@ -7105,7 +7142,7 @@ mod tests {
             ("consolidation-copy".into(), "merge record copy"),
             ("consolidation-skeleton".into(), "merge record"),
             ("consolidation-skeleton-copy".into(), "merge record copy"),
-            ("journal.json".into(), "kept: the journal"),
+            ("journal.json".into(), "journal"),
             ("bays/main/inventory/incomplete-load".into(), "load marker"),
             ("bays/main/position".into(), "position"),
             ("bays/main/position-copy".into(), "position copy"),
@@ -7115,7 +7152,7 @@ mod tests {
             ("bays/main/consolidation-copy".into(), "merge record copy"),
             ("bays/main/consolidation-skeleton".into(), "merge record"),
             ("bays/main/consolidation-skeleton-copy".into(), "merge record copy"),
-            ("bays/main/journal.json".into(), "kept: a bay's journal"),
+            ("bays/main/journal.json".into(), "journal"),
             ("bays/main/path".into(), "kept: a bay's path record"),
             ("bays/main/cherry-pick".into(), "merge record"),
             ("bays/main/cherry-pick-copy".into(), "merge record copy"),
@@ -7354,6 +7391,88 @@ mod tests {
             let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
             assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
             assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "{}: nothing may remain recorded", relative);
+
+            crate::util::file_utils::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A lost undo journal of either shape is resolved with a note, and reads as an empty journal.
+    /// The main tree's is lost as a delete's first append loses it: the append fails its folder
+    /// sync, which taints the journal and stops the removal, and a power loss then undoes the
+    /// journal's birth. A bay's is planted. Where the absence cannot be made durable, the record
+    /// stays and heal refuses.
+    ///
+    /// Revert: either journal shape's disposition back to `None` → its rows refuse → red. Revert:
+    /// resolve without `sync_nearest_ancestor` → the failing-sync rows clear → red.
+    #[test]
+    #[cfg(unix)]
+    fn heal_resolves_a_lost_journal_of_either_shape_once_its_absence_is_durable() {
+        use crate::globals::StorageRootScope;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        // (the path recorded, whether heal can make its absence durable, the note, or the
+        // refusal's line where it cannot)
+        let cases: &[(&str, bool, &str)] = &[
+            ("journal.json", true, "the undo journal \"journal.json\" is gone; it reads as an empty journal, as it \
+                would with no taint: undo finds nothing to undo there, and it keeps no deleted pallet's head"),
+            ("journal.json", false, "a lost undo journal whose loss could not be made durable: \"journal.json\""),
+            ("bays/b/journal.json", true, "the undo journal \"bays/b/journal.json\" is gone; it reads as an empty \
+                journal, as it would with no taint: undo finds nothing to undo there, and it keeps no deleted \
+                pallet's head"),
+            ("bays/b/journal.json", false, "a lost undo journal whose loss could not be made durable: \
+                \"bays/b/journal.json\""),
+        ];
+
+        for (relative, durable, note) in cases {
+            let _serial = lock_activation();
+            taint_utils::activate();
+
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("forklift-recovery-utils-lost-journal-{}-{}", std::process::id(), nanos));
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let _scope = StorageRootScope::enter(&root);
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+            let forklift = forklift_root();
+
+            let folder = forklift.join(relative).parent().unwrap().to_path_buf();
+            if *relative == "journal.json" {
+                pallet_utils::create_position_if_not_exists().unwrap();
+                let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
+                let entry = crate::util::journal_utils::delete_entry_for_test("side", &"1".repeat(64));
+                {
+                    let _fault = SyncDirFaultGuard::failing_exactly(&folder);
+                    crate::util::journal_utils::append_in_hold(&lock, &entry).expect_err("an append whose folder sync fails fails");
+                }
+                drop(lock);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the journal alone is recorded");
+            } else {
+                std::fs::create_dir_all(&folder).unwrap();
+                plant_complete_taint(&forklift, &[relative]);
+            }
+
+            let _ = crate::util::file_utils::remove_file(&forklift.join(relative));
+            assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
+
+            if !durable {
+                // Only the first sync of the folder fails: heal also syncs the root as it records
+                // its remainder.
+                let _fault = SyncDirFaultGuard::failing_exactly_once(&folder);
+                let error = run_heal().expect_err("an absence that cannot be made durable is kept");
+                assert_durability_taint(&error, &[*note]);
+                assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
+                    [PathBuf::from(relative)].into_iter().collect(), "the record stays");
+                crate::util::file_utils::remove_dir_all(&root).ok();
+                continue;
+            }
+
+            let outcome = run_heal().unwrap_or_else(|error| panic!("{}: a lost journal is resolved: {}", relative, error));
+            let resolved: Vec<String> = outcome.resolved.iter().map(|path| path.replace('\\', "/")).collect();
+            assert_eq!(resolved, [relative.to_string()], "{:?}", outcome);
+            assert!(outcome.notes.contains(&note.to_string()), "{}: {:?}", relative, outcome.notes);
+            assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "nothing may remain recorded");
+            assert!(crate::util::journal_utils::read_in(&folder).unwrap().is_empty(), "{}: the journal reads as empty", relative);
 
             crate::util::file_utils::remove_dir_all(&root).ok();
         }

@@ -203,6 +203,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   and its note names the same ways out as a lost consolidation state's, except that where no
   marker stands it names the one command whose failed write of one can be left there, a
   `forklift undo` putting a pick back. Before, it kept heal refusing, and an interrupted pick's own recovery could never run.
+  A lost undo journal (`.forklift/journal.json`, or a bay's) is now cleared the same way. It reads
+  as an empty journal, as a missing journal does with no taint, and its note says that undo finds
+  nothing to undo there and that it keeps no deleted pallet's head. Before, it kept heal refusing.
 - **`forklift-server` holds bearer-token digests, never the tokens.** The static token is now set
   as its SHA-256 digest with `--token-sha256` (or `token_sha256` in the config file), and the
   tokens file binds digests in an `[operators_sha256]` table, so a reader of the config, the tokens
