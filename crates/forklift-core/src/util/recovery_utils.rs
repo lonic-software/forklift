@@ -1875,9 +1875,11 @@ enum VanishedClass {
     MergeRecordCopy,
     /// A checkout's undo journal (`journal.json`, or a bay's), gone since the taint was recorded.
     /// Every write of it replaces the file whole (`journal_utils::write_as`), and a replacement
-    /// undone by a power loss leaves the journal it replaced, so only a write that created the
-    /// file can leave it gone. Heal never writes it. A delete's entry is appended before the ref
-    /// is unlinked, and an append that fails stops the removal
+    /// undone by a power loss leaves the journal it replaced, so of its writes only one that
+    /// created the file can leave it gone. Besides those, `bay_utils::remove_bay_state` removes a
+    /// bay's journal with its folder, and a user may remove one, as the refusal of an unreadable
+    /// journal says to; either loses the same with no taint. Heal never writes it. A delete's
+    /// entry is appended before the ref is unlinked, and an append that fails stops the removal
     /// (`pallet_utils::remove_pallet_head_in`), so a delete whose ref is gone is recorded in a
     /// journal whose name is durable; an undo's start mark rewrites a journal that stands. A
     /// missing journal reads as an empty one (`journal_utils::read_in`), taint or none, so keeping
@@ -2377,8 +2379,9 @@ fn keepsake_ref_standing(relative: &Path) -> Result<Option<String>, String> {
 /// pallet's emptied parent folders may be gone too, and the first surviving one holds the last
 /// entry the removal changed.
 fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
-    // A top-level path's parent is the empty path, which is `root` itself: it is synced by its
-    // own name below, not as `root` joined with nothing.
+    // A top-level path's parent is the empty path. It is skipped, so the folder synced below is
+    // spelled exactly `root`, not `root` with a trailing separator: the same folder either way,
+    // but a sync fault or record keyed by the root's path matches only the first spelling.
     let mut dir = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
 
     while let Some(candidate) = dir {
