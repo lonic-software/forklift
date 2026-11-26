@@ -7955,7 +7955,8 @@ mod tests {
             assert!(!forklift.join(relative).exists(), "sanity: the recorded path is gone");
 
             if !*durable {
-                let _fault = SyncDirFaultGuard::failing_exactly(&forklift);
+                // Once: the forklift root is also the folder heal's own record writes sync.
+                let _fault = SyncDirFaultGuard::failing_exactly_once(&forklift);
                 let error = run_heal().expect_err("an absence that cannot be made durable is kept");
                 assert_durability_taint(&error, &[*note]);
                 assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
