@@ -11312,7 +11312,7 @@ mod tests {
         }
 
         // The way out: with the chain removed, the same path is absent and its parent syncs.
-        file_utils::remove_file(&pallets.join("loop")).unwrap();
+        file_utils::remove_file(pallets.join("loop")).unwrap();
         {
             let _syncs = file_utils::SyncDirFaultGuard::recording();
             sync_nearest_ancestor_when(true, &root, Path::new("pallets/loop/x")).unwrap();
