@@ -45,13 +45,14 @@ use crate::util::{
     lock_utils, object_utils, pallet_utils, redaction_deleter, sign_utils,
 };
 use crate::util::signature_table::{self, SignatureTable, FILE_EXTENSION_SIGNATURE_TABLE};
+use crate::util::taint_utils::DurablePath;
 
 /// The folder under the object store that holds packs.
 pub(crate) const FOLDER_NAME_PACK: &str = "pack";
 
-/// The extension of a pack's data file (concatenated object blobs). `pub(crate)` so the
-/// durability-taint recovery walk (`recovery_utils`) can recognize a recorded taint path as a
-/// pack file without duplicating the literal.
+/// The extension of a pack's data file (concatenated object blobs). `pub(crate)` so the taint
+/// shapes (`taint_utils`) and the durability-taint recovery walk (`recovery_utils`) can
+/// recognize a recorded taint path as a pack file without duplicating the literal.
 pub(crate) const FILE_EXTENSION_PACK_DATA: &str = "pack";
 
 /// The extension of a pack's index file (sorted hash → offset/length records). `pub(crate)` for
@@ -1579,6 +1580,32 @@ pub(crate) fn pack_folder() -> PathBuf {
     PathBuf::from(file_utils::get_path_objects_root()).join(FOLDER_NAME_PACK)
 }
 
+/// `Err` unless `folder` is the folder the pack folder's [`DurablePath`] constructors put their
+/// files in. A compaction, an ingest, a transport install, a signature-table publish and each
+/// store pack writer check it before they list, delete or write a file in the folder, so their
+/// temp files, renames, the files they list or delete beside them and their taint records are
+/// all in one folder. It does not cover what their callers did first: a caller may already have
+/// created the folder, or committed state of its own, such as an eviction's record.
+/// [`pack_folder`] derives its path through the memoized objects root, the constructors from
+/// [`forklift_root`](crate::globals::forklift_root) directly, and a root whose name is not UTF-8
+/// is one where the two differ.
+fn require_durable_pack_folder(folder: &Path) -> Result<(), String> {
+    let durable = DurablePath::pack("0");
+    match durable.as_path().parent() {
+        Some(expected) if expected == folder => Ok(()),
+        expected => Err(format!(
+            "The pack folder \"{}\" is not the store's own, \"{}\"; nothing was written to it.",
+            folder.to_string_lossy(), expected.unwrap_or(Path::new("")).to_string_lossy()
+        )),
+    }
+}
+
+/// [`file_utils::sync_dir_or_taint`] for `folder`, recording the files `written`, each renamed
+/// to its [`DurablePath`] in `folder`, which [`require_durable_pack_folder`] passed.
+fn sync_pack_folder_or_taint(folder: &Path, written: &[DurablePath]) -> Result<(), String> {
+    file_utils::sync_dir_or_taint(folder, &written.iter().collect::<Vec<_>>())
+}
+
 /// Read the packs for the active warehouse, loading and caching them on first use. The
 /// returned `Arc` lets a lookup search without holding the registry lock.
 fn loaded_packs() -> Result<Arc<PackSet>, String> {
@@ -2851,6 +2878,7 @@ pub(crate) fn import_transport_packs<R: Read, T>(
     }
 
     let folder = pack_folder();
+    require_durable_pack_folder(&folder)?;
     file_utils::create_folder_if_not_exists(&folder)?;
     remove_stale_temp_files(&folder);
     let mut staged: Vec<StagedTransportPack> = Vec::with_capacity(sections.len());
@@ -2922,11 +2950,11 @@ pub(crate) fn import_transport_packs<R: Read, T>(
         // Every final path actually renamed this run — never the `(true, true)` case's paths,
         // which are kept exactly as they already stood and never renamed — so the trailing sync
         // below taints exactly what it just made visible-but-unproven, not the whole install.
-        let mut published_this_run: Vec<PathBuf> = Vec::new();
+        let mut published_this_run: Vec<DurablePath> = Vec::new();
 
         for (pair, pack_id) in staged.iter().zip(&pack_ids) {
-            let data_final = folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_DATA));
-            let index_final = folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_INDEX));
+            let (data, index) = (DurablePath::pack(pack_id), DurablePath::pack_index(pack_id));
+            let (data_final, index_final) = (data.as_path(), index.as_path());
 
             match (data_final.exists(), index_final.exists()) {
                 (true, true) => {
@@ -2942,8 +2970,8 @@ pub(crate) fn import_transport_packs<R: Read, T>(
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
                     file_utils::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
-                    published_this_run.push(data_final.clone());
-                    published_this_run.push(index_final.clone());
+                    published_this_run.push(data.clone());
+                    published_this_run.push(index.clone());
                 }
                 (false, true) => {
                     // An index without data is reader-visible corruption. Remove the stale commit
@@ -2954,16 +2982,16 @@ pub(crate) fn import_transport_packs<R: Read, T>(
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
                     file_utils::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
-                    published_this_run.push(data_final.clone());
-                    published_this_run.push(index_final.clone());
+                    published_this_run.push(data.clone());
+                    published_this_run.push(index.clone());
                 }
                 (false, false) => {
                     file_utils::rename(&pair.data_path, &data_final)
                         .map_err(|e| format!("Error while publishing bundle pack data: {}", e))?;
                     file_utils::rename(&pair.index_path, &index_final)
                         .map_err(|e| format!("Error while publishing bundle pack index: {}", e))?;
-                    published_this_run.push(data_final.clone());
-                    published_this_run.push(index_final.clone());
+                    published_this_run.push(data.clone());
+                    published_this_run.push(index.clone());
                 }
             }
         }
@@ -2971,8 +2999,7 @@ pub(crate) fn import_transport_packs<R: Read, T>(
         // A sync failure taints exactly `published_this_run`; a sync success is re-checked
         // against any taint already standing for this root before this function may report `Ok`
         // — see `file_utils::sync_dir_or_taint`.
-        let published_refs: Vec<&Path> = published_this_run.iter().map(PathBuf::as_path).collect();
-        file_utils::sync_dir_or_taint(&folder, &published_refs)?;
+        sync_pack_folder_or_taint(&folder, &published_this_run)?;
         invalidate_cache();
         // A native bundle installs whole packs verbatim from the far end's own bulk ingest —
         // the same undensified shape `--redelta` exists to fix.
@@ -4238,6 +4265,9 @@ fn compact_held(all: bool,
                 evicted: &HashSet<String>,
                 kept: &HashSet<String>) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
+    // Before anything here lists or deletes in the folder, not only at its first pack writer:
+    // a run with nothing to pack still removes superseded packs.
+    require_durable_pack_folder(&pack_folder)?;
     remove_stale_temp_files(&pack_folder);
 
     // A repack rewrites every signature table, so one it cannot read would be lost with the rest
@@ -4343,6 +4373,8 @@ fn compact_held(all: bool,
     // The new packs' own paths, so a repack never deletes one as an "old" pack (the id is
     // layout-derived, so an unchanged repack writes the very same filename).
     let mut new_pack_files: HashSet<PathBuf> = HashSet::new();
+    // `new_pack_files` as the durable paths a failed folder sync records.
+    let mut new_pack_durable: Vec<DurablePath> = Vec::new();
 
     // The write-time depth ledger (see `true_depth`): every hash this run has assigned a real (or,
     // for a still-pending chain target, a sound worst-case — see the pre-pass below) depth to.
@@ -4471,7 +4503,7 @@ fn compact_held(all: bool,
 
             let pack = match writer.as_mut() {
                 Some(pack) => pack,
-                None => writer.insert(PackWriter::new(&pack_folder)?),
+                None => writer.insert(PackWriter::new(&pack_folder, PackPlace::Store)?),
             };
 
             // Copy an existing record verbatim — a repack's fast path: the original (good) delta
@@ -4489,7 +4521,7 @@ fn compact_held(all: bool,
                 if pack.should_roll_over() {
                     let finalized = writer.take().unwrap().finalize()?;
                     packed_sources.extend(finalized.sources);
-                    new_pack_files.extend(finalized.files);
+                    note_new_pack_files(&mut new_pack_files, &mut new_pack_durable, finalized.durable);
                     stats.packs_written += 1;
                 }
                 continue;
@@ -4565,7 +4597,7 @@ fn compact_held(all: bool,
             if pack.should_roll_over() {
                 let finalized = writer.take().unwrap().finalize()?;
                 packed_sources.extend(finalized.sources);
-                new_pack_files.extend(finalized.files);
+                note_new_pack_files(&mut new_pack_files, &mut new_pack_durable, finalized.durable);
                 stats.packs_written += 1;
             }
 
@@ -4595,7 +4627,7 @@ fn compact_held(all: bool,
     if let Some(pack) = writer.take() {
         let finalized = pack.finalize()?;
         packed_sources.extend(finalized.sources);
-        new_pack_files.extend(finalized.files);
+        note_new_pack_files(&mut new_pack_files, &mut new_pack_durable, finalized.durable);
         stats.packs_written += 1;
     }
 
@@ -4625,8 +4657,7 @@ fn compact_held(all: bool,
     // taint found standing aborts here too, before the destructive sweep below ever runs. Durable-
     // before-destructive therefore means "durable *and no taint standing*," not durable alone.
     if !new_pack_files.is_empty() {
-        let new_pack_refs: Vec<&Path> = new_pack_files.iter().map(PathBuf::as_path).collect();
-        file_utils::sync_dir_or_taint(&pack_folder, &new_pack_refs)?;
+        sync_pack_folder_or_taint(&pack_folder, &new_pack_durable)?;
     }
 
     // Every new pack is durable — only now remove the originals: the loose files that were
@@ -5101,27 +5132,28 @@ fn write_signature_tables(pack_folder: &Path,
                           entries: &[([u8; HASH_LEN], Vec<u8>)],
                           bound: usize,
                           stands: impl Fn(&Path) -> bool) -> Result<PublishedTables, String> {
+    require_durable_pack_folder(pack_folder)?;
     let mut names: HashSet<PathBuf> = HashSet::new();
-    let mut written: Vec<PathBuf> = Vec::new();
+    let mut written: Vec<DurablePath> = Vec::new();
 
     for chunk in entries.chunks(bound.max(1)) {
-        let final_path = pack_folder.join(format!("{}.{}", signature_table::table_id(chunk), FILE_EXTENSION_SIGNATURE_TABLE));
-        if stands(&final_path) {
-            names.insert(final_path);
+        let durable = DurablePath::signature_table(&signature_table::table_id(chunk));
+        let final_path = durable.as_path();
+        if stands(final_path) {
+            names.insert(final_path.to_path_buf());
             continue;
         }
         let temp = temp_path(pack_folder, FILE_EXTENSION_SIGNATURE_TABLE);
         write_and_sync(&temp, &signature_table::build(chunk))?;
-        file_utils::rename(&temp, &final_path).map_err(|e| format!(
+        file_utils::rename(&temp, final_path).map_err(|e| format!(
             "Error while finalizing signature table \"{}\": {}", final_path.to_string_lossy(), e
         ))?;
-        names.insert(final_path.clone());
-        written.push(final_path);
+        names.insert(final_path.to_path_buf());
+        written.push(durable);
     }
 
     if !written.is_empty() {
-        let written_refs: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
-        file_utils::sync_dir_or_taint(pack_folder, &written_refs)?;
+        sync_pack_folder_or_taint(pack_folder, &written)?;
     }
 
     invalidate_cache();
@@ -6728,10 +6760,22 @@ fn enumerate_loose_objects() -> Result<Vec<PackTarget>, String> {
     Ok(loose)
 }
 
+/// Where a [`PackWriter`] publishes its pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackPlace {
+    /// The active store's pack folder: each file is renamed to its [`DurablePath`], which the
+    /// folder sync then records.
+    Store,
+    /// The writer's own folder, such as a transport bundle's staging folder, which no taint
+    /// record names.
+    Staging,
+}
+
 /// Accumulates objects into one pack: an append-only data file plus the records for its
 /// index, and the loose paths to delete once the pack is durable.
 struct PackWriter {
     pack_folder: PathBuf,
+    place: PackPlace,
     data_temp_path: PathBuf,
     data_writer: BufWriter<std::fs::File>,
     /// (hash, offset, length) of each blob, for the index.
@@ -6743,8 +6787,11 @@ struct PackWriter {
 }
 
 impl PackWriter {
-    /// Start a new pack, writing to a temp data file in the pack folder.
-    fn new(pack_folder: &Path) -> Result<PackWriter, String> {
+    /// Start a new pack, writing to a temp data file in `pack_folder`, to be published at `place`.
+    fn new(pack_folder: &Path, place: PackPlace) -> Result<PackWriter, String> {
+        if place == PackPlace::Store {
+            require_durable_pack_folder(pack_folder)?;
+        }
         let data_temp_path = temp_path(pack_folder, FILE_EXTENSION_PACK_DATA);
         let file = std::fs::File::create(&data_temp_path).map_err(|e| format!(
             "Error while creating pack file \"{}\": {}", data_temp_path.to_string_lossy(), e
@@ -6757,6 +6804,7 @@ impl PackWriter {
 
         Ok(PackWriter {
             pack_folder: pack_folder.to_path_buf(),
+            place,
             data_temp_path,
             data_writer,
             records: Vec::new(),
@@ -6861,8 +6909,17 @@ impl PackWriter {
         let index_temp_path = temp_path(&self.pack_folder, FILE_EXTENSION_PACK_INDEX);
         write_and_sync(&index_temp_path, &index_bytes)?;
 
-        let data_final = self.pack_folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_DATA));
-        let index_final = self.pack_folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_INDEX));
+        // A store pack is renamed to its durable paths themselves, so the paths a failed folder
+        // sync records are the files these renames put in place.
+        let durable = match self.place {
+            PackPlace::Store => vec![DurablePath::pack(&pack_id), DurablePath::pack_index(&pack_id)],
+            PackPlace::Staging => Vec::new(),
+        };
+        let (data_final, index_final) = match durable.as_slice() {
+            [data, index] => (data.as_path().to_path_buf(), index.as_path().to_path_buf()),
+            _ => (self.pack_folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_DATA)),
+                self.pack_folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_INDEX))),
+        };
 
         file_utils::rename(&self.data_temp_path, &data_final).map_err(|e| format!(
             "Error while finalizing pack data \"{}\": {}", data_final.to_string_lossy(), e
@@ -6871,7 +6928,7 @@ impl PackWriter {
             "Error while finalizing pack index \"{}\": {}", index_final.to_string_lossy(), e
         ))?;
 
-        Ok(Finalized { sources: self.sources, files: vec![data_final, index_final] })
+        Ok(Finalized { sources: self.sources, files: vec![data_final, index_final], durable })
     }
 }
 
@@ -6880,6 +6937,19 @@ impl PackWriter {
 struct Finalized {
     sources: Vec<PathBuf>,
     files: Vec<PathBuf>,
+    /// For a [`PackPlace::Store`] pack, `files` as the durable paths they were renamed to; empty
+    /// for a staging pack.
+    durable: Vec<DurablePath>,
+}
+
+/// Note a finalized store pack's files in a repack's set of new pack files, and each one not
+/// already there in the list its folder sync records.
+fn note_new_pack_files(files: &mut HashSet<PathBuf>, durable: &mut Vec<DurablePath>, finalized: Vec<DurablePath>) {
+    for path in finalized {
+        if files.insert(path.as_path().to_path_buf()) {
+            durable.push(path);
+        }
+    }
 }
 
 /// One native pack/index pair built for embedding in a transport bundle.
@@ -6953,7 +7023,7 @@ impl TransportPackBuilder {
 
     fn writer_mut(&mut self) -> Result<&mut PackWriter, String> {
         if self.writer.is_none() {
-            self.writer = Some(PackWriter::new(&self.folder)?);
+            self.writer = Some(PackWriter::new(&self.folder, PackPlace::Staging)?);
         }
         Ok(self.writer.as_mut().expect("the transport pack writer was just created"))
     }
@@ -7039,12 +7109,13 @@ pub struct StoreIngest {
     /// published so far. `finish`'s own trailing directory sync covers all of them in one call
     /// (no intermediate rollover syncs its own directory separately — see `finish`), so this is
     /// exactly the set a failure there must taint.
-    finalized_files: Vec<PathBuf>,
+    finalized_files: Vec<DurablePath>,
 }
 
 impl StoreIngest {
     pub fn new() -> Result<StoreIngest, String> {
         let folder = pack_folder();
+        require_durable_pack_folder(&folder)?;
         file_utils::create_folder_if_not_exists(&folder)?;
         remove_stale_temp_files(&folder);
 
@@ -7129,8 +7200,7 @@ impl StoreIngest {
         self.finish_current()?;
 
         if self.packs > 0 {
-            let final_paths: Vec<&Path> = self.finalized_files.iter().map(PathBuf::as_path).collect();
-            file_utils::sync_dir_or_taint(&self.folder, &final_paths)?;
+            sync_pack_folder_or_taint(&self.folder, &self.finalized_files)?;
             invalidate_cache();
             // This is exactly the shape `--redelta` densifies: objects appended straight into
             // packs, one path/window at a time, never seeing similarity across the whole store.
@@ -7167,7 +7237,7 @@ impl StoreIngest {
 
     fn writer_mut(&mut self) -> Result<&mut PackWriter, String> {
         if self.writer.is_none() {
-            self.writer = Some(PackWriter::new(&self.folder)?);
+            self.writer = Some(PackWriter::new(&self.folder, PackPlace::Store)?);
         }
         Ok(self.writer.as_mut().expect("the ingest pack writer was just created"))
     }
@@ -7184,7 +7254,7 @@ impl StoreIngest {
             return Ok(());
         };
         let finalized = writer.finalize()?;
-        self.finalized_files.extend(finalized.files);
+        self.finalized_files.extend(finalized.durable);
         self.packs += 1;
         Ok(())
     }
@@ -7913,6 +7983,71 @@ pub(crate) mod tests {
         for path in &state.recorded {
             assert!(path.starts_with("objects/pack"), "expected a pack path, got {:?}", path);
         }
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    // A signature table's own folder sync, failing, records exactly the table it just put in
+    // place. Mutation: hand the sync no paths → nothing is recorded, red.
+    #[test]
+    #[cfg(unix)]
+    fn a_signature_table_dir_sync_failure_taints_the_written_table() {
+        use crate::util::taint_utils;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-signature-table-taint-{}", std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        let forklift = crate::globals::forklift_root();
+
+        let entries = vec![([7u8; HASH_LEN], vec![1u8, 2, 3])];
+        let _guard = SyncDirFaultGuard::failing("pack");
+        let error = publish_signature_tables(&entries, 16).expect_err("a blocked pack folder must fail the table's sync");
+        assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        let expected = PathBuf::from("objects").join("pack").join(format!("{}.sigs", signature_table::table_id(&entries)));
+        assert_eq!(state.recorded.iter().collect::<Vec<_>>(), vec![&expected]);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    // A store write in a folder other than its durable paths' is refused before it writes
+    // anything, so its temp files, renames, deletions and taint records never span two folders;
+    // a store write in the active pack folder, and a staging write anywhere, go ahead. Mutations:
+    // drop the check from `PackWriter::new` → red at its `expect_err`; from
+    // `write_signature_tables` → red at its `expect_err`.
+    #[test]
+    fn a_store_write_outside_its_durable_pack_folder_is_refused_before_it_writes() {
+        let temp = std::env::temp_dir().join(format!("forklift-pack-durable-place-{}", std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
+        let _scope = StorageRootScope::enter(&temp);
+        let elsewhere = temp.join("elsewhere").join(FOLDER_NAME_PACK);
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let active = crate::globals::forklift_root().join("objects").join("pack");
+        std::fs::create_dir_all(&active).unwrap();
+        let listing = |folder: &Path| std::fs::read_dir(folder).unwrap().count();
+
+        let refused = PackWriter::new(&elsewhere, PackPlace::Store).err().expect("a store pack writer in another folder must be refused");
+        assert!(refused.contains("is not the store's own"), "got: {}", refused);
+        let refused = write_signature_tables(&elsewhere, &[([7u8; HASH_LEN], vec![1u8, 2, 3])], 16, |_| false)
+            .err().expect("a signature table in another folder must be refused");
+        assert!(refused.contains("is not the store's own"), "got: {}", refused);
+        assert_eq!(listing(&elsewhere), 0, "a refused store write must write nothing");
+
+        // The positives: a staging writer keeps its own folder, a store writer the active one.
+        assert!(PackWriter::new(&elsewhere, PackPlace::Staging).is_ok());
+        let mut writer = PackWriter::new(&active, PackPlace::Store).unwrap();
+        let compressed = zstd::encode_all(&b"blob 1\0x"[..], 0).unwrap();
+        writer.append_full([9u8; HASH_LEN], &compressed, None).unwrap();
+        let finalized = writer.finalize().unwrap();
+        assert!(finalized.files.iter().all(|path| path.parent() == Some(active.as_path()) && path.exists()));
+        assert_eq!(finalized.durable.iter().map(|path| path.as_path().to_path_buf()).collect::<Vec<_>>(), finalized.files);
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
@@ -9049,7 +9184,7 @@ pub(crate) mod tests {
         // `PackWriter` primitive `compact` uses internally.
         file_utils::create_folder_if_not_exists(&pack_folder()).unwrap();
         let compressed = zstd::encode_all(giant.as_slice(), 0).unwrap();
-        let mut writer = PackWriter::new(&pack_folder()).unwrap();
+        let mut writer = PackWriter::new(&pack_folder(), PackPlace::Store).unwrap();
         writer.append_full(giant_hash_bytes, &compressed, None).unwrap();
         writer.finalize().unwrap();
 

@@ -9349,9 +9349,9 @@ pub(crate) mod tests {
     /// The functions that put a path into a taint record, or check one on its way in: the record
     /// writer, heal's unchecked remainder writer, and the funnel whose entries
     /// `taint_utils::assert_declared` guards.
-    const TAINT_FAMILY: [&str; 6] = [
+    const TAINT_FAMILY: [&str; 7] = [
         "record_taint", "resolve_taints", "taint_after_sync_failure", "sync_result_or_taint", "sync_dir_or_taint",
-        "sync_dir_again_or_taint",
+        "sync_dir_again_or_taint", "sync_pack_folder_or_taint",
     ];
 
     /// Every mention of one of `names` in non-test source, as (file under `crates/`, the function
@@ -9595,10 +9595,12 @@ pub(crate) mod tests {
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_or_taint"),
             ("forklift-core/src/util/object_utils.rs", "store_object_stream", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "import_transport_packs", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "compact_held", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "write_signature_tables", "sync_dir_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "finish", "sync_dir_or_taint"),
+            // The pack folder's syncs, through the one helper that types their paths.
+            ("forklift-core/src/util/pack_utils.rs", "sync_pack_folder_or_taint", "sync_dir_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "import_transport_packs", "sync_pack_folder_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "compact_held", "sync_pack_folder_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "write_signature_tables", "sync_pack_folder_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "finish", "sync_pack_folder_or_taint"),
             ("forklift-core/src/util/pallet_utils.rs", "restore_copy", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/pallet_utils.rs", "unlink_ref", "sync_dir_or_taint"),
             ("forklift-core/src/util/ref_heal.rs", "sync_files_again", "sync_dir_again_or_taint"),
