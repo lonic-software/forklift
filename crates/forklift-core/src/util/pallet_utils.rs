@@ -780,10 +780,10 @@ pub enum PositionCopy {
     Unreadable(String),
 }
 
-/// Read the copy of the position in the bay-local state dir `dir`. Read once, so every decision
-/// about it is made on the same bytes.
-pub fn read_position_copy_in(dir: &Path) -> PositionCopy {
-    match std::fs::read(dir.join(FILE_NAME_POSITION_COPY)) {
+/// Read the copy of `checkout`'s position, where [`write_position_copy_for`] writes it. Read once,
+/// so every decision about it is made on the same bytes.
+pub fn read_position_copy_for(checkout: &Checkout) -> PositionCopy {
+    match std::fs::read(DurablePath::position_copy(checkout).as_path()) {
         Ok(bytes) => match decode_position(&bytes) {
             Ok(position) => PositionCopy::Reads(position),
             Err(PositionUnread::Newer(reason)) => PositionCopy::Newer(reason),

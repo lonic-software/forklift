@@ -1901,7 +1901,7 @@ enum VanishedClass {
     Position,
     /// The copy of a checkout's position, gone since the taint was recorded. No copy is a state
     /// its writer leaves on purpose: `pallet_utils::write_position_for` removes a copy it cannot
-    /// write, and `pallet_utils::read_position_copy_in` reads a missing one as witnessing nothing.
+    /// write, and `pallet_utils::read_position_copy_for` reads a missing one as witnessing nothing.
     PositionCopy,
     /// A checkout's scope (`scope`, or a bay's), gone since the taint was recorded. Its readers
     /// refuse a missing one as damaged (`scope_utils::read_bay_scope`, and
