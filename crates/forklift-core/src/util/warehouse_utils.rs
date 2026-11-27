@@ -1558,7 +1558,7 @@ mod tests {
         }
         assert_eq!(staging_leftovers(&root), Vec::<PathBuf>::new());
         assert_eq!(notes[0], "Created folder \".forklift\".");
-        assert!(notes.iter().any(|note| note == &format!("Created folder \"{}/objects\".", forklift.to_string_lossy())), "{:?}", notes);
+        assert!(notes.iter().any(|note| note == &format!("Created folder \"{}\".", forklift.join("objects").to_string_lossy())), "{:?}", notes);
         assert!(notes.iter().all(|note| !note.contains(".tmp~")), "a note names a staging path: {:?}", notes);
 
         // Prepared again: nothing to do.
