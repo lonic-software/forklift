@@ -1608,4 +1608,37 @@ mod tests {
 
         crate::util::file_utils::remove_dir_all(&root).ok();
     }
+
+    /// A sparse warehouse's scopes are recorded fetch scope first, then the main tree's copy, then
+    /// its scope, so a write that fails never leaves the scope standing without its copy.
+    /// Revert: write the scope before its copy → a failed copy leaves the scope written → red.
+    #[test]
+    fn a_sparse_warehouses_scopes_are_recorded_copy_before_scope() {
+        let (root, _scope) = scratch("sparse-scope-order");
+        let dir = root.join(".forklift");
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        let scope = PathScope::from_prefixes(["docs"]);
+        let reads = |file: &str| {
+            let bytes = std::fs::read(dir.join(file)).unwrap_or_else(|e| panic!("no {}: {}", file, e));
+            PathScope::from_bytes(&bytes, "").ok()
+        };
+
+        // A folder in the scope's place fails its write after the fetch scope and the copy landed.
+        std::fs::create_dir_all(dir.join("scope").join("in-the-way")).unwrap();
+        let error = record_sparse_scopes(&dir, &scope).unwrap_err();
+        assert!(error.starts_with("Error while recording the scope \""), "{}", error);
+        assert_eq!(reads("config/fetch-scope"), Some(scope.clone()));
+        assert_eq!(reads("scope-copy"), Some(scope.clone()));
+
+        // A folder in the copy's place fails its write before the scope is written.
+        crate::util::file_utils::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::create_dir_all(dir.join("scope-copy").join("in-the-way")).unwrap();
+        let error = record_sparse_scopes(&dir, &scope).unwrap_err();
+        assert!(error.starts_with("Error while recording the scope's copy \""), "{}", error);
+        assert_eq!(reads("config/fetch-scope"), Some(scope.clone()));
+        assert!(!dir.join("scope").exists(), "the scope is not written past its failed copy");
+
+        crate::util::file_utils::remove_dir_all(&root).ok();
+    }
 }

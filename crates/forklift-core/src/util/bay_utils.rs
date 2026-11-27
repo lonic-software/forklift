@@ -229,7 +229,9 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
         return Err(e);
     }
 
-    file_utils::sync_dir_or_taint(bay_dir, &[&DurablePath::outside_warehouse(forklift.join(FILE_NAME_BAY_REDIRECT))])
+    // The sync makes the folder's entry in the bay's working directory durable, so the folder is
+    // what it names.
+    file_utils::sync_dir_or_taint(bay_dir, &[&DurablePath::outside_warehouse(forklift.clone())])
 }
 
 /// Remove a bay's `.forklift` folder from its working directory, so the directory is no longer a
@@ -539,9 +541,7 @@ pub fn does_bay_exist(name: &str) -> bool {
 /// Record a bay's working directory in its local state (so it can be listed).
 pub fn write_bay_path(name: &str, bay_dir: &Path) -> Result<(), String> {
     let path = DurablePath::bay_path(name);
-    if let Some(state) = path.as_path().parent() {
-        file_utils::create_folder_if_not_exists(state)?;
-    }
+    file_utils::create_folder_if_not_exists(&bay_state_dir(name))?;
     let bay_dir = path_text(bay_dir, "bay directory")?;
 
     file_utils::write_file_atomically(&path, &record_utils::to_bytes(BAY_PATH_RECORD, BAY_PATH_VERSION, [bay_dir]))
