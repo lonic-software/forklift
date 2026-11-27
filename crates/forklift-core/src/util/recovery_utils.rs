@@ -2620,16 +2620,59 @@ fn keepsake_ref_standing(relative: &Path) -> Result<Option<String>, String> {
 /// pallet's emptied parent folders may be gone too, and the first surviving one holds the last
 /// entry the removal changed.
 fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
-    file_utils::sync_dir(&nearest_standing_ancestor(root, relative)?)
+    sync_nearest_ancestor_when(cfg!(unix) && file_utils::fsync_enabled(), root, relative)
+}
+
+/// [`sync_nearest_ancestor`], told whether a folder sync does anything here (`syncs`). Where it
+/// does not (off unix, or with syncs turned off), there is nothing to make durable, so nothing is
+/// listed either: a listing that cannot be read must not fail a sync that would not have run.
+fn sync_nearest_ancestor_when(syncs: bool, root: &Path, relative: &Path) -> Result<(), String> {
+    if !syncs {
+        return Ok(());
+    }
+
+    for folder in folders_holding_the_entry(root, relative)? {
+        file_utils::sync_dir(&folder)?;
+    }
+
+    Ok(())
+}
+
+/// The folders that may hold the last change a removal of `relative` (under `root`) made: the
+/// deepest folder listed under exactly the recorded names ([`nearest_standing_ancestor`]), and,
+/// when it differs, the deepest one the recorded names open. They differ when a name opens a
+/// folder its parent lists under another spelling (a volume that folds case or normalizes
+/// Unicode), or a link's target. Which of the two held the entry depends on how it was written,
+/// which nothing here records, so both are synced.
+fn folders_holding_the_entry(root: &Path, relative: &Path) -> Result<Vec<PathBuf>, String> {
+    let listed = nearest_standing_ancestor(root, relative)?;
+
+    // Only `Normal` components reach this point, so every candidate is below `root`.
+    let mut dir = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
+    let mut opened = root.to_path_buf();
+
+    while let Some(candidate) = dir {
+        if root.join(candidate).is_dir() {
+            opened = root.join(candidate);
+            break;
+        }
+        dir = candidate.parent().filter(|parent| !parent.as_os_str().is_empty());
+    }
+
+    if opened == listed {
+        Ok(vec![listed])
+    } else {
+        Ok(vec![listed, opened])
+    }
 }
 
 /// The deepest folder above `relative` (under `root`) whose every name, from `root` down, its
 /// parent lists byte for byte as a real folder. A path test would resolve the name instead: a
 /// volume that folds case opens `Foo` as a later `foo`, Windows opens `a.` as `a`, and a link
-/// opens its target, so the folder synced would be one that never held the lost entry. A name
-/// listed under no exact spelling, or as a link or a file, is not standing, and the folder that
-/// lists it is the answer. A folder whose listing cannot be read is an error, never taken for
-/// either answer.
+/// opens its target. A name listed under no exact spelling, or as a link or a file, is not
+/// standing, and the folder that lists it is the answer. A folder whose listing cannot be read
+/// is an error, and so is a name that is not a plain name (`.`, `..`, a root or a prefix): never
+/// taken for either answer.
 fn nearest_standing_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, String> {
     // Built from `root` itself, so a path with no standing folder below the root comes back
     // spelled exactly `root`, not `root` with a trailing separator: the same folder either way,
@@ -2638,12 +2681,24 @@ fn nearest_standing_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, St
 
     for component in relative.parent().into_iter().flat_map(Path::components) {
         let std::path::Component::Normal(name) = component else {
-            break;
+            return Err(format!(
+                "the recorded path \"{}\" holds \"{}\", which is not a plain name",
+                relative.to_string_lossy(), component.as_os_str().to_string_lossy()
+            ));
         };
 
-        let listed = file_utils::read_directory_entries(&standing)?
-            .into_iter()
-            .find(|entry| entry.file_name() == name);
+        let mut listed = None;
+
+        for entry in file_utils::read_directory(&standing)? {
+            let entry = entry.map_err(|e| format!(
+                "Error while reading directory \"{}\": {}", standing.to_string_lossy(), e
+            ))?;
+
+            if entry.file_name() == name {
+                listed = Some(entry);
+                break;
+            }
+        }
 
         let Some(entry) = listed else {
             break;
@@ -11222,14 +11277,76 @@ mod tests {
             assert_eq!(standing.as_os_str(), expected.as_os_str(), "{}", relative);
         }
 
+        // A name that is not a plain name is refused, never walked past: the record is not
+        // understood, so nothing is synced for it and it is kept.
+        let absolute = root.join("pallets").join("real").join("x");
+        for relative in [Path::new("./pallets/real/x"), Path::new("pallets/../real/x"), absolute.as_path()] {
+            let error = nearest_standing_ancestor(&root, relative).expect_err(&relative.to_string_lossy());
+            assert!(error.contains("which is not a plain name"), "{}: {}", relative.to_string_lossy(), error);
+        }
+
+        file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// Both folders that may hold a removed entry are synced: the one listed under exactly the
+    /// recorded names, and, where a name opens another folder, that one too. An entry written
+    /// through `Foo` on a volume that folds case lives in `foo`, the folder `Foo` opens; one
+    /// written into a `Foo` since removed was in `pallets`, the folder listing it. Nothing records
+    /// which, so the rows a probe of the volume shows it opening are answered with both.
+    ///
+    /// Mutation: `folders_holding_the_entry` returns the listed folder alone. On a volume that
+    /// folds case the `Foo` row then lacks `pallets/Foo`, and on unix the link row lacks the
+    /// link.
+    #[test]
+    fn a_name_that_opens_another_folder_syncs_both_folders() {
+        let root = std::env::temp_dir().join(format!("forklift-recovery-utils-holding-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        let pallets = root.join("pallets");
+        std::fs::create_dir_all(pallets.join("real")).unwrap();
+        std::fs::create_dir_all(pallets.join("foo")).unwrap();
+        // "café" stored decomposed; the rows ask for it composed.
+        std::fs::create_dir_all(pallets.join("cafe\u{301}")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("elsewhere"), pallets.join("link")).unwrap();
+
+        // The volume's own answers, probed on folders the rows never name.
+        std::fs::create_dir_all(root.join("probe-case")).unwrap();
+        std::fs::create_dir_all(root.join("probe-e\u{301}")).unwrap();
+        let folds_case = root.join("PROBE-CASE").is_dir();
+        let folds_normalization = root.join("probe-\u{e9}").is_dir();
+
+        let both_when = |opens: bool, name: &str| if opens {
+            vec![pallets.clone(), pallets.join(name)]
+        } else {
+            vec![pallets.clone()]
+        };
+        let mut cases = vec![
+            ("pallets/real/x", vec![pallets.join("real")]),
+            ("pallets/gone/x", vec![pallets.clone()]),
+            ("x", vec![root.clone()]),
+            ("pallets/Foo/x", both_when(folds_case, "Foo")),
+            ("pallets/caf\u{e9}/x", both_when(folds_normalization, "caf\u{e9}")),
+        ];
+        if cfg!(unix) {
+            cases.push(("pallets/link/x", vec![pallets.clone(), pallets.join("link")]));
+        }
+
+        for (relative, expected) in cases {
+            let folders = folders_holding_the_entry(&root, Path::new(relative)).unwrap_or_else(|e| panic!("{}: {}", relative, e));
+            assert_eq!(folders, expected, "{} (folds case: {}, normalization: {})", relative, folds_case, folds_normalization);
+        }
+
         file_utils::remove_dir_all(&root).ok();
     }
 
     /// A folder on the way down whose listing cannot be read is an error, so the sync fails
     /// before any folder is synced and the caller keeps the record: whether it lists the next name
-    /// exactly is unknown.
+    /// exactly is unknown. Where a sync does nothing, nothing is listed, and the same state is
+    /// `Ok`.
     ///
-    /// Mutation: an unreadable listing taken as "not listed" (`break`) → `pallets` answered → red.
+    /// Mutations: an unreadable listing taken as "not listed" (`break`) → `pallets` answered →
+    /// red; the walk run where a sync does nothing → that arm's `Ok` is an error → red.
     #[cfg(unix)]
     #[test]
     fn an_unreadable_listing_on_the_way_down_fails_the_sync() {
@@ -11242,10 +11359,20 @@ mod tests {
         // Searchable but not readable: a path test still opens `real`, a listing cannot be read.
         std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o300)).unwrap();
 
+        // A process that reads the folder anyway (root does) has no unreadable listing to test.
+        if std::fs::read_dir(&pallets).is_ok() {
+            std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o755)).unwrap();
+            file_utils::remove_dir_all(&root).ok();
+            eprintln!("skipped: this process reads a folder it has no read permission on");
+            return;
+        }
+
         let outcome = nearest_standing_ancestor(&root, Path::new("pallets/real/x"));
         let readable = nearest_standing_ancestor(&root, Path::new("pallets/x"));
+        let without_syncs = sync_nearest_ancestor_when(false, &root, Path::new("pallets/real/x"));
         std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        assert_eq!(without_syncs, Ok(()), "where a sync does nothing, nothing may be listed");
         let error = outcome.expect_err("an unreadable listing must fail the sync");
         assert!(error.contains(&format!("Error while reading directory \"{}\"", pallets.to_string_lossy())), "{}", error);
         // The domain is not empty: the same fixture answers a path that lists only the readable root.
