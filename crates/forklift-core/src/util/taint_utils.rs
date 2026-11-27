@@ -330,11 +330,15 @@ static SCOPE: TaintShape = shape("the checkout scope", Some(Disposition::Scope),
     &[Is(crate::util::scope_utils::FILE_NAME_BAY_SCOPE)]);
 static SCOPE_COPY: TaintShape = shape("the checkout scope's copy", Some(Disposition::ScopeCopy),
     &[Is(crate::util::scope_utils::FILE_NAME_SCOPE_COPY)]);
-static CONSOLIDATION: TaintShape = shape("the consolidation state", Some(Disposition::MergeRecord), &[Is("consolidation")]);
-static CONSOLIDATION_COPY: TaintShape = shape("the consolidation state's copy", Some(Disposition::MergeRecordCopy), &[Is("consolidation-copy")]);
-static SKELETON: TaintShape = shape("the consolidation skeleton", Some(Disposition::MergeRecord), &[Is("consolidation-skeleton")]);
-static SKELETON_COPY: TaintShape = shape("the consolidation skeleton's copy", Some(Disposition::MergeRecordCopy), &[Is("consolidation-skeleton-copy")]);
-static JOURNAL: TaintShape = shape("the journal", Some(Disposition::Journal), &[Is("journal.json")]);
+static CONSOLIDATION: TaintShape = shape("the consolidation state", Some(Disposition::MergeRecord),
+    &[Is(crate::util::merge_utils::FILE_NAME_CONSOLIDATION)]);
+static CONSOLIDATION_COPY: TaintShape = shape("the consolidation state's copy", Some(Disposition::MergeRecordCopy),
+    &[Is(crate::util::merge_utils::FILE_NAME_CONSOLIDATION_COPY)]);
+static SKELETON: TaintShape = shape("the consolidation skeleton", Some(Disposition::MergeRecord),
+    &[Is(crate::util::merge_utils::FILE_NAME_SKELETON)]);
+static SKELETON_COPY: TaintShape = shape("the consolidation skeleton's copy", Some(Disposition::MergeRecordCopy),
+    &[Is(crate::util::merge_utils::FILE_NAME_SKELETON_COPY)]);
+static JOURNAL: TaintShape = shape("the journal", Some(Disposition::Journal), &[Is(crate::util::journal_utils::FILE_NAME_JOURNAL)]);
 
 static BAY_LOAD_MARKER: TaintShape = shape("a bay's incomplete-load marker", Some(Disposition::LoadMarker), &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")]);
 static BAY_POSITION: TaintShape = shape("a bay's checkout position", Some(Disposition::Position),
@@ -345,18 +349,27 @@ static BAY_SCOPE: TaintShape = shape("a bay's checkout scope", Some(Disposition:
     &[Is("bays"), Name, Is(crate::util::scope_utils::FILE_NAME_BAY_SCOPE)]);
 static BAY_SCOPE_COPY: TaintShape = shape("a bay's checkout scope's copy", Some(Disposition::ScopeCopy),
     &[Is("bays"), Name, Is(crate::util::scope_utils::FILE_NAME_SCOPE_COPY)]);
-static BAY_CONSOLIDATION: TaintShape = shape("a bay's consolidation state", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("consolidation")]);
-static BAY_CONSOLIDATION_COPY: TaintShape = shape("a bay's consolidation state's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("consolidation-copy")]);
-static BAY_SKELETON: TaintShape = shape("a bay's consolidation skeleton", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("consolidation-skeleton")]);
-static BAY_SKELETON_COPY: TaintShape = shape("a bay's consolidation skeleton's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("consolidation-skeleton-copy")]);
-static BAY_JOURNAL: TaintShape = shape("a bay's journal", Some(Disposition::Journal), &[Is("bays"), Name, Is("journal.json")]);
+static BAY_CONSOLIDATION: TaintShape = shape("a bay's consolidation state", Some(Disposition::MergeRecord),
+    &[Is("bays"), Name, Is(crate::util::merge_utils::FILE_NAME_CONSOLIDATION)]);
+static BAY_CONSOLIDATION_COPY: TaintShape = shape("a bay's consolidation state's copy", Some(Disposition::MergeRecordCopy),
+    &[Is("bays"), Name, Is(crate::util::merge_utils::FILE_NAME_CONSOLIDATION_COPY)]);
+static BAY_SKELETON: TaintShape = shape("a bay's consolidation skeleton", Some(Disposition::MergeRecord),
+    &[Is("bays"), Name, Is(crate::util::merge_utils::FILE_NAME_SKELETON)]);
+static BAY_SKELETON_COPY: TaintShape = shape("a bay's consolidation skeleton's copy", Some(Disposition::MergeRecordCopy),
+    &[Is("bays"), Name, Is(crate::util::merge_utils::FILE_NAME_SKELETON_COPY)]);
+static BAY_JOURNAL: TaintShape = shape("a bay's journal", Some(Disposition::Journal),
+    &[Is("bays"), Name, Is(crate::util::journal_utils::FILE_NAME_JOURNAL)]);
 static BAY_PATH: TaintShape = shape("a bay's path record", Some(Disposition::BayPath),
     &[Is("bays"), Name, Is(crate::util::bay_utils::FILE_NAME_BAY_PATH)]);
-static BAY_CHERRY_PICK: TaintShape = shape("a bay's cherry-pick state", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("cherry-pick")]);
-static BAY_CHERRY_PICK_COPY: TaintShape = shape("a bay's cherry-pick state's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("cherry-pick-copy")]);
+static BAY_CHERRY_PICK: TaintShape = shape("a bay's cherry-pick state", Some(Disposition::MergeRecord),
+    &[Is("bays"), Name, Is(crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK)]);
+static BAY_CHERRY_PICK_COPY: TaintShape = shape("a bay's cherry-pick state's copy", Some(Disposition::MergeRecordCopy),
+    &[Is("bays"), Name, Is(crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK_COPY)]);
 
-static CHERRY_PICK: TaintShape = shape("the cherry-pick state", Some(Disposition::MergeRecord), &[Is("cherry-pick")]);
-static CHERRY_PICK_COPY: TaintShape = shape("the cherry-pick state's copy", Some(Disposition::MergeRecordCopy), &[Is("cherry-pick-copy")]);
+static CHERRY_PICK: TaintShape = shape("the cherry-pick state", Some(Disposition::MergeRecord),
+    &[Is(crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK)]);
+static CHERRY_PICK_COPY: TaintShape = shape("the cherry-pick state's copy", Some(Disposition::MergeRecordCopy),
+    &[Is(crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK_COPY)]);
 static FETCH_SCOPE: TaintShape = shape("the fetch scope", Some(Disposition::FetchScope),
     &[Is(crate::util::config_utils::FOLDER_NAME_CONFIG_ROOT), Is(crate::util::scope_utils::FILE_NAME_FETCH_SCOPE)]);
 static FETCH_LEDGER: TaintShape = shape("the fetch ledger", Some(Disposition::FetchLedger), &[Is(crate::util::fetch_ledger::FILE_NAME_LEDGER)]);
@@ -752,7 +765,8 @@ impl DurablePath {
     }
 
     pub fn journal(checkout: &Checkout) -> DurablePath {
-        let (shape, relative) = checkout.place(WriterShape::Journal, WriterShape::BayJournal, Path::new("journal.json"));
+        let (shape, relative) = checkout.place(WriterShape::Journal, WriterShape::BayJournal,
+            Path::new(crate::util::journal_utils::FILE_NAME_JOURNAL));
         Self::declared(shape, relative)
     }
 

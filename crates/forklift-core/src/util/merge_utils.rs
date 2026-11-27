@@ -8,6 +8,7 @@ use crate::globals::bay_root;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils, shift_utils};
 use crate::util::merge_state_heal::{self, MergeRecord};
+use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
 /// consolidation is in progress, it holds the head parcel hash of the pallet being
@@ -271,7 +272,9 @@ pub fn read_consolidation_state() -> Result<Option<ConsolidationState>, String> 
 /// * `Ok(())`      - If the state was written.
 /// * `Err(String)` - If the file could not be written.
 pub fn write_consolidation_state(state: &ConsolidationState) -> Result<(), String> {
-    write_record_and_copy(&get_consolidation_state_path(), &bay_root().join(FILE_NAME_CONSOLIDATION_COPY), &consolidation_state_bytes(state))
+    let checkout = Checkout::active();
+    write_record_and_copy(&DurablePath::consolidation(&checkout), &DurablePath::consolidation_copy(&checkout),
+        &consolidation_state_bytes(state))
 }
 
 /// Write a merge record at `path` and its copy at `copy`, both atomically and the copy first: a copy
@@ -280,11 +283,11 @@ pub fn write_consolidation_state(state: &ConsolidationState) -> Result<(), Strin
 /// rename landed before a later step failed leaves its record without a copy until heal re-syncs
 /// one); only a stop between the two writes leaves one ahead, which the next heal over a usable
 /// record writes back over.
-pub(crate) fn write_record_and_copy(path: &Path, copy: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_record_and_copy(path: &DurablePath, copy: &DurablePath, bytes: &[u8]) -> Result<(), String> {
     file_utils::write_file_atomically(copy, bytes)
-        .map_err(|e| format!("Error while recording the copy \"{}\": {}", copy.to_string_lossy(), e))?;
+        .map_err(|e| format!("Error while recording the copy \"{}\": {}", copy.as_path().to_string_lossy(), e))?;
     file_utils::write_file_atomically(path, bytes).inspect_err(|_| {
-        let _ = remove_record(copy);
+        let _ = remove_record(copy.as_path());
     })
 }
 
@@ -464,7 +467,8 @@ impl OutOfScopeSkeleton {
     /// Write `bytes`, a skeleton's on-disk form already checked, as the skeleton and its copy (see
     /// [`OutOfScopeSkeleton::write`]).
     pub(crate) fn write_bytes(bytes: &[u8]) -> Result<String, String> {
-        write_record_and_copy(&OutOfScopeSkeleton::path(), &bay_root().join(FILE_NAME_SKELETON_COPY), bytes)?;
+        let checkout = Checkout::active();
+        write_record_and_copy(&DurablePath::skeleton(&checkout), &DurablePath::skeleton_copy(&checkout), bytes)?;
         Ok(skeleton_digest(bytes))
     }
 
@@ -1780,12 +1784,13 @@ mod tests {
     fn a_record_write_that_fails_leaves_no_copy_of_it() {
         let root = std::env::temp_dir().join(format!("forklift-record-copy-{}", std::process::id()));
         let _ = file_utils::remove_dir_all(&root);
-        let record = root.join("consolidation");
-        std::fs::create_dir_all(record.join("held")).unwrap();
-        let copy = root.join("consolidation-copy");
+        let _scope = crate::globals::StorageRootScope::enter(&root);
+        let record = DurablePath::consolidation(&Checkout::Main);
+        std::fs::create_dir_all(record.as_path().join("held")).unwrap();
+        let copy = DurablePath::consolidation_copy(&Checkout::Main);
 
         assert!(write_record_and_copy(&record, &copy, b"bytes").is_err(), "a folder holds the record's place");
-        assert!(!copy.exists(), "the copy went with the failed write");
+        assert!(!copy.as_path().exists(), "the copy went with the failed write");
         let _ = file_utils::remove_dir_all(&root);
     }
 

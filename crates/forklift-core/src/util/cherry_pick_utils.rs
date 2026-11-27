@@ -22,6 +22,7 @@ use crate::model::operator::Operator;
 use crate::util::{merge_utils, object_utils, record_utils};
 use crate::util::merge_state_heal::{self, MergeRecord};
 use crate::util::merge_utils::Unusable;
+use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// The name of the cherry-pick-state file (inside the bay root). While a pick is in
 /// progress (its merge left conflicts), it records the source parcel, the head and pallet the pick
@@ -137,7 +138,9 @@ pub(crate) fn parse_state(bytes: &[u8]) -> Result<CherryPickState, Unusable> {
 /// * `Ok(())`      - If the state was written.
 /// * `Err(String)` - If the file could not be written.
 pub fn write_state(state: &CherryPickState) -> Result<(), String> {
-    merge_utils::write_record_and_copy(&state_path(), &bay_root().join(FILE_NAME_CHERRY_PICK_COPY), &state_bytes(state))
+    let checkout = Checkout::active();
+    merge_utils::write_record_and_copy(&DurablePath::cherry_pick(&checkout), &DurablePath::cherry_pick_copy(&checkout),
+        &state_bytes(state))
 }
 
 /// The bytes [`write_state`] writes for `state`.
