@@ -4,7 +4,8 @@ use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 use crate::util::scope_utils::PathScope;
 use crate::util::sealed_utils::Tolerated;
-use crate::util::taint_utils::DurablePath;
+use crate::util::file_utils::FinalPath;
+use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -34,7 +35,7 @@ pub const META_QUALIFIER: char = '@';
 pub const FILE_NAME_POSITION: &str = "position";
 
 /// The bay-local copy of the position file, written after it with the same bytes: the witness
-/// `heal` rebuilds a lost or damaged position from (see [`write_position_in`]).
+/// `heal` rebuilds a lost or damaged position from (see [`write_position_for`]).
 pub const FILE_NAME_POSITION_COPY: &str = "position-copy";
 
 /// The name of the default pallet (used when a warehouse is prepared).
@@ -763,7 +764,7 @@ pub fn position_damaged(path: &Path, reason: &str, next_step: &str) -> String {
     ).into()
 }
 
-/// What the copy of the position (see [`write_position_in`]) holds.
+/// What the copy of the position (see [`write_position_for`]) holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PositionCopy {
     /// The position it holds.
@@ -793,9 +794,9 @@ pub fn read_position_copy_in(dir: &Path) -> PositionCopy {
     }
 }
 
-/// Write the copy of the position in `dir` to match `position`.
-pub fn write_position_copy_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
-    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION_COPY), &position_bytes(position))
+/// Write the copy of `checkout`'s position to match `position`.
+pub fn write_position_copy_for(checkout: &Checkout, position: &BayPosition) -> Result<(), String> {
+    file_utils::write_file_atomically(&DurablePath::position_copy(checkout), &position_bytes(position))
 }
 
 /// The record bytes of `position`.
@@ -810,7 +811,7 @@ fn position_bytes(position: &BayPosition) -> Vec<u8> {
 /// * `Ok(())`      - If the position was written.
 /// * `Err(String)` - If the pallet name is invalid or the file could not be written.
 pub fn write_position(position: &BayPosition) -> Result<(), String> {
-    write_position_in(&bay_root(), position)
+    write_position_for(&Checkout::active(), position)
 }
 
 /// Record that the active bay now stands on `head`, the parcel this command just moved `pallet`
@@ -830,27 +831,37 @@ pub fn landed_but(pallet: &str, head: &str, error: &str) -> String {
     )
 }
 
-/// [`write_position`] into the bay-local state dir `dir`, whichever bay it belongs to.
+/// [`write_position`] for `checkout`, whichever bay it is.
 ///
 /// The same record is then written to a copy beside it, the witness `heal` rebuilds a lost or
 /// damaged position from: every position a bay is given is written here, so the copy holds the
 /// last one. A copy that cannot be written is removed instead, since a stale copy would rebuild a
 /// position the bay has left; only when neither can be done does the write fail (the position
 /// itself stands).
-pub fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
+pub fn write_position_for(checkout: &Checkout, position: &BayPosition) -> Result<(), String> {
+    write_position_files(&DurablePath::position(checkout), &DurablePath::position_copy(checkout), position)
+}
+
+/// [`write_position_for`] into the folder `dir`, for the tests that still name a folder.
+#[cfg(test)]
+pub(crate) fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
+    write_position_files(&dir.join(FILE_NAME_POSITION), &dir.join(FILE_NAME_POSITION_COPY), position)
+}
+
+/// Write `position` to `path`, then to its copy at `copy`, as [`write_position_for`] says.
+fn write_position_files<P: FinalPath + ?Sized>(path: &P, copy: &P, position: &BayPosition) -> Result<(), String> {
     validate_pallet_name(&position.pallet)?;
 
     let bytes = position_bytes(position);
 
-    file_utils::write_file_atomically(&dir.join(FILE_NAME_POSITION), &bytes)?;
+    file_utils::write_file_atomically(path, &bytes)?;
 
-    let copy = dir.join(FILE_NAME_POSITION_COPY);
-    file_utils::write_file_atomically(&copy, &bytes).or_else(|written| match file_utils::remove_file(&copy) {
+    file_utils::write_file_atomically(copy, &bytes).or_else(|written| match file_utils::remove_file(copy.final_path()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(removed) => Err(format!(
             "The bay position was written, but its copy \"{}\" could neither be written ({}) nor removed ({}).",
-            copy.to_string_lossy(), written.trim_end_matches('.'), removed
+            copy.final_path().to_string_lossy(), written.trim_end_matches('.'), removed
         )),
     })
 }
@@ -3229,16 +3240,16 @@ pub(crate) mod tests {
     /// Revert: map a failed copy removal to Ok → the write reports success → red.
     #[test]
     fn a_copy_that_can_neither_be_written_nor_removed_fails_the_write() {
-        let dir = std::env::temp_dir().join(format!("forklift-position-copy-{}", std::process::id()));
-        let _ = file_utils::remove_dir_all(&dir);
+        let (root, _scope) = scratch("position-copy");
+        let dir = forklift_root();
         std::fs::create_dir_all(dir.join(FILE_NAME_POSITION_COPY).join("in-the-way")).unwrap();
 
         let position = BayPosition::new("main", None);
-        let error = write_position_in(&dir, &position).unwrap_err();
+        let error = write_position_for(&Checkout::Main, &position).unwrap_err();
         assert!(error.contains("could neither be written"), "{}", error);
         assert_eq!(decode_position(&std::fs::read(dir.join(FILE_NAME_POSITION)).unwrap()).ok(), Some(position));
 
-        let _ = file_utils::remove_dir_all(&dir);
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     // What a removal reads back to tell whether a file still stands: only the answer that nothing
