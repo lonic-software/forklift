@@ -4504,7 +4504,7 @@ pub(crate) mod tests {
         // Version 1, the key id, then a one-byte length and the 64-byte signature.
         assert_eq!(signed[signed.len() - 65], 64, "{:?}", signed);
         let short = [signed[..signed.len() - 65].to_vec(), vec![63], vec![7; 63]].concat();
-        file_utils::write_file_atomically(&path, &short).unwrap();
+        file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::loose_signature(&head).unwrap(), &short).unwrap();
 
         match verify_office_chain(&fixture.anchor, &head) {
             Err(OfficeChainError::SignatureDamaged(message)) => {
@@ -4532,7 +4532,8 @@ pub(crate) mod tests {
             assert_eq!(signed[signed.len() - 65], 64, "{}: {:?}", case, signed);
             match case {
                 "unsigned" => file_utils::remove_file(&path).unwrap(),
-                _ => file_utils::write_file_atomically(&path, &[signed[..signed.len() - 65].to_vec(), vec![64], vec![0; 64]].concat()).unwrap(),
+                _ => file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::loose_signature(&odd).unwrap(),
+                    &[signed[..signed.len() - 65].to_vec(), vec![64], vec![0; 64]].concat()).unwrap(),
             }
 
             // A lost signature is no verdict on the chain, a forged one is the walk's; neither
@@ -4606,7 +4607,7 @@ pub(crate) mod tests {
                 None => {
                     let newer = crate::util::object_utils::store_copy_in_version(&head, 2);
                     let office = crate::util::office_utils::OFFICE_PALLET_NAME;
-                    for path in [crate::util::pallet_utils::get_pallet_ref_path(crate::util::pallet_utils::PalletNamespace::Meta, office), crate::util::pallet_utils::get_meta_copy_path(office)] {
+                    for path in [crate::util::taint_utils::DurablePath::meta_ref(office), crate::util::taint_utils::DurablePath::meta_copy(office)] {
                         file_utils::write_file_atomically(&path, format!("{}\n", newer).as_bytes()).unwrap();
                     }
                     newer
@@ -4640,7 +4641,7 @@ pub(crate) mod tests {
             };
             let root = crate::globals::forklift_root();
             let copy_bytes = crate::util::office_utils::encode_trust_anchor(&copy);
-            file_utils::write_file_atomically(&root.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), copy_bytes.as_bytes()).unwrap();
+            file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::trust_copy(), copy_bytes.as_bytes()).unwrap();
             let trust_path = root.join(crate::util::office_utils::FILE_NAME_TRUST);
             let trust = std::fs::read(&trust_path).unwrap();
 
@@ -4829,8 +4830,7 @@ pub(crate) mod tests {
     #[test]
     fn a_first_serve_marks_a_root_whose_anchor_waits_for_its_office() {
         let _fixture = PrivilegeFixture::new("first-serve-anchor-before-office");
-        let forklift = crate::globals::forklift_root();
-        file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), &anchor_bytes()).unwrap();
+        file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::trust_copy(), &anchor_bytes()).unwrap();
         unborn_office();
 
         assert!(crate::util::tombstone_utils::mark_served(true).unwrap());
@@ -4862,11 +4862,8 @@ pub(crate) mod tests {
     fn a_first_serve_over_an_unreadable_office_refuses_as_the_store() {
         let garbled = PrivilegeFixture::new("first-serve-unreadable-office");
         let head = office_head().unwrap();
-        let forklift = crate::globals::forklift_root();
-        file_utils::write_file_atomically(&forklift.join(crate::util::office_utils::FILE_NAME_TRUST_COPY), &anchor_bytes()).unwrap();
-        let (folder, file_name) = file_utils::get_path_for_object(&head).unwrap();
-        let object = std::path::Path::new(&folder).join(file_name);
-        file_utils::write_file_atomically(&object, b"not an object").unwrap();
+        file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::trust_copy(), &anchor_bytes()).unwrap();
+        file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::loose_object(&head).unwrap(), b"not an object").unwrap();
 
         let refused = crate::util::tombstone_utils::mark_served(true).expect_err("the first serve must refuse");
 
@@ -4881,9 +4878,7 @@ pub(crate) mod tests {
             use std::os::unix::fs::PermissionsExt;
             let _fixture = PrivilegeFixture::new("first-serve-unopenable-office");
             let head = office_head().unwrap();
-            file_utils::write_file_atomically(
-                &crate::globals::forklift_root().join(crate::util::office_utils::FILE_NAME_TRUST_COPY), &anchor_bytes(),
-            ).unwrap();
+            file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::trust_copy(), &anchor_bytes()).unwrap();
             let (folder, file_name) = file_utils::get_path_for_object(&head).unwrap();
             let object = std::path::Path::new(&folder).join(file_name);
             std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -4994,12 +4989,11 @@ pub(crate) mod tests {
 
     /// Put the trust file and its copy as `trust` and `copy` (`None`: nothing stands there).
     fn put_trust_files(trust: &Option<Vec<u8>>, copy: &Option<Vec<u8>>) {
-        let forklift = crate::globals::forklift_root();
-        for (name, bytes) in [(crate::util::office_utils::FILE_NAME_TRUST, trust), (crate::util::office_utils::FILE_NAME_TRUST_COPY, copy)] {
-            let path = forklift.join(name);
+        use crate::util::taint_utils::DurablePath;
+        for (path, bytes) in [(DurablePath::trust(), trust), (DurablePath::trust_copy(), copy)] {
             match bytes {
                 Some(bytes) => file_utils::write_file_atomically(&path, bytes).unwrap(),
-                None if path.exists() => file_utils::remove_file(&path).unwrap(),
+                None if path.as_path().exists() => file_utils::remove_file(path.as_path()).unwrap(),
                 None => {}
             }
         }
@@ -5183,9 +5177,8 @@ pub(crate) mod tests {
         let fixture = PrivilegeFixture::new("heal-trust-restores-unreadable");
         let b = TrustBytes::of(&fixture);
         TrustState { name: "equal, chain unreadable", trust: Some(b.settled.clone()), copy: Some(b.settled.clone()), served: false, unborn: false }.put();
-        file_utils::write_file_atomically(&crate::util::pallet_utils::get_pallet_ref_path(
-            crate::util::pallet_utils::PalletNamespace::Meta, crate::util::office_utils::OFFICE_PALLET_NAME,
-        ), "a".repeat(64).as_bytes()).unwrap();
+        file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::meta_ref(crate::util::office_utils::OFFICE_PALLET_NAME),
+            "a".repeat(64).as_bytes()).unwrap();
         let repaired = crate::util::office_utils::repair_trust().expect("equal, chain unreadable");
         assert!(repaired.restored.is_none());
         assert!(repaired.notes.iter().any(|note| note.contains("were not checked") && note.contains("run \"forklift heal\" again")),

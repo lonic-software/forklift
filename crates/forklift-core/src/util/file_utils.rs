@@ -7220,6 +7220,12 @@ pub(crate) mod tests {
         remove_dir_all(&temp).ok();
     }
 
+    /// A scratch file under a temporary folder that is no warehouse's, as the write entries take
+    /// it: through the escape, since no warehouse records it.
+    fn scratch_file(path: &Path) -> DurablePath {
+        DurablePath::outside_warehouse(path.to_path_buf())
+    }
+
     #[test]
     fn atomic_write_lands_the_content_and_leaves_no_temp_file() {
         // The rewritten (now fsyncing) atomic write must still publish exactly the target file with
@@ -7230,11 +7236,11 @@ pub(crate) mod tests {
 
         let target = temp.join("nested").join("value");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        write_file_atomically(&target, b"durable bytes").unwrap();
+        write_file_atomically(&scratch_file(&target), b"durable bytes").unwrap();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"durable bytes");
         // Overwrite in place — the old content must be fully replaced, still atomically.
-        write_file_atomically(&target, b"second").unwrap();
+        write_file_atomically(&scratch_file(&target), b"second").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"second");
 
         // No `.tmp*` sibling is left behind once the rename has consumed it.
@@ -7360,7 +7366,7 @@ pub(crate) mod tests {
 
         let target = temp.join("staged-object");
         let batch = WriteBatch::new();
-        batch.stage(&target, b"batch content").unwrap();
+        batch.stage(&scratch_file(&target), b"batch content").unwrap();
 
         batch.finish().unwrap();
         assert!(target.exists(), "the first finish must publish the staged write");
@@ -7386,8 +7392,8 @@ pub(crate) mod tests {
         let target_b = temp.join("never-published-b");
         {
             let batch = WriteBatch::new();
-            batch.stage(&target_a, b"should vanish a").unwrap();
-            batch.stage(&target_b, b"should vanish b").unwrap();
+            batch.stage(&scratch_file(&target_a), b"should vanish a").unwrap();
+            batch.stage(&scratch_file(&target_b), b"should vanish b").unwrap();
             assert!(!target_a.exists() && !target_b.exists());
             // `batch` drops here without `finish` being called.
         }
@@ -7418,7 +7424,8 @@ pub(crate) mod tests {
         let content: &[u8] = b"identical content every racer writes";
         let batch = WriteBatch::new();
 
-        let target_ref: &Path = &target;
+        let durable = scratch_file(&target);
+        let target_ref: &DurablePath = &durable;
         let batch_ref: &WriteBatch = &batch;
         std::thread::scope(|scope| {
             for _ in 0..200 {
@@ -7454,15 +7461,15 @@ pub(crate) mod tests {
         // staging that path); every later call for the same path — even after the winner has
         // gone on to actually stage it — gets `false`.
         let batch = WriteBatch::new();
-        let target = Path::new("/some/warehouse/.forklift/objects/ab/cdef");
+        let target = DurablePath::loose_object("abcdef").unwrap();
 
-        assert!(batch.reserve_final_path(target), "the first reservation must win");
-        assert!(!batch.reserve_final_path(target), "a second reservation for the same path must lose");
-        assert!(!batch.reserve_final_path(target), "losing is permanent, not just once");
+        assert!(batch.reserve_final_path(&target), "the first reservation must win");
+        assert!(!batch.reserve_final_path(&target), "a second reservation for the same path must lose");
+        assert!(!batch.reserve_final_path(&target), "losing is permanent, not just once");
 
         // An unrelated path is entirely unaffected.
-        let other = Path::new("/some/warehouse/.forklift/objects/ab/0000");
-        assert!(batch.reserve_final_path(other), "a different path must still win its own reservation");
+        let other = DurablePath::loose_object("ab0000").unwrap();
+        assert!(batch.reserve_final_path(&other), "a different path must still win its own reservation");
     }
 
     #[test]
@@ -7472,8 +7479,8 @@ pub(crate) mod tests {
         // (rather than one lock covering both) could let two racers both observe "not reserved
         // yet" and both proceed to stage (and compress) redundant work.
         let batch = WriteBatch::new();
-        let target = Path::new("/some/warehouse/.forklift/objects/cd/ef01");
-        let target_ref: &Path = target;
+        let target = DurablePath::loose_object("cdef01").unwrap();
+        let target_ref: &DurablePath = &target;
         let batch_ref: &WriteBatch = &batch;
 
         let wins: Vec<bool> = std::thread::scope(|scope| {
@@ -7498,9 +7505,9 @@ pub(crate) mod tests {
 
         let target = temp.join("object");
         let batch = WriteBatch::new();
-        batch.stage(&target, b"content").unwrap();
+        batch.stage(&scratch_file(&target), b"content").unwrap();
 
-        assert!(!batch.reserve_final_path(&target),
+        assert!(!batch.reserve_final_path(&scratch_file(&target)),
             "a path already staged directly must read as already reserved");
 
         remove_dir_all(&temp).ok();
@@ -7519,13 +7526,13 @@ pub(crate) mod tests {
         let target = temp.join("object");
         let batch = WriteBatch::new();
 
-        batch.stage(&target, b"round one").unwrap();
+        batch.stage(&scratch_file(&target), b"round one").unwrap();
         batch.finish().unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"round one");
 
         // A fresh reservation for the same path in the *same* batch instance, after `finish`,
         // must win again — the first round is over and published.
-        assert!(batch.reserve_final_path(&target),
+        assert!(batch.reserve_final_path(&scratch_file(&target)),
             "a path must be reservable again after the batch that staged it has finished");
 
         remove_dir_all(&temp).ok();
@@ -7545,8 +7552,8 @@ pub(crate) mod tests {
         let leaked = temp.join("promised-but-never-staged");
         let staged = temp.join("staged-fine");
         let batch = WriteBatch::new();
-        assert!(batch.reserve_final_path(&leaked));
-        batch.stage(&staged, b"complete content").unwrap();
+        assert!(batch.reserve_final_path(&scratch_file(&leaked)));
+        batch.stage(&scratch_file(&staged), b"complete content").unwrap();
 
         let error = batch.finish().unwrap_err();
         assert!(error.contains("promised-but-never-staged"),
@@ -7584,9 +7591,9 @@ pub(crate) mod tests {
 
         let batch = WriteBatch::new();
         for path in &leaked {
-            assert!(batch.reserve_final_path(path));
+            assert!(batch.reserve_final_path(&scratch_file(path)));
         }
-        batch.stage(&staged, b"content").unwrap();
+        batch.stage(&scratch_file(&staged), b"content").unwrap();
 
         let error = batch.finish().unwrap_err();
 
@@ -7611,7 +7618,7 @@ pub(crate) mod tests {
         // The empty-`pending` early return must not outrank the leak check: a batch whose only
         // producer failed before staging anything still made a promise it cannot keep.
         let batch = WriteBatch::new();
-        assert!(batch.reserve_final_path(Path::new("/warehouse/.forklift/objects/ab/cdef")));
+        assert!(batch.reserve_final_path(&DurablePath::loose_object("abcdef").unwrap()));
 
         assert!(batch.finish().is_err(),
             "a reservation with nothing staged at all must still refuse to finish");
@@ -7634,14 +7641,14 @@ pub(crate) mod tests {
         let flaky = temp.join("failed-first-round");
         let steady = temp.join("staged-both-rounds");
         let batch = WriteBatch::new();
-        assert!(batch.reserve_final_path(&flaky));
-        batch.stage(&steady, b"round one").unwrap();
+        assert!(batch.reserve_final_path(&scratch_file(&flaky)));
+        batch.stage(&scratch_file(&steady), b"round one").unwrap();
         batch.finish().unwrap_err();
 
-        assert!(batch.reserve_final_path(&flaky),
+        assert!(batch.reserve_final_path(&scratch_file(&flaky)),
             "a retry must be able to win the reservation the failed round left behind");
-        batch.stage(&flaky, b"second round, staged this time").unwrap();
-        batch.stage(&steady, b"round two").unwrap();
+        batch.stage(&scratch_file(&flaky), b"second round, staged this time").unwrap();
+        batch.stage(&scratch_file(&steady), b"round two").unwrap();
         batch.finish().unwrap();
 
         assert_eq!(std::fs::read(&flaky).unwrap(), b"second round, staged this time");
@@ -7666,8 +7673,8 @@ pub(crate) mod tests {
         let first = temp.join("renamed-before-the-failure");
         let blocked = temp.join("rename-target-blocked");
         let batch = WriteBatch::new();
-        batch.stage(&first, b"landed").unwrap();
-        batch.stage(&blocked, b"never lands").unwrap();
+        batch.stage(&scratch_file(&first), b"landed").unwrap();
+        batch.stage(&scratch_file(&blocked), b"never lands").unwrap();
 
         // Sabotage the second rename: a non-empty directory at its final path makes the rename
         // fail on every platform, after the first entry's rename already succeeded.
@@ -7718,7 +7725,7 @@ pub(crate) mod tests {
             .map(|(i, dir)| {
                 let target = dir.join("object");
                 let content = format!("content for directory {}", i);
-                batch.stage(&target, content.as_bytes()).unwrap();
+                batch.stage(&scratch_file(&target), content.as_bytes()).unwrap();
                 (target, content)
             })
             .collect();
@@ -7787,8 +7794,8 @@ pub(crate) mod tests {
         let blocked = dir_b.join("blocked");
 
         let batch = WriteBatch::new();
-        batch.stage(&landed, b"landed").unwrap();
-        batch.stage(&blocked, b"never lands").unwrap();
+        batch.stage(&scratch_file(&landed), b"landed").unwrap();
+        batch.stage(&scratch_file(&blocked), b"never lands").unwrap();
 
         // Sabotage the second rename exactly like the existing partway test: a non-empty
         // directory already at the final path fails `rename` on every platform.
@@ -7831,7 +7838,7 @@ pub(crate) mod tests {
         let batch = WriteBatch::new();
         let targets: Vec<_> = dirs.iter().map(|dir| dir.join("object")).collect();
         for target in &targets {
-            batch.stage(target, b"content").unwrap();
+            batch.stage(&scratch_file(target), b"content").unwrap();
         }
 
         // Every rename below succeeds — only the middle directory's *fsync* is sabotaged, so this
@@ -7880,8 +7887,8 @@ pub(crate) mod tests {
         let blocked = dir_b.join("blocked");
 
         let batch = WriteBatch::new();
-        batch.stage(&landed, b"landed").unwrap();
-        batch.stage(&blocked, b"never lands").unwrap();
+        batch.stage(&scratch_file(&landed), b"landed").unwrap();
+        batch.stage(&scratch_file(&blocked), b"never lands").unwrap();
         std::fs::create_dir_all(blocked.join("occupant")).unwrap();
 
         // Arm the early sync itself to fail for the one directory it will actually attempt.
@@ -7936,7 +7943,7 @@ pub(crate) mod tests {
         create_folder_if_not_exists(&shard).unwrap();
 
         let batch = WriteBatch::new();
-        batch.stage(&shard.join("441a2e45"), b"object").unwrap();
+        batch.stage(&DurablePath::loose_object("44441a2e45").unwrap(), b"object").unwrap();
 
         let _guard = DirSyncFaultGuard::recording();
         batch.finish().unwrap();
@@ -8095,7 +8102,7 @@ pub(crate) mod tests {
         create_folder_if_not_exists(&shard).unwrap();
 
         let batch = WriteBatch::new();
-        batch.stage(&shard.join("441a2e45"), b"object").unwrap();
+        batch.stage(&DurablePath::loose_object("44441a2e45").unwrap(), b"object").unwrap();
 
         let _barrier = DirSyncFaultGuard::failing_exactly(&forklift);
         let _single = SyncDirFaultGuard::failing_exactly(&forklift);
@@ -8125,7 +8132,7 @@ pub(crate) mod tests {
         create_folder_if_not_exists(&shard).unwrap();
 
         let batch = WriteBatch::new();
-        batch.stage(&shard.join("441a2e45"), b"object").unwrap();
+        batch.stage(&DurablePath::loose_object("44441a2e45").unwrap(), b"object").unwrap();
 
         let _guard = DirSyncFaultGuard::failing_exactly(&forklift.join("objects"));
         let error = batch.finish().unwrap_err();
@@ -8154,14 +8161,15 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let alpha = forklift.join("objects").join("aa").join("a1fa");
-        let beta = forklift.join("objects").join("bb").join("be7a");
+        let alpha_path = DurablePath::loose_object("aaa1fa").unwrap();
+        let beta_path = DurablePath::loose_object("bbbe7a").unwrap();
+        let (alpha, beta) = (alpha_path.as_path(), beta_path.as_path());
         std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
         std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
 
         let batch = WriteBatch::new();
-        batch.stage(&alpha, b"alpha content").unwrap();
-        batch.stage(&beta, b"beta content").unwrap();
+        batch.stage(&alpha_path, b"alpha content").unwrap();
+        batch.stage(&beta_path, b"beta content").unwrap();
 
         let _guard = DirSyncFaultGuard::failing("bb");
         let error = batch.finish().unwrap_err();
@@ -8215,16 +8223,15 @@ pub(crate) mod tests {
         let alpha_compressed = zstd::encode_all(&alpha_content[..], 0).unwrap();
         let beta_compressed = zstd::encode_all(&beta_content[..], 0).unwrap();
 
-        let (alpha_folder, alpha_file) = get_path_for_object(&alpha_hash).unwrap();
-        let (beta_folder, beta_file) = get_path_for_object(&beta_hash).unwrap();
-        std::fs::create_dir_all(&alpha_folder).unwrap();
-        std::fs::create_dir_all(&beta_folder).unwrap();
-        let alpha = PathBuf::from(&alpha_folder).join(&alpha_file);
-        let beta = PathBuf::from(&beta_folder).join(&beta_file);
+        let alpha_path = DurablePath::loose_object(&alpha_hash).unwrap();
+        let beta_path = DurablePath::loose_object(&beta_hash).unwrap();
+        let (alpha, beta) = (alpha_path.as_path(), beta_path.as_path());
+        std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
 
         let batch = WriteBatch::new();
-        batch.stage(&alpha, &alpha_compressed).unwrap();
-        batch.stage(&beta, &beta_compressed).unwrap();
+        batch.stage(&alpha_path, &alpha_compressed).unwrap();
+        batch.stage(&beta_path, &beta_compressed).unwrap();
 
         let inode_alpha_before = std::fs::metadata(&alpha).map(|m| m.ino()).ok();
         let inode_beta_before = std::fs::metadata(&beta).map(|m| m.ino()).ok();
@@ -8273,7 +8280,7 @@ pub(crate) mod tests {
         // The command proceeds: a fresh write under the now-healed root succeeds cleanly.
         let after_heal_dir = forklift.join("objects").join("cc");
         std::fs::create_dir_all(&after_heal_dir).unwrap();
-        assert!(write_file_atomically(&after_heal_dir.join("af7e"), b"ok").is_ok());
+        assert!(write_file_atomically(&DurablePath::loose_object("ccaf7e").unwrap(), b"ok").is_ok());
 
         remove_dir_all(&temp).ok();
     }
@@ -8296,14 +8303,15 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let landed = forklift.join("objects").join("aa").join("1a4d");
-        let blocked = forklift.join("objects").join("bb").join("b10c");
+        let landed_path = DurablePath::loose_object("aa1a4d").unwrap();
+        let blocked_path = DurablePath::loose_object("bbb10c").unwrap();
+        let (landed, blocked) = (landed_path.as_path(), blocked_path.as_path());
         std::fs::create_dir_all(landed.parent().unwrap()).unwrap();
         std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
 
         let batch = WriteBatch::new();
-        batch.stage(&landed, b"landed").unwrap();
-        batch.stage(&blocked, b"never lands").unwrap();
+        batch.stage(&landed_path, b"landed").unwrap();
+        batch.stage(&blocked_path, b"never lands").unwrap();
 
         // Sabotage the second rename: a non-empty directory at its final path fails `rename` on
         // every platform, after the first entry's rename already succeeded.
@@ -8338,11 +8346,12 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("cc").join("1eed");
+        let target_path = DurablePath::loose_object("cc1eed").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         let _guard = SyncDirFaultGuard::failing("cc");
-        let error = write_file_atomically(&target, b"content").unwrap_err();
+        let error = write_file_atomically(&target_path, b"content").unwrap_err();
         assert!(error.contains("injected directory-sync failure"), "got: {}", error);
 
         assert!(target.exists(), "the rename must have landed before the directory sync failed");
@@ -8378,11 +8387,12 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("dd").join("f5e5");
+        let target_path = DurablePath::loose_object("ddf5e5").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         let batch = WriteBatch::new();
-        batch.stage(&target, b"content").unwrap();
+        batch.stage(&target_path, b"content").unwrap();
         let error = batch.finish().unwrap_err();
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
             "the refusal must be machine-recognizable, got: {}", error);
@@ -8410,15 +8420,16 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("ee").join("57a4");
+        let target_path = DurablePath::loose_object("ee57a4").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        write_file_atomically(&target, b"old bytes").unwrap();
+        write_file_atomically(&target_path, b"old bytes").unwrap();
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let error = write_file_atomically(&target, b"new bytes").unwrap_err();
+        let error = write_file_atomically(&target_path, b"new bytes").unwrap_err();
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
         assert_eq!(std::fs::read(&target).unwrap(), b"old bytes", "a refused write leaves the final path as it was");
         let left: Vec<_> = std::fs::read_dir(target.parent().unwrap()).unwrap()
@@ -8446,17 +8457,18 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("ef").join("1f11");
+        let target_path = DurablePath::loose_object("ef1f11").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        write_file_atomically(&target, b"old bytes").unwrap();
+        write_file_atomically(&target_path, b"old bytes").unwrap();
 
         let _seam = PostRenameTaintSeam::arm();
-        let error = write_file_atomically(&target, b"new bytes").unwrap_err();
+        let error = write_file_atomically(&target_path, b"new bytes").unwrap_err();
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
         assert_eq!(std::fs::read(&target).unwrap(), b"new bytes", "the refused write has landed");
 
         assert!(!taint_utils::read_taints(&forklift).unwrap().standing(), "the seam's taint is cleared");
-        write_file_atomically(&target, b"later bytes").expect("the seam fires once");
+        write_file_atomically(&target_path, b"later bytes").expect("the seam fires once");
         assert_eq!(std::fs::read(&target).unwrap(), b"later bytes");
 
         remove_dir_all(&temp).ok();
@@ -8481,21 +8493,22 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("ed").join("c0e5");
+        let target_path = DurablePath::loose_object("edc0e5").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        write_file_atomically(&target, b"before the command").unwrap();
-        write_file_atomically(&target, b"the failed write").unwrap();
+        write_file_atomically(&target_path, b"before the command").unwrap();
+        write_file_atomically(&target_path, b"the failed write").unwrap();
 
         let taint_dir = forklift.join("taint");
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), taint_utils::taint_file_bytes(["objects/zz/left-by-the-failure"])).unwrap();
 
-        let put_back = write_file_compensating(&target, b"before the command");
+        let put_back = write_file_compensating(&target_path, b"before the command");
 
         assert_eq!(std::fs::read(&target).unwrap(), b"before the command", "the put-back landed");
         assert_eq!(put_back, Ok(()), "a put-back that landed with its folder synced reports Ok");
 
-        let ordinary = write_file_atomically(&target, b"an ordinary write").expect_err("an ordinary write keeps the check");
+        let ordinary = write_file_atomically(&target_path, b"an ordinary write").expect_err("an ordinary write keeps the check");
         assert!(ordinary.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", ordinary);
         assert_eq!(std::fs::read(&target).unwrap(), b"before the command");
 
@@ -8519,13 +8532,14 @@ pub(crate) mod tests {
         let _scope = StorageRootScope::enter(&temp);
         let forklift = forklift_root();
 
-        let target = forklift.join("objects").join("ec").join("c0e5");
+        let target_path = DurablePath::loose_object("ecc0e5").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        write_file_atomically(&target, b"before the command").unwrap();
+        write_file_atomically(&target_path, b"before the command").unwrap();
 
         let failed = {
             let _rig = SyncDirFaultGuard::failing_exactly(target.parent().unwrap());
-            write_file_compensating(&target, b"put back")
+            write_file_compensating(&target_path, b"put back")
         };
 
         assert!(failed.is_err(), "a failed folder sync is reported");
@@ -8554,17 +8568,18 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("9b").join("4e57");
+        let target_path = DurablePath::loose_object("9b4e57").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         let outer = SelfTripExemptionGuard::new();
         {
             let _inner = SelfTripExemptionGuard::new();
-            write_file_atomically(&target, b"inner").expect("exempt under both guards");
+            write_file_atomically(&target_path, b"inner").expect("exempt under both guards");
         }
-        write_file_atomically(&target, b"outer").expect("still exempt under the outer guard");
+        write_file_atomically(&target_path, b"outer").expect("still exempt under the outer guard");
         drop(outer);
-        let error = write_file_atomically(&target, b"after").unwrap_err();
+        let error = write_file_atomically(&target_path, b"after").unwrap_err();
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
         assert_eq!(std::fs::read(&target).unwrap(), b"outer");
 
@@ -8596,23 +8611,24 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("9a").join("f5e5");
+        let target_path = DurablePath::loose_object("9af5e5").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         // (a) Unguarded: refuses.
-        let error = write_file_atomically(&target, b"content").unwrap_err();
+        let error = write_file_atomically(&target_path, b"content").unwrap_err();
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
             "an unguarded write must refuse while a taint stands, got: {}", error);
 
         // (b) Guarded: succeeds.
         {
             let _guard = SelfTripExemptionGuard::new();
-            write_file_atomically(&target, b"content").expect(
+            write_file_atomically(&target_path, b"content").expect(
                 "a write made while the exemption guard is armed must succeed despite the standing taint");
         }
 
         // (c) Guard dropped: refuses again — not a permanent bypass.
-        let error = write_file_atomically(&target, b"content").unwrap_err();
+        let error = write_file_atomically(&target_path, b"content").unwrap_err();
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
             "once the guard drops, the identical write must refuse again, got: {}", error);
 
@@ -8652,7 +8668,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("9c").join("f5e5");
+        let target_path = DurablePath::loose_object("9cf5e5").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         // Armed on the main thread. Held across the spawn/join below so it is still armed for
@@ -8660,7 +8677,7 @@ pub(crate) mod tests {
         let _guard = SelfTripExemptionGuard::new();
 
         let child_temp = temp.clone();
-        let child_target = target.clone();
+        let child_target = target_path.clone();
         let child_result = std::thread::spawn(move || {
             // `StorageRootScope` is thread-local by design (unlike the exemption counter this
             // test pins) — the child thread must enter its own scope onto the same root so
@@ -8762,14 +8779,15 @@ pub(crate) mod tests {
         let forklift = forklift_root();
 
         // A real directory-sync failure, batched — must fail the batch but leave no taint trace.
-        let alpha = forklift.join("objects").join("aa").join("a1fa");
-        let beta = forklift.join("objects").join("bb").join("be7a");
+        let alpha_path = DurablePath::loose_object("aaa1fa").unwrap();
+        let beta_path = DurablePath::loose_object("bbbe7a").unwrap();
+        let (alpha, beta) = (alpha_path.as_path(), beta_path.as_path());
         std::fs::create_dir_all(alpha.parent().unwrap()).unwrap();
         std::fs::create_dir_all(beta.parent().unwrap()).unwrap();
 
         let batch = WriteBatch::new();
-        batch.stage(&alpha, b"alpha content").unwrap();
-        batch.stage(&beta, b"beta content").unwrap();
+        batch.stage(&alpha_path, b"alpha content").unwrap();
+        batch.stage(&beta_path, b"beta content").unwrap();
 
         {
             let _guard = DirSyncFaultGuard::failing("bb");
@@ -8793,9 +8811,10 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-1-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
-        let target = forklift.join("objects").join("cc").join("f5e5");
+        let target_path = DurablePath::loose_object("ccf5e5").unwrap();
+        let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        write_file_atomically(&target, b"content").unwrap();
+        write_file_atomically(&target_path, b"content").unwrap();
         assert!(target.exists(), "an unactivated re-check must never refuse a clean sync");
 
         remove_dir_all(&temp).ok();
