@@ -263,9 +263,8 @@ pub(crate) fn is_lowercase_hex(text: &str) -> bool {
 /// * `hash` - The hash of the object.
 ///
 /// # Returns
-/// * The path to the folder where the object is stored (without trailing path separator).
-/// The path is relative to the root folder of the warehouse
-/// (so the path to the objects root folder is included).
+/// * The path to the folder where the object is stored: the objects root's fan-out folder, built
+///   on [`forklift_root`] (relative only when no storage-root scope or bay is entered).
 /// * The file name of the object.
 ///
 /// # Example

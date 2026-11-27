@@ -4484,7 +4484,11 @@ fn compact_held(all: bool,
 
             let pack = match writer.as_mut() {
                 Some(pack) => pack,
-                None => writer.insert(PackWriter::new(PackPlace::Store)?),
+                None => {
+                    let pack = PackWriter::new(PackPlace::Store)?;
+                    debug_assert_eq!(pack.pack_folder, pack_folder, "a compaction's packs are written in the folder it lists and syncs");
+                    writer.insert(pack)
+                }
             };
 
             // Copy an existing record verbatim — a repack's fast path: the original (good) delta
@@ -4836,8 +4840,7 @@ enum Presence {
 }
 
 fn parcel_presence(set: &PackSet, hash: &str, hash_bytes: &[u8; HASH_LEN]) -> Presence {
-    let loose = file_utils::get_path_for_object(hash)
-        .map(|(folder, filename)| PathBuf::from(folder).join(filename));
+    let loose = file_utils::get_path_for_object_file(hash);
     match loose.map(|path| std::fs::symlink_metadata(path)) {
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
         _ => return Presence::Loose,
@@ -7223,7 +7226,9 @@ impl StoreIngest {
 
     fn writer_mut(&mut self) -> Result<&mut PackWriter, String> {
         if self.writer.is_none() {
-            self.writer = Some(PackWriter::new(PackPlace::Store)?);
+            let writer = PackWriter::new(PackPlace::Store)?;
+            debug_assert_eq!(writer.pack_folder, self.folder, "an ingest's packs are written in the folder it created and syncs");
+            self.writer = Some(writer);
         }
         Ok(self.writer.as_mut().expect("the ingest pack writer was just created"))
     }
