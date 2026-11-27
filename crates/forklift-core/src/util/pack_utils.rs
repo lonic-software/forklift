@@ -5638,6 +5638,10 @@ pub(crate) fn rebuild_pack_indexes() -> Result<IndexRebuild, String> {
         Err(error) => return Ok(IndexRebuild { skipped: Some(error.to_string()), ..IndexRebuild::default() }),
     };
 
+    // Heal rebuilds while the taint it is resolving still stands, and an index that landed
+    // unsynced in an earlier round records one, so the standing-taint re-check after each folder
+    // sync would refuse every publish after it; armed here, whichever caller reached this.
+    let _heal_writes = file_utils::SelfTripExemptionGuard::new();
     let mut report = IndexRebuild::default();
     let mut landed_unsynced = Vec::new();
     let mut remaining = rebuild_candidates(&folder)?;
@@ -13497,9 +13501,10 @@ pub(crate) mod tests {
     /// A rebuilt index whose folder sync fails is recorded by a taint naming exactly that index,
     /// stays in place, and is not taken again in a later round, which would move it aside as
     /// damaged. The first of two candidates, in name order, meets the failed sync, so the second
-    /// one's success opens a later round.
+    /// one's success opens a later round, published while the first one's taint stands.
     /// Mutation: sync with a plain folder sync → nothing is recorded, red; take the unsynced one
-    /// again → it is rebuilt a second time, red.
+    /// again → it is rebuilt a second time, red; leave the re-check armed → the second publish is
+    /// refused over the standing taint, red.
     #[test]
     #[cfg(unix)]
     fn a_rebuilt_index_whose_folder_sync_fails_is_recorded_and_not_rebuilt_again() {
@@ -13520,10 +13525,7 @@ pub(crate) mod tests {
         let [(unsynced_data, unsynced_index, unsynced_hash), (_, synced_index, _)] = &packs[..] else { unreachable!() };
         invalidate_cache();
 
-        // Armed as heal arms it for its whole run, the rebuild included: the first index's taint
-        // stands while the second is published.
         let report = {
-            let _heal_writes = file_utils::SelfTripExemptionGuard::new();
             let _fault = SyncDirFaultGuard::failing_exactly_once(&pack_folder());
             rebuild_pack_indexes().unwrap()
         };

@@ -1251,12 +1251,13 @@ static SELF_TRIP_EXEMPTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::at
 /// resolve is still standing). While at least one guard is held, [`taint_recheck`] returns
 /// `Ok(())` immediately instead of reading the durable taint files — see that function.
 ///
-/// Two sites arm it. `forklift heal`'s command handler holds one for its whole run, from the
+/// Three sites arm it. `forklift heal`'s command handler holds one for its whole run, from the
 /// moment its arguments validate: heal repairs config, meta refs, records, positions and refs
 /// before its recovery, all while a taint may stand, and each of those writes would otherwise be
 /// refused before its rename. `recovery_utils::attempt_heal_driven_refetch` holds one around the
-/// remote refetch, so the refetch's exemption does not depend on which caller reached the
-/// recovery; inside a heal run it nests in the run's own, which the counter makes compose.
+/// remote refetch, and `pack_utils::rebuild_pack_indexes` one around its index rebuild, so
+/// neither exemption depends on which caller reached the recovery; inside a heal run each nests
+/// in the run's own, which the counter makes compose.
 ///
 /// Construct with [`SelfTripExemptionGuard::new`] and hold it for the guard's entire lifetime;
 /// `Drop` decrements the count automatically.
