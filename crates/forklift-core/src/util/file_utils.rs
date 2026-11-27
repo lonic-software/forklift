@@ -9571,6 +9571,7 @@ pub(crate) mod tests {
             ("forklift-core/src/util/pack_utils.rs", "compact_held", "sync_pack_folder_or_taint"),
             ("forklift-core/src/util/pack_utils.rs", "write_signature_tables", "sync_pack_folder_or_taint"),
             ("forklift-core/src/util/pack_utils.rs", "finish", "sync_pack_folder_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "publish_rebuilt_index", "sync_pack_folder_or_taint"),
             ("forklift-core/src/util/pallet_utils.rs", "restore_copy", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/pallet_utils.rs", "unlink_ref", "sync_dir_or_taint"),
             ("forklift-core/src/util/ref_heal.rs", "sync_files_again", "sync_dir_again_or_taint"),
