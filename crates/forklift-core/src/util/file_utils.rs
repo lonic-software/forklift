@@ -1251,13 +1251,12 @@ static SELF_TRIP_EXEMPTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::at
 /// resolve is still standing). While at least one guard is held, [`taint_recheck`] returns
 /// `Ok(())` immediately instead of reading the durable taint files — see that function.
 ///
-/// Three sites arm it. `forklift heal`'s command handler holds one for its whole run, from the
+/// Two sites arm it. `forklift heal`'s command handler holds one for its whole run, from the
 /// moment its arguments validate: heal repairs config, meta refs, records, positions and refs
 /// before its recovery, all while a taint may stand, and each of those writes would otherwise be
 /// refused before its rename. `recovery_utils::attempt_heal_driven_refetch` holds one around the
-/// remote refetch, and `pack_utils::rebuild_pack_indexes` one around its index rebuild, so
-/// neither exemption depends on which caller reached the recovery; inside a heal run each nests
-/// in the run's own, which the counter makes compose.
+/// remote refetch, so the refetch's exemption does not depend on which caller reached the
+/// recovery; inside a heal run it nests in the run's own, which the counter makes compose.
 ///
 /// Construct with [`SelfTripExemptionGuard::new`] and hold it for the guard's entire lifetime;
 /// `Drop` decrements the count automatically.
@@ -9313,9 +9312,9 @@ pub(crate) mod tests {
     /// and so do the write entries that feed `run_write_barrier`; `sync_result_or_taint`,
     /// `taint_after_sync_failure` and `run_write_barrier` take bare paths and are private, so
     /// this census is what pins their callers.
-    const TAINT_FAMILY: [&str; 8] = [
+    const TAINT_FAMILY: [&str; 9] = [
         "record_taint", "resolve_taints", "taint_after_sync_failure", "sync_result_or_taint", "sync_dir_or_taint",
-        "sync_dir_again_or_taint", "sync_pack_folder_or_taint", "run_write_barrier",
+        "sync_dir_again_or_taint", "sync_pack_folder_or_taint", "sync_pack_folder_again_or_taint", "run_write_barrier",
     ];
 
     /// Every mention of one of `names` in non-test source, as (file under `crates/`, the function
@@ -9572,7 +9571,9 @@ pub(crate) mod tests {
             ("forklift-core/src/util/pack_utils.rs", "compact_held", "sync_pack_folder_or_taint"),
             ("forklift-core/src/util/pack_utils.rs", "write_signature_tables", "sync_pack_folder_or_taint"),
             ("forklift-core/src/util/pack_utils.rs", "finish", "sync_pack_folder_or_taint"),
-            ("forklift-core/src/util/pack_utils.rs", "publish_rebuilt_index", "sync_pack_folder_or_taint"),
+            // Heal's index rebuild, through the pack folder's form with no standing-taint re-check.
+            ("forklift-core/src/util/pack_utils.rs", "sync_pack_folder_again_or_taint", "sync_dir_again_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "publish_rebuilt_index", "sync_pack_folder_again_or_taint"),
             ("forklift-core/src/util/pallet_utils.rs", "restore_copy", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/pallet_utils.rs", "unlink_ref", "sync_dir_or_taint"),
             ("forklift-core/src/util/ref_heal.rs", "sync_files_again", "sync_dir_again_or_taint"),

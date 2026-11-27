@@ -1591,6 +1591,12 @@ fn sync_pack_folder_or_taint(folder: &Path, written: &[DurablePath]) -> Result<(
     file_utils::sync_dir_or_taint(folder, &written.iter().collect::<Vec<_>>())
 }
 
+/// [`file_utils::sync_dir_again_or_taint`] for `folder`, recording the files `written` as
+/// [`sync_pack_folder_or_taint`] does, with no standing-taint re-check: for heal's own writes.
+fn sync_pack_folder_again_or_taint(folder: &Path, written: &[DurablePath]) -> Result<(), String> {
+    file_utils::sync_dir_again_or_taint(folder, &written.iter().collect::<Vec<_>>())
+}
+
 /// Read the packs for the active warehouse, loading and caching them on first use. The
 /// returned `Arc` lets a lookup search without holding the registry lock.
 fn loaded_packs() -> Result<Arc<PackSet>, String> {
@@ -5604,8 +5610,10 @@ pub(crate) struct IndexRebuild {
     /// Each index rebuilt, with where the index it replaced was moved aside (none when the data
     /// file had no index).
     pub rebuilt: Vec<(PathBuf, Option<PathBuf>)>,
-    /// Each data file whose index could not be rebuilt, with the reason; also each whose rebuilt
-    /// index was put in place but whose folder sync failed, which a taint records.
+    /// Each index of `rebuilt` whose folder could not be synced after it was put in place, with
+    /// the sync's error, which says whether a taint records it.
+    pub unsynced: Vec<(PathBuf, String)>,
+    /// Each data file whose index could not be rebuilt, with the reason.
     pub failed: Vec<(PathBuf, String)>,
     /// Why the rebuild did not run at all: the object-store lock could not be taken.
     pub skipped: Option<String>,
@@ -5620,7 +5628,8 @@ pub(crate) struct IndexRebuild {
 ///
 /// A published index is written to a temp file and synced first; the index it replaces is moved
 /// aside to `<name>.idx.damaged-<nanos>`, never deleted. A failed sync of the pack folder after
-/// the rename records a taint for the index. Runs under [`lock_utils::StoreLock`],
+/// the rename records a taint for the index, and the index is listed as unsynced. Runs under
+/// [`lock_utils::StoreLock`],
 /// so it never races a compaction; when the lock is held the rebuild is skipped and says why.
 ///
 /// # Returns
@@ -5638,27 +5647,23 @@ pub(crate) fn rebuild_pack_indexes() -> Result<IndexRebuild, String> {
         Err(error) => return Ok(IndexRebuild { skipped: Some(error.to_string()), ..IndexRebuild::default() }),
     };
 
-    // Heal rebuilds while the taint it is resolving still stands, and an index that landed
-    // unsynced in an earlier round records one, so the standing-taint re-check after each folder
-    // sync would refuse every publish after it; armed here, whichever caller reached this.
-    let _heal_writes = file_utils::SelfTripExemptionGuard::new();
     let mut report = IndexRebuild::default();
-    let mut landed_unsynced = Vec::new();
     let mut remaining = rebuild_candidates(&folder)?;
     loop {
         let mut failed = Vec::new();
         let mut published = false;
         for data_path in std::mem::take(&mut remaining) {
             match rebuild_index(&folder, &data_path) {
-                Ok(Published { set_aside, unsynced: None }) => {
+                // An index put in place serves reads, so a later round may decode over it, and
+                // it is never taken again, even unsynced: a second rebuild would move this sound
+                // index aside as damaged.
+                Ok(Published { set_aside, unsynced }) => {
                     published = true;
-                    report.rebuilt.push((data_path.with_extension(FILE_EXTENSION_PACK_INDEX), set_aside));
-                }
-                // In place and serving reads, so a later round may decode over it; never taken
-                // again, since a second rebuild would move this sound index aside as damaged.
-                Ok(Published { unsynced: Some(reason), .. }) => {
-                    published = true;
-                    landed_unsynced.push((data_path, reason));
+                    let index = data_path.with_extension(FILE_EXTENSION_PACK_INDEX);
+                    if let Some(error) = unsynced {
+                        report.unsynced.push((index.clone(), error));
+                    }
+                    report.rebuilt.push((index, set_aside));
                 }
                 Err(reason) => failed.push((data_path, reason)),
             }
@@ -5669,7 +5674,6 @@ pub(crate) fn rebuild_pack_indexes() -> Result<IndexRebuild, String> {
         }
         remaining = failed.into_iter().map(|(path, _)| path).collect();
     }
-    report.failed.extend(landed_unsynced);
 
     Ok(report)
 }
@@ -5698,7 +5702,8 @@ fn rebuild_candidates(folder: &Path) -> Result<Vec<PathBuf>, String> {
 struct Published {
     /// Where the index it replaced was moved, if there was one.
     set_aside: Option<PathBuf>,
-    /// Why its folder could not be synced after the rename, with a taint recorded for it.
+    /// The error of its folder sync after the rename, when that failed; it says whether a taint
+    /// records the index.
     unsynced: Option<String>,
 }
 
@@ -5814,7 +5819,10 @@ fn decode_in_file(data: &[u8],
 
 /// Publish a rebuilt index at `index`, in `folder`: written and synced under a temp name, the
 /// index it replaces moved aside, then renamed in, unless an index appeared meanwhile, and the
-/// folder synced through the taint funnel, so a failed sync records `index`.
+/// folder synced through the taint funnel, so a failed sync records `index`. Its sync skips the
+/// standing-taint re-check: heal rebuilds while the taint it is resolving stands, and an index
+/// put in place unsynced earlier in the same rebuild records one, so the re-check would refuse
+/// every publish after it.
 fn publish_rebuilt_index(folder: &Path, index: &DurablePath, index_bytes: &[u8]) -> Result<Published, String> {
     let index_path = index.as_path();
     let temp = temp_path(folder, FILE_EXTENSION_PACK_INDEX);
@@ -5849,12 +5857,9 @@ fn publish_rebuilt_index(folder: &Path, index: &DurablePath, index_bytes: &[u8])
         let kept = if restored { String::new() } else { kept_at(&set_aside) };
         return Err(format!("its rebuilt index could not be put in place: {}{}", e, kept));
     }
-    let synced = sync_pack_folder_or_taint(folder, std::slice::from_ref(index));
+    let synced = sync_pack_folder_again_or_taint(folder, std::slice::from_ref(index));
     invalidate_cache();
-    let unsynced = synced.err().map(|e| format!(
-        "its rebuilt index was put in place, but the pack folder could not be synced: {}{}", e, kept_at(&set_aside)
-    ));
-    Ok(Published { set_aside, unsynced })
+    Ok(Published { set_aside, unsynced: synced.err() })
 }
 
 /// Move a replaced index aside to `<name>.damaged-<nanos>`, keeping it for inspection.
@@ -13499,12 +13504,12 @@ pub(crate) mod tests {
     }
 
     /// A rebuilt index whose folder sync fails is recorded by a taint naming exactly that index,
-    /// stays in place, and is not taken again in a later round, which would move it aside as
-    /// damaged. The first of two candidates, in name order, meets the failed sync, so the second
-    /// one's success opens a later round, published while the first one's taint stands.
-    /// Mutation: sync with a plain folder sync → nothing is recorded, red; take the unsynced one
-    /// again → it is rebuilt a second time, red; leave the re-check armed → the second publish is
-    /// refused over the standing taint, red.
+    /// stays in place, is reported rebuilt and unsynced, and is not taken again, which would move
+    /// it aside as damaged. The first of two candidates, in name order, meets the failed sync; the
+    /// second is published in the same round, while the first one's taint stands.
+    /// Mutation: sync with a plain folder sync → nothing is recorded, red; sync with the
+    /// standing-taint re-check → the second publish is refused, red; also retry the unsynced one
+    /// → its sound index is set aside, red.
     #[test]
     #[cfg(unix)]
     fn a_rebuilt_index_whose_folder_sync_fails_is_recorded_and_not_rebuilt_again() {
@@ -13522,7 +13527,7 @@ pub(crate) mod tests {
             (data, index, hash)
         }).collect();
         packs.sort();
-        let [(unsynced_data, unsynced_index, unsynced_hash), (_, synced_index, _)] = &packs[..] else { unreachable!() };
+        let [(_, unsynced_index, unsynced_hash), (_, synced_index, _)] = &packs[..] else { unreachable!() };
         invalidate_cache();
 
         let report = {
@@ -13530,12 +13535,12 @@ pub(crate) mod tests {
             rebuild_pack_indexes().unwrap()
         };
 
-        assert_eq!(report.rebuilt, vec![(synced_index.clone(), None)], "{:?}", report);
-        assert_eq!(report.failed.len(), 1, "{:?}", report);
-        let (failed, reason) = &report.failed[0];
-        assert_eq!(failed, unsynced_data);
-        assert!(reason.contains("its rebuilt index was put in place, but the pack folder could not be synced")
-            && reason.contains("injected directory-sync failure"), "{}", reason);
+        assert_eq!(report.rebuilt, vec![(unsynced_index.clone(), None), (synced_index.clone(), None)], "{:?}", report);
+        assert!(report.failed.is_empty(), "{:?}", report);
+        assert_eq!(report.unsynced.len(), 1, "{:?}", report);
+        let (unsynced, error) = &report.unsynced[0];
+        assert_eq!(unsynced, unsynced_index);
+        assert!(error.contains("injected directory-sync failure"), "{}", error);
 
         let index_name = unsynced_index.file_name().unwrap().to_str().unwrap();
         let state = taint_utils::read_taints(&crate::globals::forklift_root()).unwrap();

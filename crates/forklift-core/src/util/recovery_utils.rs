@@ -489,11 +489,10 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
     resolve_the_rest(root, &state.recorded, &attempt, &state.files).await
 }
 
-/// The lines saying what [`pack_utils::rebuild_pack_indexes`] did: each index rebuilt, and why
-/// the rebuild did not run. A data file it could not rebuild is named by
-/// [`pack_health_warning_lines`], beside the problem that made it a candidate. One whose rebuilt
-/// index was put in place with its folder unsynced is named by neither: the taint that sync
-/// recorded is read by the taint pass, which runs after the rebuild.
+/// The lines saying what [`pack_utils::rebuild_pack_indexes`] did: each index rebuilt, each of
+/// those whose folder could not be synced after it, with the sync's error, and why the rebuild did
+/// not run. A data file it could not rebuild is named by [`pack_health_warning_lines`], beside the
+/// problem that made it a candidate.
 fn index_rebuild_lines(rebuild: &pack_utils::IndexRebuild) -> Vec<String> {
     let mut lines: Vec<String> = rebuild.rebuilt.iter().map(|(index_path, set_aside)| match set_aside {
         Some(old) => format!(
@@ -502,6 +501,10 @@ fn index_rebuild_lines(rebuild: &pack_utils::IndexRebuild) -> Vec<String> {
         ),
         None => format!("pack index \"{}\" was rebuilt from its data file", index_path.to_string_lossy()),
     }).collect();
+    lines.extend(rebuild.unsynced.iter().map(|(index_path, error)| format!(
+        "pack index \"{}\" is in place, but its folder could not be synced after it: {}",
+        index_path.to_string_lossy(), error
+    )));
     if let Some(reason) = &rebuild.skipped {
         lines.push(format!(
             "pack indexes were not rebuilt this run because the object store is busy ({}); \
@@ -12358,6 +12361,23 @@ mod tests {
         crate::util::pallet_utils::write_position(&crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         pack_utils::tests::pack_as_unreadable(&web_tree, how);
         web_tree
+    }
+
+    /// Heal says where a rebuilt index's replaced copy was kept, and, for an index put in place
+    /// whose folder could not be synced, that it is in place and the sync's error.
+    /// Revert: drop the unsynced lines → the second line is missing, red.
+    #[test]
+    fn the_rebuild_lines_name_an_unsynced_index_and_where_its_old_copy_is() {
+        let rebuild = pack_utils::IndexRebuild {
+            rebuilt: vec![(PathBuf::from("p/a.idx"), Some(PathBuf::from("p/a.idx.damaged-7")))],
+            unsynced: vec![(PathBuf::from("p/a.idx"), "EIO".to_string())],
+            ..pack_utils::IndexRebuild::default()
+        };
+
+        assert_eq!(index_rebuild_lines(&rebuild), vec![
+            "pack index \"p/a.idx\" was rebuilt from its data file; the index it replaced was kept as \"p/a.idx.damaged-7\"".to_string(),
+            "pack index \"p/a.idx\" is in place, but its folder could not be synced after it: EIO".to_string(),
+        ]);
     }
 
     /// FORK-217: a vanished object whose only reference lies beneath a tree only an unreadable
