@@ -50,6 +50,7 @@ use crate::util::cherry_pick_utils::{self, FILE_NAME_CHERRY_PICK, FILE_NAME_CHER
 use crate::util::merge_utils::{self, OutOfScopeSkeleton, Unusable};
 use crate::util::{file_utils, operation_utils, pallet_utils};
 use crate::util::operation_utils::OperationKind;
+use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// The command a damaged merge record names when heal can run for it.
 const HEAL_COMMAND: &str = "forklift heal";
@@ -91,6 +92,24 @@ impl MergeRecord {
             MergeRecord::State => merge_utils::FILE_NAME_CONSOLIDATION_COPY,
             MergeRecord::Skeleton => merge_utils::FILE_NAME_SKELETON_COPY,
             MergeRecord::Pick => FILE_NAME_CHERRY_PICK_COPY,
+        }
+    }
+
+    /// The record's file in `checkout`, for a write.
+    pub(crate) fn durable(self, checkout: &Checkout) -> DurablePath {
+        match self {
+            MergeRecord::State => DurablePath::consolidation(checkout),
+            MergeRecord::Skeleton => DurablePath::skeleton(checkout),
+            MergeRecord::Pick => DurablePath::cherry_pick(checkout),
+        }
+    }
+
+    /// The copy beside it in `checkout`, for a write.
+    pub(crate) fn durable_copy(self, checkout: &Checkout) -> DurablePath {
+        match self {
+            MergeRecord::State => DurablePath::consolidation_copy(checkout),
+            MergeRecord::Skeleton => DurablePath::skeleton_copy(checkout),
+            MergeRecord::Pick => DurablePath::cherry_pick_copy(checkout),
         }
     }
 
@@ -326,6 +345,7 @@ fn status(dir: &Path, record: MergeRecord, digest: Option<&str>) -> Result<Statu
 /// * `Err(CoreError)` - A file that could not be read or written.
 pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<Repair, CoreError> {
     let dir = bay_root();
+    let place = Checkout::active();
     let marker = match operation_utils::marker_stands_in(&dir) {
         false => Marker::None,
         true => match operation_utils::read_in(&dir) {
@@ -348,7 +368,8 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
             continue;
         }
 
-        let path = dir.join(record.file_name());
+        let durable = record.durable(&place);
+        let path = durable.as_path();
         let was = match status(&dir, record, digest.as_deref())? {
             Status::Newer => continue,
             Status::Absent if record != MergeRecord::Skeleton => continue,
@@ -357,7 +378,7 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
                 if record == MergeRecord::State {
                     digest = Some(state_digest(&bytes));
                 }
-                resync_copy(&dir, record, &bytes, &checkout, notes);
+                resync_copy(&place, record, &bytes, &checkout, notes);
                 continue;
             }
             Status::Damaged(reason) => reason,
@@ -371,10 +392,10 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
             // A folder in the record's place would refuse the rename that writes it, and every heal
             // would meet it again, so it goes first. A file is left for the rename to replace: were
             // it removed and the write then failed, the next heal would read no merge at all.
-            if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-                merge_utils::remove_record(&path)?;
+            if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+                merge_utils::remove_record(path)?;
             }
-            file_utils::write_file_atomically(&path, &bytes)
+            file_utils::write_file_atomically(&durable, &bytes)
                 .map_err(|e| format!("Error while restoring the {} \"{}\": {}", record.what(), path.to_string_lossy(), e))?;
             if record == MergeRecord::State {
                 digest = Some(state_digest(&bytes));
@@ -390,8 +411,8 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
                     merge_utils::remove_record(&copy)?;
                 }
                 // A missing skeleton has nothing to remove, and is reported as nothing removed.
-                if std::fs::symlink_metadata(&path).is_ok() {
-                    merge_utils::remove_record(&path)?;
+                if std::fs::symlink_metadata(path).is_ok() {
+                    merge_utils::remove_record(path)?;
                     records.push(MergeRecordRestored { record: record.what().to_string(), file: path.to_string_lossy().into_owned(), removed: true, was });
                 }
             }
@@ -439,9 +460,9 @@ fn copy_is_newer(record: MergeRecord, bytes: &[u8]) -> bool {
 
 /// Rewrite the copy of a usable record when it is missing, damaged or different. A copy a newer
 /// Forklift wrote is left as it is. A failure is a note, not an error: the record is sound.
-fn resync_copy(dir: &Path, record: MergeRecord, bytes: &[u8], checkout: &str, notes: &mut Vec<String>) {
-    let copy = dir.join(record.copy_name());
-    match merge_utils::read_record_bytes(&copy) {
+fn resync_copy(place: &Checkout, record: MergeRecord, bytes: &[u8], checkout: &str, notes: &mut Vec<String>) {
+    let copy = record.durable_copy(place);
+    match merge_utils::read_record_bytes(copy.as_path()) {
         Ok(Some(held)) if held == bytes || copy_is_newer(record, &held) => return,
         _ => {}
     }

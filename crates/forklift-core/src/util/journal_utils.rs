@@ -9,6 +9,7 @@ use crate::util::object_utils;
 use crate::util::pallet_utils::{self, PalletNamespace, PalletRef, RefUpdateError};
 use crate::util::file_utils;
 use crate::util::lock_utils::StoreAccessLock;
+use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// The undo journal (§7.8): an append-only list of operation records kept in the bay, so `undo`
 /// can reverse the last state-changing operation — not just the last `stack`. Content addressing
@@ -16,7 +17,7 @@ use crate::util::lock_utils::StoreAccessLock;
 /// any in-progress consolidation or cherry-pick on each side of it (all tiny); the objects they point at are
 /// immutable and already stored. The working directory and inventory are the undo command's
 /// concern, not the journal's.
-const FILE_NAME_JOURNAL: &str = "journal.json";
+pub(crate) const FILE_NAME_JOURNAL: &str = "journal.json";
 
 /// The journal file's format version. The file is `{"version":5,"entries":[...]}`; any other
 /// version, or anything that does not parse as this shape, is refused by name — never read as
@@ -399,7 +400,7 @@ pub(crate) fn append_in_hold(lock: &crate::util::lock_utils::RefLock,
 pub(crate) fn put_back_in_hold(_lock: &crate::util::lock_utils::RefLock,
                                before: &[JournalEntry], error: String) -> String {
     file_utils::put_back_as_read(error, "undo journal", before, read, |entries| {
-        write_as(entries, file_utils::write_file_compensating)
+        write_compensating(entries)
     })
 }
 
@@ -1602,16 +1603,18 @@ fn read_from(path: &Path) -> Result<Vec<JournalEntry>, String> {
 
 /// Write the journal atomically.
 fn write(entries: &[JournalEntry]) -> Result<(), String> {
-    write_as(entries, file_utils::write_file_atomically)
+    file_utils::write_file_atomically(&DurablePath::journal(&Checkout::active()), &journal_bytes(entries)?)
 }
 
-/// [`write`] through `writer`: [`file_utils::write_file_atomically`], or for a put-back
-/// [`file_utils::write_file_compensating`].
-fn write_as(entries: &[JournalEntry], writer: fn(&Path, &[u8]) -> Result<(), String>) -> Result<(), String> {
-    let json = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries })
-        .map_err(|e| format!("Error while serializing the undo journal: {}", e))?;
+/// Write the journal as a put-back does, through [`file_utils::write_file_compensating`].
+fn write_compensating(entries: &[JournalEntry]) -> Result<(), String> {
+    file_utils::write_file_compensating(&DurablePath::journal(&Checkout::active()), &journal_bytes(entries)?)
+}
 
-    writer(&path(), json.as_bytes())
+/// The bytes of the journal file holding `entries`.
+fn journal_bytes(entries: &[JournalEntry]) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&JournalFile { version: JOURNAL_VERSION, entries })
+        .map_err(|e| format!("Error while serializing the undo journal: {}", e))
 }
 
 /// The journal file path of the bay in scope, for a test.
@@ -1881,8 +1884,7 @@ mod tests {
     /// Move `pallet` to `head` the way another bay or process would: a ref write outside this
     /// process's write log.
     fn move_elsewhere(pallet: &str, head: &str) {
-        let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, pallet);
-        file_utils::write_file_atomically(&path, format!("{}\n", head).as_bytes()).unwrap();
+        file_utils::write_file_atomically(&DurablePath::pallet_ref(pallet), format!("{}\n", head).as_bytes()).unwrap();
     }
 
     #[test]

@@ -8467,29 +8467,32 @@ mod tests {
         use crate::globals::StorageRootScope;
         use crate::util::file_utils::SyncDirFaultGuard;
 
-        // (the record's name, the syncs of the state folder that pass before the one that fails,
-        // the path recorded, whether heal can make its absence durable, the note, or the refusal's
-        // line where it cannot)
-        let cases: &[(&str, usize, &str, bool, &str)] = &[
-            ("cherry-pick", 0, "bays/b/cherry-pick-copy", true, "the copy of the pick state of bay \"b\" \
+        use crate::util::merge_state_heal::MergeRecord;
+        use crate::util::taint_utils::Checkout;
+
+        // (the record, the syncs of the state folder that pass before the one that fails, the path
+        // recorded, whether heal can make its absence durable, the note, or the refusal's line where
+        // it cannot)
+        let cases: &[(MergeRecord, usize, &str, bool, &str)] = &[
+            (MergeRecord::Pick, 0, "bays/b/cherry-pick-copy", true, "the copy of the pick state of bay \"b\" \
                 (\"bays/b/cherry-pick-copy\") is gone; only heal reads a copy, to write a damaged record back"),
-            ("cherry-pick", 1, "bays/b/cherry-pick", true, "the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
+            (MergeRecord::Pick, 1, "bays/b/cherry-pick", true, "the pick state of bay \"b\" (\"bays/b/cherry-pick\") is \
                 gone; that checkout reads as having no pick in progress, as it would with no taint; if a \"forklift \
                 undo\" putting a pick back failed there before this heal, run it again"),
-            ("cherry-pick", 1, "bays/b/cherry-pick", false, "a lost pick state or copy whose loss could not be made \
+            (MergeRecord::Pick, 1, "bays/b/cherry-pick", false, "a lost pick state or copy whose loss could not be made \
                 durable: \"bays/b/cherry-pick\""),
-            ("consolidation", 0, "bays/b/consolidation-copy", true, "the copy of the consolidation state of bay \"b\" \
+            (MergeRecord::State, 0, "bays/b/consolidation-copy", true, "the copy of the consolidation state of bay \"b\" \
                 (\"bays/b/consolidation-copy\") is gone; only heal reads a copy, to write a damaged record back"),
-            ("consolidation", 1, "bays/b/consolidation", true, "the consolidation state of bay \"b\" \
+            (MergeRecord::State, 1, "bays/b/consolidation", true, "the consolidation state of bay \"b\" \
                 (\"bays/b/consolidation\") is gone; that checkout reads as having no consolidation in progress, as it \
                 would with no taint; if a command that records one failed there before this heal, run it again"),
-            ("consolidation-skeleton", 1, "bays/b/consolidation-skeleton", true, "the consolidation skeleton of bay \
+            (MergeRecord::Skeleton, 1, "bays/b/consolidation-skeleton", true, "the consolidation skeleton of bay \
                 \"b\" (\"bays/b/consolidation-skeleton\") is gone, and no consolidation state stands beside it"),
-            ("consolidation", 1, "bays/b/consolidation", false, "a lost consolidation state or copy whose loss could \
+            (MergeRecord::State, 1, "bays/b/consolidation", false, "a lost consolidation state or copy whose loss could \
                 not be made durable: \"bays/b/consolidation\""),
         ];
 
-        for (name, passed, relative, durable, note) in cases {
+        for (record, passed, relative, durable, note) in cases {
             let _serial = lock_activation();
             taint_utils::activate();
 
@@ -8505,7 +8508,8 @@ mod tests {
             std::fs::create_dir_all(&folder).unwrap();
             {
                 let _fault = SyncDirFaultGuard::failing_exactly_after(&folder, *passed);
-                merge_utils::write_record_and_copy(&folder.join(name), &folder.join(format!("{}-copy", name)), b"bytes")
+                let bay = Checkout::Bay("b".to_string());
+                merge_utils::write_record_and_copy(&record.durable(&bay), &record.durable_copy(&bay), b"bytes")
                     .expect_err("a record write whose folder sync fails fails");
             }
             assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
