@@ -351,6 +351,8 @@ mod tests {
             (File::Bytes(damaged), File::Bytes(&sound), false, false),
             (File::Bytes(&newer), File::Absent, false, false),
             (File::Folder, File::Absent, false, false),
+            (File::Absent, File::Folder, false, false),
+            (File::Absent, File::Bytes(&newer), false, false),
             (File::Absent, File::Absent, true, false),
         ] {
             for (file, state) in [("position", &position), ("position-copy", &copy)] {
