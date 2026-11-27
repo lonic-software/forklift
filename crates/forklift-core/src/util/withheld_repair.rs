@@ -338,6 +338,7 @@ mod tests {
     use super::*;
     use crate::globals::{self, StorageRootScope};
     use crate::util::pallet_utils;
+    use crate::util::taint_utils::Checkout;
 
     struct Scratch {
         root: PathBuf,
@@ -352,8 +353,7 @@ mod tests {
             let scope = StorageRootScope::enter(&root);
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
             // The walk reads the bay position, as on any warehouse a host serves.
-            pallet_utils::write_position_in(&root.join(globals::FOLDER_NAME_FORKLIFT_ROOT),
-                &pallet_utils::BayPosition::new("main", None)).unwrap();
+            pallet_utils::write_position_for(&Checkout::Main, &pallet_utils::BayPosition::new("main", None)).unwrap();
             crate::util::park_utils::create_if_not_exists(&root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
 
             Scratch { root, _scope: scope }

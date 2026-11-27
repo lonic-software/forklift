@@ -5,6 +5,7 @@ use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::scope_utils::{PathScope, ScopeClass};
+use forklift_core::util::taint_utils::Checkout;
 use forklift_core::util::{
     bay_utils, file_utils, lock_utils, object_utils, operation_utils, pallet_utils, scope_utils,
     shift_utils, warehouse_utils,
@@ -112,7 +113,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     operation_utils::raise_in(&bay_utils::bay_state_dir(name), &operation)?;
     // The position goes in first, so a listed bay always has one for collection to root; a bay
     // interrupted before it is named by collection's refusal until `bay remove` drops it.
-    pallet_utils::write_position_in(&bay_utils::bay_state_dir(name), &pallet_utils::BayPosition::new(name, Some(head.clone())))?;
+    pallet_utils::write_position_for(&Checkout::Bay(name.to_string()), &pallet_utils::BayPosition::new(name, Some(head.clone())))?;
     // The path file is written before the redirect, so a bay without a path file never wrote
     // one — which is what lets `bay remove` drop such a bay without leaving a redirect behind.
     bay_utils::write_bay_path(name, &bay_dir)?;

@@ -163,7 +163,7 @@ fn heals_from_the_copy(area: &Area, root: &Path, dir: &Path, bay: Option<&str>, 
 }
 
 // Revert: read_position_at mapping every failure to a plain String → the refusal is "error", not
-// bay_position_damaged. Drop the copy write from write_position_in → heal finds no copy.
+// bay_position_damaged. Drop the copy write from write_position_files → heal finds no copy.
 #[test]
 fn a_damaged_position_in_the_working_tree_is_rebuilt_from_its_copy() {
     for kind in DAMAGES {
@@ -228,23 +228,31 @@ fn position_is_refused_over_a_position_that_reads() {
     assert_eq!(std::fs::read(&position).unwrap(), before);
 }
 
-// Revert: keep's copy comparison → a stale or missing copy stays as it was.
+// Revert: keep's copy comparison → a stale or missing copy stays as it was. Keep's copy written
+// for the main tree whatever checkout heal runs in → the bay's copy stays as it was.
 #[test]
 fn heal_rewrites_a_copy_that_does_not_match_the_position() {
     let area = Area::new("copy");
     let root = area.warehouse();
-    let dir = state_dir(&root, None);
-    let position = std::fs::read(dir.join("position")).unwrap();
+    let bay = area.bay(&root, "b1");
 
-    for stale in [None, Some(forklift_core::util::record_utils::to_bytes("position", 2, ["main", &head(&root, "main")]))] {
-        match &stale {
-            None => forklift_core::util::file_utils::remove_file(dir.join("position-copy")).unwrap(),
-            Some(bytes) => std::fs::write(dir.join("position-copy"), bytes).unwrap(),
+    for (tree, name) in [(&root, None), (&bay, Some("b1"))] {
+        let dir = state_dir(&root, name);
+        let position = std::fs::read(dir.join("position")).unwrap();
+
+        for stale in [None, Some(forklift_core::util::record_utils::to_bytes("position", 2, ["main", &head(&root, "main")]))] {
+            match &stale {
+                None => forklift_core::util::file_utils::remove_file(dir.join("position-copy")).unwrap(),
+                Some(bytes) => {
+                    assert_ne!(bytes, &position, "{:?}: the stale copy must hold another position", name);
+                    std::fs::write(dir.join("position-copy"), bytes).unwrap()
+                }
+            }
+
+            let data = parsed(&area.run_ok(tree, &["--json", "heal"]))["data"].clone();
+            assert!(data.get("position_rebuilt").is_none(), "the position itself is not rebuilt: {}", data);
+            assert_eq!(std::fs::read(dir.join("position-copy")).unwrap(), position, "{:?} {:?}", name, stale.is_some());
         }
-
-        let data = parsed(&area.run_ok(&root, &["--json", "heal"]))["data"].clone();
-        assert!(data.get("position_rebuilt").is_none(), "the position itself is not rebuilt: {}", data);
-        assert_eq!(std::fs::read(dir.join("position-copy")).unwrap(), position, "{:?}", stale.is_some());
     }
 }
 

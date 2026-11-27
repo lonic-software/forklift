@@ -322,8 +322,10 @@ static SHARD: TaintShape = shape("a staged inventory shard", Some(Disposition::S
 static BAY_SHARD: TaintShape = shape("a bay's staged inventory shard", Some(Disposition::Shard), &[Is("bays"), Name, Is("inventory"), Names, Is("data")]);
 
 static LOAD_MARKER: TaintShape = shape("the incomplete-load marker", Some(Disposition::LoadMarker), &[Is("inventory"), Is("incomplete-load")]);
-static POSITION: TaintShape = shape("the checkout position", Some(Disposition::Position), &[Is("position")]);
-static POSITION_COPY: TaintShape = shape("the checkout position's copy", Some(Disposition::PositionCopy), &[Is("position-copy")]);
+static POSITION: TaintShape = shape("the checkout position", Some(Disposition::Position),
+    &[Is(crate::util::pallet_utils::FILE_NAME_POSITION)]);
+static POSITION_COPY: TaintShape = shape("the checkout position's copy", Some(Disposition::PositionCopy),
+    &[Is(crate::util::pallet_utils::FILE_NAME_POSITION_COPY)]);
 static SCOPE: TaintShape = shape("the checkout scope", Some(Disposition::Scope), &[Is("scope")]);
 static SCOPE_COPY: TaintShape = shape("the checkout scope's copy", Some(Disposition::ScopeCopy), &[Is("scope-copy")]);
 static CONSOLIDATION: TaintShape = shape("the consolidation state", Some(Disposition::MergeRecord), &[Is("consolidation")]);
@@ -333,8 +335,10 @@ static SKELETON_COPY: TaintShape = shape("the consolidation skeleton's copy", So
 static JOURNAL: TaintShape = shape("the journal", Some(Disposition::Journal), &[Is("journal.json")]);
 
 static BAY_LOAD_MARKER: TaintShape = shape("a bay's incomplete-load marker", Some(Disposition::LoadMarker), &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")]);
-static BAY_POSITION: TaintShape = shape("a bay's checkout position", Some(Disposition::Position), &[Is("bays"), Name, Is("position")]);
-static BAY_POSITION_COPY: TaintShape = shape("a bay's checkout position's copy", Some(Disposition::PositionCopy), &[Is("bays"), Name, Is("position-copy")]);
+static BAY_POSITION: TaintShape = shape("a bay's checkout position", Some(Disposition::Position),
+    &[Is("bays"), Name, Is(crate::util::pallet_utils::FILE_NAME_POSITION)]);
+static BAY_POSITION_COPY: TaintShape = shape("a bay's checkout position's copy", Some(Disposition::PositionCopy),
+    &[Is("bays"), Name, Is(crate::util::pallet_utils::FILE_NAME_POSITION_COPY)]);
 static BAY_SCOPE: TaintShape = shape("a bay's checkout scope", Some(Disposition::Scope), &[Is("bays"), Name, Is("scope")]);
 static BAY_SCOPE_COPY: TaintShape = shape("a bay's checkout scope's copy", Some(Disposition::ScopeCopy), &[Is("bays"), Name, Is("scope-copy")]);
 static BAY_CONSOLIDATION: TaintShape = shape("a bay's consolidation state", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("consolidation")]);

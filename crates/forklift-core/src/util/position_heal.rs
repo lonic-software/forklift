@@ -2,7 +2,7 @@
 //! stand on), when it is missing or damaged.
 //!
 //! Only exact evidence rebuilds it. The position's copy, written right after it by every position
-//! write ([`pallet_utils::write_position_in`]), is the last position the bay was given. Failing
+//! write ([`pallet_utils::write_position_for`]), is the last position the bay was given. Failing
 //! that, a standing operation marker's source is where the bay stood when that operation began,
 //! and the recovery that runs later in the same heal moves it on from there. The undo journal is
 //! never used: most position writes are not journaled, so its newest entry can name a pallet the
@@ -18,6 +18,7 @@ use serde::Serialize;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::bay_root;
 use crate::util::pallet_utils::{self, BayPosition, PositionCopy, PositionUnread};
+use crate::util::taint_utils::{Checkout, DurablePath};
 use crate::util::{file_utils, journal_utils, operation_utils};
 
 /// Where a rebuilt position came from.
@@ -77,12 +78,12 @@ impl PositionRebuilt {
 ///                                 that reads, or of a pallet it cannot stand on; or a failed
 ///                                 read or write. Nothing was changed but what a write says.
 pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<PositionRebuilt>, String> {
-    let dir = bay_root();
-    let path = dir.join(pallet_utils::FILE_NAME_POSITION);
+    let checkout = Checkout::active();
+    let path = bay_root().join(pallet_utils::FILE_NAME_POSITION);
 
     let unread = match std::fs::read(&path) {
         Ok(bytes) => match pallet_utils::decode_position(&bytes) {
-            Ok(position) => return keep(&dir, position, chosen, notes),
+            Ok(position) => return keep(&checkout, position, chosen, notes),
             Err(PositionUnread::Newer(reason)) => return match chosen {
                 Some(_) => Err(format!(
                     "The bay position file \"{}\" {} This version of Forklift never writes over it, so \
@@ -101,13 +102,14 @@ pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<Po
         )),
     };
 
-    let copy = pallet_utils::read_position_copy_in(&dir);
+    let copy = pallet_utils::read_position_copy_for(&checkout);
+    let copy_path = DurablePath::position_copy(&checkout);
 
     // A copy that is there but cannot be read now may be sound, like the position itself.
     if let PositionCopy::Unreadable(reason) = &copy {
         return Err(format!(
             "The bay position file \"{}\" {} Its copy \"{}\" cannot be read: {}. Nothing was changed.",
-            path.to_string_lossy(), unread, dir.join(pallet_utils::FILE_NAME_POSITION_COPY).to_string_lossy(), reason
+            path.to_string_lossy(), unread, copy_path.as_path().to_string_lossy(), reason
         ));
     }
 
@@ -116,7 +118,7 @@ pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<Po
         return Err(format!(
             "The bay position file \"{}\" {} Its copy \"{}\" {} This version of Forklift never \
             writes over it, so nothing was changed.",
-            path.to_string_lossy(), unread, dir.join(pallet_utils::FILE_NAME_POSITION_COPY).to_string_lossy(), reason
+            path.to_string_lossy(), unread, copy_path.as_path().to_string_lossy(), reason
         ));
     }
 
@@ -165,14 +167,14 @@ pub fn sets_chosen() -> Result<bool, String> {
         Err(_) => return Ok(false),
     }
 
-    Ok(matches!(pallet_utils::read_position_copy_in(&dir), PositionCopy::Unusable) && operation_utils::read()?.is_none())
+    Ok(matches!(pallet_utils::read_position_copy_for(&Checkout::active()), PositionCopy::Unusable) && operation_utils::read()?.is_none())
 }
 
 /// A position that reads: `--position` is refused over it, and its copy is rewritten if it does
 /// not match. A copy that holds another position is a false witness, so it is removed when it
 /// cannot be rewritten; one that holds nothing usable witnesses nothing, so failing to rewrite it
 /// blocks no other repair and is a note. A copy a newer version wrote is kept.
-fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<PositionRebuilt>, String> {
+fn keep(checkout: &Checkout, position: BayPosition, chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<PositionRebuilt>, String> {
     if chosen.is_some() {
         return Err(format!(
             "The bay's position reads: it stands on pallet \"{}\". --position sets only a position that \
@@ -181,25 +183,25 @@ fn keep(dir: &std::path::Path, position: BayPosition, chosen: Option<&str>, note
         ));
     }
 
-    match pallet_utils::read_position_copy_in(dir) {
+    match pallet_utils::read_position_copy_for(checkout) {
         PositionCopy::Reads(copy) if copy == position => {}
         PositionCopy::Newer(_) => {}
         PositionCopy::Reads(_) => {
-            let path = dir.join(pallet_utils::FILE_NAME_POSITION_COPY);
-            if let Err(written) = pallet_utils::write_position_copy_in(dir, &position) {
-                match file_utils::remove_file(&path) {
+            if let Err(written) = pallet_utils::write_position_copy_for(checkout, &position) {
+                let path = DurablePath::position_copy(checkout);
+                match file_utils::remove_file(path.as_path()) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(removed) => return Err(format!(
                         "The bay position copy \"{}\" holds another position than the bay's, and could \
                         neither be rewritten ({}) nor removed ({}).",
-                        path.to_string_lossy(), written.trim_end_matches('.'), removed
+                        path.as_path().to_string_lossy(), written.trim_end_matches('.'), removed
                     )),
                 }
             }
         }
         PositionCopy::Unusable | PositionCopy::Unreadable(_) => {
-            if let Err(error) = pallet_utils::write_position_copy_in(dir, &position) {
+            if let Err(error) = pallet_utils::write_position_copy_for(checkout, &position) {
                 notes.push(format!(
                     "The bay position's copy could not be rewritten ({}), so a later loss of the position \
                     has no copy to rebuild it from.",
@@ -273,4 +275,48 @@ fn no_evidence(path: &std::path::Path, reason: &str) -> String {
 /// `names`, each quoted, comma-separated.
 fn quoted(names: &[String]) -> String {
     names.iter().map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::globals::{forklift_root, StorageRootScope};
+    use crate::util::taint_utils;
+
+    /// A copy that holds another position and cannot be rewritten is removed, and the position
+    /// it stands beside is kept.
+    /// Revert: remove the position in place of its copy → the position is gone and the copy
+    /// stands → red.
+    #[test]
+    fn a_false_copy_that_cannot_be_rewritten_is_removed_and_the_position_kept() {
+        let root = std::env::temp_dir().join(format!("forklift-position-heal-false-copy-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+
+        let position = BayPosition::new("main", None);
+        pallet_utils::write_position_for(&Checkout::Main, &position).unwrap();
+        pallet_utils::write_position_copy_for(&Checkout::Main, &BayPosition::new("other", None)).unwrap();
+        let dir = forklift_root();
+        assert!(matches!(pallet_utils::read_position_copy_for(&Checkout::Main), PositionCopy::Reads(copy) if copy.pallet == "other"));
+
+        // A taint standing in this warehouse refuses every write before its rename; a removal
+        // still runs.
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::fs::create_dir_all(dir.join("taint")).unwrap();
+        std::fs::write(dir.join("taint").join("taint-99999-0"), taint_utils::taint_file_bytes(["objects"])).unwrap();
+        taint_utils::activate();
+
+        assert_eq!(repair(None, &mut Vec::new()), Ok(None));
+
+        let copy = std::fs::symlink_metadata(dir.join(pallet_utils::FILE_NAME_POSITION_COPY));
+        assert!(matches!(copy, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound), "the copy stands: {:?}", copy);
+        let kept = std::fs::read(dir.join(pallet_utils::FILE_NAME_POSITION)).unwrap();
+        assert_eq!(pallet_utils::decode_position(&kept).ok(), Some(position));
+
+        taint_utils::reset_activation_for_test();
+        drop(_serial);
+        let _ = file_utils::remove_dir_all(&root);
+    }
 }
