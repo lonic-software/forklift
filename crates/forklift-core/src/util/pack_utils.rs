@@ -8089,7 +8089,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         let mut builder = TransportPackBuilder::new(&staging).unwrap();
         let content = crate::util::object_utils::blob_bytes(b"pack-standing-taint content");
-        builder.append_full(&blake3::hash(&content).to_hex().to_string(), &content).unwrap();
+        builder.append_full(blake3::hash(&content).to_hex().as_ref(), &content).unwrap();
         let artifacts = builder.finish().unwrap();
         let data_bytes = std::fs::read(&artifacts[0].data_path).unwrap();
         let index_bytes = std::fs::read(&artifacts[0].index_path).unwrap();
