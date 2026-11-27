@@ -1580,13 +1580,27 @@ pub(crate) fn pack_folder() -> PathBuf {
     PathBuf::from(file_utils::get_path_objects_root()).join(FOLDER_NAME_PACK)
 }
 
-/// [`file_utils::sync_dir_or_taint`] for the files `written`, each renamed to its [`DurablePath`]
-/// and recorded at it. The folder synced is the first file's: every pack folder constructor
-/// joins its file to the one pack folder under [`forklift_root`](crate::globals::forklift_root).
-/// With nothing written, `folder` is synced, which still re-checks for a standing taint.
+/// `Err` unless `folder` is the folder the pack folder's [`DurablePath`] constructors put their
+/// files in. A store write checks it before its first write, so its temp files, its renames,
+/// the files it lists or deletes beside them and its taint records are all in one folder.
+/// [`pack_folder`] derives its path through the memoized objects root, the constructors from
+/// [`forklift_root`](crate::globals::forklift_root) directly, and a root whose name is not UTF-8
+/// is one where the two differ.
+fn require_durable_pack_folder(folder: &Path) -> Result<(), String> {
+    let durable = DurablePath::pack("0");
+    match durable.as_path().parent() {
+        Some(expected) if expected == folder => Ok(()),
+        expected => Err(format!(
+            "The pack folder \"{}\" is not the store's own, \"{}\"; nothing was written to it.",
+            folder.to_string_lossy(), expected.unwrap_or(Path::new("")).to_string_lossy()
+        )),
+    }
+}
+
+/// [`file_utils::sync_dir_or_taint`] for `folder`, recording the files `written`, each renamed
+/// to its [`DurablePath`] in `folder`, which [`require_durable_pack_folder`] passed.
 fn sync_pack_folder_or_taint(folder: &Path, written: &[DurablePath]) -> Result<(), String> {
-    let synced = written.first().and_then(|first| first.as_path().parent()).unwrap_or(folder);
-    file_utils::sync_dir_or_taint(synced, &written.iter().collect::<Vec<_>>())
+    file_utils::sync_dir_or_taint(folder, &written.iter().collect::<Vec<_>>())
 }
 
 /// Read the packs for the active warehouse, loading and caching them on first use. The
@@ -2861,6 +2875,7 @@ pub(crate) fn import_transport_packs<R: Read, T>(
     }
 
     let folder = pack_folder();
+    require_durable_pack_folder(&folder)?;
     file_utils::create_folder_if_not_exists(&folder)?;
     remove_stale_temp_files(&folder);
     let mut staged: Vec<StagedTransportPack> = Vec::with_capacity(sections.len());
@@ -5111,6 +5126,7 @@ fn write_signature_tables(pack_folder: &Path,
                           entries: &[([u8; HASH_LEN], Vec<u8>)],
                           bound: usize,
                           stands: impl Fn(&Path) -> bool) -> Result<PublishedTables, String> {
+    require_durable_pack_folder(pack_folder)?;
     let mut names: HashSet<PathBuf> = HashSet::new();
     let mut written: Vec<DurablePath> = Vec::new();
 
@@ -6767,6 +6783,9 @@ struct PackWriter {
 impl PackWriter {
     /// Start a new pack, writing to a temp data file in `pack_folder`, to be published at `place`.
     fn new(pack_folder: &Path, place: PackPlace) -> Result<PackWriter, String> {
+        if place == PackPlace::Store {
+            require_durable_pack_folder(pack_folder)?;
+        }
         let data_temp_path = temp_path(pack_folder, FILE_EXTENSION_PACK_DATA);
         let file = std::fs::File::create(&data_temp_path).map_err(|e| format!(
             "Error while creating pack file \"{}\": {}", data_temp_path.to_string_lossy(), e
@@ -7991,14 +8010,13 @@ pub(crate) mod tests {
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
-    // A store pack is renamed to its durable paths, even from a writer started in another folder,
-    // and the folder sync goes to those paths' folder, so the record, the rename and the sync are
-    // one path. Mutations: rename into the writer's own folder → red at the folder assertion;
-    // sync the caller's folder → red at the sync.
+    // A store write in a folder other than its durable paths' is refused before it writes
+    // anything, so its temp files, renames, deletions and taint records never span two folders;
+    // a store write in the active pack folder, and a staging write anywhere, go ahead. Mutations:
+    // drop the check from `PackWriter::new` → red at its `expect_err`; from
+    // `write_signature_tables` → red at its `expect_err`.
     #[test]
-    fn a_store_pack_lands_at_its_durable_paths_and_their_folder_is_the_one_synced() {
-        use crate::util::file_utils::SyncDirFaultGuard;
-
+    fn a_store_write_outside_its_durable_pack_folder_is_refused_before_it_writes() {
         let temp = std::env::temp_dir().join(format!("forklift-pack-durable-place-{}", std::process::id()));
         let _ = crate::util::file_utils::remove_dir_all(&temp);
         let _scope = StorageRootScope::enter(&temp);
@@ -8006,20 +8024,25 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&elsewhere).unwrap();
         let active = crate::globals::forklift_root().join("objects").join("pack");
         std::fs::create_dir_all(&active).unwrap();
+        let listing = |folder: &Path| std::fs::read_dir(folder).unwrap().count();
 
-        let mut writer = PackWriter::new(&elsewhere, PackPlace::Store).unwrap();
+        let refused = PackWriter::new(&elsewhere, PackPlace::Store).err().expect("a store pack writer in another folder must be refused");
+        assert!(refused.contains("is not the store's own"), "got: {}", refused);
+        let refused = write_signature_tables(&elsewhere, &[([7u8; HASH_LEN], vec![1u8, 2, 3])], 16, |_| false)
+            .err().expect("a signature table in another folder must be refused");
+        assert!(refused.contains("is not the store's own"), "got: {}", refused);
+        assert_eq!(listing(&elsewhere), 0, "a refused store write must write nothing");
+
+        // The positives: a staging writer keeps its own folder, a store writer the active one.
+        assert!(PackWriter::new(&elsewhere, PackPlace::Staging).is_ok());
+        let mut writer = PackWriter::new(&active, PackPlace::Store).unwrap();
         let compressed = zstd::encode_all(&b"blob 1\0x"[..], 0).unwrap();
         writer.append_full([9u8; HASH_LEN], &compressed, None).unwrap();
         let finalized = writer.finalize().unwrap();
-
-        assert_eq!(finalized.files.iter().map(|path| path.parent().unwrap().to_path_buf()).collect::<Vec<_>>(),
-            vec![active.clone(), active.clone()], "a store pack must land in the active pack folder");
-        assert!(finalized.files.iter().all(|path| path.exists()));
+        assert!(finalized.files.iter().all(|path| path.parent() == Some(active.as_path()) && path.exists()));
         assert_eq!(finalized.durable.iter().map(|path| path.as_path().to_path_buf()).collect::<Vec<_>>(), finalized.files);
 
-        // The sync goes to the durable paths' folder, not to the folder the caller named.
-        let _guard = SyncDirFaultGuard::failing("elsewhere");
-        sync_pack_folder_or_taint(&elsewhere, &finalized.durable).expect("the active pack folder's sync must not touch \"elsewhere\"");
+        crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
     /// An incoming pack holding an object in a second spelling (here, padding before its header's
