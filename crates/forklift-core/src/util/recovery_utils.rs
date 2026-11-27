@@ -2648,11 +2648,12 @@ fn sync_nearest_ancestor_when(syncs: bool, root: &Path, relative: &Path) -> Resu
 }
 
 /// The deepest folder above `relative` (under `root`, every component a plain name) that opens as
-/// a folder, links followed. A name that is absent, under a parent that is not a folder, one the
-/// host cannot hold, or not a folder, is not standing, and the search goes up. Any other answer
-/// (no permission, an I/O error, a link loop) is an error, never taken for "absent": the folder
-/// may stand and hold the entry. With no folder standing, `root` itself, spelled exactly, so a
-/// sync fault or record keyed by the root's path matches it (not `root` with a trailing separator).
+/// a folder, links followed. A spelling that opens no folder is not standing, and the search goes
+/// up: [`lookup_opens_no_folder`] says which answers mean that, and so does a name that opens
+/// something other than a folder. Any other answer (no permission, an I/O error) is an error,
+/// never taken for "absent": the folder may stand and hold the entry. With no folder standing,
+/// `root` itself, spelled exactly, so a sync fault or record keyed by the root's path matches it
+/// (not `root` with a trailing separator).
 fn nearest_opened_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, String> {
     let mut dir = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
 
@@ -2662,8 +2663,7 @@ fn nearest_opened_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, Stri
         match std::fs::metadata(&absolute) {
             Ok(metadata) if metadata.is_dir() => return Ok(absolute),
             Ok(_) => {}
-            Err(error) if matches!(error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidFilename) => {}
+            Err(error) if lookup_opens_no_folder(&error) => {}
             Err(error) => return Err(format!("\"{}\": {}", absolute.to_string_lossy(), error)),
         }
 
@@ -2673,6 +2673,22 @@ fn nearest_opened_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, Stri
     Ok(root.to_path_buf())
 }
 
+/// Whether a lookup that failed with `error` finished resolving the spelling and found no folder
+/// there: the name is absent or a dangling link (`NotFound`), a parent on the way is not a folder
+/// (`NotADirectory`), the name is longer than the host can hold (`InvalidFilename`), or the
+/// spelling runs into a link loop. Nothing can be written, removed or synced through such a
+/// spelling. This is a closed list: any other answer leaves the lookup unfinished, and the folder
+/// may stand.
+fn lookup_opens_no_folder(error: &std::io::Error) -> bool {
+    // A loop's kind (`FilesystemLoop`) is not stable to name, so it is read by its errno.
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+
+    matches!(error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidFilename)
+}
 
 /// Every durable ref source's roots for the closure walk (§3.2: "every durable ref source", never
 /// the registration ledger) — see the module doc comment.
@@ -11191,15 +11207,16 @@ mod tests {
     }
 
     /// A removed path's removal is synced in the deepest folder its names open and in every folder
-    /// above it up to the root, so whichever folder held the entry is synced. Rows whose names
-    /// open a folder under another spelling (case, Unicode normalization, a trailing `.` on
-    /// Windows) or through a link still sync `pallets`, the folder that lists the name exactly.
-    /// The other rows: a folder one and two deep, an absent name, a top-level path (the root,
-    /// spelled exactly), a file, and a name too long for the host (taken as absent, not an error).
+    /// above it up to the root, so whichever folder held the entry is synced. A name the volume
+    /// opens under another spelling (case or Unicode normalization, as probed on folders no row
+    /// names) or through a link syncs the folder it opens, and `pallets`, which lists it exactly,
+    /// above it. The other rows: a folder one and two deep, an absent name, a top-level path (the
+    /// root, spelled exactly), a file, a name too long for the host, a link loop, and a trailing
+    /// `.` (absent here). The last few are absent, not errors: no folder opens under them.
     ///
     /// Mutations: the sync bounded by the process's storage root instead of `root` (main's
-    /// `sync_dir`) → no folder above the opened one is synced → red; a name too long taken as an
-    /// error → red.
+    /// `sync_dir`) → no folder above the opened one is synced → red; a name too long, or a link
+    /// loop, taken as an error → red.
     #[cfg(unix)]
     #[test]
     fn a_removal_is_synced_in_every_folder_that_could_hold_it() {
@@ -11214,7 +11231,20 @@ mod tests {
         std::fs::create_dir_all(root.join("elsewhere")).unwrap();
         std::fs::write(pallets.join("plain"), "a file").unwrap();
         std::os::unix::fs::symlink(root.join("elsewhere"), pallets.join("link")).unwrap();
+        std::os::unix::fs::symlink(pallets.join("loop"), pallets.join("loop")).unwrap();
         let too_long = format!("pallets/{}/x", "n".repeat(300));
+
+        // The volume's own answers, probed on folders no row names: whether it opens a name under
+        // another case, or under another Unicode normalization.
+        std::fs::create_dir_all(root.join("probe-case")).unwrap();
+        std::fs::create_dir_all(root.join("probe-e\u{301}")).unwrap();
+        let folds_case = root.join("PROBE-CASE").is_dir();
+        let folds_normalization = root.join("probe-\u{e9}").is_dir();
+        let opened_when = |opens: bool, name: &str| if opens {
+            vec![pallets.clone(), root.clone(), pallets.join(name)]
+        } else {
+            vec![root.clone(), pallets.clone()]
+        };
 
         let real = pallets.join("real");
         let exact = [
@@ -11227,19 +11257,19 @@ mod tests {
             ("pallets/plain/x", vec![root.clone(), pallets.clone()]),
             (too_long.as_str(), vec![root.clone(), pallets.clone()]),
             ("pallets/link/x", vec![pallets.clone(), root.clone(), pallets.join("link")]),
+            ("pallets/loop/x", vec![root.clone(), pallets.clone()]),
+            ("pallets/loop/deeper/x", vec![root.clone(), pallets.clone()]),
+            // No unix volume opens `a.` as `a`.
+            ("pallets/a./x", vec![root.clone(), pallets.clone()]),
+            ("pallets/Foo/x", opened_when(folds_case, "Foo")),
+            ("pallets/caf\u{e9}/x", opened_when(folds_normalization, "caf\u{e9}")),
         ];
 
         for (relative, expected) in exact {
             let _syncs = file_utils::SyncDirFaultGuard::recording();
             sync_nearest_ancestor_when(true, &root, Path::new(relative)).unwrap_or_else(|e| panic!("{}: {}", relative, e));
-            assert_eq!(file_utils::sync_dir_attempts(), expected, "{}", relative);
-        }
-
-        for relative in ["pallets/Foo/x", "pallets/caf\u{e9}/x", "pallets/a./x"] {
-            let _syncs = file_utils::SyncDirFaultGuard::recording();
-            sync_nearest_ancestor_when(true, &root, Path::new(relative)).unwrap_or_else(|e| panic!("{}: {}", relative, e));
-            let attempts = file_utils::sync_dir_attempts();
-            assert!(attempts.contains(&pallets), "{}: the folder listing the name exactly must be synced: {:?}", relative, attempts);
+            assert_eq!(file_utils::sync_dir_attempts(), expected,
+                "{} (folds case: {}, normalization: {})", relative, folds_case, folds_normalization);
         }
 
         file_utils::remove_dir_all(&root).ok();
