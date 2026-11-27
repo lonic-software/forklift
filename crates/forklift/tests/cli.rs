@@ -15336,6 +15336,59 @@ fn metadata_listing(warehouse: &TestWarehouse, relative: &str) -> Vec<String> {
     out
 }
 
+/// A bay stages in its own inventory. A stack there restamps its shards' rollups, a load clears the
+/// rollups above what it changed and writes the new shard, and a load that fails leaves its
+/// incomplete-load marker, each in the bay's folder; the main working tree's inventory is not
+/// written at all.
+#[cfg(unix)]
+#[test]
+fn a_bays_shards_rollup_clears_and_load_marker_are_written_in_the_bays_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("bay-staging-writes");
+    warehouse.write_file("dir/sub/a.txt", "v1\n");
+    warehouse.write_file("dir/b.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-b1");
+    assert_success(&warehouse.run(&["bay", "add", "b1", bay_dir.to_str().unwrap()]));
+
+    let main_inventory = |warehouse: &TestWarehouse| -> Vec<(String, Vec<u8>)> {
+        let base = warehouse.root.join(".forklift").join("inventory");
+        metadata_listing(warehouse, "inventory").into_iter()
+            .filter(|relative| base.join(relative).is_file())
+            .map(|relative| { let bytes = std::fs::read(base.join(&relative)).unwrap(); (relative, bytes) })
+            .collect()
+    };
+    let before = main_inventory(&warehouse);
+    assert!(before.iter().any(|(relative, _)| relative.ends_with("/data")), "the main tree has shards: {:?}", before);
+
+    std::fs::write(bay_dir.join("dir/sub/a.txt"), "v2\n").unwrap();
+    assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&bay_dir, &["stack", "-m", "in the bay"]));
+
+    std::fs::write(bay_dir.join("dir/sub/a.txt"), "v3\n").unwrap();
+    assert_success(&warehouse.run_at(&bay_dir, &["load", "dir/sub/a.txt"]));
+    assert!(main_inventory(&warehouse) == before, "a bay's stack and load wrote the main tree's inventory");
+
+    let blocked = bay_dir.join("dir").join("blocked.txt");
+    std::fs::write(&blocked, "unreadable\n").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(!warehouse.run_at(&bay_dir, &["load", "."]).status.success(), "the load fails on the unreadable file");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let forklift = warehouse.root.join(".forklift");
+    assert!(forklift.join("bays/b1/inventory/incomplete-load").is_file(), "the failed load's marker is in the bay");
+    assert!(!forklift.join("inventory/incomplete-load").exists(), "the main tree records no incomplete load");
+    assert!(main_inventory(&warehouse) == before, "a bay's failed load wrote the main tree's inventory");
+
+    let stacked = warehouse.run_at(&bay_dir, &["stack", "-m", "attempt", "--json"]);
+    assert_eq!(json(&stacked)["error"]["code"], "incomplete_load", "the bay's own stack is refused");
+}
+
 #[test]
 fn naming_commands_refuse_a_name_outside_the_grammar_and_suggest_the_lowercase_one() {
     let (warehouse, _bay_dir) = warehouse_with_a_bay("name-grammar-refusals");
