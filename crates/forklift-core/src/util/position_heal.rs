@@ -319,4 +319,39 @@ mod tests {
         drop(_serial);
         let _ = file_utils::remove_dir_all(&root);
     }
+
+    /// `--position` is set only over a position that is lost or damaged with no copy to witness
+    /// it: a position that reads is kept whatever its copy says, and a copy that reads is the
+    /// evidence.
+    /// Revert: read the copy where the position is read → a sound position with no copy reads
+    /// as lost → red.
+    #[test]
+    fn a_chosen_position_is_set_only_where_nothing_witnesses_the_position() {
+        let root = std::env::temp_dir().join(format!("forklift-position-heal-sets-chosen-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        let dir = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        pallet_utils::write_position_for(&Checkout::Main, &BayPosition::new("main", None)).unwrap();
+        let sound = std::fs::read(dir.join("position")).unwrap();
+
+        for (position, copy, sets) in [
+            (None, None, true),
+            (Some(&b"not a position\n"[..]), None, true),
+            (Some(&sound[..]), None, false),
+            (None, Some(&sound[..]), false),
+            (Some(&b"not a position\n"[..]), Some(&sound[..]), false),
+        ] {
+            for (file, bytes) in [("position", position), ("position-copy", copy)] {
+                match bytes {
+                    Some(bytes) => std::fs::write(dir.join(file), bytes).unwrap(),
+                    None => { let _ = file_utils::remove_file(dir.join(file)); }
+                }
+            }
+            assert_eq!(sets_chosen(), Ok(sets), "position {:?}, copy {:?}", position.is_some(), copy.is_some());
+        }
+
+        let _ = file_utils::remove_dir_all(&root);
+    }
 }
