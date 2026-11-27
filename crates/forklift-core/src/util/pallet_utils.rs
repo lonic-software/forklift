@@ -3693,6 +3693,32 @@ pub(crate) mod tests {
             }
         }
 
+        /// A copy put back to its absence, whose folder sync fails, records the copy's own path in
+        /// the taint and nothing else.
+        /// Revert: record another final path for the put-back's sync → red.
+        #[test]
+        fn a_copy_put_back_to_its_absence_whose_folder_sync_fails_taints_the_copy() {
+            let (_root, _scope) = scratch("meta-copy-restore-sync");
+            let (h0, h1) = (stub_parcel("h0"), stub_parcel("h1"));
+            write("tags", None, &h0).unwrap();
+            file_utils::remove_file(get_meta_copy_path("tags")).unwrap();
+            let before = copy_state("tags");
+            let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            taint_utils::activate();
+
+            let written = {
+                let copies = get_meta_copy_path("tags").parent().unwrap().to_path_buf();
+                let _fault = file_utils::SyncDirFaultGuard::failing_exactly(&copies);
+                write("tags", Some(&h0), &h1)
+            };
+
+            assert!(written.is_err(), "{:?}", written);
+            assert_eq!(head("tags").as_deref(), Some(h0.as_str()), "the ref is never written");
+            assert_eq!(copy_state("tags"), before, "the copy is back to its absence");
+            assert_eq!(taint_utils::read_taints(&forklift_root()).unwrap().recorded,
+                [PathBuf::from("meta-copy/tags")].into_iter().collect(), "the copy alone is recorded");
+        }
+
         /// A copy already holding the new bytes is not written again.
         /// Revert: drop the skip → the copy write is the one that lands with the error, and the
         /// ref stays at H1 → red.
@@ -6435,6 +6461,29 @@ pub(crate) mod tests {
         assert!(!pallets.join("team").exists());
         assert!(pallets.is_dir(), "the pallets folder itself is never removed");
         assert!(all_pallet_refs().unwrap().is_empty());
+
+        let _ = file_utils::remove_dir_all(&root);
+    }
+
+    /// A removal whose folder sync fails records the removed ref's own path in the taint and
+    /// nothing else.
+    /// Revert: record another final path for the removal's sync → red.
+    #[test]
+    fn a_removal_whose_folder_sync_fails_taints_the_removed_ref() {
+        let (root, _scope) = scratch("remove-sync-taint");
+        update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::activate();
+
+        let removed = {
+            let _fault = file_utils::SyncDirFaultGuard::failing_exactly(&get_namespace_folder(PalletNamespace::User));
+            remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, Some(&deleting("gone", &hash('a'))))
+        };
+
+        assert!(removed.is_err(), "{:?}", removed);
+        assert_eq!(get_pallet_head("gone").unwrap(), None, "the ref is unlinked before the sync");
+        assert_eq!(crate::util::taint_utils::read_taints(&forklift_root()).unwrap().recorded,
+            [PathBuf::from("pallets/gone")].into_iter().collect(), "the removed ref alone is recorded");
 
         let _ = file_utils::remove_dir_all(&root);
     }
