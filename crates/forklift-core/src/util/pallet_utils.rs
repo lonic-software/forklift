@@ -4,7 +4,6 @@ use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 use crate::util::scope_utils::PathScope;
 use crate::util::sealed_utils::Tolerated;
-use crate::util::file_utils::FinalPath;
 use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
@@ -839,29 +838,19 @@ pub fn landed_but(pallet: &str, head: &str, error: &str) -> String {
 /// position the bay has left; only when neither can be done does the write fail (the position
 /// itself stands).
 pub fn write_position_for(checkout: &Checkout, position: &BayPosition) -> Result<(), String> {
-    write_position_files(&DurablePath::position(checkout), &DurablePath::position_copy(checkout), position)
-}
-
-/// [`write_position_for`] into the folder `dir`, for the tests that still name a folder.
-#[cfg(test)]
-pub(crate) fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
-    write_position_files(&dir.join(FILE_NAME_POSITION), &dir.join(FILE_NAME_POSITION_COPY), position)
-}
-
-/// Write `position` to `path`, then to its copy at `copy`, as [`write_position_for`] says.
-fn write_position_files<P: FinalPath + ?Sized>(path: &P, copy: &P, position: &BayPosition) -> Result<(), String> {
     validate_pallet_name(&position.pallet)?;
 
     let bytes = position_bytes(position);
 
-    file_utils::write_file_atomically(path, &bytes)?;
+    file_utils::write_file_atomically(&DurablePath::position(checkout), &bytes)?;
 
-    file_utils::write_file_atomically(copy, &bytes).or_else(|written| match file_utils::remove_file(copy.final_path()) {
+    let copy = DurablePath::position_copy(checkout);
+    file_utils::write_file_atomically(&copy, &bytes).or_else(|written| match file_utils::remove_file(copy.as_path()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(removed) => Err(format!(
             "The bay position was written, but its copy \"{}\" could neither be written ({}) nor removed ({}).",
-            copy.final_path().to_string_lossy(), written.trim_end_matches('.'), removed
+            copy.as_path().to_string_lossy(), written.trim_end_matches('.'), removed
         )),
     })
 }

@@ -1700,9 +1700,8 @@ mod tests {
     /// parcel's hash.
     fn plant_parked(bay: &str, tree_hash: &str) -> String {
         let parcel = store_parcel(tree_hash, Vec::new());
-        let dir = crate::util::bay_utils::bay_state_dir(bay);
-        std::fs::create_dir_all(&dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        std::fs::create_dir_all(crate::util::bay_utils::bay_state_dir(bay)).unwrap();
+        crate::util::pallet_utils::write_position_for(&crate::util::taint_utils::Checkout::Bay(bay.to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         crate::util::park_utils::park_for_test(&[&parcel]);
         parcel
     }
@@ -1785,7 +1784,7 @@ mod tests {
 
         let dir = crate::util::bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&crate::util::taint_utils::Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: theirs.clone(), their_pallet: "feature".to_string(), our_head: "e".repeat(64), our_pallet: "main".to_string(),
             skeleton_digest: "0".repeat(64),

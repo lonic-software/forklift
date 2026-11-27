@@ -16,7 +16,6 @@
 use serde::Serialize;
 
 use crate::error::{CoreError, RefusalCode};
-use crate::globals::bay_root;
 use crate::util::pallet_utils::{self, BayPosition, PositionCopy, PositionUnread};
 use crate::util::taint_utils::{Checkout, DurablePath};
 use crate::util::{file_utils, journal_utils, operation_utils};
@@ -79,9 +78,10 @@ impl PositionRebuilt {
 ///                                 read or write. Nothing was changed but what a write says.
 pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<PositionRebuilt>, String> {
     let checkout = Checkout::active();
-    let path = bay_root().join(pallet_utils::FILE_NAME_POSITION);
+    let durable = DurablePath::position(&checkout);
+    let path = durable.as_path();
 
-    let unread = match std::fs::read(&path) {
+    let unread = match std::fs::read(path) {
         Ok(bytes) => match pallet_utils::decode_position(&bytes) {
             Ok(position) => return keep(&checkout, position, chosen, notes),
             Err(PositionUnread::Newer(reason)) => return match chosen {
@@ -145,10 +145,10 @@ pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<Po
         )),
         (Some(evidence), None) => evidence,
         (None, Some(pallet)) => (chosen_position(pallet)?, PositionSource::Chosen),
-        (None, None) => return Err(no_evidence(&path, &unread)),
+        (None, None) => return Err(no_evidence(path, &unread)),
     };
 
-    pallet_utils::write_position(&position)?;
+    pallet_utils::write_position_for(&checkout, &position)?;
 
     Ok(Some(PositionRebuilt { pallet: position.pallet, base: position.base, from }))
 }
@@ -157,9 +157,9 @@ pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<Po
 /// neither a copy nor an operation left unfinished says where it stood. Otherwise it refuses
 /// `--position` before writing anything.
 pub fn sets_chosen() -> Result<bool, String> {
-    let dir = bay_root();
+    let checkout = Checkout::active();
 
-    match std::fs::read(dir.join(pallet_utils::FILE_NAME_POSITION)) {
+    match std::fs::read(DurablePath::position(&checkout).as_path()) {
         Ok(bytes) => if !matches!(pallet_utils::decode_position(&bytes), Err(PositionUnread::Damaged(_))) {
             return Ok(false);
         },
@@ -167,7 +167,7 @@ pub fn sets_chosen() -> Result<bool, String> {
         Err(_) => return Ok(false),
     }
 
-    Ok(matches!(pallet_utils::read_position_copy_for(&Checkout::active()), PositionCopy::Unusable) && operation_utils::read()?.is_none())
+    Ok(matches!(pallet_utils::read_position_copy_for(&checkout), PositionCopy::Unusable) && operation_utils::read()?.is_none())
 }
 
 /// A position that reads: `--position` is refused over it, and its copy is rewritten if it does

@@ -996,7 +996,7 @@ pub(crate) mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&crate::util::taint_utils::Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
 
         let mut damaged = std::fs::read(crate::util::park_utils::parked_path()).unwrap();
         damaged[0] ^= 1;
@@ -1043,7 +1043,7 @@ pub(crate) mod tests {
             .join(file_utils::shard_folder_relative(""))
             .join(file_utils::FILE_NAME_INVENTORY_DATA);
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_utils::bay_state_dir(bay), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&crate::util::taint_utils::Checkout::Bay(bay.to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(&shard_path, InventoryBuilder::build(&inventory)).unwrap();
 
         shard_path

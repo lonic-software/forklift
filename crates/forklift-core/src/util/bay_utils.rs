@@ -916,6 +916,7 @@ pub fn current_bay_state() -> PathBuf {
 mod tests {
     use super::*;
     use crate::globals::StorageRootScope;
+    use crate::util::taint_utils::Checkout;
 
     /// A refusal read in another bay reaches a degraded note as prose: its message and its way out,
     /// never the frame that carries its code.
@@ -949,7 +950,7 @@ mod tests {
 
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: merge_base.clone(), our_pallet: "main".to_string(),
             skeleton_digest: "0".repeat(64),
@@ -958,7 +959,7 @@ mod tests {
 
         let bay_c_dir = bay_state_dir("c");
         std::fs::create_dir_all(&bay_c_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_c_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("c".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         let pick_source = "6".repeat(64);
         let pick = cherry_pick_utils::CherryPickState {
             source: pick_source.clone(), description: None, our_head: pick_base.clone(), our_pallet: "main".to_string(),
@@ -998,7 +999,7 @@ mod tests {
 
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         let dirs = all_bay_state_dirs().unwrap();
@@ -1349,7 +1350,7 @@ mod tests {
 
         assert_eq!(read_bay_current_pallet("fresh").unwrap(), None);
 
-        pallet_utils::write_position_in(&bay_state_dir("good"), &pallet_utils::BayPosition::new("good", None)).unwrap();
+        pallet_utils::write_position_for(&Checkout::Bay("good".to_string()), &pallet_utils::BayPosition::new("good", None)).unwrap();
         assert_eq!(read_bay_current_pallet("good").unwrap(), Some("good".to_string()));
 
         std::fs::write(bay_state_dir("bad").join(pallet_utils::FILE_NAME_POSITION),
