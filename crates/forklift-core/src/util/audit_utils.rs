@@ -1267,11 +1267,13 @@ fn office_history_holds(head: &str, parcel: &str) -> bool {
     }
 }
 
-/// The memo key: which warehouse, under which anchor, at which office head.
+/// The memo key: which warehouse, under which anchor, at which office head. The warehouse is
+/// spelled by its root's debug form, which escapes the bytes that are not UTF-8, so two roots
+/// that differ only in such a byte keep their own entries.
 pub(crate) fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
     format!(
-        "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
-        crate::globals::forklift_root().to_string_lossy(),
+        "{:?}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+        crate::globals::forklift_root(),
         anchor.genesis,
         anchor.enabled_at,
         anchor.boundary.join(","),
@@ -3660,6 +3662,24 @@ pub(crate) mod tests {
         };
 
         (state, key, key_id, public_hex)
+    }
+
+    /// Two warehouses whose roots differ only in a byte that is not UTF-8 keep their own verified
+    /// office chains: a lossy key would spell both alike. Only paths are built, so the roots need
+    /// not exist.
+    #[cfg(unix)]
+    #[test]
+    fn office_chain_keys_keep_apart_roots_differing_only_in_a_byte_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let anchor = TrustAnchor { genesis: "0".repeat(64), enabled_at: 0, boundary: Vec::new(), prior_genesis: None, adopts: None };
+        let key_under = |name: &[u8]| {
+            let _scope = crate::globals::StorageRootScope::enter(&std::env::temp_dir().join(std::ffi::OsStr::from_bytes(name)));
+            office_chain_key(&anchor, "head")
+        };
+
+        assert_ne!(key_under(b"forklift-office-\xff"), key_under(b"forklift-office-\xfe"));
+        assert_eq!(key_under(b"forklift-office-\xff"), key_under(b"forklift-office-\xff"));
     }
 
     #[test]

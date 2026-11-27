@@ -82,9 +82,9 @@ impl StorageRootScope {
 /// Windows (`\\?\C:\…`, or `\\?\UNC\server\share`), and three unrelated things in this
 /// repo break on them, each for its own reason:
 ///
-/// * [`normalize_root`] — verbatim paths take their separators **literally**, so a forward
-///   slash becomes a filename character and the storage layer's `\\?\C:\…\.forklift/objects`
-///   is rejected as invalid (os error 123).
+/// * [`normalize_root`] — verbatim paths take their separators **literally**, so any forward
+///   slash a path built on the storage root carries (a written-out relative path, a record's
+///   `/`-keyed name) becomes a filename character and is rejected as invalid (os error 123).
 /// * `commands::alias`'s shim — `cmd.exe` cannot execute a `\\?\`-prefixed path at all
 ///   ("The system cannot find the path specified").
 /// * `config_utils`'s not-valid refusal — the one message whose whole job is naming a file
@@ -96,16 +96,35 @@ impl StorageRootScope {
 /// of length. This was a private copy here plus a second one in `commands::alias`, the two
 /// kept in step by a comment asking the next editor to do so; it is one function now so that
 /// there is nothing to keep in step.
+///
+/// The prefix is stripped from the path's own UTF-16 units ([`strip_verbatim_units`]), never
+/// from a lossy string of it: a name holding an unpaired surrogate would otherwise come back with
+/// U+FFFD in its place, another folder.
 #[cfg(windows)]
 pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{}", rest))
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    match strip_verbatim_units(&units) {
+        Some(stripped) => PathBuf::from(std::ffi::OsString::from_wide(&stripped)),
+        None => path.to_path_buf(),
+    }
+}
+
+/// [`strip_verbatim_prefix`]'s rule over a Windows path's UTF-16 units: `\\?\UNC\server\…` becomes
+/// `\\server\…`, `\\?\C:\…` becomes `C:\…`, and `None` means the path is not verbatim. Every unit
+/// after the prefix is kept as it is, whether or not it is valid UTF-16. Built on every platform
+/// so its tests run everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn strip_verbatim_units(units: &[u16]) -> Option<Vec<u16>> {
+    let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+
+    if let Some(rest) = units.strip_prefix(wide(r"\\?\UNC\").as_slice()) {
+        let mut stripped = wide(r"\\");
+        stripped.extend_from_slice(rest);
+        Some(stripped)
     } else {
-        path.to_path_buf()
+        units.strip_prefix(wide(r"\\?\").as_slice()).map(<[u16]>::to_vec)
     }
 }
 
@@ -276,6 +295,23 @@ mod tests {
             strip_verbatim_prefix(Path::new(r"C:\warehouses\alpha")),
             PathBuf::from(r"C:\warehouses\alpha")
         );
+    }
+
+    /// The stripping rule over UTF-16 units, on every platform: the prefix goes, and every unit
+    /// after it is kept as it was, an unpaired surrogate included (0xD800 here), so a verbatim root
+    /// whose name is not valid Unicode is not rebuilt as another folder.
+    #[test]
+    fn a_verbatim_prefix_is_stripped_from_the_units_and_keeps_an_unpaired_surrogate() {
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        let with_surrogate = |prefix: &str| {
+            let mut units = wide(prefix);
+            units.extend([0xD800, u16::from(b'x')]);
+            units
+        };
+
+        assert_eq!(strip_verbatim_units(&with_surrogate(r"\\?\C:\wh\")), Some(with_surrogate(r"C:\wh\")));
+        assert_eq!(strip_verbatim_units(&with_surrogate(r"\\?\UNC\server\share\")), Some(with_surrogate(r"\\server\share\")));
+        assert_eq!(strip_verbatim_units(&with_surrogate(r"C:\wh\")), None, "a path that is not verbatim");
     }
 
     #[test]

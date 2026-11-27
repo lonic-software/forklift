@@ -66,6 +66,7 @@
 //! every finished batch is already on disk.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -155,7 +156,7 @@ struct Record {
 struct Shard {
     /// The graph root this shard belongs to, so it is flushed back to the right warehouse even
     /// when a single process (a server) serves several.
-    root: String,
+    root: PathBuf,
     /// The hex prefix this shard holds: [`SHARD_PREFIX_LEN`] characters, fewer under the debug
     /// override [`shard_prefix_len`] reads.
     prefix: String,
@@ -247,13 +248,15 @@ fn shard_prefix_len_when(debug_build: bool, setting: Option<&str>) -> usize {
 }
 
 /// The on-disk path of the shard file for a given prefix, under the current graph root.
-fn shard_path(root: &str, prefix: &str) -> std::path::PathBuf {
-    std::path::Path::new(root).join(prefix)
+fn shard_path(root: &Path, prefix: &str) -> PathBuf {
+    root.join(prefix)
 }
 
-/// The composite cache key isolating a `(root, prefix)` shard from every other warehouse's.
-fn cache_key(root: &str, prefix: &str) -> String {
-    format!("{}\u{0}{}", root, prefix)
+/// The composite cache key isolating a `(root, prefix)` shard from every other warehouse's. The
+/// root is spelled by its debug form, which escapes every byte that is not UTF-8, so two roots
+/// whose names differ only there never share a key.
+fn cache_key(root: &Path, prefix: &str) -> String {
+    format!("{:?}\u{0}{}", root, prefix)
 }
 
 // ---- shard (de)serialization -------------------------------------------------------------
@@ -386,7 +389,7 @@ fn parse_verified_shard(bytes: &[u8]) -> Option<HashMap<String, Record>> {
 /// The resident copy never loses a record while it stays resident; if it is later evicted and
 /// reloaded from a stale on-disk copy, the reload can transiently omit a racing writer's record —
 /// the same self-heal (object-walk recompute) that covers any other missing record covers this.
-fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> Result<R, String> {
+fn with_shard<R>(root: &Path, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> Result<R, String> {
     let key = cache_key(root, prefix);
 
     // Fast path: the shard is already resident. One lock acquisition, no I/O.
@@ -410,7 +413,7 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(_) => {
             let mut stand_in = Shard {
-                root: root.to_string(),
+                root: root.to_path_buf(),
                 prefix: prefix.to_string(),
                 records: HashMap::new(),
                 dirty: false,
@@ -434,7 +437,7 @@ fn with_shard<R>(root: &str, prefix: &str, f: impl FnOnce(&mut Shard) -> R) -> R
         } else {
             let victim_writes = evict_collect(&mut cache, &key);
             cache.shards.insert(key.clone(), Shard {
-                root: root.to_string(),
+                root: root.to_path_buf(),
                 prefix: prefix.to_string(),
                 records,
                 dirty: false,
@@ -473,7 +476,7 @@ fn poisoned<T>(_: T) -> String {
 /// records would only be recomputed if dropped, but a write saved is a walk saved. With a 2-hex
 /// fan-out all ≤256 shards of one warehouse fit under the cap, so this only evicts when a single
 /// process (a server) holds shards for many warehouses at once.
-fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(String, String, Vec<u8>)> {
+fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(PathBuf, String, Vec<u8>)> {
     let mut pending_writes = Vec::new();
     while cache.shards.len() >= MAX_RESIDENT_SHARDS {
         // The least-recently-accessed shard that is not the one we are about to insert.
@@ -506,8 +509,8 @@ fn evict_collect(cache: &mut Cache, incoming: &str) -> Vec<(String, String, Vec<
 /// treat a failure as best-effort. Because no directory sync runs, this never consults or
 /// records a durability taint either: on a store with a standing taint, a graph query still
 /// writes its checksummed shards, and a shard the failing device mangles simply reads as absent.
-fn write_shard_bytes(root: &str, prefix: &str, bytes: &[u8]) -> Result<(), String> {
-    file_utils::create_folder_if_not_exists(std::path::Path::new(root))?;
+fn write_shard_bytes(root: &Path, prefix: &str, bytes: &[u8]) -> Result<(), String> {
+    file_utils::create_folder_if_not_exists(root)?;
     file_utils::replace_file_unsynced(&shard_path(root, prefix), bytes)?;
     SHARD_WRITES.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -515,14 +518,14 @@ fn write_shard_bytes(root: &str, prefix: &str, bytes: &[u8]) -> Result<(), Strin
 
 /// Fetch a parcel's record if it is already stored (in a resident shard or on disk). Does not
 /// compute anything — a miss returns `None`.
-fn stored_record(root: &str, hash: &str) -> Result<Option<Record>, String> {
+fn stored_record(root: &Path, hash: &str) -> Result<Option<Record>, String> {
     let prefix = shard_prefix(hash);
     with_shard(root, &prefix, |shard| shard.records.get(hash).cloned())
 }
 
 /// Persist a batch of freshly computed records, grouped so each affected shard is rewritten
 /// exactly once (never once per record). Updates the resident copy of any loaded shard too.
-fn persist_records(root: &str, new: &HashMap<String, Record>) -> Result<(), String> {
+fn persist_records(root: &Path, new: &HashMap<String, Record>) -> Result<(), String> {
     if new.is_empty() {
         return Ok(());
     }
@@ -573,7 +576,7 @@ fn stage_records<'a>(shard: &mut Shard, records: impl IntoIterator<Item = (&'a S
 /// the shard since: a record another thread inserted meanwhile carries a newer version and stays
 /// dirty until that writer flushes it. A shard that is no longer resident is left alone. Its
 /// eviction wrote it, and reloading it here would only read back the file just written.
-fn mark_clean(root: &str, prefix: &str, version: u64) -> Result<(), String> {
+fn mark_clean(root: &Path, prefix: &str, version: u64) -> Result<(), String> {
     let mut cache = cache().lock().map_err(poisoned)?;
     if let Some(shard) = cache.shards.get_mut(&cache_key(root, prefix)) {
         if shard.version == version {
@@ -595,7 +598,7 @@ thread_local! {
 /// Ensure `hash` and every ancestor lacking a record get one, computing generation numbers by
 /// an **iterative** post-order DAG walk (no recursion — the parent chain can be tens of
 /// thousands deep). Returns the freshly computed records, already persisted.
-fn ensure(root: &str, hash: &str) -> Result<HashMap<String, Record>, String> {
+fn ensure(root: &Path, hash: &str) -> Result<HashMap<String, Record>, String> {
     #[cfg(test)]
     ENSURE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut computed: HashMap<String, Record> = HashMap::new();
@@ -1387,6 +1390,19 @@ mod tests {
         assert_eq!(order.len(), 2);
     }
 
+    /// Two graph roots whose names differ only in a byte that is not UTF-8 keep apart in the shard
+    /// cache: a lossy key would spell both alike and serve one warehouse the other's records.
+    #[cfg(unix)]
+    #[test]
+    fn graph_roots_differing_only_in_a_byte_that_is_not_utf8_have_their_own_cache_keys() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let one = Path::new(std::ffi::OsStr::from_bytes(b"graph-\xff"));
+        let other = Path::new(std::ffi::OsStr::from_bytes(b"graph-\xfe"));
+        assert_ne!(cache_key(one, "ab"), cache_key(other, "ab"));
+        assert_eq!(cache_key(one, "ab"), cache_key(one, "ab"));
+    }
+
     /// A fresh scratch directory for one test, unique per process and per test name.
     fn scratch_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("forklift-graph-{}-{}", name, std::process::id()));
@@ -1412,7 +1428,7 @@ mod tests {
             let _ = file_utils::remove_dir_all(&dir);
             return;
         }
-        let root = root_path.to_string_lossy().into_owned();
+        let root = root_path.clone();
 
         let hash = "cd".repeat(32);
         let mut new = HashMap::new();
@@ -1438,7 +1454,7 @@ mod tests {
         let dir = scratch_dir("unreadable");
         let root_path = dir.join("graph");
         std::fs::create_dir_all(&root_path).unwrap();
-        let root = root_path.to_string_lossy().into_owned();
+        let root = root_path.clone();
 
         let mut kept = HashMap::new();
         kept.insert("ef".repeat(32), Record { generation: 3, parents: vec![], filter: PathFilter::Unknown });
@@ -1531,7 +1547,7 @@ mod tests {
         // takes a record of its own, the stale snapshot must not mark it clean: that record is
         // in no file yet, and a clean shard is never written again.
         let dir = scratch_dir("aba");
-        let root = dir.join("graph").to_string_lossy().into_owned();
+        let root = dir.join("graph");
         let record = Record { generation: 1, parents: vec![], filter: PathFilter::Unknown };
         let first = "ab".repeat(32);
         let second = format!("ab{}", "cd".repeat(31));
@@ -1562,9 +1578,7 @@ mod tests {
         // (object-walk recompute), so this checks the authoritative in-memory copy via
         // `stored_record` within one residency, not across an evict/reload.)
         let root = std::env::temp_dir()
-            .join(format!("forklift-graph-conc-{}", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
+            .join(format!("forklift-graph-conc-{}", std::process::id()));
         let _ = file_utils::remove_dir_all(&root);
 
         const THREADS: u64 = 8;
