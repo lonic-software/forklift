@@ -1535,8 +1535,12 @@ impl ObjectFormCheck {
 pub fn store_object_stream(claimed_hash: &str,
                            reader: &mut impl Read,
                            expected_len: u64) -> Result<bool, String> {
-    let (folder, file_name) = file_utils::get_path_for_object(claimed_hash)?;
-    let folder_path = std::path::Path::new(&folder);
+    // One path for the temp, the rename and the directory sync, so all three name one directory.
+    let final_path = DurablePath::loose_object(claimed_hash)?;
+    let (Some(folder_path), Some(file_name)) = (final_path.as_path().parent(), final_path.as_path().file_name()) else {
+        return Err(format!("The object path for {} has no fan-out folder.", claimed_hash));
+    };
+    let file_name = file_name.to_string_lossy();
     file_utils::create_folder_if_not_exists(folder_path)?;
 
     // A temp file in the object's own shard folder, unique per write. `write_file_atomically`
@@ -1604,7 +1608,6 @@ pub fn store_object_stream(claimed_hash: &str,
     // temp-naming scheme, not because its durability contract differs); a sync success is
     // re-checked against any taint already standing for this root before this function may report
     // `Ok(true)` — see `file_utils::sync_dir_or_taint`.
-    let final_path = DurablePath::loose_object(claimed_hash)?;
     file_utils::rename(&temp_path, final_path.as_path())
         .map_err(|e| format!("Error while moving a streamed object into place: {}", e))?;
     file_utils::sync_dir_or_taint(folder_path, &[&final_path])?;
