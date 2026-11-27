@@ -9595,6 +9595,7 @@ pub(crate) mod tests {
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_or_taint"),
             ("forklift-core/src/util/object_utils.rs", "store_object_stream", "sync_dir_or_taint"),
+            ("forklift-core/src/util/bay_utils.rs", "write_bay_redirect", "sync_dir_or_taint"),
             // The pack folder's syncs, through the one helper that types their paths.
             ("forklift-core/src/util/pack_utils.rs", "sync_pack_folder_or_taint", "sync_dir_or_taint"),
             ("forklift-core/src/util/pack_utils.rs", "import_transport_packs", "sync_pack_folder_or_taint"),
@@ -9620,6 +9621,10 @@ pub(crate) mod tests {
         let found = census_of_non_test_mentions(&["outside_warehouse"]);
 
         let expected: Vec<(String, String, String)> = [
+            // A bay's redirect, written in its staging folder and synced at its place in the bay's
+            // working directory.
+            ("forklift-core/src/util/bay_utils.rs", "write_bay_redirect", "outside_warehouse"),
+            ("forklift-core/src/util/bay_utils.rs", "write_bay_redirect", "outside_warehouse"),
             // The key-owner manifest, in the keys folder, which no warehouse root contains.
             ("forklift-core/src/util/sign_utils.rs", "record_key_owner", "outside_warehouse"),
         ].into_iter().map(|(file, within, name)| (file.to_string(), within.to_string(), name.to_string())).collect();

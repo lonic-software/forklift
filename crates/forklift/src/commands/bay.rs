@@ -104,7 +104,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     // the materialize (and every later scope-aware verb in this bay, `forklift heal` included)
     // reads it back through `scope_utils::current_scope`. It is written for an unscoped bay too,
     // since a bay with no scope file is refused rather than read as unscoped.
-    scope_utils::set_bay_scope_in(&bay_utils::bay_state_dir(name), &scope)?;
+    scope_utils::set_bay_scope_for(&Checkout::Bay(name.to_string()), &scope)?;
     // Raised in the new bay before its position, and finished once its tree is materialized: a
     // bay interrupted between the two is filled in by `forklift heal` (or dropped by `bay remove`).
     let position = pallet_utils::BayPosition::new(name, Some(head.clone()));

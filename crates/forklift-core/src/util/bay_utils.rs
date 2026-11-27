@@ -18,6 +18,7 @@ use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME
 use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, record_utils, tree_utils, warehouse_utils};
 use crate::error::{CoreError, RefusalCode};
 use crate::util::record_utils::RecordError;
+use crate::util::taint_utils::DurablePath;
 
 /// The file inside a bay's `.forklift` folder that names its warehouse, and so makes that folder a
 /// bay's rather than a warehouse's.
@@ -32,7 +33,7 @@ const BAY_REDIRECT_VERSION: u32 = 2;
 /// The file inside a bay's local state recording its working directory (so the main tree
 /// can list where each bay lives), a [`record_utils`] file of kind [`BAY_PATH_RECORD`] holding
 /// that one path.
-const FILE_NAME_BAY_PATH: &str = "path";
+pub(crate) const FILE_NAME_BAY_PATH: &str = "path";
 const BAY_PATH_RECORD: &str = "bay-path";
 const BAY_PATH_VERSION: u32 = 2;
 
@@ -209,7 +210,9 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
     std::fs::create_dir(&staging)
         .map_err(|e| format!("Error while creating the bay folder \"{}\": {}", staging.to_string_lossy(), e))?;
 
-    let placed = file_utils::write_file_atomically(&staging.join(FILE_NAME_BAY_REDIRECT), &content)
+    // The redirect belongs to the bay's working directory, not to the shared `.forklift` folder a
+    // taint record names, so it is written through the escape, in its staging folder and at its place.
+    let placed = file_utils::write_file_atomically(&DurablePath::outside_warehouse(staging.join(FILE_NAME_BAY_REDIRECT)), &content)
         .and_then(|()| warehouse_utils::write_git_self_ignore(&staging))
         .and_then(|()| match std::fs::symlink_metadata(&forklift) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -226,7 +229,7 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
         return Err(e);
     }
 
-    file_utils::sync_dir(bay_dir)
+    file_utils::sync_dir_or_taint(bay_dir, &[&DurablePath::outside_warehouse(forklift.join(FILE_NAME_BAY_REDIRECT))])
 }
 
 /// Remove a bay's `.forklift` folder from its working directory, so the directory is no longer a
@@ -535,13 +538,13 @@ pub fn does_bay_exist(name: &str) -> bool {
 
 /// Record a bay's working directory in its local state (so it can be listed).
 pub fn write_bay_path(name: &str, bay_dir: &Path) -> Result<(), String> {
-    let state = bay_state_dir(name);
-    file_utils::create_folder_if_not_exists(&state)?;
+    let path = DurablePath::bay_path(name);
+    if let Some(state) = path.as_path().parent() {
+        file_utils::create_folder_if_not_exists(state)?;
+    }
     let bay_dir = path_text(bay_dir, "bay directory")?;
 
-    file_utils::write_file_atomically(
-        &state.join(FILE_NAME_BAY_PATH), &record_utils::to_bytes(BAY_PATH_RECORD, BAY_PATH_VERSION, [bay_dir])
-    )
+    file_utils::write_file_atomically(&path, &record_utils::to_bytes(BAY_PATH_RECORD, BAY_PATH_VERSION, [bay_dir]))
 }
 
 /// Read a bay's recorded working directory, or `None` when the bay never recorded one (a bay

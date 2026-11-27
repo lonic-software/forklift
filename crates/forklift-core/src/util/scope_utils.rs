@@ -27,7 +27,9 @@
 use std::path::{Path, PathBuf};
 use crate::globals::{self, bay_root};
 use crate::error::{CoreError, RefusalCode};
+use crate::util::config_utils::FOLDER_NAME_CONFIG_ROOT as FOLDER_NAME_CONFIG;
 use crate::util::record_utils::{self, RecordError};
+use crate::util::taint_utils::{self, DurablePath};
 use crate::util::warehouse_utils::{self, WarehouseMode};
 
 /// The bay-local file that records a bay's checkout scope (under `<bay_root>/`).
@@ -38,10 +40,9 @@ pub(crate) const FILE_NAME_BAY_SCOPE: &str = "scope";
 /// interrupted write never leaves a copy wider than the scope file it would replace.
 pub(crate) const FILE_NAME_SCOPE_COPY: &str = "scope-copy";
 
-/// The shared configuration folder (matches `config_utils`' own folder name) and the
-/// warehouse fetch-scope file inside it.
-const FOLDER_NAME_CONFIG: &str = "config";
-const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
+/// The warehouse fetch-scope file, in the shared configuration folder
+/// ([`config_utils::FOLDER_NAME_CONFIG_ROOT`](crate::util::config_utils::FOLDER_NAME_CONFIG_ROOT)).
+pub(crate) const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
 
 /// The [`record_utils`] kind and version of every non-full scope file. Format 2 put the root
 /// ignore file in every scope, refusing the unversioned files before it; format 3 escapes each
@@ -464,41 +465,31 @@ pub(crate) fn scope_file_is_present(path: &Path) -> Result<bool, String> {
     }
 }
 
-/// Write a scope file atomically (its parent folder must already exist).
-fn write_scope_file(path: &Path, scope: &PathScope) -> Result<(), String> {
-    crate::util::file_utils::write_file_atomically(path, &scope.to_bytes())
-}
+/// Write a checkout's scope file and its copy, the copy first: a copy write that fails fails the
+/// whole write before the scope file is touched, and an interrupted one leaves the copy naming the
+/// scope this write intended, never a wider one than the file it would replace. Both paths are
+/// built before the first write. The checkout's folder must already exist.
+pub(crate) fn write_checkout_scope(checkout: &taint_utils::Checkout, scope: &PathScope) -> Result<(), String> {
+    let (path, copy) = (DurablePath::scope(checkout), DurablePath::scope_copy(checkout));
+    let bytes = scope.to_bytes();
 
-/// The copy beside the checkout scope file at `path` ([`FILE_NAME_SCOPE_COPY`]).
-pub(crate) fn scope_copy_path(path: &Path) -> PathBuf {
-    path.with_file_name(FILE_NAME_SCOPE_COPY)
-}
-
-/// Write a checkout's scope file at `path` and its copy, the copy first: a copy write that fails
-/// fails the whole write before the scope file is touched, and an interrupted one leaves the copy
-/// naming the scope this write intended, never a wider one than the file it would replace. The
-/// parent folder must already exist.
-///
-/// # Arguments
-/// * `path`  - The checkout's scope file.
-/// * `bytes` - The scope's bytes ([`PathScope::to_bytes`]).
-/// * `write` - How each file is written: atomically, or replacing one that may already exist.
-fn write_checkout_scope_with(path: &Path, bytes: &[u8], write: fn(&Path, &[u8]) -> Result<(), String>) -> Result<(), String> {
-    let copy = scope_copy_path(path);
-    write(&copy, bytes)
-        .map_err(|e| format!("Error while recording the scope's copy \"{}\": {}", copy.to_string_lossy(), e))?;
-    write(path, bytes)
-        .map_err(|e| format!("Error while recording the scope \"{}\": {}", path.to_string_lossy(), e))
-}
-
-/// Write a checkout's scope file and its copy, the copy first ([`write_checkout_scope_with`]).
-pub(crate) fn write_checkout_scope(path: &Path, scope: &PathScope) -> Result<(), String> {
-    write_checkout_scope_with(path, &scope.to_bytes(), crate::util::file_utils::write_file_atomically)
+    crate::util::file_utils::write_file_atomically(&copy, &bytes)
+        .map_err(|e| copy_write_error(copy.as_path(), e))?;
+    crate::util::file_utils::write_file_atomically(&path, &bytes)
+        .map_err(|e| scope_write_error(path.as_path(), e))
 }
 
 /// Write only the copy beside a checkout's scope file, from a scope file `heal` found usable.
-pub(crate) fn write_scope_copy(path: &Path, scope: &PathScope) -> Result<(), String> {
-    write_scope_file(&scope_copy_path(path), scope)
+pub(crate) fn write_scope_copy(checkout: &taint_utils::Checkout, scope: &PathScope) -> Result<(), String> {
+    crate::util::file_utils::write_file_atomically(&DurablePath::scope_copy(checkout), &scope.to_bytes())
+}
+
+fn copy_write_error(copy: &Path, error: String) -> String {
+    format!("Error while recording the scope's copy \"{}\": {}", copy.to_string_lossy(), error)
+}
+
+fn scope_write_error(path: &Path, error: String) -> String {
+    format!("Error while recording the scope \"{}\": {}", path.to_string_lossy(), error)
 }
 
 /// The active checkout's scope: the main tree's ([`read_main_tree_scope`]) or the
@@ -766,16 +757,12 @@ pub fn set_bay_scope(scope: &PathScope) -> Result<(), String> {
         return Err("Only a sparse warehouse's main tree records a scope.".to_string());
     }
 
-    set_bay_scope_at(&bay_scope_path(), scope)
+    set_bay_scope_for(&taint_utils::Checkout::active(), scope)
 }
 
-/// [`set_bay_scope`] for the bay whose state dir is `dir`, before its context is entered. Every bay
-/// records its scope, a full one included ([`read_bay_scope`]).
-pub fn set_bay_scope_in(dir: &std::path::Path, scope: &PathScope) -> Result<(), String> {
-    set_bay_scope_at(&dir.join(FILE_NAME_BAY_SCOPE), scope)
-}
-
-fn set_bay_scope_at(path: &std::path::Path, scope: &PathScope) -> Result<(), String> {
+/// [`set_bay_scope`] for `checkout`, which bay creation names as its new bay before that bay's
+/// context is entered. Every bay records its scope, a full one included ([`read_bay_scope`]).
+pub fn set_bay_scope_for(checkout: &taint_utils::Checkout, scope: &PathScope) -> Result<(), String> {
     let fetch = read_fetch_scope()?;
 
     if !fetch.is_full() && scope.is_full() {
@@ -791,11 +778,11 @@ fn set_bay_scope_at(path: &std::path::Path, scope: &PathScope) -> Result<(), Str
         );
     }
 
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = DurablePath::scope(checkout).as_path().parent() {
         crate::util::file_utils::create_folder_if_not_exists(parent)?;
     }
 
-    write_checkout_scope(path, scope)
+    write_checkout_scope(checkout, scope)
 }
 
 /// Replace a sparse warehouse's fetch scope (shared across bays): `scope fetch` unions new prefixes
@@ -814,7 +801,7 @@ pub fn set_fetch_scope(scope: &PathScope) -> Result<(), String> {
         return Err("A sparse warehouse's fetch scope must name at least one path.".to_string());
     }
 
-    write_scope_file(&fetch_scope_path(), scope)
+    crate::util::file_utils::write_file_atomically(&DurablePath::fetch_scope(), &scope.to_bytes())
 }
 
 /// Write a new sparse warehouse's first fetch scope and main-tree scope into its `.forklift`
@@ -831,13 +818,15 @@ pub(crate) fn record_sparse_scopes(forklift: &Path, scope: &PathScope) -> Result
 
     let bytes = scope.to_bytes();
 
-    // The fetch scope first, then the main tree's scope with its copy before it. The fetch scope
-    // keeps no copy: heal rebuilds it from the checkouts' scopes.
+    // The fetch scope first, then the main tree's scope with its copy before it, as
+    // [`write_checkout_scope`] orders them. The fetch scope keeps no copy: heal rebuilds it from the
+    // checkouts' scopes.
     let fetch = forklift.join(FOLDER_NAME_CONFIG).join(FILE_NAME_FETCH_SCOPE);
-    crate::util::file_utils::replace_file_atomically(&fetch, &bytes)
-        .map_err(|e| format!("Error while recording the scope \"{}\": {}", fetch.to_string_lossy(), e))?;
+    crate::util::file_utils::replace_file_atomically(&fetch, &bytes).map_err(|e| scope_write_error(&fetch, e))?;
 
-    write_checkout_scope_with(&forklift.join(FILE_NAME_BAY_SCOPE), &bytes, crate::util::file_utils::replace_file_atomically)
+    let (path, copy) = (forklift.join(FILE_NAME_BAY_SCOPE), forklift.join(FILE_NAME_SCOPE_COPY));
+    crate::util::file_utils::replace_file_atomically(&copy, &bytes).map_err(|e| copy_write_error(&copy, e))?;
+    crate::util::file_utils::replace_file_atomically(&path, &bytes).map_err(|e| scope_write_error(&path, e))
 }
 
 /// Whether the store may lack content its history names: the warehouse's mode is not full (it is
