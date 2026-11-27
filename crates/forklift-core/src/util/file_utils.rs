@@ -1036,7 +1036,6 @@ pub(crate) fn sync_dir_attempts() -> Vec<PathBuf> {
 /// through) gate themselves on activation, so an unactivated process sees no behavior change
 /// from this routine's existence at all.
 fn sync_result_or_taint(sync_result: Result<(), String>, final_paths: &[&Path]) -> Result<(), String> {
-    taint_utils::assert_declared(final_paths);
     match sync_result {
         Ok(()) => taint_recheck(final_paths),
         Err(sync_error) => Err(taint_after_sync_failure(sync_error, final_paths)),
@@ -1047,7 +1046,7 @@ fn sync_result_or_taint(sync_result: Result<(), String>, final_paths: &[&Path]) 
 /// `dir` and folds the result through the same taint-or-recheck decision. `pub(crate)` so the
 /// pack write's own directory sync (`pack_utils`) can share it; the immediate write path below
 /// uses it directly.
-pub(crate) fn sync_dir_or_taint<P: FinalPath + ?Sized>(dir: &Path, final_paths: &[&P]) -> Result<(), String> {
+pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&DurablePath]) -> Result<(), String> {
     sync_result_or_taint(sync_dir(dir), &final_paths_of(final_paths))
 }
 
@@ -1060,43 +1059,13 @@ pub(crate) fn sync_dir_or_taint<P: FinalPath + ?Sized>(dir: &Path, final_paths: 
 /// recorded since the write. Its callers: heal, the process resolving taints, while
 /// [`SelfTripExemptionGuard`] skips that re-check anyway; and a compensating write or removal
 /// ([`write_file_compensating`]), which puts back what stood before its command.
-pub(crate) fn sync_dir_again_or_taint<P: FinalPath + ?Sized>(dir: &Path, final_paths: &[&P]) -> Result<(), String> {
+pub(crate) fn sync_dir_again_or_taint(dir: &Path, final_paths: &[&DurablePath]) -> Result<(), String> {
     let final_paths = final_paths_of(final_paths);
-    taint_utils::assert_declared(&final_paths);
     sync_dir(dir).map_err(|sync_error| taint_after_sync_failure(sync_error, &final_paths))
 }
 
-/// The final path a write entry hands the taint funnel: a [`DurablePath`], or, until every
-/// caller builds one, any path. Sealed, but while the blanket impl below stands every
-/// `AsRef<Path>` type is one; once it goes, nothing outside this module adds a kind.
-pub trait FinalPath: final_path_seal::Sealed {
-    fn final_path(&self) -> &Path;
-}
-
-mod final_path_seal {
-    pub trait Sealed {}
-}
-
-impl final_path_seal::Sealed for DurablePath {}
-
-impl FinalPath for DurablePath {
-    fn final_path(&self) -> &Path {
-        self.as_path()
-    }
-}
-
-// Migration only: lets the entries take a bare path while callers move onto `DurablePath`. It
-// coexists with the impl above because `DurablePath` implements no `AsRef<Path>`.
-impl<P: AsRef<Path> + ?Sized> final_path_seal::Sealed for P {}
-
-impl<P: AsRef<Path> + ?Sized> FinalPath for P {
-    fn final_path(&self) -> &Path {
-        self.as_ref()
-    }
-}
-
-fn final_paths_of<'a, P: FinalPath + ?Sized>(final_paths: &[&'a P]) -> Vec<&'a Path> {
-    final_paths.iter().map(|path| path.final_path()).collect()
+fn final_paths_of<'a>(final_paths: &[&'a DurablePath]) -> Vec<&'a Path> {
+    final_paths.iter().map(|path| path.as_path()).collect()
 }
 
 /// Record a taint for `final_paths` after a directory sync just failed, folding the taint
@@ -1106,8 +1075,6 @@ fn final_paths_of<'a, P: FinalPath + ?Sized>(final_paths: &[&'a P]) -> Vec<&'a P
 /// [`taint_utils::activate`] has been called in this process — see
 /// [`taint_utils::record_taint`]'s own doc comment.
 fn taint_after_sync_failure(sync_error: String, final_paths: &[&Path]) -> String {
-    taint_utils::assert_declared(final_paths);
-
     #[cfg(test)]
     if TAINT_RECORD_FAULT.with(|fault| fault.get()) && TAINT_RECORD_FAULTS_LEFT.with(|left| match left.get() {
         None => true,
@@ -1363,8 +1330,8 @@ impl Drop for SelfTripExemptionGuard {
 /// It exempts this one write, not the writes a caller makes around it. Inside a bulk-store
 /// session, which is process-wide, the write is only staged, as any write is, and the session's
 /// finish re-checks it.
-pub(crate) fn write_file_compensating<P: FinalPath + ?Sized>(file_path: &P, content: &[u8]) -> Result<(), String> {
-    write_file_atomically_as(file_path.final_path(), content, true)
+pub(crate) fn write_file_compensating(file_path: &DurablePath, content: &[u8]) -> Result<(), String> {
+    write_file_atomically_as(file_path, content, true)
 }
 
 /// Put a record back to `before`, as read before a command step that failed with `error`, and
@@ -1638,12 +1605,13 @@ fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
 /// Inside a bulk-store session the write is only staged and returns `Ok`: its rename and its
 /// re-check run in `BulkStoreSession::finish`, which renames every staged file and then re-checks,
 /// so a taint standing there is reported after the files were replaced.
-pub fn write_file_atomically<P: FinalPath + ?Sized>(file_path: &P, content: &[u8]) -> Result<(), String> {
-    write_file_atomically_as(file_path.final_path(), content, false)
+pub fn write_file_atomically(file_path: &DurablePath, content: &[u8]) -> Result<(), String> {
+    write_file_atomically_as(file_path, content, false)
 }
 
 /// [`write_file_atomically`], or with `compensating` [`write_file_compensating`].
-fn write_file_atomically_as(file_path: &Path, content: &[u8], compensating: bool) -> Result<(), String> {
+fn write_file_atomically_as(durable: &DurablePath, content: &[u8], compensating: bool) -> Result<(), String> {
+    let file_path = durable.as_path();
     let temporary_file_path = temp_path_for(file_path)?;
 
     // While a bulk-store session is active, stage the write and hand its (temp, final) pair to
@@ -1686,8 +1654,8 @@ fn write_file_atomically_as(file_path: &Path, content: &[u8], compensating: bool
     // sibling process) — see `sync_dir_or_taint`. Either refusal comes after the rename: the
     // write is visible, and not proven durable.
     let synced = match file_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() && compensating => sync_dir_again_or_taint(parent, &[file_path]),
-        Some(parent) if !parent.as_os_str().is_empty() => sync_dir_or_taint(parent, &[file_path]),
+        Some(parent) if !parent.as_os_str().is_empty() && compensating => sync_dir_again_or_taint(parent, &[durable]),
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir_or_taint(parent, &[durable]),
         _ => Ok(()),
     };
 
@@ -2022,12 +1990,6 @@ impl BulkStoreSession {
 /// crash-safety-critical ordering instead of risking it drifting between two copies — including
 /// the rename-failure fix below, which now applies to both callers identically.
 fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
-    // Ahead of every fsync gate: with fsync off, no path of this batch reaches the taint funnel's
-    // own checks.
-    if cfg!(debug_assertions) {
-        taint_utils::assert_declared(&pending.iter().map(|(_, final_path)| final_path.as_path()).collect::<Vec<_>>());
-    }
-
     if fsync_enabled() {
         for (temp, _) in pending {
             fsync_data(temp)?;
@@ -2486,8 +2448,8 @@ impl WriteBatch {
     /// # Returns
     /// * `Ok(())`      - If the write was staged.
     /// * `Err(String)` - If the temp file could not be created or written.
-    pub fn stage<P: FinalPath + ?Sized>(&self, file_path: &P, content: &[u8]) -> Result<(), String> {
-        let file_path = file_path.final_path();
+    pub fn stage(&self, file_path: &DurablePath, content: &[u8]) -> Result<(), String> {
+        let file_path = file_path.as_path();
         let temp_path = temp_path_for(file_path)?;
         if let Err(e) = create_and_write_file(&temp_path, content) {
             let _ = remove_file(&temp_path);
@@ -2526,8 +2488,8 @@ impl WriteBatch {
     ///
     /// A win also adds `final_path` to `reserved_not_staged` — the set
     /// [`finish`](Self::finish) checks to catch a winner that never followed through.
-    pub fn reserve_final_path<P: FinalPath + ?Sized>(&self, final_path: &P) -> bool {
-        let final_path = final_path.final_path();
+    pub fn reserve_final_path(&self, final_path: &DurablePath) -> bool {
+        let final_path = final_path.as_path();
         let mut state = self.state.lock().expect("write batch lock poisoned");
         let won = state.final_paths.insert(final_path.to_path_buf());
         if won {
@@ -5882,7 +5844,9 @@ pub(crate) mod tests {
         let dir = held_rename_dir("writers");
 
         for (name, write) in [
-            ("store", write_file_atomically as fn(&Path, &[u8]) -> Result<(), String>),
+            ("store", (|path: &Path, content: &[u8]|
+                write_file_atomically(&DurablePath::outside_warehouse(path.to_path_buf()), content))
+                as fn(&Path, &[u8]) -> Result<(), String>),
             ("config", replace_file_atomically),
         ] {
             let (path, probe) = (dir.join(name), dir.join(format!("{}-probe", name)));
@@ -9340,46 +9304,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// A storage root holding an empty `.forklift/undeclared` folder, entered on this thread.
-    fn undeclared_shape_fixture(name: &str) -> (crate::globals::StorageRootScope, PathBuf) {
-        let root = std::env::temp_dir().join(format!("forklift-file-utils-{}-{}", name, std::process::id()));
-        let _ = remove_dir_all(&root);
-        let folder = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join("undeclared");
-        std::fs::create_dir_all(&folder).unwrap();
-        let scope = crate::globals::StorageRootScope::enter(&root);
-        (scope, crate::globals::forklift_root().join("undeclared"))
-    }
-
-    /// A path under the root whose shape the taint registry does not declare, written through
-    /// the single-file write, is refused at the funnel's entry in a debug build, though its sync
-    /// holds and this process never activated the taint machinery.
-    /// Revert: drop the check at `sync_result_or_taint`'s entry → no panic → red.
-    #[test]
-    #[should_panic(expected = "names \"undeclared/record\", a path whose shape no entry of TAINT_SHAPES declares")]
-    fn the_funnel_refuses_an_undeclared_path_in_a_debug_build() {
-        let (_scope, folder) = undeclared_shape_fixture("undeclared-funnel");
-
-        let _ = write_file_atomically(&folder.join("record"), b"content");
-    }
-
-    /// The same for a batch, with fsync off, where no path of the batch reaches the funnel.
-    /// Revert: drop the check at `run_write_barrier`'s first line → no panic → red.
-    #[test]
-    #[should_panic(expected = "names \"undeclared/batched\", a path whose shape no entry of TAINT_SHAPES declares")]
-    fn the_batch_write_refuses_an_undeclared_path_with_fsync_off() {
-        let (_scope, folder) = undeclared_shape_fixture("undeclared-batch");
-        let temp = folder.join("batched.tmp");
-        std::fs::write(&temp, b"content").unwrap();
-
-        let _ = run_write_barrier(&[(temp, folder.join("batched"))]);
-    }
-
-    /// The functions that put a path into a taint record, or check one on its way in: the record
-    /// writer, heal's unchecked remainder writer, and the funnel whose entries
-    /// `taint_utils::assert_declared` guards.
-    const TAINT_FAMILY: [&str; 7] = [
+    /// The functions that put a path into a taint record: the record writer, heal's unchecked
+    /// remainder writer, and the funnel. Of the funnel, the two folder syncs take `DurablePath`s,
+    /// and so do the write entries that feed `run_write_barrier`; `sync_result_or_taint`,
+    /// `taint_after_sync_failure` and `run_write_barrier` take bare paths and are private, so
+    /// this census is what pins their callers.
+    const TAINT_FAMILY: [&str; 8] = [
         "record_taint", "resolve_taints", "taint_after_sync_failure", "sync_result_or_taint", "sync_dir_or_taint",
-        "sync_dir_again_or_taint", "sync_pack_folder_or_taint",
+        "sync_dir_again_or_taint", "sync_pack_folder_or_taint", "run_write_barrier",
     ];
 
     /// Every mention of one of `names` in non-test source, as (file under `crates/`, the function
@@ -9595,9 +9527,9 @@ pub(crate) mod tests {
     /// The census of the taint family's callers: every non-test caller, in every crate's `src/`,
     /// of the record writer, heal's remainder writer and the funnel, as a literal multiset. A new
     /// direct caller of `record_taint` or `resolve_taints`, or a new way into the funnel that
-    /// passes by its checked entries, turns it red. It sees what a source scan names, not what is
-    /// reachable: a call through a function pointer stored elsewhere is outside it, and so is test
-    /// code, which may call any of them.
+    /// passes by its typed entries, turns it red; so does a new caller of the batch barrier. It
+    /// sees what a source scan names, not what is reachable: a call through a function pointer
+    /// stored elsewhere is outside it, and so is test code, which may call any of them.
     /// Revert: add a `record_taint` call to a non-test function under any crate's `src/` → red;
     /// add a `resolve_taints` call outside heal's five sites → red.
     #[test]
@@ -9613,12 +9545,18 @@ pub(crate) mod tests {
             ("forklift-core/src/util/recovery_utils.rs", "run_pass", "resolve_taints"),
             ("forklift-core/src/util/recovery_utils.rs", "resolve_the_rest", "resolve_taints"),
             ("forklift-core/src/util/recovery_utils.rs", "rescan_torn_taint", "resolve_taints"),
-            // The funnel's three checked entries, and the batch write.
+            // Inside the funnel: its two untyped steps, from the typed folder syncs and from the
+            // batch barrier.
             ("forklift-core/src/util/file_utils.rs", "sync_result_or_taint", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "sync_dir_again_or_taint", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "sync_dir_or_taint", "sync_result_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "sync_result_or_taint"),
+            // The batch barrier's two callers: a bulk-store session's finish and a write batch's.
+            // Their lists hold bare paths; at this writing only write_file_atomically_as and
+            // stage push into them, both from a DurablePath, and nothing here pins that.
+            ("forklift-core/src/util/file_utils.rs", "run_barrier", "run_write_barrier"),
+            ("forklift-core/src/util/file_utils.rs", "finish", "run_write_barrier"),
             // The funnel's callers.
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_or_taint"),

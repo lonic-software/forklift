@@ -8,7 +8,7 @@ use std::process::Command;
 ///
 /// A child that panics is not caught here: this builds the command and runs nothing, so a test
 /// that asserts only that the command failed also passes on a panic, the debug build's
-/// undeclared-taint-shape assertion included. Every test that runs a child it expects to fail,
+/// durable-path assertions included. Every test that runs a child it expects to fail,
 /// through this or [`test_command`], is that uncovered case. So, partly, is a launched
 /// `forklift-server`: a debug build raises a request's storage panic again on a task of the
 /// server process, so the client sees only a dropped connection and the server keeps serving.
