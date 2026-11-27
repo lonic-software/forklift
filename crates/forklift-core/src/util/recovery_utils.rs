@@ -7520,7 +7520,7 @@ mod tests {
         let keepsake = forklift.join("removed-refs").join("side");
         {
             let _fault = SyncDirFaultGuard::failing_exactly(&forklift.join("removed-refs"));
-            pallet_utils::remove_damaged_ref("side", &unreadable, &keepsake)
+            pallet_utils::remove_damaged_ref("side", &unreadable, &taint_utils::DurablePath::keepsake("side"))
                 .expect_err("a keepsake whose folder sync fails fails the removal");
         }
         assert_eq!(std::fs::read(&reference).unwrap(), unreadable, "the removal stopped before the ref");
