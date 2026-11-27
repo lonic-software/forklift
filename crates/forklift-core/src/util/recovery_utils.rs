@@ -2620,22 +2620,46 @@ fn keepsake_ref_standing(relative: &Path) -> Result<Option<String>, String> {
 /// pallet's emptied parent folders may be gone too, and the first surviving one holds the last
 /// entry the removal changed.
 fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
-    // A top-level path's parent is the empty path. It is skipped, so the folder synced below is
+    file_utils::sync_dir(&nearest_standing_ancestor(root, relative)?)
+}
+
+/// The deepest folder above `relative` (under `root`) whose every name, from `root` down, its
+/// parent lists byte for byte as a real folder. A path test would resolve the name instead: a
+/// volume that folds case opens `Foo` as a later `foo`, Windows opens `a.` as `a`, and a link
+/// opens its target, so the folder synced would be one that never held the lost entry. A name
+/// listed under no exact spelling, or as a link or a file, is not standing, and the folder that
+/// lists it is the answer. A folder whose listing cannot be read is an error, never taken for
+/// either answer.
+fn nearest_standing_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    // Built from `root` itself, so a path with no standing folder below the root comes back
     // spelled exactly `root`, not `root` with a trailing separator: the same folder either way,
     // but a sync fault or record keyed by the root's path matches only the first spelling.
-    let mut dir = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
+    let mut standing = root.to_path_buf();
 
-    while let Some(candidate) = dir {
-        let absolute = root.join(candidate);
+    for component in relative.parent().into_iter().flat_map(Path::components) {
+        let std::path::Component::Normal(name) = component else {
+            break;
+        };
 
-        if absolute.is_dir() {
-            return file_utils::sync_dir(&absolute);
+        let listed = file_utils::read_directory_entries(&standing)?
+            .into_iter()
+            .find(|entry| entry.file_name() == name);
+
+        let Some(entry) = listed else {
+            break;
+        };
+
+        let file_type = entry.file_type()
+            .map_err(|e| format!("Error while reading \"{}\": {}", entry.path().to_string_lossy(), e))?;
+
+        if !file_type.is_dir() {
+            break;
         }
 
-        dir = candidate.parent().filter(|parent| !parent.as_os_str().is_empty());
+        standing.push(name);
     }
 
-    file_utils::sync_dir(root)
+    Ok(standing)
 }
 
 /// Every durable ref source's roots for the closure walk (§3.2: "every durable ref source", never
@@ -11152,6 +11176,82 @@ mod tests {
             that was legitimately overwritten in place after it was tainted");
 
         crate::util::file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// The folder synced for a removed path is the deepest one its parent lists byte for byte as a
+    /// real folder, never one a path test resolves the name to. Each case's lost entry sits under
+    /// a name that is: listed exactly (that folder), listed exactly two deep (the deeper one),
+    /// absent (its parent), top-level (the root, spelled exactly), a file (its parent), listed
+    /// only under another case (its parent), spelled with a trailing `.` (its parent), and a link
+    /// to a folder (its parent).
+    ///
+    /// Mutation: `nearest_standing_ancestor` asks `is_dir` of each candidate, deepest first. On
+    /// a volume that folds case the `Foo` row answers `pallets/Foo` (opened as `pallets/foo`), on
+    /// Windows the `a.` row answers `pallets/a.` (opened as `pallets/a`), and on unix the link row
+    /// answers the link, whose sync reaches its target.
+    #[test]
+    fn the_folder_synced_for_a_removed_path_is_listed_exactly_as_a_real_folder() {
+        let root = std::env::temp_dir().join(format!("forklift-recovery-utils-nearest-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        let pallets = root.join("pallets");
+        std::fs::create_dir_all(pallets.join("real").join("deep")).unwrap();
+        std::fs::create_dir_all(pallets.join("foo")).unwrap();
+        std::fs::create_dir_all(pallets.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(pallets.join("plain"), "a file").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("elsewhere"), pallets.join("link")).unwrap();
+
+        let mut cases = vec![
+            ("pallets/real/x", pallets.join("real")),
+            ("pallets/real/deep/x", pallets.join("real").join("deep")),
+            ("pallets/real/gone/x", pallets.join("real")),
+            ("pallets/gone/x", pallets.clone()),
+            ("x", root.clone()),
+            ("gone/x", root.clone()),
+            ("pallets/plain/x", pallets.clone()),
+            ("pallets/Foo/x", pallets.clone()),
+            ("pallets/a./x", pallets.clone()),
+        ];
+        if cfg!(unix) {
+            cases.push(("pallets/link/x", pallets.clone()));
+        }
+
+        for (relative, expected) in cases {
+            let standing = nearest_standing_ancestor(&root, Path::new(relative)).unwrap_or_else(|e| panic!("{}: {}", relative, e));
+            assert_eq!(standing.as_os_str(), expected.as_os_str(), "{}", relative);
+        }
+
+        file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// A folder on the way down whose listing cannot be read is an error, so the sync fails
+    /// before any folder is synced and the caller keeps the record: whether it lists the next name
+    /// exactly is unknown.
+    ///
+    /// Mutation: an unreadable listing taken as "not listed" (`break`) → `pallets` answered → red.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_listing_on_the_way_down_fails_the_sync() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("forklift-recovery-utils-nearest-unread-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        let pallets = root.join("pallets");
+        std::fs::create_dir_all(pallets.join("real")).unwrap();
+        // Searchable but not readable: a path test still opens `real`, a listing cannot be read.
+        std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let outcome = nearest_standing_ancestor(&root, Path::new("pallets/real/x"));
+        let readable = nearest_standing_ancestor(&root, Path::new("pallets/x"));
+        std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = outcome.expect_err("an unreadable listing must fail the sync");
+        assert!(error.contains(&format!("Error while reading directory \"{}\"", pallets.to_string_lossy())), "{}", error);
+        // The domain is not empty: the same fixture answers a path that lists only the readable root.
+        assert_eq!(readable.unwrap().as_os_str(), pallets.as_os_str());
+
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// (§10.3, mechanism check 2 — the delete variant) The complementary case to the test above:
