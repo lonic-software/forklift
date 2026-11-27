@@ -8561,7 +8561,7 @@ pub(crate) mod tests {
         // session's finish, which refuses → red.
         let session = BulkStoreSession::open().unwrap();
         let put_back = write_file_compensating(&target_path, b"put back inside a session");
-        assert_eq!(std::fs::read(&target).unwrap(), b"put back inside a session", "the put-back landed at once");
+        assert_eq!(std::fs::read(target).unwrap(), b"put back inside a session", "the put-back landed at once");
         assert_eq!(put_back, Ok(()));
         session.finish().unwrap();
 
