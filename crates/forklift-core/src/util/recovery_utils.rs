@@ -2620,22 +2620,64 @@ fn keepsake_ref_standing(relative: &Path) -> Result<Option<String>, String> {
 /// pallet's emptied parent folders may be gone too, and the first surviving one holds the last
 /// entry the removal changed.
 fn sync_nearest_ancestor(root: &Path, relative: &Path) -> Result<(), String> {
-    // A top-level path's parent is the empty path. It is skipped, so the folder synced below is
-    // spelled exactly `root`, not `root` with a trailing separator: the same folder either way,
-    // but a sync fault or record keyed by the root's path matches only the first spelling.
+    sync_nearest_ancestor_when(cfg!(unix) && file_utils::fsync_enabled(), root, relative)
+}
+
+/// [`sync_nearest_ancestor`], told whether a folder sync does anything here (`syncs`). A recorded
+/// path that is not plain names is refused on every arm. Where a sync does nothing (off unix, or
+/// with syncs turned off), nothing is probed either: a folder that cannot be examined must not
+/// fail a sync that would not have run.
+///
+/// The folder synced is the deepest one the recorded names open, and [`file_utils::sync_dir_within`]
+/// syncs every folder above it up to `root`, by spelling. Any folder that could hold the entry is
+/// one of those: a name a volume opens under another spelling (case, Unicode normalization), or a
+/// link, is synced as the folder it opens, and the folder listing it exactly as one above it.
+fn sync_nearest_ancestor_when(syncs: bool, root: &Path, relative: &Path) -> Result<(), String> {
+    if let Some(odd) = relative.components().find(|component| !matches!(component, std::path::Component::Normal(_))) {
+        return Err(format!(
+            "the recorded path \"{}\" holds \"{}\", which is not a plain name",
+            relative.to_string_lossy(), odd.as_os_str().to_string_lossy()
+        ));
+    }
+
+    if !syncs {
+        return Ok(());
+    }
+
+    file_utils::sync_dir_within(&nearest_opened_ancestor(root, relative)?, root)
+}
+
+/// The deepest folder above `relative` (under `root`, every component a plain name) that opens as
+/// a folder, links followed.
+///
+/// The search goes up only on an answer that proves the spelling opens no folder: the lookup
+/// finished and found nothing (`NotFound`, a dangling link included, even where its target is only
+/// away), found a non-folder on the way (`NotADirectory`), or opened something that is not a
+/// folder. Every other answer leaves the lookup unfinished, so the folder may stand and hold the
+/// entry, and it is an error that keeps the record: no permission, an I/O error, and the host's
+/// limits, a spelling too long to pass or a link chain the host stopped following (a true loop and
+/// a chain over the hop limit answer alike). A record names a spelling the host could pass when it
+/// was written, so a limit met now means the root or the host has changed since.
+///
+/// With no folder standing, `root` itself, spelled exactly, so a sync fault or record keyed by the
+/// root's path matches it (not `root` with a trailing separator).
+fn nearest_opened_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, String> {
     let mut dir = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
 
     while let Some(candidate) = dir {
         let absolute = root.join(candidate);
 
-        if absolute.is_dir() {
-            return file_utils::sync_dir(&absolute);
+        match std::fs::metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() => return Ok(absolute),
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
+            Err(error) => return Err(format!("\"{}\": {}", absolute.to_string_lossy(), error)),
         }
 
         dir = candidate.parent().filter(|parent| !parent.as_os_str().is_empty());
     }
 
-    file_utils::sync_dir(root)
+    Ok(root.to_path_buf())
 }
 
 /// Every durable ref source's roots for the closure walk (§3.2: "every durable ref source", never
@@ -11152,6 +11194,155 @@ mod tests {
             that was legitimately overwritten in place after it was tainted");
 
         crate::util::file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// A removed path's removal is synced in the deepest folder its names open and in every folder
+    /// above it up to the root, so whichever folder held the entry is synced. A name the volume
+    /// opens under another spelling (case or Unicode normalization, as probed on folders no row
+    /// names) or through a link syncs the folder it opens, and `pallets`, which lists it exactly,
+    /// above it. The other rows: a folder one and two deep, an absent name, a top-level path (the
+    /// root, spelled exactly), a file, and a trailing `.` (absent on the volumes this suite runs
+    /// on).
+    ///
+    /// Mutation: the sync bounded by the process's storage root instead of `root` (main's
+    /// `sync_dir`) → no folder above the opened one is synced → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_is_synced_in_every_folder_that_could_hold_it() {
+        let root = std::env::temp_dir().join(format!("forklift-recovery-utils-nearest-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        let pallets = root.join("pallets");
+        std::fs::create_dir_all(pallets.join("real").join("deep")).unwrap();
+        std::fs::create_dir_all(pallets.join("foo")).unwrap();
+        std::fs::create_dir_all(pallets.join("a")).unwrap();
+        // "café" stored decomposed; its row asks for it composed.
+        std::fs::create_dir_all(pallets.join("cafe\u{301}")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(pallets.join("plain"), "a file").unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), pallets.join("link")).unwrap();
+
+        // The volume's own answers, probed on folders no row names: whether it opens a name under
+        // another case, or under another Unicode normalization.
+        std::fs::create_dir_all(root.join("probe-case")).unwrap();
+        std::fs::create_dir_all(root.join("probe-e\u{301}")).unwrap();
+        let folds_case = root.join("PROBE-CASE").is_dir();
+        let folds_normalization = root.join("probe-\u{e9}").is_dir();
+        let opened_when = |opens: bool, name: &str| if opens {
+            vec![pallets.clone(), root.clone(), pallets.join(name)]
+        } else {
+            vec![root.clone(), pallets.clone()]
+        };
+
+        let real = pallets.join("real");
+        let exact = [
+            ("pallets/real/x", vec![pallets.clone(), root.clone(), real.clone()]),
+            ("pallets/real/deep/x", vec![real.clone(), pallets.clone(), root.clone(), real.join("deep")]),
+            ("pallets/real/gone/x", vec![pallets.clone(), root.clone(), real.clone()]),
+            ("pallets/gone/x", vec![root.clone(), pallets.clone()]),
+            ("x", vec![root.clone()]),
+            ("gone/x", vec![root.clone()]),
+            ("pallets/plain/x", vec![root.clone(), pallets.clone()]),
+            ("pallets/link/x", vec![pallets.clone(), root.clone(), pallets.join("link")]),
+            // The volumes this suite runs on do not open `a.` as `a`.
+            ("pallets/a./x", vec![root.clone(), pallets.clone()]),
+            ("pallets/Foo/x", opened_when(folds_case, "Foo")),
+            ("pallets/caf\u{e9}/x", opened_when(folds_normalization, "caf\u{e9}")),
+        ];
+
+        for (relative, expected) in exact {
+            let _syncs = file_utils::SyncDirFaultGuard::recording();
+            sync_nearest_ancestor_when(true, &root, Path::new(relative)).unwrap_or_else(|e| panic!("{}: {}", relative, e));
+            assert_eq!(file_utils::sync_dir_attempts(), expected,
+                "{} (folds case: {}, normalization: {})", relative, folds_case, folds_normalization);
+        }
+
+        file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// A recorded path that is not plain names (`.`, `..`, a root) is refused whether or not a
+    /// sync would run, never walked past: the record is not understood, so it is kept.
+    ///
+    /// Mutation: the check dropped → the arm without syncs returns `Ok` → red.
+    #[test]
+    fn a_recorded_path_that_is_not_plain_names_is_refused() {
+        let root = std::env::temp_dir().join(format!("forklift-recovery-utils-plain-{}", std::process::id()));
+        let absolute = root.join("pallets").join("x");
+
+        for relative in [Path::new("./pallets/x"), Path::new("pallets/../x"), Path::new("pallets/.."), absolute.as_path()] {
+            for syncs in [true, false] {
+                let error = sync_nearest_ancestor_when(syncs, &root, relative)
+                    .expect_err(&format!("{} (syncs: {})", relative.to_string_lossy(), syncs));
+                assert!(error.contains("which is not a plain name"), "{}: {}", relative.to_string_lossy(), error);
+            }
+        }
+    }
+
+    /// A folder on the way that cannot be examined (a host limit, a spelling too long to pass or a
+    /// link chain the host stopped following, or no search permission) is an error, never taken
+    /// for absent: it may stand and hold the entry, so nothing is synced and the caller keeps the
+    /// record. Once the link chain is gone the same path is absent and syncs, so the error clears.
+    /// Where a sync does nothing, nothing is examined, and the same state is `Ok`.
+    ///
+    /// Mutations: any metadata error taken as absent → `pallets` synced and `Ok` → red (each host
+    /// limit row too); the probe run where a sync does nothing → that arm's `Ok` is an error → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_examined_fails_the_sync() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("forklift-recovery-utils-nearest-unsearchable-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        let pallets = root.join("pallets");
+        std::fs::create_dir_all(pallets.join("real")).unwrap();
+
+        // Host limits: the host answers a path over its length limit, and a chain over its hop
+        // limit, as it answers these, with the folder standing, so the record is kept.
+        std::os::unix::fs::symlink(pallets.join("loop"), pallets.join("loop")).unwrap();
+        let too_long = "n".repeat(300);
+        for (relative, examined) in [
+            (Path::new("pallets").join(&too_long).join("x"), pallets.join(&too_long)),
+            (PathBuf::from("pallets/loop/x"), pallets.join("loop")),
+            (PathBuf::from("pallets/loop/deeper/x"), pallets.join("loop").join("deeper")),
+        ] {
+            let _syncs = file_utils::SyncDirFaultGuard::recording();
+            let error = sync_nearest_ancestor_when(true, &root, &relative)
+                .expect_err(&format!("{}: a host limit must fail the sync", relative.to_string_lossy()));
+            assert!(error.contains(&format!("\"{}\"", examined.to_string_lossy())), "{}", error);
+            assert_eq!(file_utils::sync_dir_attempts(), Vec::<PathBuf>::new(), "{}", relative.to_string_lossy());
+        }
+
+        // The way out: with the chain removed, the same path is absent and its parent syncs.
+        file_utils::remove_file(pallets.join("loop")).unwrap();
+        {
+            let _syncs = file_utils::SyncDirFaultGuard::recording();
+            sync_nearest_ancestor_when(true, &root, Path::new("pallets/loop/x")).unwrap();
+            assert_eq!(file_utils::sync_dir_attempts(), vec![root.clone(), pallets.clone()]);
+        }
+
+        // Readable but not searchable: `pallets` opens, `pallets/real` cannot be examined.
+        std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // A process that examines it anyway (root does) has no such folder to test.
+        if std::fs::metadata(pallets.join("real")).is_ok() {
+            std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o755)).unwrap();
+            file_utils::remove_dir_all(&root).ok();
+            eprintln!("skipped: this process examines a folder it has no search permission on");
+            return;
+        }
+
+        let syncs = file_utils::SyncDirFaultGuard::recording();
+        let outcome = sync_nearest_ancestor_when(true, &root, Path::new("pallets/real/x"));
+        let attempts = file_utils::sync_dir_attempts();
+        let without_syncs = sync_nearest_ancestor_when(false, &root, Path::new("pallets/real/x"));
+        drop(syncs);
+        std::fs::set_permissions(&pallets, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(without_syncs, Ok(()), "where a sync does nothing, nothing may be examined");
+        let error = outcome.expect_err("a folder that cannot be examined must fail the sync");
+        assert!(error.contains(&format!("\"{}\"", pallets.join("real").to_string_lossy())), "{}", error);
+        assert_eq!(attempts, Vec::<PathBuf>::new());
+
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// (§10.3, mechanism check 2 — the delete variant) The complementary case to the test above:
