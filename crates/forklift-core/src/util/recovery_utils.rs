@@ -491,7 +491,9 @@ async fn run_pass(root: &Path, progress: Option<&dyn Fn(&str)>) -> Result<HealOu
 
 /// The lines saying what [`pack_utils::rebuild_pack_indexes`] did: each index rebuilt, and why
 /// the rebuild did not run. A data file it could not rebuild is named by
-/// [`pack_health_warning_lines`], beside the problem that made it a candidate.
+/// [`pack_health_warning_lines`], beside the problem that made it a candidate. One whose rebuilt
+/// index was put in place with its folder unsynced is named by neither: the taint that sync
+/// recorded is read by the taint pass, which runs after the rebuild.
 fn index_rebuild_lines(rebuild: &pack_utils::IndexRebuild) -> Vec<String> {
     let mut lines: Vec<String> = rebuild.rebuilt.iter().map(|(index_path, set_aside)| match set_aside {
         Some(old) => format!(

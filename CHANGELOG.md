@@ -952,6 +952,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A pack index `heal` rebuilds is recorded when its folder cannot be synced.** If the pack
+  folder's sync fails after the rebuilt index is put in place, a durability taint now records that
+  index, so the store is not trusted as durable until `heal` settles it. Before, nothing recorded
+  it, and a later round of the same rebuild could move the sound index aside as damaged.
 - **`forklift-server` keeps a warehouse whose path is not valid UTF-8 inside it.** The server now
   reads and writes under the warehouse's own path. Before:
   - On Unix, for a path holding bytes that are not valid UTF-8, the object store and the parcel
