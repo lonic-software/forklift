@@ -3749,6 +3749,8 @@ pub(crate) mod tests {
         /// the taint and nothing else. The copy write before it lands with an error whose taint is
         /// cleared, and its own folder sync passes, so the put-back's sync is the only record.
         /// Revert: record another final path for the put-back's sync, or none → red.
+        /// Unix only: a folder sync is a no-op elsewhere, so none can fail.
+        #[cfg(unix)]
         #[test]
         fn a_copy_put_back_to_its_absence_whose_folder_sync_fails_taints_the_copy() {
             let (_root, _scope) = scratch("meta-copy-restore-sync");
@@ -6520,6 +6522,8 @@ pub(crate) mod tests {
     /// A removal whose folder sync fails records the removed ref's own path in the taint and
     /// nothing else.
     /// Revert: record another final path for the removal's sync → red.
+    /// Unix only: a folder sync is a no-op elsewhere, so none can fail.
+    #[cfg(unix)]
     #[test]
     fn a_removal_whose_folder_sync_fails_taints_the_removed_ref() {
         let (root, _scope) = scratch("remove-sync-taint");
