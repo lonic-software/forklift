@@ -4485,9 +4485,8 @@ fn compact_held(all: bool,
             let pack = match writer.as_mut() {
                 Some(pack) => pack,
                 None => {
-                    let pack = PackWriter::new(PackPlace::Store)?;
-                    debug_assert_eq!(pack.pack_folder, pack_folder, "a compaction's packs are written in the folder it lists and syncs");
-                    writer.insert(pack)
+                    debug_assert_eq!(PackPlace::Store.folder(), pack_folder, "a compaction's packs are written in the folder it lists and syncs");
+                    writer.insert(PackWriter::new(PackPlace::Store)?)
                 }
             };
 
@@ -7226,9 +7225,8 @@ impl StoreIngest {
 
     fn writer_mut(&mut self) -> Result<&mut PackWriter, String> {
         if self.writer.is_none() {
-            let writer = PackWriter::new(PackPlace::Store)?;
-            debug_assert_eq!(writer.pack_folder, self.folder, "an ingest's packs are written in the folder it created and syncs");
-            self.writer = Some(writer);
+            debug_assert_eq!(PackPlace::Store.folder(), self.folder, "an ingest's packs are written in the folder it created and syncs");
+            self.writer = Some(PackWriter::new(PackPlace::Store)?);
         }
         Ok(self.writer.as_mut().expect("the ingest pack writer was just created"))
     }

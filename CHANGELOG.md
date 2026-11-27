@@ -952,15 +952,20 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
-- **`forklift-server` keeps the objects of a warehouse whose path is not valid UTF-8 inside it.**
-  For a served warehouse whose path holds bytes that are not valid UTF-8 (on Windows, a name that
-  is not valid Unicode), the object store and parcel graph were read and written under a copy of
-  the path with those bytes replaced: a different folder beside the warehouse. Some writes went to
-  the real one, so objects could be written where they were then not found, and writing a pack was
-  refused. The server now reads and writes under the warehouse's own path. Objects an earlier
-  version put under the replaced path are not read from there. Move that copy's
-  `.forklift/objects` and `.forklift/graph` into the warehouse. The command-line client was not
-  affected.
+- **`forklift-server` keeps a warehouse whose path is not valid UTF-8 inside it.** The server now
+  reads and writes under the warehouse's own path. Before:
+  - On Unix, for a path holding bytes that are not valid UTF-8, the object store and the parcel
+    graph were read and written under a copy of the path with those bytes replaced: a different
+    folder beside the warehouse. Some writes went to the real one, so objects could be written
+    where they were then not found, and writing a pack was refused. Move that copy's
+    `.forklift/objects` and `.forklift/graph` into the warehouse.
+  - On Windows, for a name that is not valid Unicode, the whole warehouse root was the replaced
+    copy, so everything the server wrote is there. Move that copy's whole `.forklift` into the
+    warehouse.
+
+  On Windows, the command-line client wrote a configuration file reached through a symbolic link
+  whose target's name is not valid Unicode to a sibling file with the replaced name. It now
+  writes the link's target.
 - **A stack no longer drops a merge an unfinished undo was putting back.** An undo of the `stack`
   that completed a consolidation or pick, stopped after it moved the bay back and before it put the
   merge back in progress, left a bay where the next `stack` recorded an ordinary parcel, losing the
