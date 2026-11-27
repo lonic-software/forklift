@@ -1640,7 +1640,9 @@ mod tests {
         for &(shape, relative, description) in rows {
             let expected = relative.split('/').fold(forklift.clone(), |path, name| path.join(name));
             let built = writer_shape_example(shape);
-            assert_eq!(built.as_path(), expected, "{:?}", shape);
+            // The spelling, not only the components: a name's `/` is a separator of its own, as
+            // the readers' path builders push it, never one joined inside a component.
+            assert_eq!(built.as_path().as_os_str(), expected.as_os_str(), "{:?}", shape);
             let found = taint_shape(Path::new(relative)).map(|found| found.description);
             assert_eq!((found, shape.entry().description), (Some(description), description), "{:?}", shape);
             assert!(named.insert(description), "{:?} names an entry another row names", shape);
