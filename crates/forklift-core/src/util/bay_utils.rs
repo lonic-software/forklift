@@ -18,6 +18,7 @@ use crate::globals::{bay_root, forklift_root, FOLDER_NAME_BAYS_ROOT, FOLDER_NAME
 use crate::util::{cherry_pick_utils, file_utils, journal_utils, merge_utils, pallet_utils, record_utils, tree_utils, warehouse_utils};
 use crate::error::{CoreError, RefusalCode};
 use crate::util::record_utils::RecordError;
+use crate::util::taint_utils::DurablePath;
 
 /// The file inside a bay's `.forklift` folder that names its warehouse, and so makes that folder a
 /// bay's rather than a warehouse's.
@@ -32,7 +33,7 @@ const BAY_REDIRECT_VERSION: u32 = 2;
 /// The file inside a bay's local state recording its working directory (so the main tree
 /// can list where each bay lives), a [`record_utils`] file of kind [`BAY_PATH_RECORD`] holding
 /// that one path.
-const FILE_NAME_BAY_PATH: &str = "path";
+pub(crate) const FILE_NAME_BAY_PATH: &str = "path";
 const BAY_PATH_RECORD: &str = "bay-path";
 const BAY_PATH_VERSION: u32 = 2;
 
@@ -209,7 +210,9 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
     std::fs::create_dir(&staging)
         .map_err(|e| format!("Error while creating the bay folder \"{}\": {}", staging.to_string_lossy(), e))?;
 
-    let placed = file_utils::write_file_atomically(&staging.join(FILE_NAME_BAY_REDIRECT), &content)
+    // The redirect belongs to the bay's working directory, not to the shared `.forklift` folder a
+    // taint record names, so it is written through the escape, in its staging folder and at its place.
+    let placed = file_utils::write_file_atomically(&DurablePath::outside_warehouse(staging.join(FILE_NAME_BAY_REDIRECT)), &content)
         .and_then(|()| warehouse_utils::write_git_self_ignore(&staging))
         .and_then(|()| match std::fs::symlink_metadata(&forklift) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -226,7 +229,9 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
         return Err(e);
     }
 
-    file_utils::sync_dir(bay_dir)
+    // The sync makes the folder's entry in the bay's working directory durable, so the folder is
+    // what it names.
+    file_utils::sync_dir_or_taint(bay_dir, &[&DurablePath::outside_warehouse(forklift.clone())])
 }
 
 /// Remove a bay's `.forklift` folder from its working directory, so the directory is no longer a
@@ -535,13 +540,11 @@ pub fn does_bay_exist(name: &str) -> bool {
 
 /// Record a bay's working directory in its local state (so it can be listed).
 pub fn write_bay_path(name: &str, bay_dir: &Path) -> Result<(), String> {
-    let state = bay_state_dir(name);
-    file_utils::create_folder_if_not_exists(&state)?;
+    let path = DurablePath::bay_path(name);
+    file_utils::create_folder_if_not_exists(&bay_state_dir(name))?;
     let bay_dir = path_text(bay_dir, "bay directory")?;
 
-    file_utils::write_file_atomically(
-        &state.join(FILE_NAME_BAY_PATH), &record_utils::to_bytes(BAY_PATH_RECORD, BAY_PATH_VERSION, [bay_dir])
-    )
+    file_utils::write_file_atomically(&path, &record_utils::to_bytes(BAY_PATH_RECORD, BAY_PATH_VERSION, [bay_dir]))
 }
 
 /// Read a bay's recorded working directory, or `None` when the bay never recorded one (a bay
@@ -1034,6 +1037,29 @@ mod tests {
             assert_eq!(redirect.warehouse_root, PathBuf::from(root));
             assert_eq!(redirect.name, "review");
         }
+
+        file_utils::remove_dir_all(&dir).ok();
+    }
+
+    /// A bay's `.forklift` folder is made durable by syncing the working directory it was renamed
+    /// into, so a failed sync of that directory fails the write, with the sync's own error, after
+    /// the folder landed.
+    /// Revert: drop the sync after the rename → the write succeeds → red.
+    #[test]
+    #[cfg(unix)]
+    fn a_redirect_whose_working_directory_cannot_be_synced_fails() {
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        let dir = std::env::temp_dir().join(format!("forklift-bay-utils-redirect-unsynced-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let _fault = SyncDirFaultGuard::failing_exactly(&dir);
+            let error = write_bay_redirect(&dir, Path::new("/srv/warehouse"), "review").unwrap_err();
+            assert_eq!(error, format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()));
+        }
+        assert_eq!(read_bay_redirect(&dir.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap().name, "review");
 
         file_utils::remove_dir_all(&dir).ok();
     }

@@ -8282,7 +8282,7 @@ mod tests {
             std::fs::create_dir_all(&folder).unwrap();
             {
                 let _fault = SyncDirFaultGuard::failing_exactly_after(&folder, *passed);
-                scope_utils::set_bay_scope_in(&folder, &PathScope::full())
+                scope_utils::set_bay_scope_for(&Checkout::Bay("b".to_string()), &PathScope::full())
                     .expect_err("a scope write whose folder sync fails fails");
             }
             assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
@@ -8413,6 +8413,10 @@ mod tests {
             // What stands beside the record is set up before the taint, which refuses the writes.
             let scope_file = forklift.join(Path::new(relative).with_file_name(scope_utils::FILE_NAME_BAY_SCOPE));
             std::fs::create_dir_all(scope_file.parent().unwrap()).unwrap();
+            let checkout = match relative.strip_prefix("bays/").and_then(|rest| rest.split_once('/')) {
+                Some((bay, _)) => Checkout::Bay(bay.to_string()),
+                None => Checkout::Main,
+            };
             match beside {
                 Beside::Nothing => {}
                 Beside::Scope(prefixes) => {
@@ -8420,12 +8424,12 @@ mod tests {
                         true => PathScope::full(),
                         false => PathScope::from_prefixes(prefixes.iter().copied()),
                     };
-                    scope_utils::write_checkout_scope(&scope_file, &scope).unwrap();
+                    scope_utils::write_checkout_scope(&checkout, &scope).unwrap();
                     crate::util::file_utils::remove_file(&forklift.join(relative)).unwrap();
                 }
                 Beside::Damaged => std::fs::write(&scope_file, b"").unwrap(),
                 Beside::Newer => {
-                    scope_utils::write_checkout_scope(&scope_file, &PathScope::from_prefixes(["a"])).unwrap();
+                    scope_utils::write_checkout_scope(&checkout, &PathScope::from_prefixes(["a"])).unwrap();
                     crate::util::file_utils::remove_file(&forklift.join(relative)).unwrap();
                     let text = String::from_utf8(std::fs::read(&scope_file).unwrap()).unwrap();
                     // The record's own kind, read from the header it was written with, at a version past this build's.

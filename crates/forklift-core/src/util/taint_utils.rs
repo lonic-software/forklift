@@ -326,8 +326,10 @@ static POSITION: TaintShape = shape("the checkout position", Some(Disposition::P
     &[Is(crate::util::pallet_utils::FILE_NAME_POSITION)]);
 static POSITION_COPY: TaintShape = shape("the checkout position's copy", Some(Disposition::PositionCopy),
     &[Is(crate::util::pallet_utils::FILE_NAME_POSITION_COPY)]);
-static SCOPE: TaintShape = shape("the checkout scope", Some(Disposition::Scope), &[Is("scope")]);
-static SCOPE_COPY: TaintShape = shape("the checkout scope's copy", Some(Disposition::ScopeCopy), &[Is("scope-copy")]);
+static SCOPE: TaintShape = shape("the checkout scope", Some(Disposition::Scope),
+    &[Is(crate::util::scope_utils::FILE_NAME_BAY_SCOPE)]);
+static SCOPE_COPY: TaintShape = shape("the checkout scope's copy", Some(Disposition::ScopeCopy),
+    &[Is(crate::util::scope_utils::FILE_NAME_SCOPE_COPY)]);
 static CONSOLIDATION: TaintShape = shape("the consolidation state", Some(Disposition::MergeRecord), &[Is("consolidation")]);
 static CONSOLIDATION_COPY: TaintShape = shape("the consolidation state's copy", Some(Disposition::MergeRecordCopy), &[Is("consolidation-copy")]);
 static SKELETON: TaintShape = shape("the consolidation skeleton", Some(Disposition::MergeRecord), &[Is("consolidation-skeleton")]);
@@ -339,20 +341,24 @@ static BAY_POSITION: TaintShape = shape("a bay's checkout position", Some(Dispos
     &[Is("bays"), Name, Is(crate::util::pallet_utils::FILE_NAME_POSITION)]);
 static BAY_POSITION_COPY: TaintShape = shape("a bay's checkout position's copy", Some(Disposition::PositionCopy),
     &[Is("bays"), Name, Is(crate::util::pallet_utils::FILE_NAME_POSITION_COPY)]);
-static BAY_SCOPE: TaintShape = shape("a bay's checkout scope", Some(Disposition::Scope), &[Is("bays"), Name, Is("scope")]);
-static BAY_SCOPE_COPY: TaintShape = shape("a bay's checkout scope's copy", Some(Disposition::ScopeCopy), &[Is("bays"), Name, Is("scope-copy")]);
+static BAY_SCOPE: TaintShape = shape("a bay's checkout scope", Some(Disposition::Scope),
+    &[Is("bays"), Name, Is(crate::util::scope_utils::FILE_NAME_BAY_SCOPE)]);
+static BAY_SCOPE_COPY: TaintShape = shape("a bay's checkout scope's copy", Some(Disposition::ScopeCopy),
+    &[Is("bays"), Name, Is(crate::util::scope_utils::FILE_NAME_SCOPE_COPY)]);
 static BAY_CONSOLIDATION: TaintShape = shape("a bay's consolidation state", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("consolidation")]);
 static BAY_CONSOLIDATION_COPY: TaintShape = shape("a bay's consolidation state's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("consolidation-copy")]);
 static BAY_SKELETON: TaintShape = shape("a bay's consolidation skeleton", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("consolidation-skeleton")]);
 static BAY_SKELETON_COPY: TaintShape = shape("a bay's consolidation skeleton's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("consolidation-skeleton-copy")]);
 static BAY_JOURNAL: TaintShape = shape("a bay's journal", Some(Disposition::Journal), &[Is("bays"), Name, Is("journal.json")]);
-static BAY_PATH: TaintShape = shape("a bay's path record", Some(Disposition::BayPath), &[Is("bays"), Name, Is("path")]);
+static BAY_PATH: TaintShape = shape("a bay's path record", Some(Disposition::BayPath),
+    &[Is("bays"), Name, Is(crate::util::bay_utils::FILE_NAME_BAY_PATH)]);
 static BAY_CHERRY_PICK: TaintShape = shape("a bay's cherry-pick state", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("cherry-pick")]);
 static BAY_CHERRY_PICK_COPY: TaintShape = shape("a bay's cherry-pick state's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("cherry-pick-copy")]);
 
 static CHERRY_PICK: TaintShape = shape("the cherry-pick state", Some(Disposition::MergeRecord), &[Is("cherry-pick")]);
 static CHERRY_PICK_COPY: TaintShape = shape("the cherry-pick state's copy", Some(Disposition::MergeRecordCopy), &[Is("cherry-pick-copy")]);
-static FETCH_SCOPE: TaintShape = shape("the fetch scope", Some(Disposition::FetchScope), &[Is("config"), Is("fetch-scope")]);
+static FETCH_SCOPE: TaintShape = shape("the fetch scope", Some(Disposition::FetchScope),
+    &[Is(crate::util::config_utils::FOLDER_NAME_CONFIG_ROOT), Is(crate::util::scope_utils::FILE_NAME_FETCH_SCOPE)]);
 static FETCH_LEDGER: TaintShape = shape("the fetch ledger", Some(Disposition::FetchLedger), &[Is(crate::util::fetch_ledger::FILE_NAME_LEDGER)]);
 static HELD_HEADS: TaintShape = shape("the held-heads record", None, &[Is(crate::util::held_heads::FILE_NAME)]);
 static MIRROR_ROOTS: TaintShape = shape("the mirror roots record", Some(Disposition::MirrorRoots), &[Is(crate::util::mirror_utils::FILE_NAME_MIRROR_ROOTS)]);
@@ -764,11 +770,13 @@ impl DurablePath {
 
     /// A bay's path record, which names the bay's working directory.
     pub fn bay_path(name: &str) -> DurablePath {
-        Self::declared(WriterShape::BayPath, Path::new(crate::globals::FOLDER_NAME_BAYS_ROOT).join(name).join("path"))
+        Self::declared(WriterShape::BayPath,
+            Path::new(crate::globals::FOLDER_NAME_BAYS_ROOT).join(name).join(crate::util::bay_utils::FILE_NAME_BAY_PATH))
     }
 
     pub fn fetch_scope() -> DurablePath {
-        Self::declared(WriterShape::FetchScope, Path::new(crate::util::config_utils::FOLDER_NAME_CONFIG_ROOT).join("fetch-scope"))
+        Self::declared(WriterShape::FetchScope,
+            Path::new(crate::util::config_utils::FOLDER_NAME_CONFIG_ROOT).join(crate::util::scope_utils::FILE_NAME_FETCH_SCOPE))
     }
 
     pub fn fetch_ledger() -> DurablePath {

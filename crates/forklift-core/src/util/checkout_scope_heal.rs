@@ -44,7 +44,8 @@ use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{self, PathScope, RawScope, ScopeClass};
 use crate::util::warehouse_utils::{self, WarehouseMode};
 use crate::util::scope_heal::listed;
-use crate::util::{file_utils, object_utils, pallet_utils};
+use crate::util::{file_utils, object_utils, pallet_utils, taint_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// A checkout scope `heal` wrote.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
@@ -89,22 +90,36 @@ struct Checkout {
     /// Its name in a sentence.
     name: String,
 
-    /// Its scope file.
-    path: PathBuf,
+    /// Which checkout it is: its scope file and the copy beside it are read and written from this
+    /// alone.
+    place: taint_utils::Checkout,
+}
+
+impl Checkout {
+    /// Its scope file, which heal reads and writes back.
+    fn path(&self) -> DurablePath {
+        DurablePath::scope(&self.place)
+    }
+
+    /// The copy beside it.
+    fn copy(&self) -> DurablePath {
+        DurablePath::scope_copy(&self.place)
+    }
 
     /// Whether it is the warehouse's own working tree.
-    main_tree: bool,
+    fn main_tree(&self) -> bool {
+        self.place == taint_utils::Checkout::Main
+    }
 }
 
 fn checkout() -> Checkout {
-    match crate::globals::active_bay() {
-        Some(name) => Checkout { name: format!("bay \"{}\"", name), path: scope_utils::bay_scope_path(), main_tree: false },
-        None => Checkout {
-            name: "the warehouse's own working tree".to_string(),
-            path: scope_utils::main_tree_scope_path(),
-            main_tree: true,
-        },
-    }
+    let place = taint_utils::Checkout::active();
+    let name = match &place {
+        taint_utils::Checkout::Bay(name) => format!("bay \"{}\"", name),
+        taint_utils::Checkout::Main => "the warehouse's own working tree".to_string(),
+    };
+
+    Checkout { name, place }
 }
 
 /// The fetch scope, as the checks here read it.
@@ -152,7 +167,7 @@ pub(crate) fn unusable_scope(scope: &PathScope) -> Result<Option<String>, String
 
 /// The scope file of the checkout heal runs in, the one [`repair`] mends.
 pub(crate) fn active_scope_path() -> PathBuf {
-    checkout().path
+    checkout().path().as_path().to_path_buf()
 }
 
 /// Restore the scope of the checkout heal runs in from its copy, or re-sync the copy from it (see
@@ -172,18 +187,19 @@ pub fn repair(base: Base, notes: &mut Vec<String>) -> Result<Option<ScopeRestore
     let checkout = checkout();
 
     // The main tree of a warehouse that is not sparse records no scope: its reader refuses one.
-    if checkout.main_tree && !sparse {
+    if checkout.main_tree() && !sparse {
         return Ok(None);
     }
 
     let fetch = Fetch::read(sparse)?;
-    let copy_path = scope_utils::scope_copy_path(&checkout.path);
+    let copy = checkout.copy();
+    let copy_path = copy.as_path();
 
-    let was = match scope_utils::read_scope_raw(&checkout.path)? {
+    let was = match scope_utils::read_scope_raw(checkout.path().as_path())? {
         RawScope::Newer(_) => return Ok(None),
         RawScope::Read(scope) => match unusable_reason(&scope, sparse, &fetch) {
             None => {
-                resync_copy(&checkout, &copy_path, &scope, notes)?;
+                resync_copy(&checkout, &scope, notes)?;
                 return Ok(None);
             }
             // A scope file that reads but lies outside a fetch scope that reads: either file may be
@@ -191,7 +207,7 @@ pub fn repair(base: Base, notes: &mut Vec<String>) -> Result<Option<ScopeRestore
             Some(reason) if !scope.is_full() => {
                 // A copy that does not settle it is noted, so the fetch-scope heal's refusal says why
                 // heal here did not restore it.
-                return match usable_copy(&copy_path, sparse, &fetch)? {
+                return match usable_copy(copy_path, sparse, &fetch)? {
                     Ok((copy, bytes)) if copy != scope => match stranded(&copy, &fetch, base) {
                         Ok(blockers) if blockers.is_empty() => restore(&checkout, &bytes, &copy, &reason).map(Some),
                         Ok(blockers) => {
@@ -222,7 +238,7 @@ pub fn repair(base: Base, notes: &mut Vec<String>) -> Result<Option<ScopeRestore
 
     let choose = "Run \"forklift heal --scope <path>...\", naming the paths this checkout held.";
 
-    let (refused_why, remedy) = match usable_copy(&copy_path, sparse, &fetch)? {
+    let (refused_why, remedy) = match usable_copy(copy_path, sparse, &fetch)? {
         Ok((copy, bytes)) => match stranded(&copy, &fetch, base) {
             Ok(blockers) if blockers.is_empty() => return restore(&checkout, &bytes, &copy, &was).map(Some),
             // Files that already lay outside the checkout count too, and stop --scope as well, so
@@ -254,7 +270,7 @@ pub fn repair(base: Base, notes: &mut Vec<String>) -> Result<Option<ScopeRestore
         format!(
             "The scope file of {} (\"{}\") {}, so Forklift cannot tell which paths it checks out. {} Nothing \
             was changed. {}",
-            checkout.name, checkout.path.to_string_lossy(), was.trim_end_matches('.'),
+            checkout.name, checkout.path().as_path().to_string_lossy(), was.trim_end_matches('.'),
             if refused_why.ends_with('.') { refused_why.clone() } else { format!("{}.", refused_why) }, remedy
         ),
         String::new(),
@@ -297,22 +313,22 @@ fn usable_copy(copy_path: &Path, sparse: bool, fetch: &Fetch) -> Result<Result<(
 
 /// Write the scope file back with the copy's bytes, so it reads exactly as the copy does.
 fn restore(checkout: &Checkout, bytes: &[u8], scope: &PathScope, was: &str) -> Result<ScopeRestored, CoreError> {
-    file_utils::write_file_atomically(&checkout.path, bytes)
-        .map_err(|e| format!("Error while restoring the scope file \"{}\": {}", checkout.path.to_string_lossy(), e))?;
+    file_utils::write_file_atomically(&checkout.path(), bytes)
+        .map_err(|e| format!("Error while restoring the scope file \"{}\": {}", checkout.path().as_path().to_string_lossy(), e))?;
 
     Ok(ScopeRestored { checkout: checkout.name.clone(), scope: scope.prefixes().to_vec(), chosen: false, was: was.to_string() })
 }
 
 /// Rewrite a copy that is missing, damaged or different from a usable scope file. A copy a newer
 /// Forklift wrote is left as it is. A failure is a note, not an error: the scope file is sound.
-fn resync_copy(checkout: &Checkout, copy_path: &Path, scope: &PathScope, notes: &mut Vec<String>) -> Result<(), String> {
-    match scope_utils::read_scope_raw(copy_path) {
+fn resync_copy(checkout: &Checkout, scope: &PathScope, notes: &mut Vec<String>) -> Result<(), String> {
+    match scope_utils::read_scope_raw(checkout.copy().as_path()) {
         Ok(RawScope::Read(copy)) if &copy == scope => return Ok(()),
         Ok(RawScope::Newer(_)) => return Ok(()),
         _ => {}
     }
 
-    if let Err(error) = scope_utils::write_scope_copy(&checkout.path, scope) {
+    if let Err(error) = scope_utils::write_scope_copy(&checkout.place, scope) {
         notes.push(format!(
             "The copy of the scope of {} could not be rewritten ({}), so a later loss of its scope file has \
             no copy to restore it from.",
@@ -333,7 +349,7 @@ pub fn set_chosen(paths: &[String], base: Base) -> Result<ScopeRestored, CoreErr
     let sparse = warehouse_utils::warehouse_mode()? == WarehouseMode::Sparse;
     let checkout = checkout();
 
-    if checkout.main_tree && !sparse {
+    if checkout.main_tree() && !sparse {
         return Err(CoreError::from(
             "This warehouse is not sparse, so its own working tree checks out every path and records no \
             scope. --scope was not applied, and nothing was changed.".to_string()
@@ -342,11 +358,11 @@ pub fn set_chosen(paths: &[String], base: Base) -> Result<ScopeRestored, CoreErr
 
     let fetch = Fetch::read(sparse)?;
 
-    let was = match scope_utils::read_scope_raw(&checkout.path)? {
+    let was = match scope_utils::read_scope_raw(checkout.path().as_path())? {
         RawScope::Newer(reason) => return Err(CoreError::from(format!(
             "The scope file of {} (\"{}\") {} This version of Forklift never writes over it, so --scope was \
             not applied and nothing was changed.",
-            checkout.name, checkout.path.to_string_lossy(), reason
+            checkout.name, checkout.path().as_path().to_string_lossy(), reason
         ))),
         RawScope::Read(scope) => match unusable_reason(&scope, sparse, &fetch) {
             None => return Err(CoreError::from(format!(
@@ -369,7 +385,7 @@ pub fn set_chosen(paths: &[String], base: Base) -> Result<ScopeRestored, CoreErr
         format!(
             "The scope file of {} (\"{}\") {}, and whether the scope {} matches what this checkout holds cannot \
             be told: {} --scope was not applied, and nothing was changed. {}",
-            checkout.name, checkout.path.to_string_lossy(), was.trim_end_matches('.'), scope_name(&scope),
+            checkout.name, checkout.path().as_path().to_string_lossy(), was.trim_end_matches('.'), scope_name(&scope),
             if error.ends_with('.') { error.clone() } else { format!("{}.", error) }, base_unread_remedy()
         ),
         String::new(),
@@ -413,7 +429,7 @@ pub fn set_chosen(paths: &[String], base: Base) -> Result<ScopeRestored, CoreErr
         )));
     }
 
-    scope_utils::write_checkout_scope(&checkout.path, &scope)?;
+    scope_utils::write_checkout_scope(&checkout.place, &scope)?;
 
     Ok(ScopeRestored { checkout: checkout.name, scope: scope.prefixes().to_vec(), chosen: true, was })
 }
