@@ -387,9 +387,9 @@ static TRUST_COPY: TaintShape = shape("the trust anchor's copy", None, &[Is(crat
 
 /// Every shape a taint record may name, in match order; the first match wins. The pallets/,
 /// removed-refs/, meta/ and meta-copy/ entries come first, so a ref or keepsake whose name looks
-/// like an object, a shard, a pack or a signature is matched as what it is. A shape missing here
-/// fails [`assert_declared`] in a debug build the first time a test writes it, and a
-/// [`DurablePath`] built for a [`WriterShape`] is checked against the entry the variant names.
+/// like an object, a shard, a pack or a signature is matched as what it is. A [`WriterShape`]
+/// names the entry its paths take, so a writer of a shape missing here does not compile, and in
+/// a debug build a [`DurablePath`] built for a variant is checked against that entry.
 static TAINT_SHAPES: &[&TaintShape] = &[
     &PALLET_REF, &KEEPSAKE, &META_REF, &META_FOLDER_STRAY, &META_COPY, &META_COPY_STRAY,
     &LOOSE_OBJECT, &LOOSE_SIGNATURE, &PACK, &PACK_INDEX, &SIGNATURE_TABLE, &SHARD, &BAY_SHARD,
@@ -448,28 +448,6 @@ fn pattern_matches(pattern: &[Part], names: &[&std::ffi::OsStr]) -> bool {
     };
 
     fits && pattern_matches(rest, names)
-}
-
-/// In a debug build, refuse a batch of final paths that a taint could record and whose shape is
-/// not declared in [`TAINT_SHAPES`], naming the first such path. Only a batch [`resolve_root_for`]
-/// places under the root is checked, since [`record_taint`] records nothing for any other; and the
-/// check runs whether or not this process is activated, so every write the suites drive is checked,
-/// not only the ones whose sync fails. It compiles to nothing in a release build.
-pub(crate) fn assert_declared(final_paths: &[&Path]) {
-    if !cfg!(debug_assertions) {
-        return;
-    }
-    let Some(root) = resolve_root_for(final_paths) else {
-        return;
-    };
-
-    for relative in to_root_relative(&root, final_paths) {
-        debug_assert!(
-            taint_shape(&relative).is_some(),
-            "a write under \"{}\" names \"{}\", a path whose shape no entry of TAINT_SHAPES declares",
-            root.to_string_lossy(), taint_record_line(&relative)
-        );
-    }
 }
 
 /// Which checkout a checkout-local record belongs to: the main working tree's, kept at the root
