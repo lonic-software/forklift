@@ -1581,7 +1581,9 @@ pub(crate) fn pack_folder() -> PathBuf {
 }
 
 /// `Err` unless `folder` is the folder the pack folder's [`DurablePath`] constructors put their
-/// files in. A store write checks it before its first write, so its temp files, its renames,
+/// files in. A store operation checks it before it first lists, deletes or writes in the folder
+/// (a compaction, an ingest, a transport install, a signature-table publish and each store pack
+/// writer), so its temp files, its renames,
 /// the files it lists or deletes beside them and its taint records are all in one folder.
 /// [`pack_folder`] derives its path through the memoized objects root, the constructors from
 /// [`forklift_root`](crate::globals::forklift_root) directly, and a root whose name is not UTF-8
@@ -4262,6 +4264,9 @@ fn compact_held(all: bool,
                 evicted: &HashSet<String>,
                 kept: &HashSet<String>) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
+    // Before anything here lists or deletes in the folder, not only at its first pack writer:
+    // a run with nothing to pack still removes superseded packs.
+    require_durable_pack_folder(&pack_folder)?;
     remove_stale_temp_files(&pack_folder);
 
     // A repack rewrites every signature table, so one it cannot read would be lost with the rest
@@ -7109,6 +7114,7 @@ pub struct StoreIngest {
 impl StoreIngest {
     pub fn new() -> Result<StoreIngest, String> {
         let folder = pack_folder();
+        require_durable_pack_folder(&folder)?;
         file_utils::create_folder_if_not_exists(&folder)?;
         remove_stale_temp_files(&folder);
 
