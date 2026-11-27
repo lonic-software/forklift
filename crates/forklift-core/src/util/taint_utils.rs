@@ -303,8 +303,10 @@ static META_FOLDER_STRAY: TaintShape = shape("a ref in the meta folder that is n
 static META_COPY: TaintShape = shape("a meta pallet ref's copy", Some(Disposition::MetaCopy), &[Is("meta-copy"), MetaPalletName]);
 static META_COPY_STRAY: TaintShape = shape("a copy of a ref that is no meta pallet's", None, &[Is("meta-copy"), Name]);
 
-static LOOSE_OBJECT: TaintShape = shape("a loose object", Some(Disposition::Loose), &[Is("objects"), FanOut, Hex]);
-static LOOSE_SIGNATURE: TaintShape = shape("a loose object's signature", Some(Disposition::Signature), &[Is("objects"), FanOut, HexSignature]);
+static LOOSE_OBJECT: TaintShape = shape("a loose object", Some(Disposition::Loose),
+    &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT), FanOut, Hex]);
+static LOOSE_SIGNATURE: TaintShape = shape("a loose object's signature", Some(Disposition::Signature),
+    &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT), FanOut, HexSignature]);
 static PACK: TaintShape = shape("a pack", Some(Disposition::PackData), &[Is("objects"), Is("pack"), Extension("pack")]);
 static PACK_INDEX: TaintShape = shape("a pack index", Some(Disposition::PackIndex), &[Is("objects"), Is("pack"), Extension("idx")]);
 static SIGNATURE_TABLE: TaintShape = shape("a signature table", Some(Disposition::SignatureTable), &[Is("objects"), Is("pack"), Extension("sigs")]);

@@ -1,7 +1,7 @@
 use std::ops::Add;
-use std::path::Path;
 use crate::enums::object_type::ObjectType;
 use crate::util::{file_utils, object_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// A loose object.
 /// Compress it before saving it to the object store.
@@ -42,7 +42,7 @@ impl LooseObject {
 
         if !does_exist {
             let compressed = self.compress()?;
-            file_utils::write_object_to_file(Path::new(&path), &file_name, compressed)?;
+            file_utils::write_object_to_file(&DurablePath::loose_object(&self.hash)?, compressed)?;
         }
 
         Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), !does_exist))
@@ -79,8 +79,7 @@ impl LooseObject {
             return Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), false));
         }
 
-        let mut final_path = std::path::PathBuf::from(&path);
-        final_path.push(&file_name);
+        let final_path = DurablePath::loose_object(&self.hash)?;
 
         if !batch.reserve_final_path(&final_path) {
             // Already staged (by an earlier occurrence in this same batch, or a concurrent one
@@ -90,7 +89,7 @@ impl LooseObject {
         }
 
         let compressed = self.compress()?;
-        file_utils::write_object_to_file_deferred(Path::new(&path), &file_name, compressed, batch)?;
+        file_utils::write_object_to_file_deferred(&final_path, compressed, batch)?;
 
         Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), true))
     }
@@ -99,6 +98,7 @@ impl LooseObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;
     use crate::globals::StorageRootScope;
     use crate::model::blob::Blob;

@@ -2689,22 +2689,19 @@ impl Drop for WriteBatch {
 /// form exists.
 ///
 /// # Arguments
-/// * `path`      - The path to the folder where the object should be stored.
-/// * `file_name` - The name of the file where the object should be stored.
-/// * `content`   - The content of the object (should be compressed).
-/// * `batch`     - The batch to stage the write into.
+/// * `object`  - The object's final path ([`DurablePath::loose_object`]); its fan-out folder is
+///   created if missing.
+/// * `content` - The content of the object (should be compressed).
+/// * `batch`   - The batch to stage the write into.
 ///
 /// # Returns
 /// * `Ok(())`      - If the write was staged.
 /// * `Err(String)` - If an error occurred while staging the write.
-pub fn write_object_to_file_deferred(path: &Path, file_name: &str, content: Vec<u8>,
+pub fn write_object_to_file_deferred(object: &DurablePath, content: Vec<u8>,
                                      batch: &WriteBatch) -> Result<(), String> {
-    let mut file_path = PathBuf::from(path);
-    file_path.push(file_name);
+    create_object_folder(object)?;
 
-    create_folder_if_not_exists(path)?;
-
-    batch.stage(&file_path, &content)
+    batch.stage(object, &content)
 }
 
 impl Drop for BulkStoreSession {
@@ -2791,20 +2788,25 @@ pub(crate) fn macos_flush_device_cache(path: &Path) -> Result<(), String> {
 /// skipped when the hash already exists, so a truncated object would never be repaired.
 ///
 /// # Arguments
-/// * `path`      - The path to the folder where the object should be stored.
-/// * `file_name` - The name of the file where the object should be stored.
-/// * `content`   - The content of the object (should be compressed).
+/// * `object`  - The object's final path ([`DurablePath::loose_object`]); its fan-out folder is
+///   created if missing.
+/// * `content` - The content of the object (should be compressed).
 ///
 /// # Returns
 /// * `Ok(())`      - If the object was written to the file successfully.
 /// * `Err(String)` - If an error occurred while writing the object to the file.
-pub fn write_object_to_file(path: &Path, file_name: &str, content: Vec<u8>) -> Result<(), String> {
-    let mut file_path = PathBuf::from(path);
-    file_path.push(file_name);
+pub fn write_object_to_file(object: &DurablePath, content: Vec<u8>) -> Result<(), String> {
+    create_object_folder(object)?;
 
-    create_folder_if_not_exists(path)?;
+    write_file_atomically(object, &content)
+}
 
-    write_file_atomically(&file_path, &content)
+/// The fan-out folder a loose object's final path sits in, created if missing.
+fn create_object_folder(object: &DurablePath) -> Result<(), String> {
+    if let Some(folder) = object.as_path().parent() {
+        create_folder_if_not_exists(folder)?;
+    }
+    Ok(())
 }
 
 /// Retrieve the decompressed bytes of the object with the given hash, through a bounded,
@@ -5607,8 +5609,7 @@ pub(crate) mod tests {
         encoder.window_log(crate::util::object_utils::MAX_DECODE_WINDOW_LOG + 1).unwrap();
         std::io::Write::write_all(&mut encoder, &bytes).unwrap();
         encoder.finish().unwrap();
-        let (folder, file_name) = get_path_for_object(&hash).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, frame).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), frame).unwrap();
 
         assert_eq!(loose_header(&hash), None, "the bounded peek refuses the frame");
         assert_eq!(object_type_of(&hash).unwrap(), Some(crate::enums::object_type::ObjectType::Blob));
@@ -6960,8 +6961,7 @@ pub(crate) mod tests {
         let hash_a = blake3::hash(&content_a).to_hex().to_string();
 
         let compressed_b = zstd::encode_all(content_b.as_slice(), 0).unwrap();
-        let (folder, file_name) = get_path_for_object(&hash_a).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, compressed_b).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&hash_a).unwrap(), compressed_b).unwrap();
 
         let result = retrieve_object_by_hash(&hash_a);
         assert!(result.is_err(), "a loose file that hashes wrong must fail the read, got {:?}", result);
@@ -7011,8 +7011,7 @@ pub(crate) mod tests {
         let hash = blake3::hash(&content).to_hex().to_string();
 
         let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
-        let (folder, file_name) = get_path_for_object(&hash).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
 
         assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
 
@@ -7206,7 +7205,7 @@ pub(crate) mod tests {
 
         // Now the real object lands; the leftover temp must not have disturbed it.
         let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
         assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
 
         remove_dir_all(&temp).ok();
@@ -7250,8 +7249,7 @@ pub(crate) mod tests {
         let content = vec![9u8; 4000];
         let hash = blake3::hash(&content).to_hex().to_string();
         let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
-        let (folder, file_name) = get_path_for_object(&hash).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
 
         // First read caches the bytes; the second is a hit that must return the same `Arc`
         // (a pointer clone), not a fresh copy.
@@ -7279,8 +7277,7 @@ pub(crate) mod tests {
         let content = vec![0xABu8; 8000];
         let hash = blake3::hash(&content).to_hex().to_string();
         let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
-        let (folder, file_name) = get_path_for_object(&hash).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
 
         let temp_ref: &Path = &temp;
         let hash_ref: &str = &hash;
@@ -7321,8 +7318,7 @@ pub(crate) mod tests {
         {
             let _a = StorageRootScope::enter(&temp_a);
             let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
-            let (folder, file_name) = get_path_for_object(&hash).unwrap();
-            write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+            write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
             // Cache it under A.
             assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
         }
@@ -8704,16 +8700,14 @@ pub(crate) mod tests {
         let packed_content = vec![0x22u8; 500];
         let packed_hash = blake3::hash(&packed_content).to_hex().to_string();
         let compressed = zstd::encode_all(packed_content.as_slice(), 0).unwrap();
-        let (folder, file_name) = get_path_for_object(&packed_hash).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&packed_hash).unwrap(), compressed).unwrap();
         crate::util::pack_utils::compact(false, false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
 
         // A loose object, written *after* compaction so it stays loose.
         let loose_content = vec![0x33u8; 500];
         let loose_hash = blake3::hash(&loose_content).to_hex().to_string();
         let compressed = zstd::encode_all(loose_content.as_slice(), 0).unwrap();
-        let (folder, file_name) = get_path_for_object(&loose_hash).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&loose_hash).unwrap(), compressed).unwrap();
 
         assert!(does_object_exist(&loose_hash).unwrap(), "sanity: unblocked, the loose object answers true");
 
@@ -8782,8 +8776,7 @@ pub(crate) mod tests {
         let content = vec![0x44u8; 500];
         let hash = blake3::hash(&content).to_hex().to_string();
         let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
-        let (folder, file_name) = get_path_for_object(&hash).unwrap();
-        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
         assert!(does_object_exist(&hash).unwrap(), "an unactivated gate check must never refuse");
 
         // And a hand-written (pre-existing) taint file must not be honored by the re-check either.
@@ -8946,7 +8939,7 @@ pub(crate) mod tests {
         let content = b"a loose object another process packs while this one reads it".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
         let (loose_folder, file_name) = get_path_for_object(&hash).unwrap();
-        write_object_to_file(Path::new(&loose_folder), &file_name, zstd::encode_all(content.as_slice(), 0).unwrap())
+        write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), zstd::encode_all(content.as_slice(), 0).unwrap())
             .unwrap();
         let loose_path = Path::new(&loose_folder).join(&file_name);
 
@@ -9012,14 +9005,14 @@ pub(crate) mod tests {
 
             // A loose file at X's own fan-out path: either the genuine bytes, or an unrelated
             // payload that decodes cleanly but does not hash to X's address.
-            let (folder, file_name) = get_path_for_object(&hash).unwrap();
+            let (folder, _) = get_path_for_object(&hash).unwrap();
             std::fs::create_dir_all(&folder).unwrap();
             let loose_bytes = match case {
                 LooseCopy::Correct => content.clone(),
                 LooseCopy::WrongContent => b"unrelated bytes that do not hash to X's address".to_vec(),
             };
             let compressed = zstd::encode_all(loose_bytes.as_slice(), 0).unwrap();
-            write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+            write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
 
             match read_object_classified(&hash).unwrap() {
                 StoreReadOutcome::Verified(bytes) => {
@@ -9079,10 +9072,10 @@ pub(crate) mod tests {
                 Shape::VerifiedLoose => {
                     let content = b"a genuinely verified loose object";
                     let hash = blake3::hash(content).to_hex().to_string();
-                    let (folder, file_name) = get_path_for_object(&hash).unwrap();
+                    let (folder, _) = get_path_for_object(&hash).unwrap();
                     std::fs::create_dir_all(&folder).unwrap();
                     let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
-                    write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+                    write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
                     hash
                 }
                 Shape::CorruptLoose => {
@@ -9090,8 +9083,7 @@ pub(crate) mod tests {
                     let mismatched = zstd::encode_all(
                         b"these bytes do not hash to the claimed address".as_slice(), 0,
                     ).unwrap();
-                    let (folder, file_name) = get_path_for_object(&hash).unwrap();
-                    write_object_to_file(Path::new(&folder), &file_name, mismatched).unwrap();
+                    write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), mismatched).unwrap();
                     hash
                 }
                 Shape::PackedGood => {
@@ -9141,10 +9133,10 @@ pub(crate) mod tests {
                     builder.append_delta(&hash, &never_stored_base, 10, b"not a real delta payload").unwrap();
                     builder.finish().unwrap();
 
-                    let (folder, file_name) = get_path_for_object(&hash).unwrap();
+                    let (folder, _) = get_path_for_object(&hash).unwrap();
                     std::fs::create_dir_all(&folder).unwrap();
                     let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
-                    write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+                    write_object_to_file(&DurablePath::loose_object(&hash).unwrap(), compressed).unwrap();
 
                     hash
                 }
@@ -9625,6 +9617,10 @@ pub(crate) mod tests {
     fn the_escape_has_exactly_its_census_of_callers() {
         let found = census_of_non_test_mentions(&["outside_warehouse"]);
 
-        assert_eq!(found, Vec::<(String, String, String)>::new());
+        let expected: Vec<(String, String, String)> = [
+            // The key-owner manifest, in the keys folder, which no warehouse root contains.
+            ("forklift-core/src/util/sign_utils.rs", "record_key_owner", "outside_warehouse"),
+        ].into_iter().map(|(file, within, name)| (file.to_string(), within.to_string(), name.to_string())).collect();
+        assert_eq!(found, expected);
     }
 }

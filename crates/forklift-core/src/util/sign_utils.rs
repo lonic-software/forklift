@@ -7,6 +7,7 @@ use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use crate::util::{file_utils, pack_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// The environment variable that overrides the private key directory. Its main purpose
 /// is to keep tests away from the developer's real keys (like `FORKLIFT_GLOBAL_CONFIG`).
@@ -214,7 +215,7 @@ fn record_key_owner(key_id: &str, owner: &str) -> Result<(), String> {
 
     document[key_id] = toml_edit::value(owner);
 
-    file_utils::write_file_atomically(&path, document.to_string().as_bytes())
+    file_utils::write_file_atomically(&DurablePath::outside_warehouse(path), document.to_string().as_bytes())
 }
 
 /// The key ids this machine holds for the given owner, per the local manifest.
@@ -522,7 +523,7 @@ pub fn store_parcel_signature(parcel_hash: &str,
 /// a signature needs the store to hold one it would refuse.
 #[cfg(test)]
 pub(crate) fn overwrite_signature_sidecar_for_test(parcel_hash: &str, signature: &ParcelSignature) {
-    let path = get_signature_path(parcel_hash).unwrap();
+    let path = DurablePath::loose_signature(parcel_hash).unwrap();
     file_utils::write_file_atomically(&path, &encode_parcel_signature(signature)).unwrap();
 }
 
@@ -832,8 +833,8 @@ fn store_signature_once(parcel_hash: &str, bytes: &[u8]) -> Result<(), String> {
         ));
     }
 
-    let path = get_signature_path(parcel_hash)?;
-    if let Some(parent) = path.parent() {
+    let path = DurablePath::loose_signature(parcel_hash)?;
+    if let Some(parent) = path.as_path().parent() {
         // A native bundle may install the signed parcel into a pack, so its loose-object fan-out
         // directory need not exist. The sidecar remains loose and must create that directory.
         file_utils::create_folder_if_not_exists(parent)?;

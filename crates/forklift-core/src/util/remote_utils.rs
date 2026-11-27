@@ -13343,10 +13343,8 @@ mod tests {
         // remote below can serve those same raw bytes back under that hash.
         let pack_resident_content = crate::util::object_utils::blob_bytes(b"already packed and perfectly fine");
         let pack_resident_hash = blake3::hash(&pack_resident_content).to_hex().to_string();
-        let (resident_folder, resident_file_name) =
-            file_utils::get_path_for_object(&pack_resident_hash).unwrap();
         file_utils::write_object_to_file(
-            std::path::Path::new(&resident_folder), &resident_file_name,
+            &crate::util::taint_utils::DurablePath::loose_object(&pack_resident_hash).unwrap(),
             zstd::encode_all(pack_resident_content.as_slice(), 0).unwrap()
         ).unwrap();
         let stats = pack_utils::compact(false, false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
@@ -13360,10 +13358,9 @@ mod tests {
         // shape `hash_mismatch` classifies as a D4 corrupt candidate upstream.
         let genuine_content = crate::util::object_utils::blob_bytes(b"the real bytes this hash belongs to");
         let corrupt_hash = blake3::hash(&genuine_content).to_hex().to_string();
-        let (corrupt_folder, corrupt_file_name) = file_utils::get_path_for_object(&corrupt_hash).unwrap();
         let wrong_bytes = zstd::encode_all(b"not the genuine bytes at all".as_slice(), 0).unwrap();
         file_utils::write_object_to_file(
-            std::path::Path::new(&corrupt_folder), &corrupt_file_name, wrong_bytes
+            &crate::util::taint_utils::DurablePath::loose_object(&corrupt_hash).unwrap(), wrong_bytes
         ).unwrap();
 
         // The remote serves genuine, correct bytes for *both* hashes — including the pack-resident

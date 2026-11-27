@@ -5165,7 +5165,7 @@ mod tests {
 
         let hash = "ab".to_string() + &"cd".repeat(31);
         let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
-        file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
+        file_utils::write_object_to_file(&crate::util::taint_utils::DurablePath::loose_object(&hash).unwrap(), b"bytes".to_vec()).unwrap();
         let upper = Path::new(&folder).with_file_name("AB");
         file_utils::rename(&folder, &upper).unwrap();
         let canonical = Path::new(&folder).join(&file_name);
