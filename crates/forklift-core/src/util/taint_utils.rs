@@ -388,8 +388,8 @@ static TRUST_COPY: TaintShape = shape("the trust anchor's copy", None, &[Is(crat
 /// Every shape a taint record may name, in match order; the first match wins. The pallets/,
 /// removed-refs/, meta/ and meta-copy/ entries come first, so a ref or keepsake whose name looks
 /// like an object, a shard, a pack or a signature is matched as what it is. A [`WriterShape`]
-/// names the entry its paths take, so a writer of a shape missing here does not compile, and in
-/// a debug build a [`DurablePath`] built for a variant is checked against that entry.
+/// does not compile until it names a shape; that the shape is listed here is checked in a debug
+/// build, where a [`DurablePath`] built for a variant must classify as the shape it names.
 static TAINT_SHAPES: &[&TaintShape] = &[
     &PALLET_REF, &KEEPSAKE, &META_REF, &META_FOLDER_STRAY, &META_COPY, &META_COPY_STRAY,
     &LOOSE_OBJECT, &LOOSE_SIGNATURE, &PACK, &PACK_INDEX, &SIGNATURE_TABLE, &SHARD, &BAY_SHARD,
@@ -592,7 +592,8 @@ impl WriterShape {
 /// implements no `From`, `AsRef` or `Deref` to or from a path type; [`DurablePath::as_path`]
 /// lends its path. A constructor reads
 /// [`forklift_root`] when it is called, and that changes when a bay context is entered, so one
-/// built before the switch names the old root.
+/// built before the switch names the old root. Its debug-build checks run then too, against
+/// that root; nothing checks the path again when it is written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurablePath(PathBuf);
 

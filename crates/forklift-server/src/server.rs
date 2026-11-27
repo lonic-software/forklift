@@ -3044,7 +3044,7 @@ fn storage_task_failed(error: tokio::task::JoinError) -> (HandlerError, Option<P
 
 /// What a request's storage task that did not finish leaves for its caller to report. A debug build
 /// raises a panic again on the caller's task instead: a reply would let a test that expects any
-/// failure pass over it, the debug build's undeclared-taint-shape assertion included. A release
+/// failure pass over it, the debug build's durable-path assertions included. A release
 /// build reports it, so one request's panic never takes the server down. Only a request's task
 /// calls it: a panic raised in a task nobody awaits is lost (a debug build's [`StoragePanic`]
 /// aborts the process when tokio drops it), and the state that task keeps is left unsettled.

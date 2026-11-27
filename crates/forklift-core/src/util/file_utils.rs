@@ -9303,10 +9303,13 @@ pub(crate) mod tests {
     }
 
     /// The functions that put a path into a taint record: the record writer, heal's unchecked
-    /// remainder writer, and the funnel, whose entries take a `DurablePath`.
-    const TAINT_FAMILY: [&str; 7] = [
+    /// remainder writer, and the funnel. Of the funnel, the two folder syncs take `DurablePath`s,
+    /// and so do the write entries that feed `run_write_barrier`; `sync_result_or_taint`,
+    /// `taint_after_sync_failure` and `run_write_barrier` take bare paths and are private, so
+    /// this census is what pins their callers.
+    const TAINT_FAMILY: [&str; 8] = [
         "record_taint", "resolve_taints", "taint_after_sync_failure", "sync_result_or_taint", "sync_dir_or_taint",
-        "sync_dir_again_or_taint", "sync_pack_folder_or_taint",
+        "sync_dir_again_or_taint", "sync_pack_folder_or_taint", "run_write_barrier",
     ];
 
     /// Every mention of one of `names` in non-test source, as (file under `crates/`, the function
@@ -9522,7 +9525,7 @@ pub(crate) mod tests {
     /// The census of the taint family's callers: every non-test caller, in every crate's `src/`,
     /// of the record writer, heal's remainder writer and the funnel, as a literal multiset. A new
     /// direct caller of `record_taint` or `resolve_taints`, or a new way into the funnel that
-    /// passes by its typed entries, turns it red. It sees what a source scan names, not what is
+    /// passes by its typed entries, turns it red; so does a new caller of the batch barrier. It sees what a source scan names, not what is
     /// reachable: a call through a function pointer stored elsewhere is outside it, and so is test
     /// code, which may call any of them.
     /// Revert: add a `record_taint` call to a non-test function under any crate's `src/` → red;
@@ -9540,12 +9543,17 @@ pub(crate) mod tests {
             ("forklift-core/src/util/recovery_utils.rs", "run_pass", "resolve_taints"),
             ("forklift-core/src/util/recovery_utils.rs", "resolve_the_rest", "resolve_taints"),
             ("forklift-core/src/util/recovery_utils.rs", "rescan_torn_taint", "resolve_taints"),
-            // The funnel's three entries, and the batch write.
+            // Inside the funnel: its two untyped steps, from the typed folder syncs and from the
+            // batch barrier.
             ("forklift-core/src/util/file_utils.rs", "sync_result_or_taint", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "sync_dir_again_or_taint", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "sync_dir_or_taint", "sync_result_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "sync_result_or_taint"),
+            // The batch barrier's two callers: a bulk-store session's finish, whose list only
+            // write_file_atomically_as fills, and a write batch's, whose list only stage fills.
+            ("forklift-core/src/util/file_utils.rs", "run_barrier", "run_write_barrier"),
+            ("forklift-core/src/util/file_utils.rs", "finish", "run_write_barrier"),
             // The funnel's callers.
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "write_file_atomically_as", "sync_dir_or_taint"),
