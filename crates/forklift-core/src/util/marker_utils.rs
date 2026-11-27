@@ -202,8 +202,8 @@ pub fn restore(path: &DurablePath, set: &BTreeSet<String>) {
 
 /// Unconditionally clear the marker, best-effort — see [`remove_covered_by`]'s doc comment on
 /// why failures are swallowed here too.
-pub fn clear(path: &Path) {
-    let _ = file_utils::remove_file(path);
+pub fn clear(path: &DurablePath) {
+    let _ = file_utils::remove_file(path.as_path());
 }
 
 /// Write `set`'s serialized bytes to `path`, or remove `path` entirely when `set` is empty — a
@@ -215,7 +215,7 @@ pub fn clear(path: &Path) {
 /// ([`remove_covered_by`]) passes `false` and keeps the standing-taint re-checks.
 fn write_set_or_clear(path: &DurablePath, set: &BTreeSet<String>, compensating: bool) -> Result<(), String> {
     if set.is_empty() {
-        clear(path.as_path());
+        clear(path);
         return Ok(());
     }
 
@@ -344,7 +344,7 @@ mod tests {
         add(&path, "src").unwrap();
         add(&path, "docs").unwrap();
 
-        clear(path.as_path());
+        clear(&path);
         assert!(!path.as_path().exists());
     }
 

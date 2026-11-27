@@ -225,7 +225,7 @@ pub fn clear_recorded_under(root_key: &str) -> BTreeSet<String> {
 /// fast-forward, `git import`'s initial checkout, `lower`/`clone`'s materialization) calls
 /// this once it has finished. Best-effort (see [`mark_load_completed`]'s doc comment).
 pub fn clear_all_recorded() {
-    marker_utils::clear(marker_path().as_path());
+    marker_utils::clear(&marker_path());
 }
 
 /// Display a warehouse path key the way user-facing messages spell the warehouse root — the one

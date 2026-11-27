@@ -3541,6 +3541,33 @@ mod tests {
         publish_shards(&mut ShardLedger::read().unwrap(), ShardPublish { removed, ..ShardPublish::of(writes) })
     }
 
+    /// Under a root whose name is not UTF-8, the shard's readers and its writer name different
+    /// paths, so the write is refused and nothing lands at the writer's path. Linux only: APFS will
+    /// not create such a name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shard_write_is_refused_where_its_readers_read_another_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent = std::env::temp_dir().join(format!("forklift-inventory-test-not-utf8-{}", std::process::id()));
+        let root = parent.join(std::ffi::OsStr::from_bytes(b"w\xff"));
+        let _ = file_utils::remove_dir_all(&parent);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&root);
+        std::fs::create_dir_all(file_utils::get_path_inventory_root()).unwrap();
+        ShardLedger::rebuild(&BTreeSet::new()).unwrap();
+
+        let error = publish(vec![("a", forged_shard(1, InventoryItemState::Normal))], &[]).unwrap_err();
+        let written = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join(crate::globals::FOLDER_NAME_INVENTORY_ROOT)
+            .join(file_utils::shard_folder_relative("a"));
+        let landed = written.exists();
+        drop(scope);
+        let _ = file_utils::remove_dir_all(&parent);
+
+        assert!(error.contains("was not written: it would go to"), "{error}");
+        assert!(!landed, "nothing is written at the writer's path");
+    }
+
     /// The funnel decides every rollup from the shard on disk: a stat-only rewrite keeps the one on
     /// disk, a change gets none, and neither keeps the one the producer handed in.
     #[test]
