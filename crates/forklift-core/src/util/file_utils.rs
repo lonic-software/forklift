@@ -90,12 +90,15 @@ pub fn create_folder_if_not_exists(path: &Path) -> Result<bool, String> {
     }
 }
 
+/// One thread's memo of a root: the scope fingerprint it was resolved under, and the root.
+type RootMemo = std::cell::RefCell<Option<((u64, u64), PathBuf)>>;
+
 /// Resolve a shared `.forklift/<folder>` root, memoized in `memo` against the storage-root scope
 /// fingerprint ([`globals::scope_fingerprint`]).
 ///
 /// A hot read path resolves a root on every object access (for the pack-registry key, the
 /// read-cache key, the graph-shard key), and each resolution reads the bay-context lock and
-/// rebuilds the path. This returns a clone of the cached string while the scope is unchanged and
+/// rebuilds the path. This returns a clone of the cached path while the scope is unchanged and
 /// recomputes the instant it changes — so a server switching warehouses (or a bay entered
 /// mid-process) is never served a stale root, while a walk within one scope pays the cost once.
 ///
@@ -103,7 +106,7 @@ pub fn create_folder_if_not_exists(path: &Path) -> Result<bool, String> {
 /// [`DurablePath`] constructors write in whatever the root's name: a lossy string of a root whose
 /// name is not UTF-8 named another folder.
 fn memoized_root(
-    memo: &'static std::thread::LocalKey<std::cell::RefCell<Option<((u64, u64), PathBuf)>>>,
+    memo: &'static std::thread::LocalKey<RootMemo>,
     folder: &str,
 ) -> PathBuf {
     let fingerprint = crate::globals::scope_fingerprint();
@@ -126,8 +129,7 @@ fn memoized_root(
 /// * The path to the "objects root" folder.
 pub fn get_path_objects_root() -> PathBuf {
     thread_local! {
-        static MEMO: std::cell::RefCell<Option<((u64, u64), PathBuf)>> =
-            const { std::cell::RefCell::new(None) };
+        static MEMO: RootMemo = const { std::cell::RefCell::new(None) };
     }
     memoized_root(&MEMO, FOLDER_NAME_OBJECTS_ROOT)
 }
@@ -152,8 +154,7 @@ pub fn get_path_inventory_root() -> PathBuf {
 /// * The path to the "graph root" folder.
 pub fn get_path_graph_root() -> PathBuf {
     thread_local! {
-        static MEMO: std::cell::RefCell<Option<((u64, u64), PathBuf)>> =
-            const { std::cell::RefCell::new(None) };
+        static MEMO: RootMemo = const { std::cell::RefCell::new(None) };
     }
     memoized_root(&MEMO, FOLDER_NAME_GRAPH_ROOT)
 }
