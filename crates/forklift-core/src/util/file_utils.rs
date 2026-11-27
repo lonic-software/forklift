@@ -1056,7 +1056,8 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&DurablePath]) -> Res
 }
 
 /// Sync `dir` again for `final_paths`, which an earlier write reported unsynced and may have
-/// landed, recording a taint when this sync fails too, through the same
+/// landed, or for heal's own first sync after a rename (the pack-index rebuild), recording a
+/// taint when this sync fails, through the same
 /// [`taint_after_sync_failure`] as [`sync_dir_or_taint`]. Unlike it, there is no standing-taint
 /// re-check, so a sync that holds returns `Ok` whatever taint stands, or fails to read: the
 /// re-check refuses whenever a taint stands, so for a sync that held it would say only that a
@@ -9312,9 +9313,9 @@ pub(crate) mod tests {
     /// and so do the write entries that feed `run_write_barrier`; `sync_result_or_taint`,
     /// `taint_after_sync_failure` and `run_write_barrier` take bare paths and are private, so
     /// this census is what pins their callers.
-    const TAINT_FAMILY: [&str; 8] = [
+    const TAINT_FAMILY: [&str; 9] = [
         "record_taint", "resolve_taints", "taint_after_sync_failure", "sync_result_or_taint", "sync_dir_or_taint",
-        "sync_dir_again_or_taint", "sync_pack_folder_or_taint", "run_write_barrier",
+        "sync_dir_again_or_taint", "sync_pack_folder_or_taint", "sync_pack_folder_again_or_taint", "run_write_barrier",
     ];
 
     /// Every mention of one of `names` in non-test source, as (file under `crates/`, the function
@@ -9571,6 +9572,9 @@ pub(crate) mod tests {
             ("forklift-core/src/util/pack_utils.rs", "compact_held", "sync_pack_folder_or_taint"),
             ("forklift-core/src/util/pack_utils.rs", "write_signature_tables", "sync_pack_folder_or_taint"),
             ("forklift-core/src/util/pack_utils.rs", "finish", "sync_pack_folder_or_taint"),
+            // Heal's index rebuild, through the pack folder's form with no standing-taint re-check.
+            ("forklift-core/src/util/pack_utils.rs", "sync_pack_folder_again_or_taint", "sync_dir_again_or_taint"),
+            ("forklift-core/src/util/pack_utils.rs", "publish_rebuilt_index", "sync_pack_folder_again_or_taint"),
             ("forklift-core/src/util/pallet_utils.rs", "restore_copy", "sync_dir_again_or_taint"),
             ("forklift-core/src/util/pallet_utils.rs", "unlink_ref", "sync_dir_or_taint"),
             ("forklift-core/src/util/ref_heal.rs", "sync_files_again", "sync_dir_again_or_taint"),
