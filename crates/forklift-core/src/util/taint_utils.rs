@@ -350,8 +350,9 @@ static TRUST_COPY: TaintShape = shape("the trust anchor's copy", None, &[Is("tru
 
 /// Every shape a taint record may name, in match order; the first match wins. The pallets/,
 /// removed-refs/, meta/ and meta-copy/ entries come first, so a ref or keepsake whose name looks
-/// like an object, a shard, a pack or a signature is matched as what it is. A writer's path is
-/// checked against the entry its [`WriterShape`] names when its [`DurablePath`] is built.
+/// like an object, a shard, a pack or a signature is matched as what it is. A shape missing here
+/// fails [`assert_declared`] in a debug build the first time a test writes it, and a
+/// [`DurablePath`] built for a [`WriterShape`] is checked against the entry the variant names.
 static TAINT_SHAPES: &[&TaintShape] = &[
     &PALLET_REF, &KEEPSAKE, &META_REF, &META_FOLDER_STRAY, &META_COPY, &META_COPY_STRAY,
     &LOOSE_OBJECT, &LOOSE_SIGNATURE, &PACK, &PACK_INDEX, &SIGNATURE_TABLE, &SHARD, &BAY_SHARD,
@@ -572,9 +573,9 @@ impl WriterShape {
 /// [`file_utils`](crate::util::file_utils) hand a taint record. Its field is private, so outside
 /// this module one is had only from its constructors: one per writer shape, each building its
 /// path under [`forklift_root`] from the shape's parts, or [`DurablePath::outside_warehouse`] for
-/// a file no warehouse records. It converts to and from no other path type, and is built
-/// immediately before the write that takes it, since [`forklift_root`] changes when a bay
-/// context is entered.
+/// a file no warehouse records. It converts to and from no other path type. A constructor reads
+/// [`forklift_root`] when it is called, and that changes when a bay context is entered, so one
+/// built before the switch names the old root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurablePath(PathBuf);
 
@@ -585,9 +586,8 @@ impl DurablePath {
     }
 
     /// `relative` under [`forklift_root`], for a writer of `shape`. In a debug build, refuses a
-    /// path whose declared entry is not the one `shape` names, naming both: a name argument
-    /// holding a separator, or a meta copy built for an ordinary pallet's name, renders into
-    /// another entry or none.
+    /// path whose declared entry is not the one `shape` names, naming both, such as a meta copy
+    /// built for an ordinary pallet's name, which classifies as a stray in the meta-copy folder.
     fn declared(shape: WriterShape, relative: PathBuf) -> DurablePath {
         if cfg!(debug_assertions) {
             let found = taint_shape(&relative);
