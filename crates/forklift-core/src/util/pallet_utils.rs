@@ -841,10 +841,10 @@ pub fn write_position_for(checkout: &Checkout, position: &BayPosition) -> Result
     validate_pallet_name(&position.pallet)?;
 
     let bytes = position_bytes(position);
+    let (path, copy) = (DurablePath::position(checkout), DurablePath::position_copy(checkout));
 
-    file_utils::write_file_atomically(&DurablePath::position(checkout), &bytes)?;
+    file_utils::write_file_atomically(&path, &bytes)?;
 
-    let copy = DurablePath::position_copy(checkout);
     file_utils::write_file_atomically(&copy, &bytes).or_else(|written| match file_utils::remove_file(copy.as_path()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

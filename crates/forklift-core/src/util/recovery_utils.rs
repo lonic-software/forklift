@@ -8691,7 +8691,10 @@ mod tests {
                 Beside::DamagedWithStateCopy => {
                     std::fs::write(&state, b"not a state\n").unwrap();
                     std::fs::write(dir.join(merge_utils::FILE_NAME_CONSOLIDATION_COPY), state_of("0".repeat(64))).unwrap();
-                    let checkout = if relative.starts_with("bays/b/") { Checkout::Bay("b".to_string()) } else { Checkout::Main };
+                    let checkout = match relative.strip_prefix("bays/").and_then(|rest| rest.split_once('/')) {
+                        Some((bay, _)) => Checkout::Bay(bay.to_string()),
+                        None => Checkout::Main,
+                    };
                     crate::util::pallet_utils::write_position_for(&checkout, &crate::util::pallet_utils::BayPosition::new("main", Some(head.clone()))).unwrap();
                 }
                 Beside::NewerStateAndMarker => {

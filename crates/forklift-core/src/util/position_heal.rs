@@ -320,36 +320,55 @@ mod tests {
         let _ = file_utils::remove_dir_all(&root);
     }
 
-    /// `--position` is set only over a position that is lost or damaged with no copy to witness
-    /// it: a position that reads is kept whatever its copy says, and a copy that reads is the
-    /// evidence.
+    /// `--position` is set only over a position that is lost or damaged with no copy and no
+    /// operation left unfinished to witness it: a position that reads, that a newer version wrote,
+    /// or that cannot be read now is kept, and a copy that reads is the evidence.
     /// Revert: read the copy where the position is read → a sound position with no copy reads
     /// as lost → red.
     #[test]
     fn a_chosen_position_is_set_only_where_nothing_witnesses_the_position() {
+        #[derive(Debug)]
+        enum File<'a> { Absent, Bytes(&'a [u8]), Folder }
+
         let root = std::env::temp_dir().join(format!("forklift-position-heal-sets-chosen-{}", std::process::id()));
         let _ = file_utils::remove_dir_all(&root);
         let dir = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&dir).unwrap();
         let _scope = StorageRootScope::enter(&root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
-        pallet_utils::write_position_for(&Checkout::Main, &BayPosition::new("main", None)).unwrap();
+        let main = BayPosition::new("main", None);
+        pallet_utils::write_position_for(&Checkout::Main, &main).unwrap();
         let sound = std::fs::read(dir.join("position")).unwrap();
+        let newer = crate::util::record_utils::to_bytes("position", 99, ["main", ""]);
+        let damaged = &b"not a position\n"[..];
 
-        for (position, copy, sets) in [
-            (None, None, true),
-            (Some(&b"not a position\n"[..]), None, true),
-            (Some(&sound[..]), None, false),
-            (None, Some(&sound[..]), false),
-            (Some(&b"not a position\n"[..]), Some(&sound[..]), false),
+        for (position, copy, marker, sets) in [
+            (File::Absent, File::Absent, false, true),
+            (File::Bytes(damaged), File::Absent, false, true),
+            (File::Absent, File::Bytes(damaged), false, true),
+            (File::Bytes(&sound), File::Absent, false, false),
+            (File::Absent, File::Bytes(&sound), false, false),
+            (File::Bytes(damaged), File::Bytes(&sound), false, false),
+            (File::Bytes(&newer), File::Absent, false, false),
+            (File::Folder, File::Absent, false, false),
+            (File::Absent, File::Absent, true, false),
         ] {
-            for (file, bytes) in [("position", position), ("position-copy", copy)] {
-                match bytes {
-                    Some(bytes) => std::fs::write(dir.join(file), bytes).unwrap(),
-                    None => { let _ = file_utils::remove_file(dir.join(file)); }
+            for (file, state) in [("position", &position), ("position-copy", &copy)] {
+                let path = dir.join(file);
+                let _ = file_utils::remove_dir_all(&path);
+                let _ = file_utils::remove_file(&path);
+                match state {
+                    File::Absent => {}
+                    File::Bytes(bytes) => std::fs::write(&path, bytes).unwrap(),
+                    File::Folder => std::fs::create_dir(&path).unwrap(),
                 }
             }
-            assert_eq!(sets_chosen(), Ok(sets), "position {:?}, copy {:?}", position.is_some(), copy.is_some());
+            let _ = file_utils::remove_file(dir.join(operation_utils::FILE_NAME_OPERATION));
+            if marker {
+                let operation = operation_utils::Operation::new(operation_utils::OperationKind::Shift, main.clone(), None, main.clone());
+                operation_utils::raise_in(&dir, &operation).unwrap();
+            }
+            assert_eq!(sets_chosen(), Ok(sets), "position {:?}, copy {:?}, marker {}", position, copy, marker);
         }
 
         let _ = file_utils::remove_dir_all(&root);
