@@ -1881,7 +1881,8 @@ mod tests {
     /// nothing, while a non-test sibling does.
     /// Revert: drop `visit_trait_item_fn` → the trait's method is not named → red; drop its
     /// outside-the-impl push → the nested trait's `Self(..)` counts as the constructor → red; drop
-    /// any of the `cfg(test)` skips → the test-only item is counted → red.
+    /// the `cfg(test)` skip of an impl method, a trait method or a trait → the test-only item is
+    /// counted → red. (The free-function, module and impl skips are not pinned here.)
     #[test]
     fn the_constructor_census_reads_what_it_claims() {
         let read = |source: &str| {
