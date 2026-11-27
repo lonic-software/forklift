@@ -504,7 +504,8 @@ fn index_rebuild_lines(rebuild: &pack_utils::IndexRebuild) -> Vec<String> {
     lines.extend(rebuild.unsynced.iter().map(|(index_path, error)| format!(
         "pack index \"{}\" is in place, but its folder could not be synced after it: {}{}",
         index_path.to_string_lossy(), error,
-        if file_utils::is_taint_unrecorded(error) { "" } else { "; a durability taint records it" }
+        // Past tense: the taint pass after the rebuild may already have settled it.
+        if file_utils::is_taint_unrecorded(error) { "" } else { "; a durability taint recorded it" }
     )));
     if let Some(reason) = &rebuild.skipped {
         lines.push(format!(
@@ -12387,7 +12388,7 @@ mod tests {
         assert_eq!(index_rebuild_lines(&rebuild), vec![
             "pack index \"p/a.idx\" was rebuilt from its data file; the index it replaced was kept as \"p/a.idx.damaged-7\"".to_string(),
             "pack index \"p/b.idx\" was rebuilt from its data file".to_string(),
-            "pack index \"p/a.idx\" is in place, but its folder could not be synced after it: EIO; a durability taint records it".to_string(),
+            "pack index \"p/a.idx\" is in place, but its folder could not be synced after it: EIO; a durability taint recorded it".to_string(),
             format!("pack index \"p/b.idx\" is in place, but its folder could not be synced after it: {}", unrecorded),
         ]);
     }

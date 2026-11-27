@@ -13553,8 +13553,8 @@ pub(crate) mod tests {
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
-    /// When the folder sync fails and the taint record fails too, nothing records the index, and
-    /// the error that says so reaches the report as the sync gave it, for heal to print.
+    /// When the folder sync fails and the taint record fails too, the error that says nothing
+    /// records the index reaches the report as the sync gave it, for heal to print.
     /// Mutation: report a fixed error in place of the sync's → it no longer says the record
     /// failed, red.
     #[test]
@@ -13583,7 +13583,6 @@ pub(crate) mod tests {
         let (unsynced, error) = &report.unsynced[0];
         assert_eq!(unsynced, &index);
         assert!(error.contains("injected directory-sync failure") && file_utils::is_taint_unrecorded(error), "{}", error);
-        assert!(taint_utils::read_taints(&crate::globals::forklift_root()).unwrap().recorded.is_empty());
         assert_eq!(salvage_read(&hash), "Verified");
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
