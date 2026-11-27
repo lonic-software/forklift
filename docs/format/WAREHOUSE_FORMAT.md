@@ -279,7 +279,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `mirror.git/**` | foreign | `mirror_utils::FOLDER_NAME_MIRROR_REPOSITORY` |
 | `.gitignore` | foreign | `warehouse_utils::FILE_NAME_GIT_SELF_IGNORE` |
 | `.gitignore`, in a bay's own folder too | foreign | `warehouse_utils::FILE_NAME_GIT_SELF_IGNORE` |
-| `config/`, `config/warehouse.toml` | rewritable | `config_utils::FOLDER_NAME_CONFIG_ROOT`, `config_utils::FILE_NAME_WAREHOUSE_CONFIG`, `scope_utils::FOLDER_NAME_CONFIG` |
+| `config/`, `config/warehouse.toml` | rewritable | `config_utils::FOLDER_NAME_CONFIG_ROOT`, `config_utils::FILE_NAME_WAREHOUSE_CONFIG` |
 | `config/warehouse.toml.lock` | lock | |
 | `config/warehouse.toml.damaged` | rewritable | `config_utils::FILE_NAME_WAREHOUSE_CONFIG_DAMAGED` |
 | `config/fetch-scope` | rewritable | `scope_utils::FILE_NAME_FETCH_SCOPE` |
