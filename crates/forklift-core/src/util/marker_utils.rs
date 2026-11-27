@@ -53,6 +53,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use crate::util::{file_utils, path_utils, record_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// Read the set of path keys currently recorded at `path`.
 ///
@@ -129,8 +130,8 @@ pub fn pending_add(path: &Path, key: &str) -> Option<Vec<u8>> {
 /// # Returns
 /// * `Ok(())`      - `key` is now covered by the recorded set (freshly added, or already was).
 /// * `Err(String)` - The write failed.
-pub fn add(path: &Path, key: &str) -> Result<(), String> {
-    match pending_add(path, key) {
+pub fn add(path: &DurablePath, key: &str) -> Result<(), String> {
+    match pending_add(path.as_path(), key) {
         None => Ok(()),
         Some(bytes) => write_bytes(path, &bytes, false),
     }
@@ -143,10 +144,10 @@ pub fn add(path: &Path, key: &str) -> Result<(), String> {
 ///
 /// The caller is responsible for calling `batch.finish()`; nothing staged here is durable until
 /// that returns `Ok`.
-pub fn add_deferred(batch: &file_utils::WriteBatch, path: &Path, key: &str) -> Result<(), String> {
-    let Some(bytes) = pending_add(path, key) else { return Ok(()) };
+pub fn add_deferred(batch: &file_utils::WriteBatch, path: &DurablePath, key: &str) -> Result<(), String> {
+    let Some(bytes) = pending_add(path.as_path(), key) else { return Ok(()) };
 
-    ensure_parent_folder(path)?;
+    ensure_parent_folder(path.as_path())?;
     batch.stage(path, &bytes)
 }
 
@@ -173,8 +174,8 @@ pub fn add_deferred(batch: &file_utils::WriteBatch, path: &Path, key: &str) -> R
 /// whatever was actually read, so it reflects reality even if the eventual write then fails (that
 /// failure still leaves the marker exactly as it was) — this return value describes what
 /// *should* have changed.
-pub fn remove_covered_by(path: &Path, by: &str) -> BTreeSet<String> {
-    let Ok(existing) = read(path) else { return BTreeSet::new() };
+pub fn remove_covered_by(path: &DurablePath, by: &str) -> BTreeSet<String> {
+    let Ok(existing) = read(path.as_path()) else { return BTreeSet::new() };
 
     let (removed, kept): (BTreeSet<String>, BTreeSet<String>) = existing.into_iter()
         .partition(|recorded| path_utils::covers(by, recorded));
@@ -195,7 +196,7 @@ pub fn remove_covered_by(path: &Path, by: &str) -> BTreeSet<String> {
 /// ([`file_utils::write_file_compensating`]), so a taint standing for the storage root does not
 /// refuse it, whoever recorded that taint: those bytes stood on disk before the command. An empty
 /// one removes the file, as [`clear`] does.
-pub fn restore(path: &Path, set: &BTreeSet<String>) {
+pub fn restore(path: &DurablePath, set: &BTreeSet<String>) {
     let _ = write_set_or_clear(path, set, true);
 }
 
@@ -212,9 +213,9 @@ pub fn clear(path: &Path) {
 ///
 /// With `compensating`, the write is [`file_utils::write_file_compensating`]; a forward write
 /// ([`remove_covered_by`]) passes `false` and keeps the standing-taint re-checks.
-fn write_set_or_clear(path: &Path, set: &BTreeSet<String>, compensating: bool) -> Result<(), String> {
+fn write_set_or_clear(path: &DurablePath, set: &BTreeSet<String>, compensating: bool) -> Result<(), String> {
     if set.is_empty() {
-        clear(path);
+        clear(path.as_path());
         return Ok(());
     }
 
@@ -223,8 +224,8 @@ fn write_set_or_clear(path: &Path, set: &BTreeSet<String>, compensating: bool) -
 
 /// Write `bytes` to `path`, creating its folder first: with `compensating`, through
 /// [`file_utils::write_file_compensating`], else [`file_utils::write_file_atomically`].
-fn write_bytes(path: &Path, bytes: &[u8], compensating: bool) -> Result<(), String> {
-    ensure_parent_folder(path)?;
+fn write_bytes(path: &DurablePath, bytes: &[u8], compensating: bool) -> Result<(), String> {
+    ensure_parent_folder(path.as_path())?;
     if compensating {
         file_utils::write_file_compensating(path, bytes)
     } else {
@@ -243,27 +244,27 @@ fn ensure_parent_folder(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn scratch(name: &str) -> PathBuf {
+    /// A marker file in a scratch folder of its own, which no warehouse holds.
+    fn scratch(name: &str) -> DurablePath {
         let dir = std::env::temp_dir()
             .join(format!("forklift-marker-utils-{}-{}", name, std::process::id()));
         let _ = file_utils::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("marker")
+        DurablePath::outside_warehouse(dir.join("marker"))
     }
 
     #[test]
     fn a_missing_file_reads_as_the_empty_set() {
         let path = scratch("missing");
-        assert_eq!(read(&path).unwrap(), BTreeSet::new());
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::new());
     }
 
     #[test]
     fn add_records_a_key_and_read_sees_it() {
         let path = scratch("add-read");
         add(&path, "src").unwrap();
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["src".to_string()]));
     }
 
     #[test]
@@ -271,7 +272,7 @@ mod tests {
         let path = scratch("absorb-narrower");
         add(&path, "src/api").unwrap();
         add(&path, "src").unwrap(); // covers "src/api" -> replaces it
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["src".to_string()]));
     }
 
     #[test]
@@ -279,7 +280,7 @@ mod tests {
         let path = scratch("skip-redundant");
         add(&path, "src").unwrap();
         add(&path, "src/api").unwrap(); // already covered by "src" -> no change
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["src".to_string()]));
     }
 
     #[test]
@@ -287,7 +288,7 @@ mod tests {
         let path = scratch("disjoint");
         add(&path, "src/a").unwrap();
         add(&path, "src/b").unwrap();
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src/a".to_string(), "src/b".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["src/a".to_string(), "src/b".to_string()]));
     }
 
     #[test]
@@ -299,7 +300,7 @@ mod tests {
 
         let removed = remove_covered_by(&path, "src"); // covers "src/a" and "src/b", not "docs"
         assert_eq!(removed, BTreeSet::from(["src/a".to_string(), "src/b".to_string()]));
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["docs".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["docs".to_string()]));
     }
 
     #[test]
@@ -309,7 +310,7 @@ mod tests {
 
         let removed = remove_covered_by(&path, "src/sub"); // does not cover "src" (its own ancestor)
         assert!(removed.is_empty());
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["src".to_string()]));
     }
 
     /// The regression this fix closes: `by` covering only a narrow slice of a *broader* recorded
@@ -323,7 +324,7 @@ mod tests {
 
         let removed = remove_covered_by(&path, "bigdir"); // "" covers "bigdir", not the reverse
         assert!(removed.is_empty(), "must not clear a broader entry: {:?}", removed);
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["".to_string()]));
     }
 
     #[test]
@@ -333,8 +334,8 @@ mod tests {
 
         let removed = remove_covered_by(&path, ""); // the empty key covers everything
         assert_eq!(removed, BTreeSet::from(["src".to_string()]));
-        assert!(!path.exists());
-        assert_eq!(read(&path).unwrap(), BTreeSet::new());
+        assert!(!path.as_path().exists());
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::new());
     }
 
     #[test]
@@ -343,26 +344,26 @@ mod tests {
         add(&path, "src").unwrap();
         add(&path, "docs").unwrap();
 
-        clear(&path);
-        assert!(!path.exists());
+        clear(path.as_path());
+        assert!(!path.as_path().exists());
     }
 
     #[test]
     fn pending_add_reports_none_when_nothing_would_change() {
         let path = scratch("pending-none");
         add(&path, "src").unwrap();
-        assert!(pending_add(&path, "src/api").is_none());
+        assert!(pending_add(path.as_path(),"src/api").is_none());
     }
 
     #[test]
     fn pending_add_reports_the_bytes_add_would_write() {
         let path = scratch("pending-some");
-        let bytes = pending_add(&path, "src").expect("a fresh key must produce bytes to write");
-        assert!(!path.exists(), "pending_add must not perform the write itself");
+        let bytes = pending_add(path.as_path(),"src").expect("a fresh key must produce bytes to write");
+        assert!(!path.as_path().exists(), "pending_add must not perform the write itself");
 
         // Writing those bytes by hand must produce exactly what `add` itself would have written.
-        std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+        std::fs::write(path.as_path(),&bytes).unwrap();
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["src".to_string()]));
     }
 
     #[test]
@@ -371,10 +372,10 @@ mod tests {
         let batch = file_utils::WriteBatch::new();
 
         add_deferred(&batch, &path, "src").unwrap();
-        assert!(!path.exists(), "a deferred add must not be visible before the batch finishes");
+        assert!(!path.as_path().exists(), "a deferred add must not be visible before the batch finishes");
 
         batch.finish().unwrap();
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["src".to_string()]));
     }
 
     #[test]
@@ -387,14 +388,14 @@ mod tests {
         batch.finish().unwrap();
 
         // Unchanged: the deferred add for the already-covered key never staged anything.
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["src".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["src".to_string()]));
     }
 
     #[test]
     fn read_reports_malformed_content_as_an_error() {
         let path = scratch("malformed");
-        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap(); // never valid UTF-8
-        assert!(read(&path).is_err());
+        std::fs::write(path.as_path(),[0xFF, 0xFE, 0x00, 0xFF]).unwrap(); // never valid UTF-8
+        assert!(read(path.as_path()).is_err());
     }
 
     #[test]
@@ -403,10 +404,10 @@ mod tests {
         // it becomes the root key, which covers every key, readable again.
         for malformed in [&[0xFF, 0xFE, 0x00, 0xFF][..], b"src\n"] {
             let path = scratch("self-heal");
-            std::fs::write(&path, malformed).unwrap();
+            std::fs::write(path.as_path(),malformed).unwrap();
 
             add(&path, "other").unwrap();
-            assert_eq!(read(&path).unwrap(), BTreeSet::from(["".to_string()]));
+            assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["".to_string()]));
         }
     }
 
@@ -414,7 +415,7 @@ mod tests {
     fn a_lone_blank_line_round_trips_as_the_root_key() {
         let path = scratch("root-key");
         add(&path, "").unwrap();
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["".to_string()]));
     }
 
     #[test]
@@ -424,14 +425,14 @@ mod tests {
             add(&path, key).unwrap();
         }
 
-        assert_eq!(read(&path).unwrap(), BTreeSet::from(["a\nb".to_string(), "c\r".to_string(), "d\\ne".to_string()]));
+        assert_eq!(read(path.as_path()).unwrap(), BTreeSet::from(["a\nb".to_string(), "c\r".to_string(), "d\\ne".to_string()]));
     }
 
     #[test]
     fn a_marker_without_its_format_header_is_refused() {
         let path = scratch("headerless");
-        std::fs::write(&path, "src\n").unwrap();
+        std::fs::write(path.as_path(),"src\n").unwrap();
 
-        assert!(read(&path).is_err());
+        assert!(read(path.as_path()).is_err());
     }
 }

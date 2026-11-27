@@ -3556,7 +3556,15 @@ pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<V
 ///                           not be read.
 pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
     let file_path = get_inventory_data_path_for_key(key)?;
+    let present = judge_shard_file(key, &file_path)?;
 
+    Ok((file_path, present))
+}
+
+/// [`judge_shard_address`] for `file_path`, `key`'s shard file however its caller built the path:
+/// whether a shard file is there, once every level of its address has been judged without
+/// following a link.
+pub(crate) fn judge_shard_file(key: &str, file_path: &Path) -> Result<bool, String> {
     let damaged = |entry: &Path, expected: &str| Err(format!(
         "The inventory of folder \"{}\" cannot be used: \"{}\" is not a {} (a link is never followed). {}",
         load_guard_utils::display_path(key), entry.to_string_lossy(), expected, STAGING_DAMAGE_REMEDY
@@ -3564,17 +3572,17 @@ pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
 
     // The folders first: below a non-folder, the shard itself reads as not found on Windows and as
     // not a directory elsewhere, and neither names the damage.
-    if let Some(folder) = non_folder_in_shard_chain(&file_path) {
+    if let Some(folder) = non_folder_in_shard_chain(file_path) {
         if file_path.ancestors().nth(4) == Some(folder) {
             return Err(unresolved_inventory_root(folder));
         }
         return damaged(folder, "folder");
     }
 
-    match std::fs::symlink_metadata(&file_path) {
-        Ok(metadata) if metadata.is_file() => Ok((file_path, true)),
-        Ok(_) => damaged(&file_path, "file"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((file_path, false)),
+    match std::fs::symlink_metadata(file_path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => damaged(file_path, "file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(format!(
             "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
             load_guard_utils::display_path(key), file_path.to_string_lossy(), e

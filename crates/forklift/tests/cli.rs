@@ -9927,8 +9927,11 @@ fn a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure() {
     assert_success(&warehouse.run(&["load", "."]));
 
     let marker_path = incomplete_load_marker_path(&warehouse);
-    std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-    forklift_core::util::marker_utils::add(&marker_path, "").unwrap();
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        forklift_core::util::marker_utils::add(&forklift_core::util::load_guard_utils::marker_path(), "").unwrap();
+    }
+    assert!(marker_path.is_file(), "the marker is written where the warehouse reads it");
 
     let stacked = warehouse.run(&["stack", "-m", "second", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));

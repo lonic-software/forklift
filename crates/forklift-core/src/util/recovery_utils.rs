@@ -7570,7 +7570,7 @@ mod tests {
             let forklift = forklift_root();
 
             let marker = load_guard_utils::marker_path();
-            let folder = marker.parent().unwrap().to_path_buf();
+            let folder = marker.as_path().parent().unwrap().to_path_buf();
             {
                 let batch = file_utils::WriteBatch::new();
                 load_guard_utils::stage_start_marker(&batch, "src").unwrap();
@@ -7580,7 +7580,7 @@ mod tests {
             assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
                 [PathBuf::from("inventory/incomplete-load")].into_iter().collect(), "the marker alone is recorded");
 
-            crate::util::file_utils::remove_file(&marker).unwrap();
+            crate::util::file_utils::remove_file(marker.as_path()).unwrap();
 
             if !durable {
                 let _fault = SyncDirFaultGuard::failing_exactly(&folder);

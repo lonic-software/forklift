@@ -3061,7 +3061,7 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
     // the two leaves it registered with no shard, which stages nothing.
     let marker_path = load_guard_utils::marker_path();
     let marker_bytes = load_guard_utils::pending_start_marker(path.as_key());
-    let extra = marker_bytes.as_deref().map(|bytes| (marker_path.as_path(), bytes));
+    let extra = marker_bytes.as_deref().map(|bytes| (&marker_path, bytes));
 
     publish_shards(&mut ledger, ShardPublish {
         register: BTreeSet::from([parent.as_key().to_string()]),
@@ -3451,8 +3451,8 @@ mod tests {
     /// Write a shard straight to `key`'s address, registered or not: a fixture placing one, never
     /// a writer (every writer goes through a `ShardLedger`).
     fn plant_shard(inventory: &Inventory, key: &str) {
-        let path = file_utils::get_inventory_data_path_for_key(key).unwrap();
-        file_utils::create_folder_if_not_exists(path.parent().unwrap()).unwrap();
+        let path = crate::util::taint_utils::DurablePath::shard(&crate::util::taint_utils::Checkout::active(), key).unwrap();
+        file_utils::create_folder_if_not_exists(path.as_path().parent().unwrap()).unwrap();
         file_utils::write_file_atomically(&path, &InventoryBuilder::build(inventory)).unwrap();
     }
 

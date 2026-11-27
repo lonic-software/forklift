@@ -24,6 +24,7 @@
 
 use super::*;
 use crate::model::inventory::RollupStamp;
+use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// Serializes every funnel against every other in this process: each holds it from its first read
 /// of a shard to its last write or removal, so no two interleave one shard's read and its rewrite
@@ -56,7 +57,7 @@ fn stage_rollup_clear(ledger: &ShardLedger, key: &str, batch: &file_utils::Write
         return Ok(());
     };
 
-    let shard_path = file_utils::get_inventory_data_path_for_key(key)?;
+    let shard_path = DurablePath::shard(&Checkout::active(), key)?;
 
     let mut inventory = parser::inventory::inventory_parser::parse_inventory(&bytes)
         .map_err(|e| format!("Error while parsing the inventory of folder \"{}\": {}", key, e))?;
@@ -66,7 +67,7 @@ fn stage_rollup_clear(ledger: &ShardLedger, key: &str, batch: &file_utils::Write
     }
 
     inventory.clear_rollup();
-    let bytes = ensure_inventory_folder_and_build(&inventory, &shard_path)?;
+    let bytes = ensure_inventory_folder_and_build(&inventory, shard_path.as_path())?;
 
     batch.stage(&shard_path, &bytes)
 }
@@ -119,7 +120,7 @@ pub(super) struct ShardPublish<'a> {
     pub(super) expected: Option<BTreeMap<String, Option<Vec<u8>>>>,
     /// One other, unrelated file published in the same barrier as the shards' content: see
     /// `inventory_utils::add_file_to_inventory`'s incomplete-load marker.
-    pub(super) extra: Option<(&'a Path, &'a [u8])>,
+    pub(super) extra: Option<(&'a DurablePath, &'a [u8])>,
 }
 
 impl<'a> ShardPublish<'a> {
@@ -258,7 +259,7 @@ pub(super) fn publish_shards(ledger: &mut ShardLedger, publish: ShardPublish) ->
     }
 
     if let Some((extra_path, extra_content)) = extra {
-        if let Some(parent) = extra_path.parent() {
+        if let Some(parent) = extra_path.as_path().parent() {
             if !parent.as_os_str().is_empty() {
                 file_utils::create_folder_if_not_exists(parent)?;
             }
@@ -335,9 +336,10 @@ impl ShardLedger {
     }
 
 
-    /// The shard path of `key`, for a write: refused when `key` is not registered, or when its
-    /// address is damaged, so that nothing is written through a link.
-    fn shard_path_for_write(&self, key: &str) -> Result<std::path::PathBuf, String> {
+    /// The shard path of `key` in the active checkout, for a write: refused when `key` is not
+    /// registered, or when its address is damaged, so that nothing is written through a link. The
+    /// path judged is the one returned.
+    fn shard_path_for_write(&self, key: &str) -> Result<DurablePath, String> {
         if !self.holds(key) {
             return Err(format!(
                 "The inventory of folder \"{}\" was not written: the folder is not registered in the \
@@ -346,7 +348,10 @@ impl ShardLedger {
             ));
         }
 
-        Ok(file_utils::judge_shard_address(key)?.0)
+        let shard_path = DurablePath::shard(&Checkout::active(), key)?;
+        file_utils::judge_shard_file(key, shard_path.as_path())?;
+
+        Ok(shard_path)
     }
 }
 
@@ -521,7 +526,7 @@ fn replace_differing_inventories(shards: &BTreeMap<String, Inventory>) -> Result
 
     for (key, bytes) in &writes {
         let shard_path = ledger.shard_path_for_write(key)?;
-        create_shard_folder(&shard_path)?;
+        create_shard_folder(shard_path.as_path())?;
         phase_b_batch.stage(&shard_path, bytes)?;
     }
 
@@ -761,8 +766,8 @@ fn save_inventory_deferred(ledger: &ShardLedger,
 
 /// Stage `inventory` into `batch` at `inventory_path`, a path `ShardLedger::shard_path_for_write`
 /// already judged.
-fn stage_shard_at(inventory_path: &Path, inventory: &Inventory, batch: &file_utils::WriteBatch) -> Result<(), String> {
-    let bytes = ensure_inventory_folder_and_build(inventory, inventory_path)?;
+fn stage_shard_at(inventory_path: &DurablePath, inventory: &Inventory, batch: &file_utils::WriteBatch) -> Result<(), String> {
+    let bytes = ensure_inventory_folder_and_build(inventory, inventory_path.as_path())?;
 
     batch.stage(inventory_path, &bytes)
 }
