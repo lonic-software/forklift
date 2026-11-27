@@ -1345,8 +1345,10 @@ impl Drop for SelfTripExemptionGuard {
 /// returns, and the taint keeps the warehouse gated until heal.
 ///
 /// It exempts this one write, not the writes a caller makes around it. Inside a bulk-store
-/// session, which is process-wide, the write is only staged, as any write is, and the session's
-/// finish re-checks it with the rest of the batch.
+/// session, which is process-wide, it is not staged with the session's other writes: their
+/// batch is refused whole before its first rename while a taint stands, so a staged put-back
+/// would never land. It is written at once, as with no session open: what it puts back stood
+/// before the command, not something the batch wrote.
 pub(crate) fn write_file_compensating(file_path: &DurablePath, content: &[u8]) -> Result<(), String> {
     write_file_atomically_as(file_path, content, true)
 }
@@ -1638,7 +1640,10 @@ fn write_file_atomically_as(durable: &DurablePath, content: &[u8], compensating:
     // durability barrier and every rename as one batch. The invariant this function otherwise
     // enforces per-write (a final name never exists before its bytes are durable) still holds:
     // the rename simply has not happened yet, so `file_path` stays invisible until it does.
-    {
+    // A compensating write is never staged: the batch is refused whole before its first rename
+    // while a taint stands, and the taint a put-back follows is often exactly that one, so it
+    // lands here at once, as it would with no session open.
+    if !compensating {
         let mut session = bulk_session_registry().lock().expect("bulk store session lock poisoned");
         if let Some(pending) = session.as_mut() {
             create_and_write_file(&temporary_file_path, content)?;
@@ -8549,6 +8554,16 @@ pub(crate) mod tests {
         let ordinary = write_file_atomically(&target_path, b"an ordinary write").expect_err("an ordinary write keeps the check");
         assert!(ordinary.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", ordinary);
         assert_eq!(std::fs::read(&target).unwrap(), b"before the command");
+
+        // Inside a bulk-store session too: a put-back is not staged into a batch the taint
+        // refuses whole, it lands at once.
+        // Revert: stage a compensating write like any other → the bytes are not there until the
+        // session's finish, which refuses → red.
+        let session = BulkStoreSession::open().unwrap();
+        let put_back = write_file_compensating(&target_path, b"put back inside a session");
+        assert_eq!(std::fs::read(&target).unwrap(), b"put back inside a session", "the put-back landed at once");
+        assert_eq!(put_back, Ok(()));
+        session.finish().unwrap();
 
         remove_dir_all(&temp).ok();
     }

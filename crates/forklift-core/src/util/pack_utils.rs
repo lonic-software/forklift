@@ -4518,7 +4518,7 @@ fn compact_held(all: bool,
                 stats.objects_packed += 1;
 
                 if pack.should_roll_over() {
-                    let finalized = writer.take().unwrap().finalize()?;
+                    let finalized = writer.take().unwrap().finalize(&new_pack_durable)?;
                     packed_sources.extend(finalized.sources);
                     note_new_pack_files(&mut new_pack_files, &mut new_pack_durable, finalized.durable);
                     stats.packs_written += 1;
@@ -4594,7 +4594,7 @@ fn compact_held(all: bool,
             stats.objects_packed += 1;
 
             if pack.should_roll_over() {
-                let finalized = writer.take().unwrap().finalize()?;
+                let finalized = writer.take().unwrap().finalize(&new_pack_durable)?;
                 packed_sources.extend(finalized.sources);
                 note_new_pack_files(&mut new_pack_files, &mut new_pack_durable, finalized.durable);
                 stats.packs_written += 1;
@@ -4624,7 +4624,7 @@ fn compact_held(all: bool,
     }
 
     if let Some(pack) = writer.take() {
-        let finalized = pack.finalize()?;
+        let finalized = pack.finalize(&new_pack_durable)?;
         packed_sources.extend(finalized.sources);
         note_new_pack_files(&mut new_pack_files, &mut new_pack_durable, finalized.durable);
         stats.packs_written += 1;
@@ -6932,7 +6932,14 @@ impl PackWriter {
     /// Returns the loose files this pack now holds (the caller deletes them once **every** pack
     /// is durable) and this pack's two final paths (so a repack never deletes, as an "old"
     /// pack, a file a new pack was just written to — an idempotent repack lands on that name).
-    fn finalize(mut self) -> Result<Finalized, String> {
+    ///
+    /// `published_before` is the durable paths of the packs this run already finalized, which
+    /// its one folder sync at the end has not yet made durable. Only a run's first store pack is
+    /// re-checked for a standing taint before its renames: a refusal at a later one would skip
+    /// that sync and leave the earlier packs visible, not durable, and named by no taint. A
+    /// taint that appears after the first pack is one recorded while the run was in flight, and
+    /// the re-check after the folder sync refuses the run once every pack is durable.
+    fn finalize(mut self, published_before: &[DurablePath]) -> Result<Finalized, String> {
         self.data_writer.flush().map_err(|e| format!("Error while flushing pack: {}", e))?;
         if file_utils::fsync_enabled() {
             self.data_writer.get_ref().sync_all()
@@ -6960,14 +6967,15 @@ impl PackWriter {
                 self.pack_folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_INDEX))),
         };
 
-        // A store pack is refused before its renames while a taint stands, and both temps go: a
-        // compaction or an ingest re-checks this way at every pack it finalizes, so a taint
-        // standing refuses the next pack, not only the first. A staging pack has no durable path,
-        // so nothing is re-checked for it.
-        if let Err(refused) = file_utils::refuse_if_taint_standing(&durable.iter().collect::<Vec<_>>()) {
-            let _ = file_utils::remove_file(&self.data_temp_path);
-            let _ = file_utils::remove_file(&index_temp_path);
-            return Err(refused);
+        // A run's first store pack is refused before its renames while a taint stands, and both
+        // temps go (see `published_before` above). A staging pack has no durable path, so
+        // nothing is re-checked for it.
+        if published_before.is_empty() {
+            if let Err(refused) = file_utils::refuse_if_taint_standing(&durable.iter().collect::<Vec<_>>()) {
+                let _ = file_utils::remove_file(&self.data_temp_path);
+                let _ = file_utils::remove_file(&index_temp_path);
+                return Err(refused);
+            }
         }
 
         file_utils::rename(&self.data_temp_path, &data_final).map_err(|e| format!(
@@ -7088,7 +7096,8 @@ impl TransportPackBuilder {
         let Some(writer) = self.writer.take() else {
             return Ok(());
         };
-        let finalized = writer.finalize()?;
+        // A staging pack: nothing is re-checked, so nothing published before it is read.
+        let finalized = writer.finalize(&[])?;
         let mut data_path = None;
         let mut index_path = None;
 
@@ -7238,7 +7247,10 @@ impl StoreIngest {
     ///                       for this root on the re-check that runs right before this returns
     ///                       (see `sync_dir_or_taint`). An unactivated process skips that
     ///                       re-check entirely.
-    /// * `Err(String)`     - A pack write, `finalize`, or the trailing directory sync failed. On
+    /// * `Err(String)`     - A pack write, `finalize`, or the trailing directory sync failed. A
+    ///                       taint standing when the ingest's first pack would be published
+    ///                       refuses it there, with nothing published; one found by the re-check
+    ///                       after the sync refuses an ingest whose packs are durable. On
     ///                       the directory-sync failure specifically, every pack finalized during
     ///                       this ingest (`finalized_files`, data + index paths, across every
     ///                       rollover) is visible but its directory entries are not proven
@@ -7302,7 +7314,7 @@ impl StoreIngest {
         let Some(writer) = self.writer.take() else {
             return Ok(());
         };
-        let finalized = writer.finalize()?;
+        let finalized = writer.finalize(&self.finalized_files)?;
         self.finalized_files.extend(finalized.durable);
         self.packs += 1;
         Ok(())
@@ -8114,6 +8126,23 @@ pub(crate) mod tests {
         assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "table: got: {}", error);
         assert_eq!(listing(), 0, "table: a refused publish renames nothing and leaves no temp");
 
+        // A run's first store pack is refused before its renames; a later one is not, since a
+        // refusal there would skip the run's one folder sync and leave the packs before it
+        // visible, not durable, and named by no taint.
+        // Revert: re-check before every pack's renames → the later pack is refused → red.
+        let compressed = zstd::encode_all(&b"blob 1\0x"[..], 0).unwrap();
+        let mut writer = PackWriter::new(PackPlace::Store).unwrap();
+        writer.append_full([9u8; HASH_LEN], &compressed, None).unwrap();
+        let error = writer.finalize(&[]).err().expect("a standing taint must refuse a run's first pack");
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "first pack: got: {}", error);
+        assert_eq!(listing(), 0, "first pack: a refused pack renames nothing and leaves no temp");
+
+        let mut writer = PackWriter::new(PackPlace::Store).unwrap();
+        writer.append_full([9u8; HASH_LEN], &compressed, None).unwrap();
+        let earlier = [DurablePath::pack("earlier"), DurablePath::pack_index("earlier")];
+        let finalized = writer.finalize(&earlier).expect("a run's later pack is published under the taint");
+        assert!(finalized.files.iter().all(|path| path.exists()), "later pack: {:?}", finalized.files);
+
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
@@ -8132,14 +8161,14 @@ pub(crate) mod tests {
 
         let mut writer = PackWriter::new(PackPlace::Store).unwrap();
         writer.append_full([9u8; HASH_LEN], &compressed, None).unwrap();
-        let finalized = writer.finalize().unwrap();
+        let finalized = writer.finalize(&[]).unwrap();
         assert!(finalized.files.iter().all(|path| path.parent() == Some(active.as_path()) && path.exists()),
             "a store pack is in the active pack folder: {:?}", finalized.files);
         assert_eq!(finalized.durable.iter().map(|path| path.as_path().to_path_buf()).collect::<Vec<_>>(), finalized.files);
 
         let mut writer = PackWriter::new(PackPlace::Staging(elsewhere.clone())).unwrap();
         writer.append_full([9u8; HASH_LEN], &compressed, None).unwrap();
-        let finalized = writer.finalize().unwrap();
+        let finalized = writer.finalize(&[]).unwrap();
         assert!(finalized.files.iter().all(|path| path.parent() == Some(elsewhere.as_path()) && path.exists()),
             "a staging pack is in its own folder: {:?}", finalized.files);
         assert!(finalized.durable.is_empty(), "a staging pack records no durable path");
@@ -9317,7 +9346,7 @@ pub(crate) mod tests {
         let compressed = zstd::encode_all(giant.as_slice(), 0).unwrap();
         let mut writer = PackWriter::new(PackPlace::Store).unwrap();
         writer.append_full(giant_hash_bytes, &compressed, None).unwrap();
-        writer.finalize().unwrap();
+        writer.finalize(&[]).unwrap();
 
         // A corrupt loose duplicate at the giant's own fan-out path -- honest bitrot (wrong
         // content entirely), not a re-encode, so it fails verification outright rather than
