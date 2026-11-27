@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use crate::globals::forklift_root;
 use crate::util::{file_utils, object_utils, pallet_utils, record_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// The record's file name, at the shared `.forklift` root: every bay mirrors into one place.
 pub const FILE_NAME_MIRROR_ROOTS: &str = "mirror-roots";
@@ -63,7 +64,7 @@ pub fn read_mirror_roots() -> Result<BTreeMap<String, String>, String> {
 
 /// Replace the record with `roots`, atomically.
 pub fn write_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String> {
-    file_utils::write_file_atomically(&mirror_roots_path(), &roots_bytes(roots))
+    file_utils::write_file_atomically(&DurablePath::mirror_roots(), &roots_bytes(roots))
 }
 
 /// What a write of the record did, as reading it back showed. A write can land and still fail,
@@ -178,7 +179,7 @@ pub fn put_back_mirror_roots(before: &BTreeMap<String, String>) -> RootsWrite {
 
 /// Write the record as `wanted` through the compensating write, read back after a failure.
 fn write_compensating(wanted: &BTreeMap<String, String>) -> RootsWrite {
-    match file_utils::write_file_compensating(&mirror_roots_path(), &roots_bytes(wanted)) {
+    match file_utils::write_file_compensating(&DurablePath::mirror_roots(), &roots_bytes(wanted)) {
         Ok(()) => RootsWrite::Landed,
         Err(failed) => read_back(failed, wanted),
     }

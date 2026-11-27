@@ -22,6 +22,7 @@ use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
 use crate::util::{alias_utils, file_utils, object_utils, pallet_utils, sign_utils, toml_spelling};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError};
+use crate::util::taint_utils::DurablePath;
 
 /// The name of the office meta pallet — the tracked-metadata pallet holding users and
 /// keys. It lives in the meta namespace (`.forklift/meta/office`, not `.forklift/pallets/`),
@@ -1761,7 +1762,7 @@ fn write_trust_install(lock: &crate::util::lock_utils::RefLock,
                        install: &TrustInstall,
                        bytes: &[u8],
                        redaction: Option<&crate::util::redaction_utils::RedactionCheck>) -> Result<(), RefUpdateError> {
-    file_utils::write_file_atomically(&forklift_root().join(FILE_NAME_TRUST), bytes)?;
+    file_utils::write_file_atomically(&DurablePath::trust(), bytes)?;
 
     #[cfg(test)]
     tests::BETWEEN_TRUST_WRITES.with(|seam| seam.take().map(|seam| seam()));
@@ -1811,12 +1812,12 @@ fn write_trust_office(lock: &crate::util::lock_utils::RefLock,
 /// anchor back is a compensating write ([`file_utils::write_file_compensating`]): a taint the
 /// failed install left standing does not stop it, and a failed folder sync records one.
 fn restore_trust_file(previous: Option<&[u8]>) -> Result<(), String> {
-    let path = forklift_root().join(FILE_NAME_TRUST);
+    let path = DurablePath::trust();
 
     match previous {
         Some(previous) => file_utils::write_file_compensating(&path, previous),
         None => {
-            file_utils::remove_file(&path)
+            file_utils::remove_file(path.as_path())
                 .map_err(|e| format!("Error while removing the trust file: {}", e))?;
             // A bare sync, unlike a meta copy's removal: heal cannot classify a taint naming a
             // trust file that is gone, so this arm adds none. A taint the forward write's own sync
@@ -1829,7 +1830,7 @@ fn restore_trust_file(previous: Option<&[u8]>) -> Result<(), String> {
 /// Write the trust file's copy ([`FILE_NAME_TRUST_COPY`]) as `bytes`, durably. Only under the ref
 /// lock, and only with the bytes the trust file holds.
 fn write_trust_copy(_lock: &crate::util::lock_utils::RefLock, bytes: &[u8]) -> Result<(), String> {
-    file_utils::write_file_atomically(&forklift_root().join(FILE_NAME_TRUST_COPY), bytes)
+    file_utils::write_file_atomically(&DurablePath::trust_copy(), bytes)
 }
 
 /// Bring the trust file's copy level with the trust file, when the trust file holds exactly
@@ -2234,7 +2235,7 @@ fn repair_trust_noting(repair: &mut TrustRepair) -> Result<(), String> {
             let Some(Ok(bytes)) = &files.copy else {
                 unreachable!("only a copy that parses is written to the trust file");
             };
-            file_utils::write_file_atomically(&trust_path, bytes)?;
+            file_utils::write_file_atomically(&DurablePath::trust(), bytes)?;
             repair.restored = Some(TrustRestored { written: TrustFileWritten::Trust, path: trust_path, from: copy_path });
         }
         TrustFileWritten::Copy => {
@@ -2715,9 +2716,9 @@ const SERVED_TRUST_REFUSAL: &str = "This warehouse is served, or its first serve
 #[cfg(test)]
 pub(crate) fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
     let _ref_lock = crate::util::lock_utils::RefLock::acquire()?;
-    let path = forklift_root().join(FILE_NAME_TRUST);
+    let path = DurablePath::trust();
 
-    if path.exists() {
+    if path.as_path().exists() {
         return Err("Trust is already established for this warehouse; it cannot be re-established.".to_string());
     }
 

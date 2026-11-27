@@ -9536,14 +9536,14 @@ mod tests {
     fn a_trust_install_refuses_a_copy_it_would_not_write_over_before_it_writes() {
         for unwritable in [UnwritableCopy::Newer, UnwritableCopy::Directory] {
             let fixture = Regenesis::new(&format!("unwritable-copy-{:?}", unwritable));
-            let copy_path = crate::globals::forklift_root().join(office_utils::FILE_NAME_TRUST_COPY);
+            let copy_path = crate::util::taint_utils::DurablePath::trust_copy();
             let newer = String::from_utf8(fixture.old_bytes.clone()).unwrap().replace("version = 1", "version = 2").into_bytes();
             assert_ne!(newer, fixture.old_bytes, "the fixture's anchor names its version");
             match unwritable {
                 UnwritableCopy::Newer => file_utils::write_file_atomically(&copy_path, &newer).unwrap(),
                 UnwritableCopy::Directory => {
-                    file_utils::remove_file(&copy_path).unwrap();
-                    std::fs::create_dir(&copy_path).unwrap();
+                    file_utils::remove_file(copy_path.as_path()).unwrap();
+                    std::fs::create_dir(copy_path.as_path()).unwrap();
                 }
             }
 
