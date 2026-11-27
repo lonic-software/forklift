@@ -290,62 +290,79 @@ enum Part {
 use Part::{Extension, FanOut, Hex, HexSignature, Is, MetaPalletName, Name, Names};
 use VanishedDisposition as Disposition;
 
+const fn shape(description: &'static str, disposition: Option<VanishedDisposition>, pattern: &'static [Part]) -> TaintShape {
+    TaintShape { description, disposition, pattern }
+}
+
+// Each shape is a named static so that [`WriterShape::entry`] can name the one its writer
+// produces; [`TAINT_SHAPES`] lists them in match order.
+static PALLET_REF: TaintShape = shape("a pallet ref", Some(Disposition::Ref), &[Is("pallets"), Names]);
+static KEEPSAKE: TaintShape = shape("a removed ref's keepsake", Some(Disposition::Keepsake), &[Is("removed-refs"), Names]);
+static META_REF: TaintShape = shape("a meta pallet ref", Some(Disposition::MetaRef), &[Is("meta"), MetaPalletName]);
+static META_FOLDER_STRAY: TaintShape = shape("a ref in the meta folder that is no meta pallet's", None, &[Is("meta"), Name]);
+static META_COPY: TaintShape = shape("a meta pallet ref's copy", Some(Disposition::MetaCopy), &[Is("meta-copy"), MetaPalletName]);
+static META_COPY_STRAY: TaintShape = shape("a copy of a ref that is no meta pallet's", None, &[Is("meta-copy"), Name]);
+
+static LOOSE_OBJECT: TaintShape = shape("a loose object", Some(Disposition::Loose), &[Is("objects"), FanOut, Hex]);
+static LOOSE_SIGNATURE: TaintShape = shape("a loose object's signature", Some(Disposition::Signature), &[Is("objects"), FanOut, HexSignature]);
+static PACK: TaintShape = shape("a pack", Some(Disposition::PackData), &[Is("objects"), Is("pack"), Extension("pack")]);
+static PACK_INDEX: TaintShape = shape("a pack index", Some(Disposition::PackIndex), &[Is("objects"), Is("pack"), Extension("idx")]);
+static SIGNATURE_TABLE: TaintShape = shape("a signature table", Some(Disposition::SignatureTable), &[Is("objects"), Is("pack"), Extension("sigs")]);
+static SHARD: TaintShape = shape("a staged inventory shard", Some(Disposition::Shard), &[Is("inventory"), Names, Is("data")]);
+static BAY_SHARD: TaintShape = shape("a bay's staged inventory shard", Some(Disposition::Shard), &[Is("bays"), Name, Is("inventory"), Names, Is("data")]);
+
+static LOAD_MARKER: TaintShape = shape("the incomplete-load marker", Some(Disposition::LoadMarker), &[Is("inventory"), Is("incomplete-load")]);
+static POSITION: TaintShape = shape("the checkout position", Some(Disposition::Position), &[Is("position")]);
+static POSITION_COPY: TaintShape = shape("the checkout position's copy", Some(Disposition::PositionCopy), &[Is("position-copy")]);
+static SCOPE: TaintShape = shape("the checkout scope", Some(Disposition::Scope), &[Is("scope")]);
+static SCOPE_COPY: TaintShape = shape("the checkout scope's copy", Some(Disposition::ScopeCopy), &[Is("scope-copy")]);
+static CONSOLIDATION: TaintShape = shape("the consolidation state", Some(Disposition::MergeRecord), &[Is("consolidation")]);
+static CONSOLIDATION_COPY: TaintShape = shape("the consolidation state's copy", Some(Disposition::MergeRecordCopy), &[Is("consolidation-copy")]);
+static SKELETON: TaintShape = shape("the consolidation skeleton", Some(Disposition::MergeRecord), &[Is("consolidation-skeleton")]);
+static SKELETON_COPY: TaintShape = shape("the consolidation skeleton's copy", Some(Disposition::MergeRecordCopy), &[Is("consolidation-skeleton-copy")]);
+static JOURNAL: TaintShape = shape("the journal", Some(Disposition::Journal), &[Is("journal.json")]);
+
+static BAY_LOAD_MARKER: TaintShape = shape("a bay's incomplete-load marker", Some(Disposition::LoadMarker), &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")]);
+static BAY_POSITION: TaintShape = shape("a bay's checkout position", Some(Disposition::Position), &[Is("bays"), Name, Is("position")]);
+static BAY_POSITION_COPY: TaintShape = shape("a bay's checkout position's copy", Some(Disposition::PositionCopy), &[Is("bays"), Name, Is("position-copy")]);
+static BAY_SCOPE: TaintShape = shape("a bay's checkout scope", Some(Disposition::Scope), &[Is("bays"), Name, Is("scope")]);
+static BAY_SCOPE_COPY: TaintShape = shape("a bay's checkout scope's copy", Some(Disposition::ScopeCopy), &[Is("bays"), Name, Is("scope-copy")]);
+static BAY_CONSOLIDATION: TaintShape = shape("a bay's consolidation state", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("consolidation")]);
+static BAY_CONSOLIDATION_COPY: TaintShape = shape("a bay's consolidation state's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("consolidation-copy")]);
+static BAY_SKELETON: TaintShape = shape("a bay's consolidation skeleton", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("consolidation-skeleton")]);
+static BAY_SKELETON_COPY: TaintShape = shape("a bay's consolidation skeleton's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("consolidation-skeleton-copy")]);
+static BAY_JOURNAL: TaintShape = shape("a bay's journal", Some(Disposition::Journal), &[Is("bays"), Name, Is("journal.json")]);
+static BAY_PATH: TaintShape = shape("a bay's path record", Some(Disposition::BayPath), &[Is("bays"), Name, Is("path")]);
+static BAY_CHERRY_PICK: TaintShape = shape("a bay's cherry-pick state", Some(Disposition::MergeRecord), &[Is("bays"), Name, Is("cherry-pick")]);
+static BAY_CHERRY_PICK_COPY: TaintShape = shape("a bay's cherry-pick state's copy", Some(Disposition::MergeRecordCopy), &[Is("bays"), Name, Is("cherry-pick-copy")]);
+
+static CHERRY_PICK: TaintShape = shape("the cherry-pick state", Some(Disposition::MergeRecord), &[Is("cherry-pick")]);
+static CHERRY_PICK_COPY: TaintShape = shape("the cherry-pick state's copy", Some(Disposition::MergeRecordCopy), &[Is("cherry-pick-copy")]);
+static FETCH_SCOPE: TaintShape = shape("the fetch scope", Some(Disposition::FetchScope), &[Is("config"), Is("fetch-scope")]);
+static FETCH_LEDGER: TaintShape = shape("the fetch ledger", Some(Disposition::FetchLedger), &[Is("fetched-heads")]);
+static HELD_HEADS: TaintShape = shape("the held-heads record", None, &[Is("held-heads")]);
+static MIRROR_ROOTS: TaintShape = shape("the mirror roots record", Some(Disposition::MirrorRoots), &[Is("mirror-roots")]);
+static SERVED: TaintShape = shape("the served record", None, &[Is("served")]);
+static TOMBSTONES: TaintShape = shape("the tombstones record", None, &[Is("tombstones")]);
+static UNVOUCHED_HEADS: TaintShape = shape("the unvouched-heads record", None, &[Is("unvouched-heads")]);
+static TRUST: TaintShape = shape("the trust anchor", None, &[Is("trust")]);
+static TRUST_COPY: TaintShape = shape("the trust anchor's copy", None, &[Is("trust-copy")]);
+
 /// Every shape a taint record may name, in match order; the first match wins. The pallets/,
 /// removed-refs/, meta/ and meta-copy/ entries come first, so a ref or keepsake whose name looks
 /// like an object, a shard, a pack or a signature is matched as what it is. A shape missing here
-/// fails [`assert_declared`] in a debug build the first time a test writes it.
-static TAINT_SHAPES: &[TaintShape] = &[
-    TaintShape { description: "a pallet ref", disposition: Some(Disposition::Ref), pattern: &[Is("pallets"), Names] },
-    TaintShape { description: "a removed ref's keepsake", disposition: Some(Disposition::Keepsake), pattern: &[Is("removed-refs"), Names] },
-    TaintShape { description: "a meta pallet ref", disposition: Some(Disposition::MetaRef), pattern: &[Is("meta"), MetaPalletName] },
-    TaintShape { description: "a ref in the meta folder that is no meta pallet's", disposition: None, pattern: &[Is("meta"), Name] },
-    TaintShape { description: "a meta pallet ref's copy", disposition: Some(Disposition::MetaCopy), pattern: &[Is("meta-copy"), MetaPalletName] },
-    TaintShape { description: "a copy of a ref that is no meta pallet's", disposition: None, pattern: &[Is("meta-copy"), Name] },
-
-    TaintShape { description: "a loose object", disposition: Some(Disposition::Loose), pattern: &[Is("objects"), FanOut, Hex] },
-    TaintShape { description: "a loose object's signature", disposition: Some(Disposition::Signature), pattern: &[Is("objects"), FanOut, HexSignature] },
-    TaintShape { description: "a pack", disposition: Some(Disposition::PackData), pattern: &[Is("objects"), Is("pack"), Extension("pack")] },
-    TaintShape { description: "a pack index", disposition: Some(Disposition::PackIndex), pattern: &[Is("objects"), Is("pack"), Extension("idx")] },
-    TaintShape { description: "a signature table", disposition: Some(Disposition::SignatureTable), pattern: &[Is("objects"), Is("pack"), Extension("sigs")] },
-    TaintShape { description: "a staged inventory shard", disposition: Some(Disposition::Shard), pattern: &[Is("inventory"), Names, Is("data")] },
-    TaintShape { description: "a bay's staged inventory shard", disposition: Some(Disposition::Shard), pattern: &[Is("bays"), Name, Is("inventory"), Names, Is("data")] },
-
-    TaintShape { description: "the incomplete-load marker", disposition: Some(Disposition::LoadMarker), pattern: &[Is("inventory"), Is("incomplete-load")] },
-    TaintShape { description: "the checkout position", disposition: Some(Disposition::Position), pattern: &[Is("position")] },
-    TaintShape { description: "the checkout position's copy", disposition: Some(Disposition::PositionCopy), pattern: &[Is("position-copy")] },
-    TaintShape { description: "the checkout scope", disposition: Some(Disposition::Scope), pattern: &[Is("scope")] },
-    TaintShape { description: "the checkout scope's copy", disposition: Some(Disposition::ScopeCopy), pattern: &[Is("scope-copy")] },
-    TaintShape { description: "the consolidation state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("consolidation")] },
-    TaintShape { description: "the consolidation state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("consolidation-copy")] },
-    TaintShape { description: "the consolidation skeleton", disposition: Some(Disposition::MergeRecord), pattern: &[Is("consolidation-skeleton")] },
-    TaintShape { description: "the consolidation skeleton's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("consolidation-skeleton-copy")] },
-    TaintShape { description: "the journal", disposition: Some(Disposition::Journal), pattern: &[Is("journal.json")] },
-
-    TaintShape { description: "a bay's incomplete-load marker", disposition: Some(Disposition::LoadMarker), pattern: &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")] },
-    TaintShape { description: "a bay's checkout position", disposition: Some(Disposition::Position), pattern: &[Is("bays"), Name, Is("position")] },
-    TaintShape { description: "a bay's checkout position's copy", disposition: Some(Disposition::PositionCopy), pattern: &[Is("bays"), Name, Is("position-copy")] },
-    TaintShape { description: "a bay's checkout scope", disposition: Some(Disposition::Scope), pattern: &[Is("bays"), Name, Is("scope")] },
-    TaintShape { description: "a bay's checkout scope's copy", disposition: Some(Disposition::ScopeCopy), pattern: &[Is("bays"), Name, Is("scope-copy")] },
-    TaintShape { description: "a bay's consolidation state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("consolidation")] },
-    TaintShape { description: "a bay's consolidation state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("consolidation-copy")] },
-    TaintShape { description: "a bay's consolidation skeleton", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("consolidation-skeleton")] },
-    TaintShape { description: "a bay's consolidation skeleton's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("consolidation-skeleton-copy")] },
-    TaintShape { description: "a bay's journal", disposition: Some(Disposition::Journal), pattern: &[Is("bays"), Name, Is("journal.json")] },
-    TaintShape { description: "a bay's path record", disposition: Some(Disposition::BayPath), pattern: &[Is("bays"), Name, Is("path")] },
-    TaintShape { description: "a bay's cherry-pick state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("bays"), Name, Is("cherry-pick")] },
-    TaintShape { description: "a bay's cherry-pick state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("bays"), Name, Is("cherry-pick-copy")] },
-
-    TaintShape { description: "the cherry-pick state", disposition: Some(Disposition::MergeRecord), pattern: &[Is("cherry-pick")] },
-    TaintShape { description: "the cherry-pick state's copy", disposition: Some(Disposition::MergeRecordCopy), pattern: &[Is("cherry-pick-copy")] },
-    TaintShape { description: "the fetch scope", disposition: Some(Disposition::FetchScope), pattern: &[Is("config"), Is("fetch-scope")] },
-    TaintShape { description: "the fetch ledger", disposition: Some(Disposition::FetchLedger), pattern: &[Is("fetched-heads")] },
-    TaintShape { description: "the held-heads record", disposition: None, pattern: &[Is("held-heads")] },
-    TaintShape { description: "the mirror roots record", disposition: Some(Disposition::MirrorRoots), pattern: &[Is("mirror-roots")] },
-    TaintShape { description: "the served record", disposition: None, pattern: &[Is("served")] },
-    TaintShape { description: "the tombstones record", disposition: None, pattern: &[Is("tombstones")] },
-    TaintShape { description: "the unvouched-heads record", disposition: None, pattern: &[Is("unvouched-heads")] },
-    TaintShape { description: "the trust anchor", disposition: None, pattern: &[Is("trust")] },
-    TaintShape { description: "the trust anchor's copy", disposition: None, pattern: &[Is("trust-copy")] },
+/// fails [`assert_declared`] in a debug build the first time a test writes it, and a
+/// [`DurablePath`] built for a [`WriterShape`] is checked against the entry the variant names.
+static TAINT_SHAPES: &[&TaintShape] = &[
+    &PALLET_REF, &KEEPSAKE, &META_REF, &META_FOLDER_STRAY, &META_COPY, &META_COPY_STRAY,
+    &LOOSE_OBJECT, &LOOSE_SIGNATURE, &PACK, &PACK_INDEX, &SIGNATURE_TABLE, &SHARD, &BAY_SHARD,
+    &LOAD_MARKER, &POSITION, &POSITION_COPY, &SCOPE, &SCOPE_COPY, &CONSOLIDATION, &CONSOLIDATION_COPY,
+    &SKELETON, &SKELETON_COPY, &JOURNAL,
+    &BAY_LOAD_MARKER, &BAY_POSITION, &BAY_POSITION_COPY, &BAY_SCOPE, &BAY_SCOPE_COPY, &BAY_CONSOLIDATION,
+    &BAY_CONSOLIDATION_COPY, &BAY_SKELETON, &BAY_SKELETON_COPY, &BAY_JOURNAL, &BAY_PATH, &BAY_CHERRY_PICK,
+    &BAY_CHERRY_PICK_COPY,
+    &CHERRY_PICK, &CHERRY_PICK_COPY, &FETCH_SCOPE, &FETCH_LEDGER, &HELD_HEADS, &MIRROR_ROOTS, &SERVED, &TOMBSTONES,
+    &UNVOUCHED_HEADS, &TRUST, &TRUST_COPY,
 ];
 
 /// The declared shape of a root-relative path, or `None` for a path no entry of the registry
@@ -360,7 +377,7 @@ pub(crate) fn taint_shape(relative: &Path) -> Option<&'static TaintShape> {
         }
     }
 
-    TAINT_SHAPES.iter().find(|shape| pattern_matches(shape.pattern, &names))
+    TAINT_SHAPES.iter().copied().find(|shape| pattern_matches(shape.pattern, &names))
 }
 
 fn pattern_matches(pattern: &[Part], names: &[&std::ffi::OsStr]) -> bool {
@@ -416,6 +433,375 @@ pub(crate) fn assert_declared(final_paths: &[&Path]) {
             root.to_string_lossy(), taint_record_line(&relative)
         );
     }
+}
+
+/// Which checkout a checkout-local record belongs to: the main working tree's, kept at the root
+/// of [`forklift_root`], or a named bay's, kept under its `bays/<name>` folder there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Checkout {
+    Main,
+    Bay(String),
+}
+
+impl Checkout {
+    /// The checkout this thread works in, read from the bay context as
+    /// [`bay_root`](crate::globals::bay_root) reads it.
+    pub fn active() -> Checkout {
+        match crate::globals::active_bay() {
+            None => Checkout::Main,
+            Some(name) => Checkout::Bay(name),
+        }
+    }
+
+    /// `file` in this checkout's folder, root-relative, with the variant of the two given that
+    /// declares it there.
+    fn place(&self, main: WriterShape, bay: WriterShape, file: &Path) -> (WriterShape, PathBuf) {
+        match self {
+            Checkout::Main => (main, file.to_path_buf()),
+            Checkout::Bay(name) => (bay, Path::new(crate::globals::FOLDER_NAME_BAYS_ROOT).join(name).join(file)),
+        }
+    }
+}
+
+/// One kind of path a writer produces: each names the [`TaintShape`] its paths take. An entry of
+/// [`TAINT_SHAPES`] no variant names is one only heal meets, such as a stray name in the meta
+/// folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriterShape {
+    PalletRef,
+    Keepsake,
+    MetaRef,
+    MetaCopy,
+    LooseObject,
+    LooseSignature,
+    Pack,
+    PackIndex,
+    SignatureTable,
+    Shard,
+    BayShard,
+    LoadMarker,
+    BayLoadMarker,
+    Position,
+    BayPosition,
+    PositionCopy,
+    BayPositionCopy,
+    Scope,
+    BayScope,
+    ScopeCopy,
+    BayScopeCopy,
+    Consolidation,
+    BayConsolidation,
+    ConsolidationCopy,
+    BayConsolidationCopy,
+    Skeleton,
+    BaySkeleton,
+    SkeletonCopy,
+    BaySkeletonCopy,
+    Journal,
+    BayJournal,
+    CherryPick,
+    BayCherryPick,
+    CherryPickCopy,
+    BayCherryPickCopy,
+    BayPath,
+    FetchScope,
+    FetchLedger,
+    HeldHeads,
+    MirrorRoots,
+    Served,
+    Tombstones,
+    UnvouchedHeads,
+    Trust,
+    TrustCopy,
+}
+
+impl WriterShape {
+    /// The entry of [`TAINT_SHAPES`] this variant's paths take. No wildcard arm: a new variant
+    /// does not compile until it names one.
+    fn entry(self) -> &'static TaintShape {
+        match self {
+            WriterShape::PalletRef => &PALLET_REF,
+            WriterShape::Keepsake => &KEEPSAKE,
+            WriterShape::MetaRef => &META_REF,
+            WriterShape::MetaCopy => &META_COPY,
+            WriterShape::LooseObject => &LOOSE_OBJECT,
+            WriterShape::LooseSignature => &LOOSE_SIGNATURE,
+            WriterShape::Pack => &PACK,
+            WriterShape::PackIndex => &PACK_INDEX,
+            WriterShape::SignatureTable => &SIGNATURE_TABLE,
+            WriterShape::Shard => &SHARD,
+            WriterShape::BayShard => &BAY_SHARD,
+            WriterShape::LoadMarker => &LOAD_MARKER,
+            WriterShape::BayLoadMarker => &BAY_LOAD_MARKER,
+            WriterShape::Position => &POSITION,
+            WriterShape::BayPosition => &BAY_POSITION,
+            WriterShape::PositionCopy => &POSITION_COPY,
+            WriterShape::BayPositionCopy => &BAY_POSITION_COPY,
+            WriterShape::Scope => &SCOPE,
+            WriterShape::BayScope => &BAY_SCOPE,
+            WriterShape::ScopeCopy => &SCOPE_COPY,
+            WriterShape::BayScopeCopy => &BAY_SCOPE_COPY,
+            WriterShape::Consolidation => &CONSOLIDATION,
+            WriterShape::BayConsolidation => &BAY_CONSOLIDATION,
+            WriterShape::ConsolidationCopy => &CONSOLIDATION_COPY,
+            WriterShape::BayConsolidationCopy => &BAY_CONSOLIDATION_COPY,
+            WriterShape::Skeleton => &SKELETON,
+            WriterShape::BaySkeleton => &BAY_SKELETON,
+            WriterShape::SkeletonCopy => &SKELETON_COPY,
+            WriterShape::BaySkeletonCopy => &BAY_SKELETON_COPY,
+            WriterShape::Journal => &JOURNAL,
+            WriterShape::BayJournal => &BAY_JOURNAL,
+            WriterShape::CherryPick => &CHERRY_PICK,
+            WriterShape::BayCherryPick => &BAY_CHERRY_PICK,
+            WriterShape::CherryPickCopy => &CHERRY_PICK_COPY,
+            WriterShape::BayCherryPickCopy => &BAY_CHERRY_PICK_COPY,
+            WriterShape::BayPath => &BAY_PATH,
+            WriterShape::FetchScope => &FETCH_SCOPE,
+            WriterShape::FetchLedger => &FETCH_LEDGER,
+            WriterShape::HeldHeads => &HELD_HEADS,
+            WriterShape::MirrorRoots => &MIRROR_ROOTS,
+            WriterShape::Served => &SERVED,
+            WriterShape::Tombstones => &TOMBSTONES,
+            WriterShape::UnvouchedHeads => &UNVOUCHED_HEADS,
+            WriterShape::Trust => &TRUST,
+            WriterShape::TrustCopy => &TRUST_COPY,
+        }
+    }
+}
+
+/// The final path of a durable write: what the write entries of
+/// [`file_utils`](crate::util::file_utils) hand a taint record. Its field is private, so outside
+/// this module one is had only from its constructors: one per record, taking a [`Checkout`]
+/// where the record is checkout-local, each building its path under [`forklift_root`] from the
+/// record's parts, or [`DurablePath::outside_warehouse`] for a file no warehouse records. It
+/// implements no `From`, `AsRef` or `Deref` to or from a path type; [`DurablePath::as_path`]
+/// lends its path. A constructor reads
+/// [`forklift_root`] when it is called, and that changes when a bay context is entered, so one
+/// built before the switch names the old root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurablePath(PathBuf);
+
+impl DurablePath {
+    /// The path, for the write itself.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// `relative` under [`forklift_root`], for a writer of `shape`. In a debug build, refuses a
+    /// path whose declared entry is not the one `shape` names, naming both, such as a meta copy
+    /// built for an ordinary pallet's name, which classifies as a stray in the meta-copy folder.
+    fn declared(shape: WriterShape, relative: PathBuf) -> DurablePath {
+        if cfg!(debug_assertions) {
+            let found = taint_shape(&relative);
+            assert!(
+                found.is_some_and(|found| std::ptr::eq(found, shape.entry())),
+                "a {:?} writer built \"{}\", which is {}, not {}",
+                shape, taint_record_line(&relative), found.map_or("no declared shape", |found| found.description),
+                shape.entry().description
+            );
+        }
+        DurablePath(forklift_root().join(relative))
+    }
+
+    /// A durable file no warehouse records: one outside [`forklift_root`], such as the key-owner
+    /// manifest in the keys folder or a bay's redirect in its staging folder. In a debug build,
+    /// refuses a path [`record_taint`] would place under the root.
+    pub fn outside_warehouse(path: PathBuf) -> DurablePath {
+        if cfg!(debug_assertions) {
+            assert!(
+                resolve_root_for(&[&path]).is_none(),
+                "an out-of-warehouse write names \"{}\", which is under the warehouse folder \"{}\"",
+                path.to_string_lossy(), forklift_root().to_string_lossy()
+            );
+        }
+        DurablePath(path)
+    }
+
+    pub fn pallet_ref(name: &str) -> DurablePath {
+        Self::declared(WriterShape::PalletRef, Path::new(crate::util::pallet_utils::FOLDER_NAME_PALLETS_ROOT).join(name))
+    }
+
+    /// The keepsake of a removed ref, by its slot's file name in the removed-refs folder.
+    pub fn keepsake(file_name: &str) -> DurablePath {
+        Self::declared(WriterShape::Keepsake, Path::new("removed-refs").join(file_name))
+    }
+
+    pub fn meta_ref(name: &str) -> DurablePath {
+        Self::declared(WriterShape::MetaRef, Path::new(crate::util::pallet_utils::FOLDER_NAME_META_ROOT).join(name))
+    }
+
+    pub fn meta_copy(name: &str) -> DurablePath {
+        Self::declared(WriterShape::MetaCopy, Path::new(crate::util::pallet_utils::FOLDER_NAME_META_COPY_ROOT).join(name))
+    }
+
+    /// A loose object, by its full hash, at its fan-out folder. `Err` for a hash too short to
+    /// split or not all lowercase hex.
+    pub fn loose_object(hash: &str) -> Result<DurablePath, String> {
+        let (fan_out, rest) = split_object_hash(hash)?;
+        Ok(Self::declared(WriterShape::LooseObject, Path::new(crate::globals::FOLDER_NAME_OBJECTS_ROOT).join(fan_out).join(rest)))
+    }
+
+    /// A loose object's signature, beside the object.
+    pub fn loose_signature(hash: &str) -> Result<DurablePath, String> {
+        let (fan_out, rest) = split_object_hash(hash)?;
+        let file_name = format!("{}{}", rest, crate::util::sign_utils::FILE_SUFFIX_SIGNATURE);
+        Ok(Self::declared(WriterShape::LooseSignature, Path::new(crate::globals::FOLDER_NAME_OBJECTS_ROOT).join(fan_out).join(file_name)))
+    }
+
+    pub fn pack(id: &str) -> DurablePath {
+        Self::declared(WriterShape::Pack, pack_folder_file(id, crate::util::pack_utils::FILE_EXTENSION_PACK_DATA))
+    }
+
+    pub fn pack_index(id: &str) -> DurablePath {
+        Self::declared(WriterShape::PackIndex, pack_folder_file(id, crate::util::pack_utils::FILE_EXTENSION_PACK_INDEX))
+    }
+
+    pub fn signature_table(id: &str) -> DurablePath {
+        Self::declared(WriterShape::SignatureTable,
+            pack_folder_file(id, crate::util::signature_table::FILE_EXTENSION_SIGNATURE_TABLE))
+    }
+
+    /// The staged inventory shard of the directory whose warehouse path key is `key`, at its
+    /// shard address in the checkout's inventory. `Err` when that inventory's metadata names
+    /// another format version, as [`file_utils::get_inventory_data_path_for_key`] refuses it.
+    pub fn shard(checkout: &Checkout, key: &str) -> Result<DurablePath, String> {
+        let (_, inventory) = checkout.place(WriterShape::Shard, WriterShape::BayShard,
+            Path::new(crate::globals::FOLDER_NAME_INVENTORY_ROOT));
+        file_utils::gate_inventory_layout(&forklift_root().join(&inventory))?;
+
+        let file = Path::new(crate::globals::FOLDER_NAME_INVENTORY_ROOT).join(file_utils::shard_folder_relative(key))
+            .join(file_utils::FILE_NAME_INVENTORY_DATA);
+        let (shape, relative) = checkout.place(WriterShape::Shard, WriterShape::BayShard, &file);
+        Ok(Self::declared(shape, relative))
+    }
+
+    pub fn load_marker(checkout: &Checkout) -> DurablePath {
+        let file = Path::new(crate::globals::FOLDER_NAME_INVENTORY_ROOT).join("incomplete-load");
+        let (shape, relative) = checkout.place(WriterShape::LoadMarker, WriterShape::BayLoadMarker, &file);
+        Self::declared(shape, relative)
+    }
+
+    pub fn position(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::Position, WriterShape::BayPosition,
+            Path::new(crate::util::pallet_utils::FILE_NAME_POSITION));
+        Self::declared(shape, relative)
+    }
+
+    pub fn position_copy(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::PositionCopy, WriterShape::BayPositionCopy,
+            Path::new(crate::util::pallet_utils::FILE_NAME_POSITION_COPY));
+        Self::declared(shape, relative)
+    }
+
+    pub fn scope(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::Scope, WriterShape::BayScope,
+            Path::new(crate::util::scope_utils::FILE_NAME_BAY_SCOPE));
+        Self::declared(shape, relative)
+    }
+
+    pub fn scope_copy(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::ScopeCopy, WriterShape::BayScopeCopy,
+            Path::new(crate::util::scope_utils::FILE_NAME_SCOPE_COPY));
+        Self::declared(shape, relative)
+    }
+
+    pub fn consolidation(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::Consolidation, WriterShape::BayConsolidation,
+            Path::new(crate::util::merge_utils::FILE_NAME_CONSOLIDATION));
+        Self::declared(shape, relative)
+    }
+
+    pub fn consolidation_copy(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::ConsolidationCopy, WriterShape::BayConsolidationCopy,
+            Path::new(crate::util::merge_utils::FILE_NAME_CONSOLIDATION_COPY));
+        Self::declared(shape, relative)
+    }
+
+    pub fn skeleton(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::Skeleton, WriterShape::BaySkeleton,
+            Path::new(crate::util::merge_utils::FILE_NAME_SKELETON));
+        Self::declared(shape, relative)
+    }
+
+    pub fn skeleton_copy(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::SkeletonCopy, WriterShape::BaySkeletonCopy,
+            Path::new(crate::util::merge_utils::FILE_NAME_SKELETON_COPY));
+        Self::declared(shape, relative)
+    }
+
+    pub fn journal(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::Journal, WriterShape::BayJournal, Path::new("journal.json"));
+        Self::declared(shape, relative)
+    }
+
+    pub fn cherry_pick(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::CherryPick, WriterShape::BayCherryPick,
+            Path::new(crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK));
+        Self::declared(shape, relative)
+    }
+
+    pub fn cherry_pick_copy(checkout: &Checkout) -> DurablePath {
+        let (shape, relative) = checkout.place(WriterShape::CherryPickCopy, WriterShape::BayCherryPickCopy,
+            Path::new(crate::util::cherry_pick_utils::FILE_NAME_CHERRY_PICK_COPY));
+        Self::declared(shape, relative)
+    }
+
+    /// A bay's path record, which names the bay's working directory.
+    pub fn bay_path(name: &str) -> DurablePath {
+        Self::declared(WriterShape::BayPath, Path::new(crate::globals::FOLDER_NAME_BAYS_ROOT).join(name).join("path"))
+    }
+
+    pub fn fetch_scope() -> DurablePath {
+        Self::declared(WriterShape::FetchScope, Path::new(crate::util::config_utils::FOLDER_NAME_CONFIG_ROOT).join("fetch-scope"))
+    }
+
+    pub fn fetch_ledger() -> DurablePath {
+        Self::declared(WriterShape::FetchLedger, PathBuf::from("fetched-heads"))
+    }
+
+    pub fn held_heads() -> DurablePath {
+        Self::declared(WriterShape::HeldHeads, PathBuf::from("held-heads"))
+    }
+
+    pub fn mirror_roots() -> DurablePath {
+        Self::declared(WriterShape::MirrorRoots, PathBuf::from(crate::util::mirror_utils::FILE_NAME_MIRROR_ROOTS))
+    }
+
+    pub fn served() -> DurablePath {
+        Self::declared(WriterShape::Served, PathBuf::from("served"))
+    }
+
+    pub fn tombstones() -> DurablePath {
+        Self::declared(WriterShape::Tombstones, PathBuf::from("tombstones"))
+    }
+
+    pub fn unvouched_heads() -> DurablePath {
+        Self::declared(WriterShape::UnvouchedHeads, PathBuf::from("unvouched-heads"))
+    }
+
+    pub fn trust() -> DurablePath {
+        Self::declared(WriterShape::Trust, PathBuf::from(crate::util::office_utils::FILE_NAME_TRUST))
+    }
+
+    pub fn trust_copy() -> DurablePath {
+        Self::declared(WriterShape::TrustCopy, PathBuf::from(crate::util::office_utils::FILE_NAME_TRUST_COPY))
+    }
+}
+
+/// A full object hash split at its fan-out folder, or `Err` for anything
+/// [`file_utils::get_path_for_object`] refuses: too short to split, or not all lowercase hex.
+fn split_object_hash(hash: &str) -> Result<(&str, &str), String> {
+    if !file_utils::is_object_hash_or_prefix(hash) {
+        return Err(format!("\"{}\" is not a valid object hash.", hash));
+    }
+
+    Ok(hash.split_at(file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS))
+}
+
+/// `<id>.<extension>` in the pack folder, root-relative.
+fn pack_folder_file(id: &str, extension: &str) -> PathBuf {
+    Path::new(crate::globals::FOLDER_NAME_OBJECTS_ROOT).join(crate::util::pack_utils::FOLDER_NAME_PACK)
+        .join(format!("{}.{}", id, extension))
 }
 
 /// Strip `root` off every path in `final_paths`. Only ever called once [`resolve_root_for`] has
@@ -1105,6 +1491,368 @@ mod tests {
 
         assert_eq!(mismatched, Vec::<(String, bool, bool)>::new(), "(path, declared for the main tree, for a bay)");
         assert!(declared_for_both >= 10, "sanity: the spec's bay rows were read: {}", declared_for_both);
+    }
+
+    /// An absolute storage root, entered on this thread; nothing is created under it.
+    fn absolute_root(name: &str) -> (StorageRootScope, PathBuf) {
+        let root = std::env::temp_dir().join(format!("forklift-taint-utils-{}-{}", name, std::process::id()));
+        assert!(root.is_absolute(), "sanity: the root is absolute: {}", root.display());
+        (StorageRootScope::enter(&root), root)
+    }
+
+    /// One example of `shape`, built through its constructor. No wildcard arm: a new variant
+    /// does not compile without one.
+    fn writer_shape_example(shape: WriterShape) -> DurablePath {
+        let bay = Checkout::Bay("side".to_string());
+        let shard = "src/lib";
+        match shape {
+            WriterShape::PalletRef => DurablePath::pallet_ref("team/main"),
+            WriterShape::Keepsake => DurablePath::keepsake("team%2Fmain+1"),
+            WriterShape::MetaRef => DurablePath::meta_ref("haul"),
+            WriterShape::MetaCopy => DurablePath::meta_copy("haul"),
+            WriterShape::LooseObject => DurablePath::loose_object("ab12cd").unwrap(),
+            WriterShape::LooseSignature => DurablePath::loose_signature("ab12cd").unwrap(),
+            WriterShape::Pack => DurablePath::pack("p1"),
+            WriterShape::PackIndex => DurablePath::pack_index("p1"),
+            WriterShape::SignatureTable => DurablePath::signature_table("p1"),
+            WriterShape::Shard => DurablePath::shard(&Checkout::Main, shard).unwrap(),
+            WriterShape::BayShard => DurablePath::shard(&bay, shard).unwrap(),
+            WriterShape::LoadMarker => DurablePath::load_marker(&Checkout::Main),
+            WriterShape::BayLoadMarker => DurablePath::load_marker(&bay),
+            WriterShape::Position => DurablePath::position(&Checkout::Main),
+            WriterShape::BayPosition => DurablePath::position(&bay),
+            WriterShape::PositionCopy => DurablePath::position_copy(&Checkout::Main),
+            WriterShape::BayPositionCopy => DurablePath::position_copy(&bay),
+            WriterShape::Scope => DurablePath::scope(&Checkout::Main),
+            WriterShape::BayScope => DurablePath::scope(&bay),
+            WriterShape::ScopeCopy => DurablePath::scope_copy(&Checkout::Main),
+            WriterShape::BayScopeCopy => DurablePath::scope_copy(&bay),
+            WriterShape::Consolidation => DurablePath::consolidation(&Checkout::Main),
+            WriterShape::BayConsolidation => DurablePath::consolidation(&bay),
+            WriterShape::ConsolidationCopy => DurablePath::consolidation_copy(&Checkout::Main),
+            WriterShape::BayConsolidationCopy => DurablePath::consolidation_copy(&bay),
+            WriterShape::Skeleton => DurablePath::skeleton(&Checkout::Main),
+            WriterShape::BaySkeleton => DurablePath::skeleton(&bay),
+            WriterShape::SkeletonCopy => DurablePath::skeleton_copy(&Checkout::Main),
+            WriterShape::BaySkeletonCopy => DurablePath::skeleton_copy(&bay),
+            WriterShape::Journal => DurablePath::journal(&Checkout::Main),
+            WriterShape::BayJournal => DurablePath::journal(&bay),
+            WriterShape::CherryPick => DurablePath::cherry_pick(&Checkout::Main),
+            WriterShape::BayCherryPick => DurablePath::cherry_pick(&bay),
+            WriterShape::CherryPickCopy => DurablePath::cherry_pick_copy(&Checkout::Main),
+            WriterShape::BayCherryPickCopy => DurablePath::cherry_pick_copy(&bay),
+            WriterShape::BayPath => DurablePath::bay_path("side"),
+            WriterShape::FetchScope => DurablePath::fetch_scope(),
+            WriterShape::FetchLedger => DurablePath::fetch_ledger(),
+            WriterShape::HeldHeads => DurablePath::held_heads(),
+            WriterShape::MirrorRoots => DurablePath::mirror_roots(),
+            WriterShape::Served => DurablePath::served(),
+            WriterShape::Tombstones => DurablePath::tombstones(),
+            WriterShape::UnvouchedHeads => DurablePath::unvouched_heads(),
+            WriterShape::Trust => DurablePath::trust(),
+            WriterShape::TrustCopy => DurablePath::trust_copy(),
+        }
+    }
+
+    /// Every writer shape's constructor renders its example into the entry the variant names, at
+    /// the path written here, and a checkout-local record's main and bay variants are separate
+    /// rows. Every entry of the registry is named by exactly one row, or is one of the heal-only
+    /// entries listed here. The escape keeps a path outside the warehouse folder as given.
+    /// Revert: point `WriterShape::BayPosition` at the main tree's entry → its row's description
+    /// differs → red; build a bay's record under the root → its row's path differs → red.
+    #[test]
+    fn every_writer_shape_renders_its_example_into_its_entry() {
+        let (_scope, root) = absolute_root("writer-shapes");
+        let forklift = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
+
+        let rows: &[(WriterShape, &str, &str)] = &[
+            (WriterShape::PalletRef, "pallets/team/main", "a pallet ref"),
+            (WriterShape::Keepsake, "removed-refs/team%2Fmain+1", "a removed ref's keepsake"),
+            (WriterShape::MetaRef, "meta/haul", "a meta pallet ref"),
+            (WriterShape::MetaCopy, "meta-copy/haul", "a meta pallet ref's copy"),
+            (WriterShape::LooseObject, "objects/ab/12cd", "a loose object"),
+            (WriterShape::LooseSignature, "objects/ab/12cd.sig", "a loose object's signature"),
+            (WriterShape::Pack, "objects/pack/p1.pack", "a pack"),
+            (WriterShape::PackIndex, "objects/pack/p1.idx", "a pack index"),
+            (WriterShape::SignatureTable, "objects/pack/p1.sigs", "a signature table"),
+            (WriterShape::Shard, "inventory/inv_/32/ae56798cd16a1f7d10d50387731aaceed83ae94f48bcf50fc30b7444c43191/data", "a staged inventory shard"),
+            (WriterShape::BayShard, "bays/side/inventory/inv_/32/ae56798cd16a1f7d10d50387731aaceed83ae94f48bcf50fc30b7444c43191/data", "a bay's staged inventory shard"),
+            (WriterShape::LoadMarker, "inventory/incomplete-load", "the incomplete-load marker"),
+            (WriterShape::BayLoadMarker, "bays/side/inventory/incomplete-load", "a bay's incomplete-load marker"),
+            (WriterShape::Position, "position", "the checkout position"),
+            (WriterShape::BayPosition, "bays/side/position", "a bay's checkout position"),
+            (WriterShape::PositionCopy, "position-copy", "the checkout position's copy"),
+            (WriterShape::BayPositionCopy, "bays/side/position-copy", "a bay's checkout position's copy"),
+            (WriterShape::Scope, "scope", "the checkout scope"),
+            (WriterShape::BayScope, "bays/side/scope", "a bay's checkout scope"),
+            (WriterShape::ScopeCopy, "scope-copy", "the checkout scope's copy"),
+            (WriterShape::BayScopeCopy, "bays/side/scope-copy", "a bay's checkout scope's copy"),
+            (WriterShape::Consolidation, "consolidation", "the consolidation state"),
+            (WriterShape::BayConsolidation, "bays/side/consolidation", "a bay's consolidation state"),
+            (WriterShape::ConsolidationCopy, "consolidation-copy", "the consolidation state's copy"),
+            (WriterShape::BayConsolidationCopy, "bays/side/consolidation-copy", "a bay's consolidation state's copy"),
+            (WriterShape::Skeleton, "consolidation-skeleton", "the consolidation skeleton"),
+            (WriterShape::BaySkeleton, "bays/side/consolidation-skeleton", "a bay's consolidation skeleton"),
+            (WriterShape::SkeletonCopy, "consolidation-skeleton-copy", "the consolidation skeleton's copy"),
+            (WriterShape::BaySkeletonCopy, "bays/side/consolidation-skeleton-copy", "a bay's consolidation skeleton's copy"),
+            (WriterShape::Journal, "journal.json", "the journal"),
+            (WriterShape::BayJournal, "bays/side/journal.json", "a bay's journal"),
+            (WriterShape::CherryPick, "cherry-pick", "the cherry-pick state"),
+            (WriterShape::BayCherryPick, "bays/side/cherry-pick", "a bay's cherry-pick state"),
+            (WriterShape::CherryPickCopy, "cherry-pick-copy", "the cherry-pick state's copy"),
+            (WriterShape::BayCherryPickCopy, "bays/side/cherry-pick-copy", "a bay's cherry-pick state's copy"),
+            (WriterShape::BayPath, "bays/side/path", "a bay's path record"),
+            (WriterShape::FetchScope, "config/fetch-scope", "the fetch scope"),
+            (WriterShape::FetchLedger, "fetched-heads", "the fetch ledger"),
+            (WriterShape::HeldHeads, "held-heads", "the held-heads record"),
+            (WriterShape::MirrorRoots, "mirror-roots", "the mirror roots record"),
+            (WriterShape::Served, "served", "the served record"),
+            (WriterShape::Tombstones, "tombstones", "the tombstones record"),
+            (WriterShape::UnvouchedHeads, "unvouched-heads", "the unvouched-heads record"),
+            (WriterShape::Trust, "trust", "the trust anchor"),
+            (WriterShape::TrustCopy, "trust-copy", "the trust anchor's copy"),
+        ];
+        let heal_only = ["a ref in the meta folder that is no meta pallet's", "a copy of a ref that is no meta pallet's"];
+
+        let mut named = BTreeSet::new();
+        for &(shape, relative, description) in rows {
+            let expected = relative.split('/').fold(forklift.clone(), |path, name| path.join(name));
+            let built = writer_shape_example(shape);
+            assert_eq!(built.as_path(), expected, "{:?}", shape);
+            let found = taint_shape(Path::new(relative)).map(|found| found.description);
+            assert_eq!((found, shape.entry().description), (Some(description), description), "{:?}", shape);
+            assert!(named.insert(description), "{:?} names an entry another row names", shape);
+        }
+
+        let unnamed: Vec<&str> = TAINT_SHAPES.iter().map(|entry| entry.description)
+            .filter(|description| !named.contains(description)).collect();
+        assert_eq!(unnamed, heal_only);
+        assert_eq!(named.len() + heal_only.len(), TAINT_SHAPES.len(), "sanity: every entry was read");
+
+        let outside = root.join("elsewhere").join("record");
+        assert_eq!(DurablePath::outside_warehouse(outside.clone()).as_path(), outside);
+
+        // The main tree's shard is the path the reader of that key opens.
+        let read = file_utils::get_inventory_data_path_for_key("src/lib").unwrap();
+        assert_eq!(DurablePath::shard(&Checkout::Main, "src/lib").unwrap().as_path(), Path::new(&read));
+    }
+
+    /// A constructor refuses what its writer's own path builder refuses today: a hash that is not
+    /// lowercase hex, whatever its length, and a shard of an inventory whose metadata names
+    /// another format version, in the main tree and in a bay. A well-formed hash and a shard of
+    /// an inventory this build knows are built (the table test above).
+    /// Revert: drop the hex check in `split_object_hash`, or the gate in `shard` → `Ok` → red.
+    #[test]
+    fn a_constructor_refuses_what_its_writers_path_builder_refuses() {
+        let (_scope, root) = absolute_root("writer-refusals");
+        let _ = file_utils::remove_dir_all(&root);
+
+        for hash in ["ZZ1234", "../../etc/x", "AB12CD"] {
+            assert!(file_utils::get_path_for_object(hash).is_err(), "sanity: the writer refuses {}", hash);
+            assert_eq!(DurablePath::loose_object(hash), Err(format!("\"{}\" is not a valid object hash.", hash)));
+            assert_eq!(DurablePath::loose_signature(hash), Err(format!("\"{}\" is not a valid object hash.", hash)));
+        }
+
+        let bay = Checkout::Bay("side".to_string());
+        for (checkout, inventory) in [(&Checkout::Main, Path::new("inventory")), (&bay, Path::new("bays/side/inventory"))] {
+            // Each inventory is a root the gate has not passed in this process.
+            let inventory = forklift_root().join(inventory);
+            std::fs::create_dir_all(&inventory).unwrap();
+            let newer = record_utils::to_bytes(file_utils::INVENTORY_METADATA_RECORD,
+                file_utils::INVENTORY_METADATA_VERSION + 1, ["./"]);
+            std::fs::write(inventory.join(file_utils::FILE_NAME_INVENTORY_METADATA), newer).unwrap();
+
+            let refused = DurablePath::shard(checkout, "src/lib");
+            assert!(refused.as_ref().is_err_and(|e| e.contains("does not know")), "{:?}: {:?}", checkout, refused);
+        }
+        file_utils::remove_dir_all(&root).ok();
+    }
+
+    /// A constructor refuses a path that classifies as another entry: a meta copy built for an
+    /// ordinary pallet's name classifies as the heal-only meta-copy entry, the first entry it
+    /// matches.
+    /// Revert: drop the check in `declared` → no panic → red.
+    #[test]
+    #[should_panic(expected = "a MetaCopy writer built \"meta-copy/main\", which is a copy of a ref that is no meta pallet's, not a meta pallet ref's copy")]
+    fn a_constructor_refuses_a_path_of_another_entry_in_a_debug_build() {
+        let (_scope, _root) = absolute_root("writer-mismatch");
+
+        let _ = DurablePath::meta_copy("main");
+    }
+
+    /// The escape refuses a path under the warehouse folder, spelled absolutely.
+    /// Revert: drop the assertion in `outside_warehouse` → no panic → red.
+    #[test]
+    #[should_panic(expected = "an out-of-warehouse write names")]
+    fn the_escape_refuses_a_path_under_the_warehouse_in_a_debug_build() {
+        let (_scope, _root) = absolute_root("escape-in-root");
+
+        let _ = DurablePath::outside_warehouse(forklift_root().join("position"));
+    }
+
+    /// Whether `ty` names `DurablePath`, or `Self` where `Self` is it, anywhere inside.
+    fn mentions_durable_path(ty: &syn::ReturnType, self_is_durable: bool) -> bool {
+        struct Mentions(bool, bool);
+        impl<'ast> syn::visit::Visit<'ast> for Mentions {
+            fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+                self.0 |= ident == "DurablePath" || (self.1 && ident == "Self");
+            }
+        }
+        let mut mentions = Mentions(false, self_is_durable);
+        syn::visit::Visit::visit_return_type(&mut mentions, ty);
+        mentions.0
+    }
+
+    /// Where this file's non-test source builds a `DurablePath`, and which functions return one.
+    #[derive(Default)]
+    struct Constructions {
+        within: Vec<String>,
+        durable_impl: Vec<bool>,
+        built_in: BTreeSet<String>,
+        returned_by: BTreeSet<String>,
+    }
+
+    impl Constructions {
+        fn in_durable_impl(&self) -> bool {
+            self.durable_impl.last().copied().unwrap_or(false)
+        }
+
+        /// Whether `path`, as an expression, is the type's constructor.
+        fn is_constructor(&self, path: &syn::Path) -> bool {
+            let single_self = path.segments.len() == 1 && path.segments[0].ident == "Self";
+            path.segments.last().is_some_and(|last| last.ident == "DurablePath")
+                || (single_self && self.in_durable_impl())
+        }
+
+        fn note_built(&mut self) {
+            let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
+            self.built_in.insert(within);
+        }
+
+        /// A function returning a `DurablePath`, by its name inside `impl DurablePath`, and
+        /// marked as outside it anywhere else, so no allowed name passes there.
+        fn note_fn(&mut self, sig: &syn::Signature) {
+            if mentions_durable_path(&sig.output, self.in_durable_impl()) {
+                let name = sig.ident.to_string();
+                self.returned_by.insert(if self.in_durable_impl() { name } else { format!("{} (outside impl DurablePath)", name) });
+            }
+        }
+    }
+
+    use crate::util::file_utils::tests::is_test_only as is_cfg_test;
+
+    impl<'ast> syn::visit::Visit<'ast> for Constructions {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !is_cfg_test(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if is_cfg_test(&item.attrs) {
+                return;
+            }
+            let durable = matches!(&*item.self_ty, syn::Type::Path(ty)
+                if ty.path.segments.last().is_some_and(|last| last.ident == "DurablePath"));
+            self.durable_impl.push(durable);
+            syn::visit::visit_item_impl(self, item);
+            self.durable_impl.pop();
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !is_cfg_test(&item.attrs) {
+                // A free function, even one nested in a method's body, is outside the impl.
+                self.durable_impl.push(false);
+                self.note_fn(&item.sig);
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+                self.within.pop();
+                self.durable_impl.pop();
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            self.note_fn(&item.sig);
+            self.within.push(item.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, item);
+            self.within.pop();
+        }
+
+        fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+            if self.is_constructor(&expr.path) {
+                self.note_built();
+            }
+            syn::visit::visit_expr_path(self, expr);
+        }
+
+        fn visit_expr_struct(&mut self, expr: &'ast syn::ExprStruct) {
+            if self.is_constructor(&expr.path) {
+                self.note_built();
+            }
+            syn::visit::visit_expr_struct(self, expr);
+        }
+    }
+
+    /// The constructor census over this file's non-test source: a `DurablePath` is built, by a
+    /// call, a braced literal or the constructor taken as a value, spelled `DurablePath` or
+    /// `Self` in any impl for it, only in `declared` and `outside_warehouse`; and every function
+    /// returning one, bare or inside another type, is a function of `impl DurablePath` the
+    /// writer-shape example calls, or one of those two. The type derives only the traits listed
+    /// here, so no derive (`Default`, `Deserialize`) builds one either.
+    /// Revert: add `fn sneaky(p: &Path) -> Result<DurablePath, String> { Ok(Self(p.to_path_buf())) }`
+    /// to `impl DurablePath` → red.
+    #[test]
+    fn a_durable_path_is_built_only_by_its_constructors() {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/util/taint_utils.rs");
+        let source = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {}", file.display(), e));
+        let parsed = syn::parse_file(&source).unwrap();
+
+        let definition = parsed.items.iter().find_map(|item| match item {
+            syn::Item::Struct(definition) if definition.ident == "DurablePath" => Some(definition),
+            _ => None,
+        }).expect("the type is defined in this file");
+        let mut derived = Vec::new();
+        for attribute in definition.attrs.iter().filter(|attribute| !attribute.path().is_ident("doc")) {
+            assert!(attribute.path().is_ident("derive"), "an attribute other than a derive: {:?}", attribute.path().get_ident());
+            attribute.parse_nested_meta(|meta| {
+                derived.push(meta.path.get_ident().map(|ident| ident.to_string()).unwrap_or_default());
+                Ok(())
+            }).unwrap();
+        }
+        assert_eq!(derived, ["Clone", "Debug", "PartialEq", "Eq"]);
+
+        let mut constructions = Constructions::default();
+        syn::visit::Visit::visit_file(&mut constructions, &parsed);
+        assert_eq!(constructions.built_in, BTreeSet::from(["declared".to_string(), "outside_warehouse".to_string()]));
+
+        struct Called(BTreeSet<String>);
+        impl<'ast> syn::visit::Visit<'ast> for Called {
+            fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+                let segments: Vec<String> = expr.path.segments.iter().map(|segment| segment.ident.to_string()).collect();
+                if let [ty, function] = segments.as_slice() {
+                    if ty == "DurablePath" {
+                        self.0.insert(function.clone());
+                    }
+                }
+            }
+        }
+        let example = parsed.items.iter().find_map(|item| match item {
+            syn::Item::Mod(module) if module.ident == "tests" => module.content.as_ref(),
+            _ => None,
+        }).and_then(|(_, items)| items.iter().find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "writer_shape_example" => Some(function),
+            _ => None,
+        })).expect("the writer-shape example is in the tests module");
+        let mut called = Called(BTreeSet::new());
+        syn::visit::Visit::visit_item_fn(&mut called, example);
+        assert!(called.0.len() >= 30, "sanity: the example's constructors were read: {:?}", called.0);
+
+        let allowed: BTreeSet<String> = called.0.iter().cloned()
+            .chain(["declared".to_string(), "outside_warehouse".to_string()]).collect();
+        let unlisted: Vec<&String> = constructions.returned_by.iter().filter(|name| !allowed.contains(*name)).collect();
+        assert_eq!(unlisted, Vec::<&String>::new());
+        assert!(constructions.returned_by.contains("position") && constructions.returned_by.contains("loose_object"),
+            "sanity: returns were read, bare and inside a Result: {:?}", constructions.returned_by);
     }
 
     fn scratch(name: &str) -> PathBuf {

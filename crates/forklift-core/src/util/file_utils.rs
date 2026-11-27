@@ -14,6 +14,7 @@ use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAM
 use crate::util::load_guard_utils;
 use crate::util::record_utils;
 use crate::util::taint_utils;
+use crate::util::taint_utils::DurablePath;
 
 /// The number of characters in an object hash that are used for creating the folders.
 /// The remaining characters are used for the file name.
@@ -1045,8 +1046,8 @@ fn sync_result_or_taint(sync_result: Result<(), String>, final_paths: &[&Path]) 
 /// `dir` and folds the result through the same taint-or-recheck decision. `pub(crate)` so the
 /// pack write's own directory sync (`pack_utils`) can share it; the immediate write path below
 /// uses it directly.
-pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(), String> {
-    sync_result_or_taint(sync_dir(dir), final_paths)
+pub(crate) fn sync_dir_or_taint<P: FinalPath + ?Sized>(dir: &Path, final_paths: &[&P]) -> Result<(), String> {
+    sync_result_or_taint(sync_dir(dir), &final_paths_of(final_paths))
 }
 
 /// Sync `dir` again for `final_paths`, which an earlier write reported unsynced and may have
@@ -1058,9 +1059,43 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(),
 /// recorded since the write. Its callers: heal, the process resolving taints, while
 /// [`SelfTripExemptionGuard`] skips that re-check anyway; and a compensating write or removal
 /// ([`write_file_compensating`]), which puts back what stood before its command.
-pub(crate) fn sync_dir_again_or_taint(dir: &Path, final_paths: &[&Path]) -> Result<(), String> {
-    taint_utils::assert_declared(final_paths);
-    sync_dir(dir).map_err(|sync_error| taint_after_sync_failure(sync_error, final_paths))
+pub(crate) fn sync_dir_again_or_taint<P: FinalPath + ?Sized>(dir: &Path, final_paths: &[&P]) -> Result<(), String> {
+    let final_paths = final_paths_of(final_paths);
+    taint_utils::assert_declared(&final_paths);
+    sync_dir(dir).map_err(|sync_error| taint_after_sync_failure(sync_error, &final_paths))
+}
+
+/// The final path a write entry hands the taint funnel: a [`DurablePath`], or, until every
+/// caller builds one, any path. Sealed, but while the blanket impl below stands every
+/// `AsRef<Path>` type is one; once it goes, nothing outside this module adds a kind.
+pub trait FinalPath: final_path_seal::Sealed {
+    fn final_path(&self) -> &Path;
+}
+
+mod final_path_seal {
+    pub trait Sealed {}
+}
+
+impl final_path_seal::Sealed for DurablePath {}
+
+impl FinalPath for DurablePath {
+    fn final_path(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+// Migration only: lets the entries take a bare path while callers move onto `DurablePath`. It
+// coexists with the impl above because `DurablePath` implements no `AsRef<Path>`.
+impl<P: AsRef<Path> + ?Sized> final_path_seal::Sealed for P {}
+
+impl<P: AsRef<Path> + ?Sized> FinalPath for P {
+    fn final_path(&self) -> &Path {
+        self.as_ref()
+    }
+}
+
+fn final_paths_of<'a, P: FinalPath + ?Sized>(final_paths: &[&'a P]) -> Vec<&'a Path> {
+    final_paths.iter().map(|path| path.final_path()).collect()
 }
 
 /// Record a taint for `final_paths` after a directory sync just failed, folding the taint
@@ -1327,8 +1362,8 @@ impl Drop for SelfTripExemptionGuard {
 /// It exempts this one write, not the writes a caller makes around it. Inside a bulk-store
 /// session, which is process-wide, the write is only staged, as any write is, and the session's
 /// finish re-checks it.
-pub(crate) fn write_file_compensating(file_path: &Path, content: &[u8]) -> Result<(), String> {
-    write_file_atomically_as(file_path, content, true)
+pub(crate) fn write_file_compensating<P: FinalPath + ?Sized>(file_path: &P, content: &[u8]) -> Result<(), String> {
+    write_file_atomically_as(file_path.final_path(), content, true)
 }
 
 /// Put a record back to `before`, as read before a command step that failed with `error`, and
@@ -1602,8 +1637,8 @@ fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
 /// Inside a bulk-store session the write is only staged and returns `Ok`: its rename and its
 /// re-check run in `BulkStoreSession::finish`, which renames every staged file and then re-checks,
 /// so a taint standing there is reported after the files were replaced.
-pub fn write_file_atomically(file_path: &Path, content: &[u8]) -> Result<(), String> {
-    write_file_atomically_as(file_path, content, false)
+pub fn write_file_atomically<P: FinalPath + ?Sized>(file_path: &P, content: &[u8]) -> Result<(), String> {
+    write_file_atomically_as(file_path.final_path(), content, false)
 }
 
 /// [`write_file_atomically`], or with `compensating` [`write_file_compensating`].
@@ -2450,7 +2485,8 @@ impl WriteBatch {
     /// # Returns
     /// * `Ok(())`      - If the write was staged.
     /// * `Err(String)` - If the temp file could not be created or written.
-    pub fn stage(&self, file_path: &Path, content: &[u8]) -> Result<(), String> {
+    pub fn stage<P: FinalPath + ?Sized>(&self, file_path: &P, content: &[u8]) -> Result<(), String> {
+        let file_path = file_path.final_path();
         let temp_path = temp_path_for(file_path)?;
         if let Err(e) = create_and_write_file(&temp_path, content) {
             let _ = remove_file(&temp_path);
@@ -2489,7 +2525,8 @@ impl WriteBatch {
     ///
     /// A win also adds `final_path` to `reserved_not_staged` — the set
     /// [`finish`](Self::finish) checks to catch a winner that never followed through.
-    pub fn reserve_final_path(&self, final_path: &Path) -> bool {
+    pub fn reserve_final_path<P: FinalPath + ?Sized>(&self, final_path: &P) -> bool {
+        let final_path = final_path.final_path();
         let mut state = self.state.lock().expect("write batch lock poisoned");
         let won = state.final_paths.insert(final_path.to_path_buf());
         if won {
@@ -3749,13 +3786,13 @@ pub fn shard_folder_relative(key: &str) -> PathBuf {
 static PASSED_INVENTORY_ROOTS: std::sync::RwLock<BTreeSet<PathBuf>> = std::sync::RwLock::new(BTreeSet::new());
 
 /// Refuse an inventory root whose metadata header names another format version, once per process
-/// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
+/// per root. [`get_inventory_store_root`] and `DurablePath::shard` both run it, so it guards the paths
 /// that reach a shard without reading the metadata first (`git import` resets the inventory without
 /// reading it). A damaged, unreadable or absent metadata file passes, as does one that is not a
 /// regular file, which is never opened (a link is never followed): the metadata read reports each
 /// of them, the absent one only while the store holds a shard, and a reset rewrites the file
 /// without reading it.
-fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
+pub(crate) fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
     use std::io::BufRead;
 
     if PASSED_INVENTORY_ROOTS.read().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(inventory_root) {
@@ -3788,9 +3825,9 @@ fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
 /// The root of the shard store, `inv_` under the inventory root: the one folder that holds every
 /// shard, so removing it clears the whole store.
 ///
-/// Fallible because it is the single producer of shard paths: it refuses an inventory whose
-/// metadata names another format version (see [`gate_inventory_layout`]), so no shard is read or
-/// written over a layout this build does not know.
+/// Fallible because it refuses an inventory whose metadata names another format version (see
+/// [`gate_inventory_layout`]), as `DurablePath::shard` does, so no shard path either builds is
+/// read or written over a layout this build does not know.
 ///
 /// # Returns
 /// * `Ok(PathBuf)` - The path of the store root.
@@ -5508,7 +5545,7 @@ pub(crate) fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// A put-back says what holds by reading the record back: unchanged, the record is not
     /// written and the error is as given; a write that lands and still fails is put back but may
     /// not be durable; one that does not land could not be put back; one that goes says nothing.
@@ -9325,13 +9362,13 @@ mod tests {
         "sync_dir_again_or_taint",
     ];
 
-    /// Every mention of a [`TAINT_FAMILY`] function in non-test source, as (file under `crates/`,
-    /// the function it is in, the function named). A call, the function taken as a value, a name
-    /// anywhere in a macro's tokens, and the original name of a renamed import all count. An item
-    /// under `#[cfg(test)]` or `#[cfg(all(test, …))]` is skipped whole, and so is the file of an
-    /// out-of-line module declared under one.
-    #[derive(Default)]
+    /// Every mention of one of `names` in non-test source, as (file under `crates/`, the function
+    /// it is in, the name). A call, the function taken as a value, a name anywhere in a macro's
+    /// tokens, and the original name of a renamed import all count. An item under `#[cfg(test)]`
+    /// or `#[cfg(all(test, …))]` is skipped whole, and so is the file of an out-of-line module
+    /// declared under one.
     struct TaintCallers {
+        names: &'static [&'static str],
         file: String,
         within: Vec<String>,
         found: Vec<(String, String, String)>,
@@ -9349,7 +9386,7 @@ mod tests {
         }
     }
 
-    fn is_test_only(attributes: &[syn::Attribute]) -> bool {
+    pub(crate) fn is_test_only(attributes: &[syn::Attribute]) -> bool {
         attributes.iter().any(|attribute| {
             attribute.path().is_ident("cfg") && attribute.parse_args::<syn::Meta>().is_ok_and(|meta| cfg_requires_test(&meta))
         })
@@ -9369,8 +9406,12 @@ mod tests {
     }
 
     impl TaintCallers {
+        fn new(names: &'static [&'static str]) -> TaintCallers {
+            TaintCallers { names, file: String::new(), within: Vec::new(), found: Vec::new() }
+        }
+
         fn note(&mut self, name: &str) {
-            if TAINT_FAMILY.contains(&name) {
+            if self.names.contains(&name) {
                 let within = self.within.last().cloned().unwrap_or_else(|| "<item>".to_string());
                 self.found.push((self.file.clone(), within, name.to_string()));
             }
@@ -9459,11 +9500,15 @@ mod tests {
     /// `cfg(test)` → the `all(test, unix)` row is counted → red.
     #[test]
     fn the_census_visitor_counts_what_it_claims() {
-        let census = |source: &str| {
-            let mut callers = TaintCallers { file: "f.rs".to_string(), ..TaintCallers::default() };
+        let census_of = |names: &'static [&'static str], source: &str| {
+            let mut callers = TaintCallers { file: "f.rs".to_string(), ..TaintCallers::new(names) };
             syn::visit::Visit::visit_file(&mut callers, &syn::parse_file(source).unwrap());
             callers.found.into_iter().map(|(_, within, name)| format!("{} {}", within, name)).collect::<Vec<_>>()
         };
+        let census = |source: &str| census_of(&TAINT_FAMILY, source);
+
+        assert_eq!(census_of(&["outside_warehouse"], "fn f() { DurablePath::outside_warehouse(p); record_taint(); }"),
+            vec!["f outside_warehouse"]);
 
         assert_eq!(census("use crate::util::taint_utils::record_taint as note;\nfn f() { note(); }"),
             vec!["<item> record_taint"]);
@@ -9490,16 +9535,9 @@ mod tests {
         }
     }
 
-    /// The census of the taint family's callers: every non-test caller, in every crate's `src/`,
-    /// of the record writer, heal's remainder writer and the funnel, as a literal multiset. A new
-    /// direct caller of `record_taint` or `resolve_taints`, or a new way into the funnel that
-    /// passes by its checked entries, turns it red. It sees what a source scan names, not what is
-    /// reachable: a call through a function pointer stored elsewhere is outside it, and so is test
-    /// code, which may call any of them.
-    /// Revert: add a `record_taint` call to a non-test function under any crate's `src/` → red;
-    /// add a `resolve_taints` call outside heal's five sites → red.
-    #[test]
-    fn the_taint_family_has_exactly_its_census_of_callers() {
+    /// Every mention of one of `names` in non-test source under every crate's `src/`, sorted,
+    /// as [`TaintCallers`] counts them.
+    fn census_of_non_test_mentions(names: &'static [&'static str]) -> Vec<(String, String, String)> {
         let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let mut files = Vec::new();
         for entry in std::fs::read_dir(crates).unwrap() {
@@ -9520,7 +9558,7 @@ mod tests {
         assert!(test_only.iter().any(|path| path.ends_with("forklift/src/test_support.rs")),
             "sanity: an out-of-line test module is found: {:?}", test_only);
 
-        let mut callers = TaintCallers::default();
+        let mut callers = TaintCallers::new(names);
         for (file, syntax) in &parsed {
             if test_only.iter().any(|path| file.starts_with(path)) {
                 continue;
@@ -9531,6 +9569,20 @@ mod tests {
         }
         let mut found = callers.found;
         found.sort();
+        found
+    }
+
+    /// The census of the taint family's callers: every non-test caller, in every crate's `src/`,
+    /// of the record writer, heal's remainder writer and the funnel, as a literal multiset. A new
+    /// direct caller of `record_taint` or `resolve_taints`, or a new way into the funnel that
+    /// passes by its checked entries, turns it red. It sees what a source scan names, not what is
+    /// reachable: a call through a function pointer stored elsewhere is outside it, and so is test
+    /// code, which may call any of them.
+    /// Revert: add a `record_taint` call to a non-test function under any crate's `src/` → red;
+    /// add a `resolve_taints` call outside heal's five sites → red.
+    #[test]
+    fn the_taint_family_has_exactly_its_census_of_callers() {
+        let found = census_of_non_test_mentions(&TAINT_FAMILY);
 
         let mut expected: Vec<(String, String, String)> = [
             // The one writer of a new record, from the end of a failed folder sync only.
@@ -9562,5 +9614,17 @@ mod tests {
         expected.sort();
 
         assert_eq!(found, expected);
+    }
+
+    /// The census of the escape's callers: every non-test mention, in every crate's `src/`, of
+    /// `DurablePath::outside_warehouse`, the one constructor that takes a caller's path, as a
+    /// literal set. A new caller turns it red until it is added here. The scan is the one the
+    /// taint family's census above runs, which finds its members.
+    /// Revert: add an `outside_warehouse` mention to a non-test function → red.
+    #[test]
+    fn the_escape_has_exactly_its_census_of_callers() {
+        let found = census_of_non_test_mentions(&["outside_warehouse"]);
+
+        assert_eq!(found, Vec::<(String, String, String)>::new());
     }
 }
