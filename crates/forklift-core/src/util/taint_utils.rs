@@ -339,12 +339,12 @@ static BAY_CHERRY_PICK_COPY: TaintShape = shape("a bay's cherry-pick state's cop
 static CHERRY_PICK: TaintShape = shape("the cherry-pick state", Some(Disposition::MergeRecord), &[Is("cherry-pick")]);
 static CHERRY_PICK_COPY: TaintShape = shape("the cherry-pick state's copy", Some(Disposition::MergeRecordCopy), &[Is("cherry-pick-copy")]);
 static FETCH_SCOPE: TaintShape = shape("the fetch scope", Some(Disposition::FetchScope), &[Is("config"), Is("fetch-scope")]);
-static FETCH_LEDGER: TaintShape = shape("the fetch ledger", Some(Disposition::FetchLedger), &[Is("fetched-heads")]);
-static HELD_HEADS: TaintShape = shape("the held-heads record", None, &[Is("held-heads")]);
+static FETCH_LEDGER: TaintShape = shape("the fetch ledger", Some(Disposition::FetchLedger), &[Is(crate::util::fetch_ledger::FILE_NAME_LEDGER)]);
+static HELD_HEADS: TaintShape = shape("the held-heads record", None, &[Is(crate::util::held_heads::FILE_NAME)]);
 static MIRROR_ROOTS: TaintShape = shape("the mirror roots record", Some(Disposition::MirrorRoots), &[Is("mirror-roots")]);
-static SERVED: TaintShape = shape("the served record", None, &[Is("served")]);
-static TOMBSTONES: TaintShape = shape("the tombstones record", None, &[Is("tombstones")]);
-static UNVOUCHED_HEADS: TaintShape = shape("the unvouched-heads record", None, &[Is("unvouched-heads")]);
+static SERVED: TaintShape = shape("the served record", None, &[Is(crate::util::tombstone_utils::FILE_NAME_SERVED)]);
+static TOMBSTONES: TaintShape = shape("the tombstones record", None, &[Is(crate::util::tombstone_utils::FILE_NAME_TOMBSTONES)]);
+static UNVOUCHED_HEADS: TaintShape = shape("the unvouched-heads record", None, &[Is(crate::util::take_utils::FILE_NAME_UNVOUCHED)]);
 static TRUST: TaintShape = shape("the trust anchor", None, &[Is("trust")]);
 static TRUST_COPY: TaintShape = shape("the trust anchor's copy", None, &[Is("trust-copy")]);
 
@@ -756,11 +756,11 @@ impl DurablePath {
     }
 
     pub fn fetch_ledger() -> DurablePath {
-        Self::declared(WriterShape::FetchLedger, PathBuf::from("fetched-heads"))
+        Self::declared(WriterShape::FetchLedger, PathBuf::from(crate::util::fetch_ledger::FILE_NAME_LEDGER))
     }
 
     pub fn held_heads() -> DurablePath {
-        Self::declared(WriterShape::HeldHeads, PathBuf::from("held-heads"))
+        Self::declared(WriterShape::HeldHeads, PathBuf::from(crate::util::held_heads::FILE_NAME))
     }
 
     pub fn mirror_roots() -> DurablePath {
@@ -768,15 +768,15 @@ impl DurablePath {
     }
 
     pub fn served() -> DurablePath {
-        Self::declared(WriterShape::Served, PathBuf::from("served"))
+        Self::declared(WriterShape::Served, PathBuf::from(crate::util::tombstone_utils::FILE_NAME_SERVED))
     }
 
     pub fn tombstones() -> DurablePath {
-        Self::declared(WriterShape::Tombstones, PathBuf::from("tombstones"))
+        Self::declared(WriterShape::Tombstones, PathBuf::from(crate::util::tombstone_utils::FILE_NAME_TOMBSTONES))
     }
 
     pub fn unvouched_heads() -> DurablePath {
-        Self::declared(WriterShape::UnvouchedHeads, PathBuf::from("unvouched-heads"))
+        Self::declared(WriterShape::UnvouchedHeads, PathBuf::from(crate::util::take_utils::FILE_NAME_UNVOUCHED))
     }
 
     pub fn trust() -> DurablePath {
@@ -1772,10 +1772,30 @@ mod tests {
         }
 
         fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-            self.note_fn(&item.sig);
-            self.within.push(item.sig.ident.to_string());
-            syn::visit::visit_impl_item_fn(self, item);
-            self.within.pop();
+            if !is_cfg_test(&item.attrs) {
+                self.note_fn(&item.sig);
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if !is_cfg_test(&item.attrs) {
+                syn::visit::visit_item_trait(self, item);
+            }
+        }
+
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            if !is_cfg_test(&item.attrs) {
+                // A trait's `Self` is its implementor, so a trait method is outside the impl.
+                self.durable_impl.push(false);
+                self.note_fn(&item.sig);
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_trait_item_fn(self, item);
+                self.within.pop();
+                self.durable_impl.pop();
+            }
         }
 
         fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
@@ -1853,6 +1873,35 @@ mod tests {
         assert_eq!(unlisted, Vec::<&String>::new());
         assert!(constructions.returned_by.contains("position") && constructions.returned_by.contains("loose_object"),
             "sanity: returns were read, bare and inside a Result: {:?}", constructions.returned_by);
+    }
+
+    /// What the constructor census reads, over literal sources: a trait's method that returns or
+    /// builds the type counts, as outside its impl, even where the trait sits in a method of the
+    /// impl; a `#[cfg(test)]` method, in the impl or a trait, or a `#[cfg(test)]` trait, counts for
+    /// nothing, while a non-test sibling does.
+    /// Revert: drop `visit_trait_item_fn` → the trait's method is not named → red; drop its
+    /// outside-the-impl push → the nested trait's `Self(..)` counts as the constructor → red; drop
+    /// the `cfg(test)` skip of an impl method, a trait method or a trait → the test-only item is
+    /// counted → red. (The free-function, module and impl skips are not pinned here.)
+    #[test]
+    fn the_constructor_census_reads_what_it_claims() {
+        let read = |source: &str| {
+            let mut constructions = Constructions::default();
+            syn::visit::Visit::visit_file(&mut constructions, &syn::parse_file(source).unwrap());
+            (constructions.built_in, constructions.returned_by)
+        };
+        let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<BTreeSet<String>>();
+
+        assert_eq!(read("trait T { fn f() -> DurablePath { DurablePath(p) } }"),
+            (names(&["f"]), names(&["f (outside impl DurablePath)"])));
+        assert_eq!(read("impl DurablePath { #[cfg(test)] fn t() -> Self { Self(p) } fn u() -> Self { Self(p) } }"),
+            (names(&["u"]), names(&["u"])));
+        assert_eq!(read("impl DurablePath { fn m() { trait T { fn f() -> Self { Self(p) } } } }"),
+            (names(&[]), names(&[])));
+        assert_eq!(read("trait T { #[cfg(test)] fn t() -> DurablePath { DurablePath(p) } }"),
+            (names(&[]), names(&[])));
+        assert_eq!(read("#[cfg(test)] trait T { fn t() -> DurablePath { DurablePath(p) } }"),
+            (names(&[]), names(&[])));
     }
 
     fn scratch(name: &str) -> PathBuf {

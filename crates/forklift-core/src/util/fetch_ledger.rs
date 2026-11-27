@@ -24,9 +24,10 @@ use std::path::PathBuf;
 use crate::globals;
 use crate::util::lock_utils::RefLock;
 use crate::util::{file_utils, object_utils, origin_move, record_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// The ledger file's name in the shared forklift root, and its [`record_utils`] kind and version.
-const FILE_NAME_LEDGER: &str = "fetched-heads";
+pub(crate) const FILE_NAME_LEDGER: &str = "fetched-heads";
 const LEDGER_RECORD: &str = "fetched-heads";
 const LEDGER_VERSION: u32 = 2;
 
@@ -84,7 +85,7 @@ pub fn write_ledger(lock: &RefLock, entries: &[LedgerEntry]) -> Result<(), Strin
 
     let lines = entries.iter().map(|entry| format!("{} {}", entry.head, entry.pallet));
 
-    file_utils::write_file_atomically(&ledger_path(), &record_utils::to_bytes(LEDGER_RECORD, LEDGER_VERSION, lines))
+    file_utils::write_file_atomically(&DurablePath::fetch_ledger(), &record_utils::to_bytes(LEDGER_RECORD, LEDGER_VERSION, lines))
 }
 
 /// Add `head` to the ledger, unless it is there already: a scoped fetch about to run, in the same
