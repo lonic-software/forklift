@@ -1577,4 +1577,35 @@ mod tests {
 
         crate::util::file_utils::remove_dir_all(&root).ok();
     }
+
+    /// Each scope lands at its own path: a checkout's scope and its copy in that checkout's
+    /// folder, the working tree's in the root and a bay's under its state folder, and the fetch
+    /// scope in the configuration folder.
+    /// Revert: build the copy's path from the scope's constructor → no copy file → red.
+    #[test]
+    fn each_scope_lands_at_its_own_path() {
+        let (root, _scope) = scratch("scope-paths");
+        let dir = root.join(".forklift");
+        std::fs::create_dir_all(dir.join("bays").join("b")).unwrap();
+
+        for (checkout, folder, prefix) in [
+            (taint_utils::Checkout::Main, dir.clone(), "main-only"),
+            (taint_utils::Checkout::Bay("b".to_string()), dir.join("bays/b"), "bay-only"),
+        ] {
+            let scope = PathScope::from_prefixes([prefix]);
+            write_checkout_scope(&checkout, &scope).unwrap();
+            for file in ["scope", "scope-copy"] {
+                let bytes = std::fs::read(folder.join(file)).unwrap_or_else(|e| panic!("{:?} has no {}: {}", checkout, file, e));
+                assert_eq!(PathScope::from_bytes(&bytes, "").ok(), Some(scope.clone()), "{:?} {}", checkout, file);
+            }
+        }
+
+        mark_for_test(WarehouseMode::Sparse);
+        let fetch = PathScope::from_prefixes(["fetched"]);
+        set_fetch_scope(&fetch).unwrap();
+        let bytes = std::fs::read(dir.join("config/fetch-scope")).unwrap();
+        assert_eq!(PathScope::from_bytes(&bytes, "").ok(), Some(fetch));
+
+        crate::util::file_utils::remove_dir_all(&root).ok();
+    }
 }

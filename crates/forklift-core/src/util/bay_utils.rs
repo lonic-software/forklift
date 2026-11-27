@@ -1041,6 +1041,29 @@ mod tests {
         file_utils::remove_dir_all(&dir).ok();
     }
 
+    /// A bay's `.forklift` folder is made durable by syncing the working directory it was renamed
+    /// into, so a failed sync of that directory fails the write, with the sync's own error, after
+    /// the folder landed.
+    /// Revert: drop the sync after the rename → the write succeeds → red.
+    #[test]
+    #[cfg(unix)]
+    fn a_redirect_whose_working_directory_cannot_be_synced_fails() {
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        let dir = std::env::temp_dir().join(format!("forklift-bay-utils-redirect-unsynced-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let _fault = SyncDirFaultGuard::failing_exactly(&dir);
+            let error = write_bay_redirect(&dir, Path::new("/srv/warehouse"), "review").unwrap_err();
+            assert_eq!(error, format!("injected directory-sync failure for \"{}\"", dir.to_string_lossy()));
+        }
+        assert_eq!(read_bay_redirect(&dir.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap().name, "review");
+
+        file_utils::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_bay_name_is_one_folder_of_the_pallet_grammar() {
         assert!(validate_bay_name("b1").is_ok());
