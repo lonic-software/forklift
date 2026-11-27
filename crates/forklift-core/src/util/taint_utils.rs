@@ -1645,7 +1645,7 @@ mod tests {
     #[test]
     fn a_constructor_refuses_what_its_writers_path_builder_refuses() {
         let (_scope, root) = absolute_root("writer-refusals");
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = file_utils::remove_dir_all(&root);
 
         for hash in ["ZZ1234", "../../etc/x", "AB12CD"] {
             assert!(file_utils::get_path_for_object(hash).is_err(), "sanity: the writer refuses {}", hash);
@@ -1665,7 +1665,7 @@ mod tests {
             let refused = DurablePath::shard(checkout, "src/lib");
             assert!(refused.as_ref().is_err_and(|e| e.contains("does not know")), "{:?}: {:?}", checkout, refused);
         }
-        std::fs::remove_dir_all(&root).ok();
+        file_utils::remove_dir_all(&root).ok();
     }
 
     /// A constructor refuses a path that classifies as another entry: a meta copy built for an
