@@ -4,6 +4,7 @@ use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 use crate::util::scope_utils::PathScope;
 use crate::util::sealed_utils::Tolerated;
+use crate::util::taint_utils::DurablePath;
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -152,6 +153,30 @@ pub(crate) fn get_pallet_ref_path(namespace: PalletNamespace, name: &str) -> Pat
     }
 
     path
+}
+
+/// Refuse `doing` (a write of meta pallet `name`'s ref or copy) unless `name` is a meta pallet
+/// this forklift knows. Nothing has been written when it refuses.
+fn refuse_unknown_meta_pallet(name: &str, doing: &str) -> Result<(), String> {
+    match crate::util::meta_tree::check_meta_pallet_name(name) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(format!(
+            "Refusing to {}: @{} is not a meta pallet this forklift knows. It may have been written \
+            by a newer forklift; upgrade to change it. Nothing was written.",
+            doing, name
+        )),
+    }
+}
+
+/// The final path of a write or a removal of pallet `name`'s ref in `namespace`: the
+/// [`DurablePath`] of [`get_pallet_ref_path`]'s file. A meta pallet's name must be one of
+/// [`META_PALLET_NAMES`](crate::util::meta_tree::META_PALLET_NAMES); a debug build refuses any
+/// other.
+pub(crate) fn ref_durable_path(namespace: PalletNamespace, name: &str) -> DurablePath {
+    match namespace {
+        PalletNamespace::User => DurablePath::pallet_ref(name),
+        PalletNamespace::Meta => DurablePath::meta_ref(name),
+    }
 }
 
 /// Get the path of the copy of meta pallet `name`'s ref (see [`FOLDER_NAME_META_COPY_ROOT`]).
@@ -1904,14 +1929,14 @@ fn require_copy(name: &str, judged: &MetaCopyState) -> Result<(), RefUpdateError
 /// the ref lock, after keeping those bytes in the new file `kept`. Nothing else is written: no
 /// tombstone and no journal entry, since nothing the ref held could be read. What only that ref
 /// reached is no longer rooted.
-pub fn remove_damaged_ref(name: &str, bytes: &[u8], kept: &Path) -> Result<(), RefUpdateError> {
+pub fn remove_damaged_ref(name: &str, bytes: &[u8], kept: &DurablePath) -> Result<(), RefUpdateError> {
     let _lock = crate::util::lock_utils::RefLock::acquire()?;
 
     require_damage(PalletNamespace::User, name, &RefDamage::Unreadable(bytes.to_vec()))?;
 
     keep_removed(kept, bytes, name)?;
 
-    unlink_ref(PalletNamespace::User, &get_pallet_ref_path(PalletNamespace::User, name))
+    unlink_ref(PalletNamespace::User, &ref_durable_path(PalletNamespace::User, name))
         .map_err(RefUpdateError::Failed)
 }
 
@@ -1931,7 +1956,8 @@ pub fn blocked_copy_step(name: &str, rerun: &str) -> String {
 }
 
 /// Keep `bytes`, removed from a file of pallet `name`, in `kept`, a new file.
-fn keep_removed(kept: &Path, bytes: &[u8], name: &str) -> Result<(), RefUpdateError> {
+fn keep_removed(durable: &DurablePath, bytes: &[u8], name: &str) -> Result<(), RefUpdateError> {
+    let kept = durable.as_path();
     // A file there whose state cannot be read may hold other bytes: it is never written over.
     if stands(kept).map_err(|e| RefUpdateError::Failed(format!(
         "Whether the file \"{}\" the ref of pallet \"{}\" was to be kept in already exists could not be read: {}",
@@ -1949,7 +1975,7 @@ fn keep_removed(kept: &Path, bytes: &[u8], name: &str) -> Result<(), RefUpdateEr
         ))?;
     }
 
-    file_utils::write_file_atomically(kept, bytes)?;
+    file_utils::write_file_atomically(durable, bytes)?;
     Ok(())
 }
 
@@ -2490,6 +2516,12 @@ fn write_head_locked(
 ) -> Result<(), RefUpdateError> {
     debug_assert!(!compensating || namespace == PalletNamespace::User, "only a user ref is written as a compensating write");
     validate_head_write(name, new)?;
+    if namespace == PalletNamespace::Meta {
+        // A name read from elsewhere, such as an undo entry, may be no meta pallet's, and only a
+        // meta pallet has a ref and a copy here. After the head's own check, as the message cuts
+        // the head at a byte offset.
+        refuse_unknown_meta_pallet(name, &format!("set pallet \"@{}\" to {}", name, &new[..new.len().min(12)]))?;
+    }
 
     if !redaction.is_for(namespace, name, expected, new) || !redaction.holds(lock)? {
         return Err(RefUpdateError::Failed(format!(
@@ -2509,7 +2541,7 @@ fn write_head_locked(
         crate::util::fetch_ledger::record_fetch(lock, old, name)?;
     }
 
-    let path = get_pallet_ref_path(namespace, name);
+    let path = ref_durable_path(namespace, name);
     let bytes = format!("{}\n", new).into_bytes();
     let landed = || get_pallet_head_in(namespace, name).ok().flatten().as_deref() == Some(new);
 
@@ -2519,7 +2551,7 @@ fn write_head_locked(
             true => write_ref_file_with(&path, name, &bytes, file_utils::write_file_compensating),
         },
         PalletNamespace::Meta => {
-            let copy = get_meta_copy_path(name);
+            let copy = DurablePath::meta_copy(name);
 
             match (order, found.is_some()) {
                 (WriteOrder::Backward, _) => write_ref_file(&path, name, &bytes)
@@ -2533,7 +2565,7 @@ fn write_head_locked(
                     }
                 }
                 (WriteOrder::Forward, true) => {
-                    let prior = read_file_state(&copy)?;
+                    let prior = read_file_state(copy.as_path())?;
                     // A copy already at the new bytes is not written again (`write_copy_file`),
                     // and `restore_copy` finds it at its prior state.
                     match write_copy_file(&copy, &bytes) {
@@ -2566,15 +2598,16 @@ fn write_head_locked(
 
 /// Write the ref file at `path` of pallet `name`, creating its folder. A folder standing where
 /// the ref file must go is refused before anything is written.
-fn write_ref_file(path: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+fn write_ref_file(path: &DurablePath, name: &str, bytes: &[u8]) -> Result<(), String> {
     write_ref_file_with(path, name, bytes, file_utils::write_file_atomically)
 }
 
 /// [`write_ref_file`], writing the bytes with `write`.
-fn write_ref_file_with(path: &Path,
+fn write_ref_file_with(durable: &DurablePath,
                        name: &str,
                        bytes: &[u8],
-                       write: fn(&Path, &[u8]) -> Result<(), String>) -> Result<(), String> {
+                       write: fn(&DurablePath, &[u8]) -> Result<(), String>) -> Result<(), String> {
+    let path = durable.as_path();
     // A folder where the ref file must go (left by a nested name whose emptied folders could not
     // be removed) reads as an unborn pallet; writing over it is refused by name, never attempted.
     if path.is_dir() {
@@ -2589,11 +2622,12 @@ fn write_ref_file_with(path: &Path,
         file_utils::create_folder_if_not_exists(parent)?;
     }
 
-    write(path, bytes)
+    write(durable, bytes)
 }
 
-/// Write a meta ref's copy at `path` with `bytes`, unless it already holds exactly them.
-fn write_copy_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Write a meta ref's copy at `durable` with `bytes`, unless it already holds exactly them.
+fn write_copy_file(durable: &DurablePath, bytes: &[u8]) -> Result<(), String> {
+    let path = durable.as_path();
     if read_file_state(path).ok() == Some(MetaCopyState::Bytes(bytes.to_vec())) {
         return Ok(());
     }
@@ -2602,22 +2636,23 @@ fn write_copy_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file_utils::create_folder_if_not_exists(parent)?;
     }
 
-    file_utils::write_file_atomically(path, bytes)
+    file_utils::write_file_atomically(durable, bytes)
 }
 
-/// Put a meta ref's copy at `path` back to `prior`, after the write `error` left the ref at its
+/// Put a meta ref's copy at `durable` back to `prior`, after the write `error` left the ref at its
 /// own prior head, and return the error to report. The restore is read back, since a write can
 /// land and still return an error; one that did not land leaves the copy at the new head, which
 /// passed every check of the write, and says so. A compensating write
 /// ([`file_utils::write_file_compensating`]): a taint the failed write left standing does not stop
 /// it, and a failed folder sync records one.
-fn restore_copy(path: &Path, prior: &MetaCopyState, error: String) -> String {
+fn restore_copy(durable: &DurablePath, prior: &MetaCopyState, error: String) -> String {
+    let path = durable.as_path();
     let restored = match read_file_state(path) {
         Ok(state) if state == *prior => return error,
         _ => match prior {
-            MetaCopyState::Bytes(bytes) => file_utils::write_file_compensating(path, bytes),
+            MetaCopyState::Bytes(bytes) => file_utils::write_file_compensating(durable, bytes),
             MetaCopyState::Absent => match file_utils::remove_file(path) {
-                Ok(()) => path.parent().map_or(Ok(()), |parent| file_utils::sync_dir_again_or_taint(parent, &[path])),
+                Ok(()) => path.parent().map_or(Ok(()), |parent| file_utils::sync_dir_again_or_taint(parent, &[durable])),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e.to_string()),
             },
@@ -2668,6 +2703,8 @@ pub enum CopyMend {
 ///                                       the copy back to tell.
 pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState) -> Result<CopyMend, CopyMendError> {
     validate_pallet_name(name).map_err(CopyMendError::Refused)?;
+    refuse_unknown_meta_pallet(name, &format!("mend the copy of pallet \"@{}\"", name))
+        .map_err(CopyMendError::Refused)?;
 
     let reference = PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() };
     let Some(head) = parse_ref_bytes(judged_ref) else {
@@ -2700,13 +2737,13 @@ pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState
         }));
     }
 
-    let copy = get_meta_copy_path(name);
+    let copy = DurablePath::meta_copy(name);
 
-    if read_file_state(&copy).map_err(CopyMendError::Refused)? != *judged_copy {
+    if read_file_state(copy.as_path()).map_err(CopyMendError::Refused)? != *judged_copy {
         return Err(CopyMendError::Refused(format!(
             "Refusing to mend the copy of pallet \"{}\" (\"{}\"): it changed since it was judged. \
             Nothing was written. Run the command again.",
-            reference.to_wire(), copy.to_string_lossy()
+            reference.to_wire(), copy.as_path().to_string_lossy()
         )));
     }
 
@@ -2885,8 +2922,7 @@ pub fn remove_pallet_head_in(
         None => None,
     };
 
-    let path = get_pallet_ref_path(namespace, name);
-    let unlinked = unlink_ref(namespace, &path);
+    let unlinked = unlink_ref(namespace, &ref_durable_path(namespace, name));
 
     match get_pallet_head_in(namespace, name) {
         Ok(None) => {
@@ -2918,10 +2954,11 @@ pub fn remove_pallet_head_in(
     }
 }
 
-/// Unlink the ref file at `path` and every folder of a nested name it leaves empty, up to the
+/// Unlink the ref file at `durable` and every folder of a nested name it leaves empty, up to the
 /// namespace folder, syncing each removal's parent through the durability taint. Folder removal
 /// stops at the first that does not go (it holds another ref, or anything else).
-fn unlink_ref(namespace: PalletNamespace, path: &Path) -> Result<(), String> {
+fn unlink_ref(namespace: PalletNamespace, durable: &DurablePath) -> Result<(), String> {
+    let path = durable.as_path();
     file_utils::remove_file(path).map_err(|e| format!(
         "Error while removing the ref file \"{}\": {}", path.to_string_lossy(), e
     ))?;
@@ -2930,7 +2967,7 @@ fn unlink_ref(namespace: PalletNamespace, path: &Path) -> Result<(), String> {
     let mut removed: &Path = path;
 
     while let Some(parent) = removed.parent() {
-        file_utils::sync_dir_or_taint(parent, &[path])?;
+        file_utils::sync_dir_or_taint(parent, &[durable])?;
 
         if parent == top || !parent.starts_with(&top) || file_utils::remove_dir(parent).is_err() {
             break;
@@ -3675,6 +3712,65 @@ pub(crate) mod tests {
                 assert!(!message.contains("could not be put back"), "{}: {}", case, message);
                 assert_eq!(taint_utils::read_taints(&forklift_root()).unwrap().standing(), standing, "{}", case);
             }
+        }
+
+        /// A meta pallet this forklift does not know, such as one an undo entry from a newer
+        /// forklift names, is refused before its ref or copy is written, in every build: a put-back
+        /// and a mend each return an error naming it, and leave the ref and the copy as they were.
+        /// Revert: drop either refusal → that call writes a stray (release) or panics (debug), red.
+        #[test]
+        fn a_meta_pallet_this_forklift_does_not_know_is_refused_before_any_write() {
+            let (_root, _scope) = scratch("meta-unknown-name");
+            let (h1, h2) = (stub_parcel("h1"), stub_parcel("h2"));
+            let reference = get_pallet_ref_path(PalletNamespace::Meta, "newpallet");
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            std::fs::write(&reference, ref_bytes_of(&h2)).unwrap();
+
+            let put_back = put_back_pallet_head_in(PalletNamespace::Meta, "newpallet", &h2, &h1);
+            let mend = mend_meta_copy("newpallet", &ref_bytes_of(&h2), &MetaCopyState::Absent);
+
+            let Err(RefUpdateError::Failed(message)) = put_back else { panic!("{:?}", put_back) };
+            assert!(message.starts_with("Refusing to set pallet \"@newpallet\" to ") && message.ends_with(
+                "@newpallet is not a meta pallet this forklift knows. It may have been written by a newer \
+                forklift; upgrade to change it. Nothing was written."), "{}", message);
+            let Err(CopyMendError::Refused(message)) = mend else { panic!("{:?}", mend) };
+            assert_eq!(message, "Refusing to mend the copy of pallet \"@newpallet\": @newpallet is not a meta \
+                pallet this forklift knows. It may have been written by a newer forklift; upgrade to change it. \
+                Nothing was written.");
+            assert_eq!(std::fs::read(&reference).unwrap(), ref_bytes_of(&h2), "the ref is as it was");
+            assert!(std::fs::symlink_metadata(get_meta_copy_path("newpallet")).is_err(), "no copy is written");
+        }
+
+        fn ref_bytes_of(head: &str) -> Vec<u8> {
+            format!("{}\n", head).into_bytes()
+        }
+
+        /// A copy put back to its absence, whose folder sync fails, records the copy's own path in
+        /// the taint and nothing else. The copy write before it lands with an error whose taint is
+        /// cleared, and its own folder sync passes, so the put-back's sync is the only record.
+        /// Revert: record another final path for the put-back's sync, or none → red.
+        /// Unix only: a folder sync is a no-op elsewhere, so none can fail.
+        #[cfg(unix)]
+        #[test]
+        fn a_copy_put_back_to_its_absence_whose_folder_sync_fails_taints_the_copy() {
+            let (_root, _scope) = scratch("meta-copy-restore-sync");
+            let (h0, h1) = (stub_parcel("h0"), stub_parcel("h1"));
+            write("tags", None, &h0).unwrap();
+            file_utils::remove_file(get_meta_copy_path("tags")).unwrap();
+            let before = copy_state("tags");
+            let _landed = land_next_write_with_an_error();
+
+            let written = {
+                let copies = get_meta_copy_path("tags").parent().unwrap().to_path_buf();
+                let _fault = file_utils::SyncDirFaultGuard::failing_exactly_after(&copies, 1);
+                write("tags", Some(&h0), &h1)
+            };
+
+            assert!(written.is_err(), "{:?}", written);
+            assert_eq!(head("tags").as_deref(), Some(h0.as_str()), "the ref is never written");
+            assert_eq!(copy_state("tags"), before, "the copy is back to its absence");
+            assert_eq!(taint_utils::read_taints(&forklift_root()).unwrap().recorded,
+                [PathBuf::from("meta-copy/tags")].into_iter().collect(), "the copy alone is recorded");
         }
 
         /// A copy already holding the new bytes is not written again.
@@ -4707,6 +4803,10 @@ pub(crate) mod tests {
         use crate::enums::dir_entry_type::DirEntryType;
         use crate::util::redaction_utils::{record_redaction, Redaction};
 
+        /// The meta pallet these tests write. Only a meta pallet's name has a meta ref
+        /// constructor; a debug build refuses any other.
+        const META: &str = crate::util::kv_utils::KV_PALLET_NAME;
+
         /// Record an unsigned redaction of `hash`.
         fn redact(hash: &str) {
             let redaction = Redaction {
@@ -4947,7 +5047,7 @@ pub(crate) mod tests {
             let (_root, _scope) = scratch("redacted-unread");
             let held = blob("held");
             let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
-            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, None, &base, &RefPreconditions::NONE).unwrap();
             redact(&blob("unrelated"));
 
             let path = get_pallet_ref_path(PalletNamespace::Meta, crate::util::redaction_utils::REDACTIONS_PALLET_NAME);
@@ -4956,7 +5056,7 @@ pub(crate) mod tests {
             BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || std::fs::write(&path, &bytes).unwrap())));
 
             let next = parcel(&tree(&[("more", &blob("more"), DirEntryType::Normal)]), &[&base]);
-            let written = update_meta_pallet_head("notes", Some(&base), &next, &RefPreconditions::NONE);
+            let written = update_meta_pallet_head(META, Some(&base), &next, &RefPreconditions::NONE);
             match &written {
                 Err(RefUpdateError::Failed(why)) => {
                     assert!(why.contains("pallet \"@redactions\""), "{}", why);
@@ -4965,7 +5065,7 @@ pub(crate) mod tests {
                 }
                 other => panic!("expected the @redactions read's failure, got {:?}", other),
             }
-            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
+            assert_eq!(get_meta_pallet_head(META).unwrap().as_deref(), Some(base.as_str()), "nothing was written");
         }
 
         // Revert: report the refusal's own message → it says "Nothing was written" after a
@@ -5026,14 +5126,14 @@ pub(crate) mod tests {
             let (_root, _scope) = scratch("redacted-meta");
             let held = blob("held");
             let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
-            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, None, &base, &RefPreconditions::NONE).unwrap();
             redact(&held);
 
             let inherits = parcel(&tree(&[
                 ("held", &held, DirEntryType::Normal),
                 ("more", &blob("more"), DirEntryType::Normal),
             ]), &[&base]);
-            update_meta_pallet_head("notes", Some(&base), &inherits, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, Some(&base), &inherits, &RefPreconditions::NONE).unwrap();
 
             let later = blob("later");
             redact(&later);
@@ -5042,9 +5142,9 @@ pub(crate) mod tests {
                 ("later", &later, DirEntryType::Normal),
             ]), &[&inherits]);
             assert_redacted(
-                update_meta_pallet_head("notes", Some(&inherits), &adds, &RefPreconditions::NONE), "later", &later
+                update_meta_pallet_head(META, Some(&inherits), &adds, &RefPreconditions::NONE), "later", &later
             );
-            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(inherits.as_str()));
+            assert_eq!(get_meta_pallet_head(META).unwrap().as_deref(), Some(inherits.as_str()));
         }
 
         // Revert: drop `served` from the walk's reached set → the served chain adding the redacted
@@ -5054,12 +5154,12 @@ pub(crate) mod tests {
             let (_root, _scope) = scratch("redacted-served");
             let held = blob("held");
             let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
-            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, None, &base, &RefPreconditions::NONE).unwrap();
             let local = parcel(&tree(&[
                 ("held", &held, DirEntryType::Normal),
                 ("mine", &blob("mine"), DirEntryType::Normal),
             ]), &[&base]);
-            update_meta_pallet_head("notes", Some(&base), &local, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, Some(&base), &local, &RefPreconditions::NONE).unwrap();
 
             let secret = blob("secret");
             redact(&secret);
@@ -5083,13 +5183,13 @@ pub(crate) mod tests {
             };
             let refused = replay(&[("later", &later, DirEntryType::Normal)]);
             assert_redacted(
-                update_meta_pallet_head_served("notes", Some(&local), &refused, &remote, &RefPreconditions::NONE), "later", &later
+                update_meta_pallet_head_served(META, Some(&local), &refused, &remote, &RefPreconditions::NONE), "later", &later
             );
-            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(local.as_str()));
+            assert_eq!(get_meta_pallet_head(META).unwrap().as_deref(), Some(local.as_str()));
 
             let taken = replay(&[]);
-            update_meta_pallet_head_served("notes", Some(&local), &taken, &remote, &RefPreconditions::NONE).unwrap();
-            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(taken.as_str()));
+            update_meta_pallet_head_served(META, Some(&local), &taken, &remote, &RefPreconditions::NONE).unwrap();
+            assert_eq!(get_meta_pallet_head(META).unwrap().as_deref(), Some(taken.as_str()));
         }
 
         /// A remote's `@redactions` head holding a redaction of `pending`, then one recorded only here
@@ -6415,6 +6515,31 @@ pub(crate) mod tests {
         assert!(!pallets.join("team").exists());
         assert!(pallets.is_dir(), "the pallets folder itself is never removed");
         assert!(all_pallet_refs().unwrap().is_empty());
+
+        let _ = file_utils::remove_dir_all(&root);
+    }
+
+    /// A removal whose folder sync fails records the removed ref's own path in the taint and
+    /// nothing else.
+    /// Revert: record another final path for the removal's sync → red.
+    /// Unix only: a folder sync is a no-op elsewhere, so none can fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_whose_folder_sync_fails_taints_the_removed_ref() {
+        let (root, _scope) = scratch("remove-sync-taint");
+        update_pallet_head("gone", None, &hash('a'), &RefPreconditions::NONE).unwrap();
+        let _serial = crate::util::taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::util::taint_utils::activate();
+
+        let removed = {
+            let _fault = file_utils::SyncDirFaultGuard::failing_exactly(&get_namespace_folder(PalletNamespace::User));
+            remove_pallet_head_in(PalletNamespace::User, "gone", &hash('a'), &RefPreconditions::NONE, Some(&deleting("gone", &hash('a'))))
+        };
+
+        assert!(removed.is_err(), "{:?}", removed);
+        assert_eq!(get_pallet_head("gone").unwrap(), None, "the ref is unlinked before the sync");
+        assert_eq!(crate::util::taint_utils::read_taints(&forklift_root()).unwrap().recorded,
+            [PathBuf::from("pallets/gone")].into_iter().collect(), "the removed ref alone is recorded");
 
         let _ = file_utils::remove_dir_all(&root);
     }

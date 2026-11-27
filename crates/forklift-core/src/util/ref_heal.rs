@@ -52,6 +52,7 @@ use crate::globals::forklift_root;
 use crate::util::operation_utils::OperationKind;
 use crate::util::pallet_utils::{self, PalletNamespace, RefDamage, RefUpdateError};
 use crate::util::{bay_utils, file_utils, heal_utils, journal_utils, merge_utils, object_utils, operation_utils, taint_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// The shortest hex prefix a damaged ref's bytes are salvaged from.
 const MIN_SALVAGE_PREFIX: usize = 8;
@@ -1032,19 +1033,19 @@ fn mended(error: &RefUpdateError, namespace: PalletNamespace, name: &str) -> Res
 /// * `Err(why)` - If a sync failed and no taint records it either: which file is not durable, and
 ///   the error.
 fn sync_again(namespace: PalletNamespace, name: &str) -> Result<Option<String>, String> {
-    let mut written = vec![("ref", pallet_utils::get_pallet_ref_path(namespace, name))];
+    let mut written = vec![("ref", pallet_utils::ref_durable_path(namespace, name))];
     if namespace == PalletNamespace::Meta {
-        written.push(("copy", pallet_utils::get_meta_copy_path(name)));
+        written.push(("copy", DurablePath::meta_copy(name)));
     }
     sync_files_again(&written)
 }
 
 /// [`sync_again`] for the folder of each of `written`, each named by the word its error says.
-fn sync_files_again(written: &[(&str, std::path::PathBuf)]) -> Result<Option<String>, String> {
+fn sync_files_again(written: &[(&str, DurablePath)]) -> Result<Option<String>, String> {
     let mut tainted = None;
     // A copy the write did not get as far as leaves nothing to sync.
-    for (file, path) in written.iter().filter(|(_, path)| path.symlink_metadata().is_ok()) {
-        let Some(folder) = path.parent() else { continue };
+    for (file, path) in written.iter().filter(|(_, path)| path.as_path().symlink_metadata().is_ok()) {
+        let Some(folder) = path.as_path().parent() else { continue };
         // Not sync_dir_or_taint: wherever no exemption is armed, its standing-taint re-check
         // would file a sync that held as failed. Heal arms one for its run today, so this keeps
         // the re-sync right without depending on that exemption's scope.
@@ -1385,7 +1386,7 @@ pub struct Removed {
 }
 
 /// The folder unreadable refs that `--remove-ref` removed are kept in.
-const FOLDER_NAME_REMOVED_REFS: &str = "removed-refs";
+pub(crate) const FOLDER_NAME_REMOVED_REFS: &str = "removed-refs";
 
 /// `forklift heal --remove-ref <pallet>`: remove damaged `pallet`'s unreadable ref, keeping its
 /// bytes in a file of their own. Allowed only when no checkout stands on the pallet, nothing names
@@ -1402,17 +1403,16 @@ pub fn remove_damaged_ref(pallet: &str, notes: &mut Vec<String>) -> Result<Remov
 
     pallet_utils::remove_damaged_ref(pallet, bytes, &kept).map_err(|error| error.to_string())?;
 
-    Ok(Removed { pallet: pallet.to_string(), kept: kept.to_string_lossy().into_owned() })
+    Ok(Removed { pallet: pallet.to_string(), kept: kept.as_path().to_string_lossy().into_owned() })
 }
 
 /// The first free path under the removed-refs folder for bytes removed from `pallet`'s ref:
 /// [`kept_name`]'s slots in order.
-fn kept_path(pallet: &str) -> std::path::PathBuf {
-    let folder = forklift_root().join(FOLDER_NAME_REMOVED_REFS);
-    (0..).map(|n| folder.join(kept_name(pallet, n)))
+fn kept_path(pallet: &str) -> DurablePath {
+    (0..).map(|n| DurablePath::keepsake(&kept_name(pallet, n)))
         // A slot whose state cannot be read is taken as free, and keeping the bytes there then
         // refuses it ([`pallet_utils`]'s keep reads it back), so it is never written over.
-        .find(|path| std::fs::symlink_metadata(path).is_err())
+        .find(|path| std::fs::symlink_metadata(path.as_path()).is_err())
         .expect("an unbounded range always yields a free name")
 }
 
@@ -2168,7 +2168,7 @@ fn copy_write_failed(state: &MetaState, head: &str, pass: Pass, error: &pallet_u
     };
     let again = match read {
         ReadBack::Landed | ReadBack::Unread(_) if unrecorded => {
-            sync_files_again(&[("copy", pallet_utils::get_meta_copy_path(&state.name))])
+            sync_files_again(&[("copy", DurablePath::meta_copy(&state.name))])
         }
         _ => Ok(None),
     };
@@ -3369,10 +3369,10 @@ mod tests {
                     std::fs::set_permissions(&standing, std::fs::Permissions::from_mode(0o000)).unwrap();
                 }
             }
-            let path = pallet_utils::get_pallet_ref_path(PalletNamespace::User, "main");
-            let folder = path.parent().unwrap().to_path_buf();
+            let path = DurablePath::pallet_ref("main");
+            let folder = path.as_path().parent().unwrap().to_path_buf();
             std::fs::create_dir_all(&folder).unwrap();
-            std::fs::write(&path, format!("{}\n", head)).unwrap();
+            std::fs::write(path.as_path(), format!("{}\n", head)).unwrap();
             let taints = || std::fs::read_dir(&taint_dir).unwrap().count();
 
             // The fixture's taint stands: a sync the re-check guards is refused.
@@ -4111,8 +4111,7 @@ mod tests {
                     let resettled = crate::util::office_utils::encode_trust_anchor(&crate::util::office_utils::TrustAnchor {
                         enabled_at: fixture.anchor.enabled_at + 1, ..fixture.anchor.clone()
                     });
-                    let copy = crate::globals::forklift_root().join(crate::util::office_utils::FILE_NAME_TRUST_COPY);
-                    crate::util::file_utils::write_file_atomically(&copy, resettled.as_bytes()).unwrap();
+                    crate::util::file_utils::write_file_atomically(&DurablePath::trust_copy(), resettled.as_bytes()).unwrap();
                     (PalletNamespace::Meta, OFFICE_PALLET_NAME, head)
                 }
                 (Row::Redactions, _) => {

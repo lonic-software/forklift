@@ -296,12 +296,16 @@ const fn shape(description: &'static str, disposition: Option<VanishedDispositio
 
 // Each shape is a named static so that [`WriterShape::entry`] can name the one its writer
 // produces; [`TAINT_SHAPES`] lists them in match order.
-static PALLET_REF: TaintShape = shape("a pallet ref", Some(Disposition::Ref), &[Is("pallets"), Names]);
-static KEEPSAKE: TaintShape = shape("a removed ref's keepsake", Some(Disposition::Keepsake), &[Is("removed-refs"), Names]);
-static META_REF: TaintShape = shape("a meta pallet ref", Some(Disposition::MetaRef), &[Is("meta"), MetaPalletName]);
-static META_FOLDER_STRAY: TaintShape = shape("a ref in the meta folder that is no meta pallet's", None, &[Is("meta"), Name]);
-static META_COPY: TaintShape = shape("a meta pallet ref's copy", Some(Disposition::MetaCopy), &[Is("meta-copy"), MetaPalletName]);
-static META_COPY_STRAY: TaintShape = shape("a copy of a ref that is no meta pallet's", None, &[Is("meta-copy"), Name]);
+static PALLET_REF: TaintShape = shape("a pallet ref", Some(Disposition::Ref), &[Is(crate::util::pallet_utils::FOLDER_NAME_PALLETS_ROOT), Names]);
+static KEEPSAKE: TaintShape = shape("a removed ref's keepsake", Some(Disposition::Keepsake),
+    &[Is(crate::util::ref_heal::FOLDER_NAME_REMOVED_REFS), Names]);
+static META_REF: TaintShape = shape("a meta pallet ref", Some(Disposition::MetaRef), &[Is(crate::util::pallet_utils::FOLDER_NAME_META_ROOT), MetaPalletName]);
+static META_FOLDER_STRAY: TaintShape = shape("a ref in the meta folder that is no meta pallet's", None,
+    &[Is(crate::util::pallet_utils::FOLDER_NAME_META_ROOT), Name]);
+static META_COPY: TaintShape = shape("a meta pallet ref's copy", Some(Disposition::MetaCopy),
+    &[Is(crate::util::pallet_utils::FOLDER_NAME_META_COPY_ROOT), MetaPalletName]);
+static META_COPY_STRAY: TaintShape = shape("a copy of a ref that is no meta pallet's", None,
+    &[Is(crate::util::pallet_utils::FOLDER_NAME_META_COPY_ROOT), Name]);
 
 static LOOSE_OBJECT: TaintShape = shape("a loose object", Some(Disposition::Loose),
     &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT), FanOut, Hex]);
@@ -623,21 +627,23 @@ impl DurablePath {
         DurablePath(path)
     }
 
+    /// User pallet `name`'s ref, each `/`-separated part of the name a folder, as
+    /// [`get_pallet_ref_path`](crate::util::pallet_utils::get_pallet_ref_path) spells it.
     pub fn pallet_ref(name: &str) -> DurablePath {
-        Self::declared(WriterShape::PalletRef, Path::new(crate::util::pallet_utils::FOLDER_NAME_PALLETS_ROOT).join(name))
+        Self::declared(WriterShape::PalletRef, name_under(crate::util::pallet_utils::FOLDER_NAME_PALLETS_ROOT, name))
     }
 
     /// The keepsake of a removed ref, by its slot's file name in the removed-refs folder.
     pub fn keepsake(file_name: &str) -> DurablePath {
-        Self::declared(WriterShape::Keepsake, Path::new("removed-refs").join(file_name))
+        Self::declared(WriterShape::Keepsake, Path::new(crate::util::ref_heal::FOLDER_NAME_REMOVED_REFS).join(file_name))
     }
 
     pub fn meta_ref(name: &str) -> DurablePath {
-        Self::declared(WriterShape::MetaRef, Path::new(crate::util::pallet_utils::FOLDER_NAME_META_ROOT).join(name))
+        Self::declared(WriterShape::MetaRef, name_under(crate::util::pallet_utils::FOLDER_NAME_META_ROOT, name))
     }
 
     pub fn meta_copy(name: &str) -> DurablePath {
-        Self::declared(WriterShape::MetaCopy, Path::new(crate::util::pallet_utils::FOLDER_NAME_META_COPY_ROOT).join(name))
+        Self::declared(WriterShape::MetaCopy, name_under(crate::util::pallet_utils::FOLDER_NAME_META_COPY_ROOT, name))
     }
 
     /// A loose object, by its full hash, at its fan-out folder. `Err` for a hash too short to
@@ -802,6 +808,16 @@ fn split_object_hash(hash: &str) -> Result<(&str, &str), String> {
     }
 
     Ok(hash.split_at(file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS))
+}
+
+/// Pallet `name` in `folder`, root-relative, each `/`-separated part of the name its own
+/// component.
+fn name_under(folder: &str, name: &str) -> PathBuf {
+    let mut path = PathBuf::from(folder);
+    for part in name.split('/') {
+        path.push(part);
+    }
+    path
 }
 
 /// `<id>.<extension>` in the pack folder, root-relative.
@@ -1624,7 +1640,9 @@ mod tests {
         for &(shape, relative, description) in rows {
             let expected = relative.split('/').fold(forklift.clone(), |path, name| path.join(name));
             let built = writer_shape_example(shape);
-            assert_eq!(built.as_path(), expected, "{:?}", shape);
+            // The spelling, not only the components: a name's `/` is a separator of its own, as
+            // the readers' path builders push it, never one joined inside a component.
+            assert_eq!(built.as_path().as_os_str(), expected.as_os_str(), "{:?}", shape);
             let found = taint_shape(Path::new(relative)).map(|found| found.description);
             assert_eq!((found, shape.entry().description), (Some(description), description), "{:?}", shape);
             assert!(named.insert(description), "{:?} names an entry another row names", shape);

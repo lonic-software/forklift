@@ -5625,15 +5625,17 @@ mod tests {
         let mut meta = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         meta.add_child(TreeItem::new("cell".to_string(), cell.clone(), DirEntryType::Normal));
         meta.add_child(TreeItem::new("shared".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
-        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &meta);
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, crate::util::kv_utils::KV_PALLET_NAME, &meta);
         root.add_child(TreeItem::new("shared".to_string(), shared_object.hash.clone(), DirEntryType::Tree));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
         // One parcel both a meta head and a user head name: same tree, same description.
         let parcel_leaf = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"an absent leaf of a shared parcel"));
         let mut one = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         one.add_child(TreeItem::new("d.txt".to_string(), parcel_leaf.clone(), DirEntryType::Normal));
-        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "both", &one);
-        plant_head_over_tree(pallet_utils::PalletNamespace::User, "both", &one);
+        // The user pallet shares the meta pallet's name, so their parcels share a description.
+        let shared_name = crate::util::tag_utils::TAGS_PALLET_NAME;
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, shared_name, &one);
+        plant_head_over_tree(pallet_utils::PalletNamespace::User, shared_name, &one);
         file_utils::forget_cached_objects();
 
         let lost = find_lost_objects().unwrap();
@@ -5884,7 +5886,7 @@ mod tests {
         let lost = "5".repeat(64);
 
         let root = metadata_tree_with_a_lost_cell(&lost);
-        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &root);
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, crate::util::kv_utils::KV_PALLET_NAME, &root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
         scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
 
@@ -6072,7 +6074,7 @@ mod tests {
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "side", &metadata_tree_with_a_lost_cell(&out_of_scope));
         let mut plain = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         plain.add_child(TreeItem::new("README".to_string(), under_meta.clone(), DirEntryType::Normal));
-        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &plain);
+        plant_head_over_tree(pallet_utils::PalletNamespace::Meta, crate::util::kv_utils::KV_PALLET_NAME, &plain);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
         scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
 
@@ -7520,7 +7522,7 @@ mod tests {
         let keepsake = forklift.join("removed-refs").join("side");
         {
             let _fault = SyncDirFaultGuard::failing_exactly(&forklift.join("removed-refs"));
-            pallet_utils::remove_damaged_ref("side", &unreadable, &keepsake)
+            pallet_utils::remove_damaged_ref("side", &unreadable, &taint_utils::DurablePath::keepsake("side"))
                 .expect_err("a keepsake whose folder sync fails fails the removal");
         }
         assert_eq!(std::fs::read(&reference).unwrap(), unreadable, "the removal stopped before the ref");

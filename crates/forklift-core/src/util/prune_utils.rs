@@ -1402,9 +1402,9 @@ mod tests {
 
         let other = store_tree(&[("w.txt", &f.web_blob, DirEntryType::Normal)]);
         let plain = store_parcel(&store_tree(&[("other", &other, DirEntryType::Tree)]), Vec::new());
-        pallet_utils::update_meta_pallet_head("notes", None, &plain, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::update_meta_pallet_head(crate::util::kv_utils::KV_PALLET_NAME, None, &plain, &pallet_utils::RefPreconditions::NONE).unwrap();
         let shaped = office_parcel_holding(&f.readme_blob);
-        pallet_utils::update_meta_pallet_head("other", None, &shaped, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::update_meta_pallet_head(crate::util::manifest_utils::MANIFEST_PALLET_NAME, None, &shaped, &pallet_utils::RefPreconditions::NONE).unwrap();
         // A crafted user head naming the meta parcels as parents.
         let user = store_parcel(&f.root_tree, vec![plain, shaped]);
         pallet_utils::update_pallet_head_in(PalletNamespace::User, "side", None, &user, &pallet_utils::RefPreconditions::NONE).unwrap();
@@ -1435,7 +1435,7 @@ mod tests {
             if adopted {
                 sources.pin_parcels.push((meta, office_utils::PinAbsencePolicy::Loss));
             } else {
-                pallet_utils::update_meta_pallet_head("notes", None, &meta, &pallet_utils::RefPreconditions::NONE).unwrap();
+                pallet_utils::update_meta_pallet_head(crate::util::kv_utils::KV_PALLET_NAME, None, &meta, &pallet_utils::RefPreconditions::NONE).unwrap();
             }
 
             let post_prune = PathScope::from_prefixes(["src/api"]);

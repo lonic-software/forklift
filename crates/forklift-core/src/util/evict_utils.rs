@@ -837,7 +837,7 @@ mod tests {
     fn plan_keeps_a_meta_pallets_history_in_full() {
         let _scratch = Scratch::new("meta-ref");
         let (parcel, _) = metadata_parcel("office\n");
-        pallet_utils::update_meta_pallet_head("notes", None, &parcel, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::update_meta_pallet_head(crate::util::kv_utils::KV_PALLET_NAME, None, &parcel, &pallet_utils::RefPreconditions::NONE).unwrap();
         let hold = store_access();
 
         let plan = plan_evict(&[parcel], &HashSet::new(), &hold).unwrap();
