@@ -502,8 +502,9 @@ fn index_rebuild_lines(rebuild: &pack_utils::IndexRebuild) -> Vec<String> {
         None => format!("pack index \"{}\" was rebuilt from its data file", index_path.to_string_lossy()),
     }).collect();
     lines.extend(rebuild.unsynced.iter().map(|(index_path, error)| format!(
-        "pack index \"{}\" is in place, but its folder could not be synced after it: {}",
-        index_path.to_string_lossy(), error
+        "pack index \"{}\" is in place, but its folder could not be synced after it: {}{}",
+        index_path.to_string_lossy(), error,
+        if file_utils::is_taint_unrecorded(error) { "" } else { "; a durability taint records it" }
     )));
     if let Some(reason) = &rebuild.skipped {
         lines.push(format!(
@@ -12364,19 +12365,30 @@ mod tests {
     }
 
     /// Heal says where a rebuilt index's replaced copy was kept, and, for an index put in place
-    /// whose folder could not be synced, that it is in place and the sync's error.
-    /// Revert: drop the unsynced lines → the second line is missing, red.
+    /// whose folder could not be synced, that it is in place, the sync's error, and that a taint
+    /// records it only when the error does not say its record failed.
+    /// Revert: drop the unsynced lines → the last two lines are missing, red; say a taint records
+    /// every one → the unrecorded line claims it, red.
     #[test]
     fn the_rebuild_lines_name_an_unsynced_index_and_where_its_old_copy_is() {
+        let unrecorded = "EIO (additionally, while recording a durability taint for the affected object(s): ENOSPC)";
         let rebuild = pack_utils::IndexRebuild {
-            rebuilt: vec![(PathBuf::from("p/a.idx"), Some(PathBuf::from("p/a.idx.damaged-7")))],
-            unsynced: vec![(PathBuf::from("p/a.idx"), "EIO".to_string())],
+            rebuilt: vec![
+                (PathBuf::from("p/a.idx"), Some(PathBuf::from("p/a.idx.damaged-7"))),
+                (PathBuf::from("p/b.idx"), None),
+            ],
+            unsynced: vec![
+                (PathBuf::from("p/a.idx"), "EIO".to_string()),
+                (PathBuf::from("p/b.idx"), unrecorded.to_string()),
+            ],
             ..pack_utils::IndexRebuild::default()
         };
 
         assert_eq!(index_rebuild_lines(&rebuild), vec![
             "pack index \"p/a.idx\" was rebuilt from its data file; the index it replaced was kept as \"p/a.idx.damaged-7\"".to_string(),
-            "pack index \"p/a.idx\" is in place, but its folder could not be synced after it: EIO".to_string(),
+            "pack index \"p/b.idx\" was rebuilt from its data file".to_string(),
+            "pack index \"p/a.idx\" is in place, but its folder could not be synced after it: EIO; a durability taint records it".to_string(),
+            format!("pack index \"p/b.idx\" is in place, but its folder could not be synced after it: {}", unrecorded),
         ]);
     }
 

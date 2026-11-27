@@ -1056,7 +1056,8 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&DurablePath]) -> Res
 }
 
 /// Sync `dir` again for `final_paths`, which an earlier write reported unsynced and may have
-/// landed, recording a taint when this sync fails too, through the same
+/// landed, or for heal's own first sync after a rename (the pack-index rebuild), recording a
+/// taint when this sync fails, through the same
 /// [`taint_after_sync_failure`] as [`sync_dir_or_taint`]. Unlike it, there is no standing-taint
 /// re-check, so a sync that holds returns `Ok` whatever taint stands, or fails to read: the
 /// re-check refuses whenever a taint stands, so for a sync that held it would say only that a

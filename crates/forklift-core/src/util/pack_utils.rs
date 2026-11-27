@@ -13552,4 +13552,40 @@ pub(crate) mod tests {
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
+
+    /// When the folder sync fails and the taint record fails too, nothing records the index, and
+    /// the error that says so reaches the report as the sync gave it, for heal to print.
+    /// Mutation: report a fixed error in place of the sync's → it no longer says the record
+    /// failed, red.
+    #[test]
+    #[cfg(unix)]
+    fn a_rebuilt_index_whose_sync_and_taint_record_both_fail_says_nothing_records_it() {
+        use crate::util::taint_utils;
+        use crate::util::file_utils::{SyncDirFaultGuard, TaintRecordFaultGuard};
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+        let (temp, _scope) = salvage_root("fork626-rebuild-unrecorded");
+
+        let (bytes, hash) = blob449("rebuilt over a failed sync and a failed taint record");
+        let (_, index) = write_named_pack(&[(hash.clone(), full_record(&bytes))]);
+        file_utils::remove_file(&index).unwrap();
+        invalidate_cache();
+
+        let report = {
+            let _fault = SyncDirFaultGuard::failing_exactly_once(&pack_folder());
+            let _record = TaintRecordFaultGuard::failing_once();
+            rebuild_pack_indexes().unwrap()
+        };
+
+        assert_eq!(report.rebuilt, vec![(index.clone(), None)], "{:?}", report);
+        assert_eq!(report.unsynced.len(), 1, "{:?}", report);
+        let (unsynced, error) = &report.unsynced[0];
+        assert_eq!(unsynced, &index);
+        assert!(error.contains("injected directory-sync failure") && file_utils::is_taint_unrecorded(error), "{}", error);
+        assert!(taint_utils::read_taints(&crate::globals::forklift_root()).unwrap().recorded.is_empty());
+        assert_eq!(salvage_read(&hash), "Verified");
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
 }
