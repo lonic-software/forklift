@@ -13508,8 +13508,9 @@ pub(crate) mod tests {
     /// it aside as damaged. The first of two candidates, in name order, meets the failed sync; the
     /// second is published in the same round, while the first one's taint stands.
     /// Mutation: sync with a plain folder sync → nothing is recorded, red; sync with the
-    /// standing-taint re-check → the second publish is refused, red; also retry the unsynced one
-    /// → its sound index is set aside, red.
+    /// standing-taint re-check → the second, synced index is reported unsynced over the first
+    /// one's taint, red; also retry the unsynced one → it is rebuilt again and its sound index set
+    /// aside, red.
     #[test]
     #[cfg(unix)]
     fn a_rebuilt_index_whose_folder_sync_fails_is_recorded_and_not_rebuilt_again() {
