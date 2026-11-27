@@ -952,6 +952,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **`heal` makes a removed path's absence durable in the folder that held it.** When a recorded
+  path is gone, `heal` syncs the nearest folder above it that still stands, then clears the record.
+  It now finds that folder only by the exact names its parent lists, and counts a link as no
+  folder. Before, on a volume that ignores case, on Windows for a name ending in `.`, or through a
+  link, it could sync a folder of another spelling or the link's target, and clear the record
+  without the real folder synced. A folder whose listing cannot be read now keeps the record.
 - **A pack index `heal` rebuilds is recorded when its folder cannot be synced.** If the pack
   folder's sync fails after the rebuilt index is put in place, a durability taint now records that
   index, so the store is not trusted as durable until `heal` settles it, and `heal` says the index

@@ -11185,7 +11185,7 @@ mod tests {
     /// only under another case (its parent), spelled with a trailing `.` (its parent), and a link
     /// to a folder (its parent).
     ///
-    /// Mutation: `nearest_standing_ancestor` asks `is_dir` of each candidate, deepest first. On
+    /// Mutation: `nearest_standing_ancestor` asks `is_dir` of each name instead of the listing. On
     /// a volume that folds case the `Foo` row answers `pallets/Foo` (opened as `pallets/foo`), on
     /// Windows the `a.` row answers `pallets/a.` (opened as `pallets/a`), and on unix the link row
     /// answers the link, whose sync reaches its target.
