@@ -3642,7 +3642,7 @@ mod tests {
         for (version, newer) in [(2, true), (1, false)] {
             let mut bytes = crate::util::byte_utils::number_to_vlq_bytes(version);
             bytes.push(0xff);
-            crate::util::file_utils::write_file_atomically(&sign_utils::get_signature_path(&signed).unwrap(), &bytes).unwrap();
+            crate::util::file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::loose_signature(&signed).unwrap(), &bytes).unwrap();
             let error = typed(&signed);
             assert_eq!(matches!(error, MetaCheckError::Newer(_)), newer, "{:?}", error);
             assert_eq!(matches!(error, MetaCheckError::Untold(_)), !newer, "{:?}", error);

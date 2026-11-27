@@ -4599,7 +4599,7 @@ pub(crate) mod tests {
             assert!(crate::util::tombstone_utils::mark_served(true).unwrap(), "{}: the root is served", name);
             let head = match sidecar {
                 Some(sidecar) => {
-                    file_utils::write_file_atomically(&sign_utils::get_signature_path(&head).unwrap(), &sidecar).unwrap();
+                    file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::loose_signature(&head).unwrap(), &sidecar).unwrap();
                     head
                 }
                 // The office's head is the same parcel as a newer Forklift would store it.

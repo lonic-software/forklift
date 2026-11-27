@@ -5533,7 +5533,7 @@ pub(crate) mod tests {
         let (root, _scope) = scratch("respelled-prefix");
         let hash = "ab".to_string() + &"cd".repeat(31);
         let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
-        file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
+        file_utils::write_object_to_file(&crate::util::taint_utils::DurablePath::loose_object(&hash).unwrap(), b"bytes".to_vec()).unwrap();
         let listed = Path::new(&folder).join(&file_name);
         file_utils::rename(&listed, listed.with_file_name(file_name.to_ascii_uppercase())).unwrap();
         let folds = listed.exists();
@@ -5561,8 +5561,8 @@ pub(crate) mod tests {
 
         let (root, _scope) = scratch("unlistable-fan-out");
         let hash = "ab".to_string() + &"cd".repeat(31);
-        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
-        file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
+        let (folder, _) = file_utils::get_path_for_object(&hash).unwrap();
+        file_utils::write_object_to_file(&crate::util::taint_utils::DurablePath::loose_object(&hash).unwrap(), b"bytes".to_vec()).unwrap();
         assert_eq!(object_hashes_with_prefix("ab"), Ok(vec![hash.clone()]), "the folder lists while it is readable");
         assert_eq!(object_hashes_with_prefix("ef"), Ok(vec![]), "an absent folder holds nothing");
         std::fs::write(Path::new(&file_utils::get_path_objects_root()).join("12"), b"stray").unwrap();
@@ -5597,8 +5597,8 @@ pub(crate) mod tests {
 
         let (root, _scope) = scratch("unreadable-other-entry");
         let hash = "ab".to_string() + &"cd".repeat(31);
-        let (folder, file_name) = file_utils::get_path_for_object(&hash).unwrap();
-        file_utils::write_object_to_file(Path::new(&folder), &file_name, b"bytes".to_vec()).unwrap();
+        let (folder, _) = file_utils::get_path_for_object(&hash).unwrap();
+        file_utils::write_object_to_file(&crate::util::taint_utils::DurablePath::loose_object(&hash).unwrap(), b"bytes".to_vec()).unwrap();
         std::fs::write(Path::new(&folder).join("EF".repeat(31)), b"other").unwrap();
 
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o444)).unwrap();

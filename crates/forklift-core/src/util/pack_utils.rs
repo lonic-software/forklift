@@ -7706,8 +7706,7 @@ pub(crate) mod tests {
     /// Store a loose object the way the real store does (zstd, fanned out by hash prefix).
     fn store_loose(hash: &str, content: &[u8]) {
         let compressed = zstd::encode_all(content, 0).unwrap();
-        let (folder, file_name) = file_utils::get_path_for_object(hash).unwrap();
-        file_utils::write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        file_utils::write_object_to_file(&crate::util::taint_utils::DurablePath::loose_object(hash).unwrap(), compressed).unwrap();
     }
 
     /// Deterministic, non-trivially-compressible filler bytes (an LCG stream, not real
@@ -8102,7 +8101,7 @@ pub(crate) mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&good_hash).unwrap();
         let corrupt_path = Path::new(&folder).join(&file_name);
         let compressed = zstd::encode_all(wrong_plaintext.as_slice(), 0).unwrap();
-        file_utils::write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        file_utils::write_object_to_file(&crate::util::taint_utils::DurablePath::loose_object(&good_hash).unwrap(), compressed).unwrap();
 
         let genuine_content = b"a genuine sibling object".to_vec();
         let genuine_hash = blake3::hash(&genuine_content).to_hex().to_string();
@@ -8142,7 +8141,7 @@ pub(crate) mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&garbage_hash).unwrap();
         let garbage_path = Path::new(&folder).join(&file_name);
         file_utils::write_object_to_file(
-            Path::new(&folder), &file_name, b"not a zstd frame at all".to_vec()
+            &crate::util::taint_utils::DurablePath::loose_object(&garbage_hash).unwrap(), b"not a zstd frame at all".to_vec()
         ).unwrap();
 
         let genuine_content = b"a second genuine object".to_vec();
@@ -9060,7 +9059,7 @@ pub(crate) mod tests {
         let (folder, file_name) = file_utils::get_path_for_object(&giant_hash_hex).unwrap();
         let giant_loose_path = Path::new(&folder).join(&file_name);
         file_utils::write_object_to_file(
-            Path::new(&folder), &file_name, b"not the giant at all -- honest bitrot".to_vec()
+            &crate::util::taint_utils::DurablePath::loose_object(&giant_hash_hex).unwrap(), b"not the giant at all -- honest bitrot".to_vec()
         ).unwrap();
 
         // Reachable history: a tree referencing the giant blob's hash, a parentless parcel,
@@ -10067,9 +10066,8 @@ pub(crate) mod tests {
         // Corrupt v1's blob loose file in place: a well-formed zstd frame (so it decodes) whose
         // plaintext hashes to a different address (so it fails `verify_object_bytes`) — the
         // hash-mismatch flavor of `PrepSlot::CorruptLoose`, not the decode-failure one.
-        let (folder, file_name) = file_utils::get_path_for_object(&blob_v1_hash).unwrap();
         let wrong_bytes = zstd::encode_all(b"not the bytes that belong at this address".as_slice(), 0).unwrap();
-        file_utils::write_object_to_file(Path::new(&folder), &file_name, wrong_bytes).unwrap();
+        file_utils::write_object_to_file(&crate::util::taint_utils::DurablePath::loose_object(&blob_v1_hash).unwrap(), wrong_bytes).unwrap();
 
         let stats = compact(false, false, false, &Progress::NONE).unwrap();
 

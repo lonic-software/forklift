@@ -13,6 +13,7 @@ use crate::model::recipe::{Recipe, RecipeChunk};
 use crate::model::tree_item::TreeItem;
 use crate::parser;
 use crate::util::{byte_utils, chunk_utils, fanout_utils, file_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// The largest *whole* object any store or bundle will accept on the way in — the write/import
 /// ceiling that closes the max-object-size policy (DESIGN.html §9.4b, §5.0 row D item 7). After
@@ -872,8 +873,7 @@ pub(crate) fn store_copy_in_version(hash: &str, version: u8) -> String {
     assert!(version < 0x80 && bytes[0] == 1, "a single-byte version over the current one");
     bytes[0] = version;
     let newer = hash_object_bytes(&bytes);
-    let (path, file_name) = file_utils::get_path_for_object(&newer).unwrap();
-    file_utils::write_object_to_file(std::path::Path::new(&path), &file_name, zstd::encode_all(&bytes[..], 0).unwrap()).unwrap();
+    file_utils::write_object_to_file(&DurablePath::loose_object(&newer).unwrap(), zstd::encode_all(&bytes[..], 0).unwrap()).unwrap();
     newer
 }
 
@@ -979,9 +979,7 @@ fn store_object_bytes_impl(claimed_hash: &str, bytes: &[u8], check_presence: boo
     let compressed = zstd::encode_all(bytes, 0)
         .map_err(|e| format!("Error while compressing object {}: {}", claimed_hash, e))?;
 
-    let (path, file_name) = file_utils::get_path_for_object(claimed_hash)?;
-
-    file_utils::write_object_to_file(std::path::Path::new(&path), &file_name, compressed)?;
+    file_utils::write_object_to_file(&DurablePath::loose_object(claimed_hash)?, compressed)?;
 
     Ok(true)
 }
@@ -1537,8 +1535,12 @@ impl ObjectFormCheck {
 pub fn store_object_stream(claimed_hash: &str,
                            reader: &mut impl Read,
                            expected_len: u64) -> Result<bool, String> {
-    let (folder, file_name) = file_utils::get_path_for_object(claimed_hash)?;
-    let folder_path = std::path::Path::new(&folder);
+    // One path for the temp, the rename and the directory sync, so all three name one directory.
+    let final_path = DurablePath::loose_object(claimed_hash)?;
+    let (Some(folder_path), Some(file_name)) = (final_path.as_path().parent(), final_path.as_path().file_name()) else {
+        return Err(format!("The object path for {} has no fan-out folder.", claimed_hash));
+    };
+    let file_name = file_name.to_string_lossy();
     file_utils::create_folder_if_not_exists(folder_path)?;
 
     // A temp file in the object's own shard folder, unique per write. `write_file_atomically`
@@ -1606,10 +1608,9 @@ pub fn store_object_stream(claimed_hash: &str,
     // temp-naming scheme, not because its durability contract differs); a sync success is
     // re-checked against any taint already standing for this root before this function may report
     // `Ok(true)` — see `file_utils::sync_dir_or_taint`.
-    let final_path = folder_path.join(&file_name);
-    file_utils::rename(&temp_path, &final_path)
+    file_utils::rename(&temp_path, final_path.as_path())
         .map_err(|e| format!("Error while moving a streamed object into place: {}", e))?;
-    file_utils::sync_dir_or_taint(folder_path, &[final_path.as_path()])?;
+    file_utils::sync_dir_or_taint(folder_path, &[&final_path])?;
 
     Ok(true)
 }

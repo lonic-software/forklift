@@ -3560,7 +3560,7 @@ mod tests {
                 let head = tags("signed");
                 let mut bytes = crate::util::byte_utils::number_to_vlq_bytes(1);
                 bytes.push(0xff);
-                crate::util::file_utils::write_file_atomically(&crate::util::sign_utils::get_signature_path(&head).unwrap(), &bytes).unwrap();
+                crate::util::file_utils::write_file_atomically(&crate::util::taint_utils::DurablePath::loose_signature(&head).unwrap(), &bytes).unwrap();
                 (lost.clone(), Some(head), None)
             })),
             #[cfg(unix)]
