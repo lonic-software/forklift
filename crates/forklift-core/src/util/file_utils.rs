@@ -134,9 +134,10 @@ pub fn get_path_objects_root() -> String {
 ///
 /// # Returns
 /// * The path to the "inventory root" folder.
-pub fn get_path_inventory_root() -> String {
-    // The inventory is bay-local: each bay stages independently.
-    bay_root().to_string_lossy().into_owned().add(PATH_SEPARATOR).add(FOLDER_NAME_INVENTORY_ROOT)
+pub fn get_path_inventory_root() -> PathBuf {
+    // The inventory is bay-local: each bay stages independently. Built as a path, never through a
+    // string, so it is the folder the `DurablePath` constructors write in, whatever the root's name.
+    bay_root().join(FOLDER_NAME_INVENTORY_ROOT)
 }
 
 /// Get the path to the commit-graph root folder (the sharded, self-healing DAG cache, §B).
@@ -3556,7 +3557,15 @@ pub fn retrieve_inventory_or_none_by_key(key: &str) -> Result<(PathBuf, Option<V
 ///                           not be read.
 pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
     let file_path = get_inventory_data_path_for_key(key)?;
+    let present = judge_shard_file(key, &file_path)?;
 
+    Ok((file_path, present))
+}
+
+/// [`judge_shard_address`] for `file_path`, `key`'s shard file however its caller built the path:
+/// whether a shard file is there, once every level of its address has been judged without
+/// following a link.
+pub(crate) fn judge_shard_file(key: &str, file_path: &Path) -> Result<bool, String> {
     let damaged = |entry: &Path, expected: &str| Err(format!(
         "The inventory of folder \"{}\" cannot be used: \"{}\" is not a {} (a link is never followed). {}",
         load_guard_utils::display_path(key), entry.to_string_lossy(), expected, STAGING_DAMAGE_REMEDY
@@ -3564,17 +3573,17 @@ pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
 
     // The folders first: below a non-folder, the shard itself reads as not found on Windows and as
     // not a directory elsewhere, and neither names the damage.
-    if let Some(folder) = non_folder_in_shard_chain(&file_path) {
+    if let Some(folder) = non_folder_in_shard_chain(file_path) {
         if file_path.ancestors().nth(4) == Some(folder) {
             return Err(unresolved_inventory_root(folder));
         }
         return damaged(folder, "folder");
     }
 
-    match std::fs::symlink_metadata(&file_path) {
-        Ok(metadata) if metadata.is_file() => Ok((file_path, true)),
-        Ok(_) => damaged(&file_path, "file"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((file_path, false)),
+    match std::fs::symlink_metadata(file_path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => damaged(file_path, "file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(format!(
             "Error while reading the inventory of folder \"{}\" from file \"{}\": {}",
             load_guard_utils::display_path(key), file_path.to_string_lossy(), e
@@ -3614,7 +3623,7 @@ fn non_folder_in_shard_chain(data_path: &Path) -> Option<&Path> {
 
 /// The path of the inventory metadata file, whether or not it exists.
 pub fn get_inventory_metadata_path() -> PathBuf {
-    PathBuf::from(get_path_inventory_root()).join(FILE_NAME_INVENTORY_METADATA)
+    get_path_inventory_root().join(FILE_NAME_INVENTORY_METADATA)
 }
 
 /// Retrieve the contents of the inventory metadata file (i.e. the paths of existing inventory
@@ -3654,7 +3663,7 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
             ),
         ).into()),
         Err(e) => {
-            let inventory_root = PathBuf::from(get_path_inventory_root());
+            let inventory_root = get_path_inventory_root();
             if std::fs::symlink_metadata(&inventory_root).is_ok() && !std::fs::metadata(&inventory_root).is_ok_and(|meta| meta.is_dir()) {
                 return Err(unresolved_inventory_root(&inventory_root));
             }
@@ -3835,7 +3844,7 @@ pub(crate) fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String>
 /// * `Ok(PathBuf)` - The path of the store root.
 /// * `Err(String)` - If the inventory metadata is in another format version.
 pub fn get_inventory_store_root() -> Result<PathBuf, String> {
-    let inventory_root = PathBuf::from(get_path_inventory_root());
+    let inventory_root = get_path_inventory_root();
 
     gate_inventory_layout(&inventory_root)?;
 

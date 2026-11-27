@@ -2520,7 +2520,7 @@ impl ShardLedger {
 
         remove_store_entry(&store_root).map_err(|e| format!("Error while clearing the staging area: {}", e))?;
 
-        let inventory_root = std::path::PathBuf::from(file_utils::get_path_inventory_root());
+        let inventory_root = file_utils::get_path_inventory_root();
         file_utils::create_folder_if_not_exists(&inventory_root)?;
         file_utils::sync_folders_before_flushed_write(&BTreeSet::from([inventory_root]))?;
 
@@ -2590,7 +2590,7 @@ impl ShardLedger {
 ///                   or synced.
 fn clear_new_addresses(new_entries: &BTreeSet<String>) -> Result<(), String> {
     let store_root = file_utils::get_inventory_store_root()?;
-    let inventory_root = std::path::PathBuf::from(file_utils::get_path_inventory_root());
+    let inventory_root = file_utils::get_path_inventory_root();
 
     file_utils::create_folder_if_not_exists(&inventory_root)?;
 
@@ -3061,7 +3061,7 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
     // the two leaves it registered with no shard, which stages nothing.
     let marker_path = load_guard_utils::marker_path();
     let marker_bytes = load_guard_utils::pending_start_marker(path.as_key());
-    let extra = marker_bytes.as_deref().map(|bytes| (marker_path.as_path(), bytes));
+    let extra = marker_bytes.as_deref().map(|bytes| (&marker_path, bytes));
 
     publish_shards(&mut ledger, ShardPublish {
         register: BTreeSet::from([parent.as_key().to_string()]),
@@ -3451,8 +3451,8 @@ mod tests {
     /// Write a shard straight to `key`'s address, registered or not: a fixture placing one, never
     /// a writer (every writer goes through a `ShardLedger`).
     fn plant_shard(inventory: &Inventory, key: &str) {
-        let path = file_utils::get_inventory_data_path_for_key(key).unwrap();
-        file_utils::create_folder_if_not_exists(path.parent().unwrap()).unwrap();
+        let path = crate::util::taint_utils::DurablePath::shard(&crate::util::taint_utils::Checkout::active(), key).unwrap();
+        file_utils::create_folder_if_not_exists(path.as_path().parent().unwrap()).unwrap();
         file_utils::write_file_atomically(&path, &InventoryBuilder::build(inventory)).unwrap();
     }
 
@@ -3539,6 +3539,26 @@ mod tests {
         let removed = removed.iter().map(|key| key.to_string()).collect();
 
         publish_shards(&mut ShardLedger::read().unwrap(), ShardPublish { removed, ..ShardPublish::of(writes) })
+    }
+
+    /// The shard and the load marker are read where they are written, under a root whose name is
+    /// not UTF-8 too: the readers' inventory root is built as a path, never through a lossy
+    /// string. Only paths are built, so the root need not exist (APFS will not create one).
+    #[cfg(unix)]
+    #[test]
+    fn readers_and_writers_name_the_same_inventory_paths_under_a_root_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        use crate::util::taint_utils::{Checkout, DurablePath};
+
+        let root = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"forklift-not-utf8-\xff"));
+        let _scope = crate::globals::StorageRootScope::enter(&root);
+
+        for key in ["", "a", "a/b"] {
+            assert_eq!(DurablePath::shard(&Checkout::Main, key).unwrap().as_path(),
+                file_utils::get_inventory_data_path_for_key(key).unwrap(), "the shard of {key:?}");
+        }
+        assert_eq!(DurablePath::load_marker(&Checkout::Main).as_path().parent(),
+            Some(file_utils::get_path_inventory_root().as_path()), "the load marker's folder");
     }
 
     /// The funnel decides every rollup from the shard on disk: a stat-only rewrite keeps the one on
@@ -5175,7 +5195,7 @@ mod tests {
         let _scratch = Scratch::new("sync-inventory-root");
         stamped_chain_with_sibling();
 
-        let inventory_root = std::path::PathBuf::from(file_utils::get_path_inventory_root());
+        let inventory_root = file_utils::get_path_inventory_root();
 
         assert_registration_waits_for_the_sync_of("new", &inventory_root);
     }
@@ -5266,7 +5286,7 @@ mod tests {
         let scratch = Scratch::new("inventory-root-out-of-reach");
         stamped_chain_with_sibling();
 
-        let inventory_root = std::path::PathBuf::from(file_utils::get_path_inventory_root());
+        let inventory_root = file_utils::get_path_inventory_root();
         let moved = scratch.root.join("drive");
         file_utils::rename(&inventory_root, &moved).unwrap();
         link_to(&scratch.root.join("unmounted"), &inventory_root, true);
@@ -5417,7 +5437,7 @@ mod tests {
 
     /// Put a shard data file at `key`'s address, as a load would, and return its path.
     fn plant(key: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let folder = std::path::PathBuf::from(file_utils::get_path_inventory_root()).join(file_utils::shard_folder_relative(key));
+        let folder = file_utils::get_path_inventory_root().join(file_utils::shard_folder_relative(key));
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("data"), bytes).unwrap();
         folder.join("data")
@@ -5432,7 +5452,7 @@ mod tests {
 
         plant("a", b"one");
         plant("c", b"two");
-        let bare = std::path::PathBuf::from(file_utils::get_path_inventory_root()).join(file_utils::shard_folder_relative("d"));
+        let bare = file_utils::get_path_inventory_root().join(file_utils::shard_folder_relative("d"));
         std::fs::create_dir_all(&bare).unwrap();
 
         let all = file_utils::shard_data_addresses(false).unwrap();

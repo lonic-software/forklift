@@ -2832,7 +2832,7 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
 
     // The bay's shards sit where the main tree's would, under the bay's own inventory root.
     let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
-    let main_inventory = std::path::PathBuf::from(forklift_core::util::file_utils::get_path_inventory_root());
+    let main_inventory = forklift_core::util::file_utils::get_path_inventory_root();
     let bay_inventory = warehouse.root.join(".forklift").join("bays").join("scoped").join("inventory");
     let shard = |key: &str| {
         let main_path = forklift_core::util::file_utils::get_inventory_data_path_for_key(key).unwrap();
@@ -9927,8 +9927,11 @@ fn a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure() {
     assert_success(&warehouse.run(&["load", "."]));
 
     let marker_path = incomplete_load_marker_path(&warehouse);
-    std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-    forklift_core::util::marker_utils::add(&marker_path, "").unwrap();
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        forklift_core::util::marker_utils::add(&forklift_core::util::load_guard_utils::marker_path(), "").unwrap();
+    }
+    assert!(marker_path.is_file(), "the marker is written where the warehouse reads it");
 
     let stacked = warehouse.run(&["stack", "-m", "second", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
@@ -15331,6 +15334,74 @@ fn metadata_listing(warehouse: &TestWarehouse, relative: &str) -> Vec<String> {
     walk(&base, &base, &mut out);
     out.sort();
     out
+}
+
+/// A bay stages in its own inventory. A stack there restamps its shards' rollups, a load clears the
+/// rollups above what it changed and writes the new shard, and a load that fails leaves its
+/// incomplete-load marker, each in the bay's folder; the main working tree's inventory is not
+/// written at all.
+#[cfg(unix)]
+#[test]
+fn a_bays_shards_rollup_clears_and_load_marker_are_written_in_the_bays_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let warehouse = TestWarehouse::new("bay-staging-writes");
+    warehouse.write_file("dir/sub/a.txt", "v1\n");
+    warehouse.write_file("dir/b.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
+
+    let bay_dir = warehouse.home.join("bay-b1");
+    assert_success(&warehouse.run(&["bay", "add", "b1", bay_dir.to_str().unwrap()]));
+
+    // Every shard file under `.forklift/<relative>`, with its bytes.
+    let shards = |relative: &str| -> Vec<(String, Vec<u8>)> {
+        let base = warehouse.root.join(".forklift").join(relative);
+        metadata_listing(&warehouse, relative).into_iter()
+            .filter(|path| path.ends_with("/data") && base.join(path).is_file())
+            .map(|path| { let bytes = std::fs::read(base.join(&path)).unwrap(); (path, bytes) })
+            .collect()
+    };
+    let main_inventory = || -> Vec<(String, Vec<u8>)> {
+        let base = warehouse.root.join(".forklift").join("inventory");
+        metadata_listing(&warehouse, "inventory").into_iter()
+            .filter(|relative| base.join(relative).is_file())
+            .map(|relative| { let bytes = std::fs::read(base.join(&relative)).unwrap(); (relative, bytes) })
+            .collect()
+    };
+    let before = main_inventory();
+    assert!(before.iter().any(|(relative, _)| relative.ends_with("/data")), "the main tree has shards: {:?}", before);
+
+    std::fs::write(bay_dir.join("dir/sub/a.txt"), "v2\n").unwrap();
+    assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&bay_dir, &["stack", "-m", "in the bay"]));
+
+    let bay_before = shards("bays/b1/inventory");
+    std::fs::write(bay_dir.join("dir/sub/a.txt"), "v3\n").unwrap();
+    assert_success(&warehouse.run_at(&bay_dir, &["load", "dir/sub/a.txt"]));
+    let bay_after = shards("bays/b1/inventory");
+    assert_eq!(bay_before.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        bay_after.iter().map(|(path, _)| path).collect::<Vec<_>>(), "the load keeps the bay's shard set");
+    let rewritten = bay_before.iter().zip(&bay_after).filter(|(old, new)| old.1 != new.1).count();
+    // The shard of "dir/sub", and the rollup clears of "dir" and the root.
+    assert_eq!(rewritten, 3, "the load rewrote the bay's shards: {:?}", bay_after.iter().map(|(path, _)| path).collect::<Vec<_>>());
+    assert!(main_inventory() == before, "a bay's stack and load wrote the main tree's inventory");
+
+    let blocked = bay_dir.join("dir").join("blocked.txt");
+    std::fs::write(&blocked, "unreadable\n").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(!warehouse.run_at(&bay_dir, &["load", "."]).status.success(), "the load fails on the unreadable file");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let forklift = warehouse.root.join(".forklift");
+    assert!(forklift.join("bays/b1/inventory/incomplete-load").is_file(), "the failed load's marker is in the bay");
+    assert!(!forklift.join("inventory/incomplete-load").exists(), "the main tree records no incomplete load");
+    assert!(main_inventory() == before, "a bay's failed load wrote the main tree's inventory");
+
+    let stacked = warehouse.run_at(&bay_dir, &["stack", "-m", "attempt", "--json"]);
+    assert_eq!(json(&stacked)["error"]["code"], "incomplete_load", "the bay's own stack is refused");
 }
 
 #[test]

@@ -1139,7 +1139,7 @@ fn fill(forklift: &Path, shown: &Path) -> Result<(Vec<String>, Vec<PathBuf>), St
 
     let folders = [
         PathBuf::from(file_utils::get_path_objects_root()),
-        PathBuf::from(file_utils::get_path_inventory_root()),
+        file_utils::get_path_inventory_root(),
         config_utils::get_warehouse_config_folder(),
     ];
 

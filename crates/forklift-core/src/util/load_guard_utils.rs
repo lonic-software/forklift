@@ -119,19 +119,21 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::util::{file_utils, marker_utils, tree_utils};
+use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// The name of the incomplete-load marker file (kept beside the inventory metadata file — see
 /// the module doc comment on why this placement is safe against a whole-staging-area wipe).
-const FILE_NAME_INCOMPLETE_LOAD_MARKER: &str = "incomplete-load";
+pub(crate) const FILE_NAME_INCOMPLETE_LOAD_MARKER: &str = "incomplete-load";
 
 /// The stable `incomplete_load` refusal code, re-exported from the typed [`RefusalCode`] (the
 /// same convention `scope_utils` and `query_utils` use for their own codes).
 pub const CODE_INCOMPLETE_LOAD: &str = RefusalCode::IncompleteLoad.as_str();
 
-/// The path of the incomplete-load marker file, resolved against the active storage-root scope
-/// (see [`file_utils::get_path_inventory_root`]) — this process's view of where it lives.
-pub fn marker_path() -> PathBuf {
-    PathBuf::from(file_utils::get_path_inventory_root()).join(FILE_NAME_INCOMPLETE_LOAD_MARKER)
+/// The incomplete-load marker of the checkout this thread works in, in its inventory folder
+/// under the active storage-root scope: this process's view of where it lives. Built at each call,
+/// so it names the checkout active then.
+pub fn marker_path() -> DurablePath {
+    DurablePath::load_marker(&Checkout::active())
 }
 
 /// The path of the incomplete-load marker file under a given warehouse root, independent of any
@@ -155,7 +157,7 @@ pub fn marker_path_under(warehouse_root: &Path) -> PathBuf {
 ///                   [`marker_path`] as part of the caller's own first durable barrier.
 /// * `None`        - `root_key` is already covered by what is recorded; nothing to stage.
 pub fn pending_start_marker(root_key: &str) -> Option<Vec<u8>> {
-    marker_utils::pending_add(&marker_path(), root_key)
+    marker_utils::pending_add(marker_path().as_path(), root_key)
 }
 
 /// Stage the marker write (if any) for `root_key` into `batch` instead of writing it immediately
@@ -171,7 +173,7 @@ pub fn stage_start_marker(batch: &file_utils::WriteBatch, root_key: &str) -> Res
 /// What the marker records now, read before a load stages its start so a load that publishes no
 /// shard can withdraw it with [`withdraw_start`]; `None` when the marker cannot be read.
 pub fn recorded() -> Option<BTreeSet<String>> {
-    marker_utils::read(&marker_path()).ok()
+    marker_utils::read(marker_path().as_path()).ok()
 }
 
 /// Withdraw the start a load staged, for a load refused before it published any shard: put the
@@ -317,7 +319,7 @@ fn malformed_marker_refusal(read_error: &str) -> CoreError {
     let next_step = format!(
         "Run \"forklift load .\": it rewrites \"{}\" as an incomplete load of the whole \
         warehouse and, once it completes, clears it. Then try again.",
-        path.to_string_lossy()
+        path.as_path().to_string_lossy()
     );
 
     CoreError::refusal(
@@ -343,7 +345,7 @@ fn malformed_marker_refusal(read_error: &str) -> CoreError {
 ///                      than risk treating unreadable state as "nothing recorded" (see the
 ///                      module doc comment's malformed-marker section).
 pub fn check_no_incomplete_load() -> Result<(), CoreError> {
-    match marker_utils::read(&marker_path()) {
+    match marker_utils::read(marker_path().as_path()) {
         Ok(recorded) if recorded.is_empty() => Ok(()),
         Ok(recorded) => Err(incomplete_load_refusal(&recorded)),
         Err(read_error) => Err(malformed_marker_refusal(&read_error)),
@@ -511,8 +513,8 @@ mod tests {
         let temp = temp_warehouse("malformed");
         let _scope = StorageRootScope::enter(&temp);
 
-        std::fs::create_dir_all(marker_path().parent().unwrap()).unwrap();
-        std::fs::write(marker_path(), [0xFF, 0xFE, 0x00, 0xFF]).unwrap(); // never valid UTF-8
+        std::fs::create_dir_all(marker_path().as_path().parent().unwrap()).unwrap();
+        std::fs::write(marker_path().as_path(), [0xFF, 0xFE, 0x00, 0xFF]).unwrap(); // never valid UTF-8
 
         // The check side must fail closed, never silently pass.
         let error = check_no_incomplete_load().unwrap_err();
@@ -521,7 +523,7 @@ mod tests {
         // A load over the malformed marker proceeds, and rewrites it as the root: the unreadable
         // file may have recorded any load, so finishing one under "src" does not clear it.
         start_load("src");
-        assert_eq!(marker_utils::read(&marker_path()).unwrap(), BTreeSet::from([String::new()]));
+        assert_eq!(marker_utils::read(marker_path().as_path()).unwrap(), BTreeSet::from([String::new()]));
 
         mark_load_completed("src");
         let error = check_no_incomplete_load().unwrap_err();

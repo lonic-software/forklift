@@ -318,10 +318,13 @@ static PACK_INDEX: TaintShape = shape("a pack index", Some(Disposition::PackInde
 static SIGNATURE_TABLE: TaintShape = shape("a signature table", Some(Disposition::SignatureTable),
     &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT), Is(crate::util::pack_utils::FOLDER_NAME_PACK),
         Extension(crate::util::signature_table::FILE_EXTENSION_SIGNATURE_TABLE)]);
-static SHARD: TaintShape = shape("a staged inventory shard", Some(Disposition::Shard), &[Is("inventory"), Names, Is("data")]);
-static BAY_SHARD: TaintShape = shape("a bay's staged inventory shard", Some(Disposition::Shard), &[Is("bays"), Name, Is("inventory"), Names, Is("data")]);
+static SHARD: TaintShape = shape("a staged inventory shard", Some(Disposition::Shard),
+    &[Is(crate::globals::FOLDER_NAME_INVENTORY_ROOT), Names, Is(file_utils::FILE_NAME_INVENTORY_DATA)]);
+static BAY_SHARD: TaintShape = shape("a bay's staged inventory shard", Some(Disposition::Shard),
+    &[Is(crate::globals::FOLDER_NAME_BAYS_ROOT), Name, Is(crate::globals::FOLDER_NAME_INVENTORY_ROOT), Names, Is(file_utils::FILE_NAME_INVENTORY_DATA)]);
 
-static LOAD_MARKER: TaintShape = shape("the incomplete-load marker", Some(Disposition::LoadMarker), &[Is("inventory"), Is("incomplete-load")]);
+static LOAD_MARKER: TaintShape = shape("the incomplete-load marker", Some(Disposition::LoadMarker),
+    &[Is(crate::globals::FOLDER_NAME_INVENTORY_ROOT), Is(crate::util::load_guard_utils::FILE_NAME_INCOMPLETE_LOAD_MARKER)]);
 static POSITION: TaintShape = shape("the checkout position", Some(Disposition::Position),
     &[Is(crate::util::pallet_utils::FILE_NAME_POSITION)]);
 static POSITION_COPY: TaintShape = shape("the checkout position's copy", Some(Disposition::PositionCopy),
@@ -340,7 +343,8 @@ static SKELETON_COPY: TaintShape = shape("the consolidation skeleton's copy", So
     &[Is(crate::util::merge_utils::FILE_NAME_SKELETON_COPY)]);
 static JOURNAL: TaintShape = shape("the journal", Some(Disposition::Journal), &[Is(crate::util::journal_utils::FILE_NAME_JOURNAL)]);
 
-static BAY_LOAD_MARKER: TaintShape = shape("a bay's incomplete-load marker", Some(Disposition::LoadMarker), &[Is("bays"), Name, Is("inventory"), Is("incomplete-load")]);
+static BAY_LOAD_MARKER: TaintShape = shape("a bay's incomplete-load marker", Some(Disposition::LoadMarker),
+    &[Is(crate::globals::FOLDER_NAME_BAYS_ROOT), Name, Is(crate::globals::FOLDER_NAME_INVENTORY_ROOT), Is(crate::util::load_guard_utils::FILE_NAME_INCOMPLETE_LOAD_MARKER)]);
 static BAY_POSITION: TaintShape = shape("a bay's checkout position", Some(Disposition::Position),
     &[Is("bays"), Name, Is(crate::util::pallet_utils::FILE_NAME_POSITION)]);
 static BAY_POSITION_COPY: TaintShape = shape("a bay's checkout position's copy", Some(Disposition::PositionCopy),
@@ -711,7 +715,7 @@ impl DurablePath {
     }
 
     pub fn load_marker(checkout: &Checkout) -> DurablePath {
-        let file = Path::new(crate::globals::FOLDER_NAME_INVENTORY_ROOT).join("incomplete-load");
+        let file = Path::new(crate::globals::FOLDER_NAME_INVENTORY_ROOT).join(crate::util::load_guard_utils::FILE_NAME_INCOMPLETE_LOAD_MARKER);
         let (shape, relative) = checkout.place(WriterShape::LoadMarker, WriterShape::BayLoadMarker, &file);
         Self::declared(shape, relative)
     }
