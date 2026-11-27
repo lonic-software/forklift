@@ -1167,7 +1167,7 @@ mod tests {
 
         let m0 = store_parcel(&store_tree(&[("record", &meta, FILE)]), Vec::new());
         let m1 = store_parcel(&store_tree(&[("record", &store_blob("now\n"), FILE)]), vec![m0]);
-        pallet_utils::update_meta_pallet_head("notes", None, &m1, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::update_meta_pallet_head(crate::util::kv_utils::KV_PALLET_NAME, None, &m1, &pallet_utils::RefPreconditions::NONE).unwrap();
         plant_staged_shard("b", &[("wip.txt", &staged, FILE)]);
 
         let targets: HashSet<String> = [&old, &base, &head, &meta, &staged].into_iter().cloned().collect();
@@ -1176,7 +1176,7 @@ mod tests {
         let expected: BTreeMap<String, Vec<CopyHolder>> = [
             (base, vec![CopyHolder::Base(Checkout::Main)]),
             (head, vec![CopyHolder::Pallet("main".to_string())]),
-            (meta, vec![CopyHolder::MetaHistory("notes".to_string())]),
+            (meta, vec![CopyHolder::MetaHistory("kv".to_string())]),
             (staged, vec![CopyHolder::Staged(Checkout::Bay("b".to_string()))]),
         ].into_iter().collect();
         assert_eq!(census, expected, "old history names nothing: {}", old);
@@ -1352,7 +1352,7 @@ mod tests {
         set_base(&head);
         plant_staged_shard("b", &[("wip.mkv", &staged, FILE)]);
         let cell = store_parcel(&store_tree(&[("record", &meta, FILE)]), Vec::new());
-        pallet_utils::update_meta_pallet_head("notes", None, &cell, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::update_meta_pallet_head(crate::util::kv_utils::KV_PALLET_NAME, None, &cell, &pallet_utils::RefPreconditions::NONE).unwrap();
         for hash in [&named, &staged, &meta, &both] {
             withholding::withhold(hash, "DMCA notice 9").unwrap();
         }
@@ -1366,7 +1366,7 @@ mod tests {
         assert_eq!(deletion.objects, vec![named.clone()]);
         assert_eq!(deletion.held, [
             (staged.clone(), vec![CopyHolder::Staged(Checkout::Bay("b".to_string()))]),
-            (meta.clone(), vec![CopyHolder::MetaHistory("notes".to_string())]),
+            (meta.clone(), vec![CopyHolder::MetaHistory("kv".to_string())]),
             (both.clone(), vec![CopyHolder::Pallet("main".to_string()), CopyHolder::Base(Checkout::Main)]),
         ].into_iter().collect());
         assert!(!present(&named), "the withheld copy is deleted");

@@ -4723,6 +4723,10 @@ pub(crate) mod tests {
         use crate::enums::dir_entry_type::DirEntryType;
         use crate::util::redaction_utils::{record_redaction, Redaction};
 
+        /// The meta pallet these tests write. Only a meta pallet's name has a meta ref
+        /// constructor; a debug build refuses any other.
+        const META: &str = crate::util::kv_utils::KV_PALLET_NAME;
+
         /// Record an unsigned redaction of `hash`.
         fn redact(hash: &str) {
             let redaction = Redaction {
@@ -4963,7 +4967,7 @@ pub(crate) mod tests {
             let (_root, _scope) = scratch("redacted-unread");
             let held = blob("held");
             let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
-            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, None, &base, &RefPreconditions::NONE).unwrap();
             redact(&blob("unrelated"));
 
             let path = get_pallet_ref_path(PalletNamespace::Meta, crate::util::redaction_utils::REDACTIONS_PALLET_NAME);
@@ -4972,7 +4976,7 @@ pub(crate) mod tests {
             BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || std::fs::write(&path, &bytes).unwrap())));
 
             let next = parcel(&tree(&[("more", &blob("more"), DirEntryType::Normal)]), &[&base]);
-            let written = update_meta_pallet_head("notes", Some(&base), &next, &RefPreconditions::NONE);
+            let written = update_meta_pallet_head(META, Some(&base), &next, &RefPreconditions::NONE);
             match &written {
                 Err(RefUpdateError::Failed(why)) => {
                     assert!(why.contains("pallet \"@redactions\""), "{}", why);
@@ -4981,7 +4985,7 @@ pub(crate) mod tests {
                 }
                 other => panic!("expected the @redactions read's failure, got {:?}", other),
             }
-            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
+            assert_eq!(get_meta_pallet_head(META).unwrap().as_deref(), Some(base.as_str()), "nothing was written");
         }
 
         // Revert: report the refusal's own message → it says "Nothing was written" after a
@@ -5042,14 +5046,14 @@ pub(crate) mod tests {
             let (_root, _scope) = scratch("redacted-meta");
             let held = blob("held");
             let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
-            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, None, &base, &RefPreconditions::NONE).unwrap();
             redact(&held);
 
             let inherits = parcel(&tree(&[
                 ("held", &held, DirEntryType::Normal),
                 ("more", &blob("more"), DirEntryType::Normal),
             ]), &[&base]);
-            update_meta_pallet_head("notes", Some(&base), &inherits, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, Some(&base), &inherits, &RefPreconditions::NONE).unwrap();
 
             let later = blob("later");
             redact(&later);
@@ -5058,9 +5062,9 @@ pub(crate) mod tests {
                 ("later", &later, DirEntryType::Normal),
             ]), &[&inherits]);
             assert_redacted(
-                update_meta_pallet_head("notes", Some(&inherits), &adds, &RefPreconditions::NONE), "later", &later
+                update_meta_pallet_head(META, Some(&inherits), &adds, &RefPreconditions::NONE), "later", &later
             );
-            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(inherits.as_str()));
+            assert_eq!(get_meta_pallet_head(META).unwrap().as_deref(), Some(inherits.as_str()));
         }
 
         // Revert: drop `served` from the walk's reached set → the served chain adding the redacted
@@ -5070,12 +5074,12 @@ pub(crate) mod tests {
             let (_root, _scope) = scratch("redacted-served");
             let held = blob("held");
             let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
-            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, None, &base, &RefPreconditions::NONE).unwrap();
             let local = parcel(&tree(&[
                 ("held", &held, DirEntryType::Normal),
                 ("mine", &blob("mine"), DirEntryType::Normal),
             ]), &[&base]);
-            update_meta_pallet_head("notes", Some(&base), &local, &RefPreconditions::NONE).unwrap();
+            update_meta_pallet_head(META, Some(&base), &local, &RefPreconditions::NONE).unwrap();
 
             let secret = blob("secret");
             redact(&secret);
@@ -5099,13 +5103,13 @@ pub(crate) mod tests {
             };
             let refused = replay(&[("later", &later, DirEntryType::Normal)]);
             assert_redacted(
-                update_meta_pallet_head_served("notes", Some(&local), &refused, &remote, &RefPreconditions::NONE), "later", &later
+                update_meta_pallet_head_served(META, Some(&local), &refused, &remote, &RefPreconditions::NONE), "later", &later
             );
-            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(local.as_str()));
+            assert_eq!(get_meta_pallet_head(META).unwrap().as_deref(), Some(local.as_str()));
 
             let taken = replay(&[]);
-            update_meta_pallet_head_served("notes", Some(&local), &taken, &remote, &RefPreconditions::NONE).unwrap();
-            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(taken.as_str()));
+            update_meta_pallet_head_served(META, Some(&local), &taken, &remote, &RefPreconditions::NONE).unwrap();
+            assert_eq!(get_meta_pallet_head(META).unwrap().as_deref(), Some(taken.as_str()));
         }
 
         /// A remote's `@redactions` head holding a redaction of `pending`, then one recorded only here
