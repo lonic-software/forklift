@@ -45,13 +45,14 @@ use crate::util::{
     lock_utils, object_utils, pallet_utils, redaction_deleter, sign_utils,
 };
 use crate::util::signature_table::{self, SignatureTable, FILE_EXTENSION_SIGNATURE_TABLE};
+use crate::util::taint_utils::DurablePath;
 
 /// The folder under the object store that holds packs.
 pub(crate) const FOLDER_NAME_PACK: &str = "pack";
 
-/// The extension of a pack's data file (concatenated object blobs). `pub(crate)` so the
-/// durability-taint recovery walk (`recovery_utils`) can recognize a recorded taint path as a
-/// pack file without duplicating the literal.
+/// The extension of a pack's data file (concatenated object blobs). `pub(crate)` so the taint
+/// shapes (`taint_utils`) and the durability-taint recovery walk (`recovery_utils`) can
+/// recognize a recorded taint path as a pack file without duplicating the literal.
 pub(crate) const FILE_EXTENSION_PACK_DATA: &str = "pack";
 
 /// The extension of a pack's index file (sorted hash → offset/length records). `pub(crate)` for
@@ -1579,6 +1580,33 @@ pub(crate) fn pack_folder() -> PathBuf {
     PathBuf::from(file_utils::get_path_objects_root()).join(FOLDER_NAME_PACK)
 }
 
+/// The durable path of `written`, a file this module renamed into the pack folder, from its
+/// name: `<id>.pack`, `<id>.idx` or `<id>.sigs`, each through its constructor. `Err` for any
+/// other name. In a debug build, refuses a constructor's path that is not `written`, such as a
+/// pack folder under a root other than the active one, so a taint record names the file the
+/// rename put in place.
+fn durable_pack_file(written: &Path) -> Result<DurablePath, String> {
+    let id = written.file_stem().and_then(|stem| stem.to_str());
+    let durable = match (id, written.extension().and_then(|extension| extension.to_str())) {
+        (Some(id), Some(FILE_EXTENSION_PACK_DATA)) => DurablePath::pack(id),
+        (Some(id), Some(FILE_EXTENSION_PACK_INDEX)) => DurablePath::pack_index(id),
+        (Some(id), Some(FILE_EXTENSION_SIGNATURE_TABLE)) => DurablePath::signature_table(id),
+        _ => return Err(format!("\"{}\" is no pack folder file's name.", written.to_string_lossy())),
+    };
+    if cfg!(debug_assertions) {
+        assert!(durable.as_path() == written, "a pack folder write put \"{}\" in place, but its durable path is \"{}\"",
+            written.to_string_lossy(), durable.as_path().to_string_lossy());
+    }
+    Ok(durable)
+}
+
+/// [`file_utils::sync_dir_or_taint`] for `folder`, the pack folder `written` was renamed into,
+/// recording each file by its [`durable_pack_file`].
+fn sync_pack_folder_or_taint<'a>(folder: &Path, written: impl IntoIterator<Item = &'a PathBuf>) -> Result<(), String> {
+    let durable: Vec<DurablePath> = written.into_iter().map(|path| durable_pack_file(path)).collect::<Result<_, _>>()?;
+    file_utils::sync_dir_or_taint(folder, &durable.iter().collect::<Vec<_>>())
+}
+
 /// Read the packs for the active warehouse, loading and caching them on first use. The
 /// returned `Arc` lets a lookup search without holding the registry lock.
 fn loaded_packs() -> Result<Arc<PackSet>, String> {
@@ -2971,8 +2999,7 @@ pub(crate) fn import_transport_packs<R: Read, T>(
         // A sync failure taints exactly `published_this_run`; a sync success is re-checked
         // against any taint already standing for this root before this function may report `Ok`
         // — see `file_utils::sync_dir_or_taint`.
-        let published_refs: Vec<&Path> = published_this_run.iter().map(PathBuf::as_path).collect();
-        file_utils::sync_dir_or_taint(&folder, &published_refs)?;
+        sync_pack_folder_or_taint(&folder, &published_this_run)?;
         invalidate_cache();
         // A native bundle installs whole packs verbatim from the far end's own bulk ingest —
         // the same undensified shape `--redelta` exists to fix.
@@ -4625,8 +4652,7 @@ fn compact_held(all: bool,
     // taint found standing aborts here too, before the destructive sweep below ever runs. Durable-
     // before-destructive therefore means "durable *and no taint standing*," not durable alone.
     if !new_pack_files.is_empty() {
-        let new_pack_refs: Vec<&Path> = new_pack_files.iter().map(PathBuf::as_path).collect();
-        file_utils::sync_dir_or_taint(&pack_folder, &new_pack_refs)?;
+        sync_pack_folder_or_taint(&pack_folder, &new_pack_files)?;
     }
 
     // Every new pack is durable — only now remove the originals: the loose files that were
@@ -5120,8 +5146,7 @@ fn write_signature_tables(pack_folder: &Path,
     }
 
     if !written.is_empty() {
-        let written_refs: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
-        file_utils::sync_dir_or_taint(pack_folder, &written_refs)?;
+        sync_pack_folder_or_taint(pack_folder, &written)?;
     }
 
     invalidate_cache();
@@ -7129,8 +7154,7 @@ impl StoreIngest {
         self.finish_current()?;
 
         if self.packs > 0 {
-            let final_paths: Vec<&Path> = self.finalized_files.iter().map(PathBuf::as_path).collect();
-            file_utils::sync_dir_or_taint(&self.folder, &final_paths)?;
+            sync_pack_folder_or_taint(&self.folder, &self.finalized_files)?;
             invalidate_cache();
             // This is exactly the shape `--redelta` densifies: objects appended straight into
             // packs, one path/window at a time, never seeing similarity across the whole store.
@@ -7915,6 +7939,48 @@ pub(crate) mod tests {
         }
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    // A signature table's own folder sync, failing, records exactly the table it just put in
+    // place. Mutation: hand the sync no paths → nothing is recorded, red.
+    #[test]
+    #[cfg(unix)]
+    fn a_signature_table_dir_sync_failure_taints_the_written_table() {
+        use crate::util::taint_utils;
+        use crate::util::file_utils::SyncDirFaultGuard;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-signature-table-taint-{}", std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        let forklift = crate::globals::forklift_root();
+
+        let entries = vec![([7u8; HASH_LEN], vec![1u8, 2, 3])];
+        let _guard = SyncDirFaultGuard::failing("pack");
+        let error = publish_signature_tables(&entries, 16).expect_err("a blocked pack folder must fail the table's sync");
+        assert!(error.contains("injected directory-sync failure"), "got: {}", error);
+
+        let state = taint_utils::read_taints(&forklift).unwrap();
+        let expected = PathBuf::from("objects").join("pack").join(format!("{}.sigs", signature_table::table_id(&entries)));
+        assert_eq!(state.recorded.iter().collect::<Vec<_>>(), vec![&expected]);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    // A pack folder file's durable path is the file the rename put in place: one named like a
+    // pack under another folder is refused in a debug build, naming both. Mutation: drop the
+    // check → no panic, red.
+    #[test]
+    #[should_panic(expected = "but its durable path is")]
+    fn a_pack_file_outside_the_active_pack_folder_is_refused_its_durable_path() {
+        let temp = std::env::temp_dir().join(format!("forklift-pack-durable-elsewhere-{}", std::process::id()));
+        let _scope = StorageRootScope::enter(&temp);
+        let elsewhere = temp.join("elsewhere").join(FOLDER_NAME_PACK).join(format!("{}.{}", "ab".repeat(32), FILE_EXTENSION_PACK_DATA));
+        let _ = durable_pack_file(&elsewhere);
     }
 
     /// An incoming pack holding an object in a second spelling (here, padding before its header's

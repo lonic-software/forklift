@@ -307,9 +307,13 @@ static LOOSE_OBJECT: TaintShape = shape("a loose object", Some(Disposition::Loos
     &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT), FanOut, Hex]);
 static LOOSE_SIGNATURE: TaintShape = shape("a loose object's signature", Some(Disposition::Signature),
     &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT), FanOut, HexSignature]);
-static PACK: TaintShape = shape("a pack", Some(Disposition::PackData), &[Is("objects"), Is("pack"), Extension("pack")]);
-static PACK_INDEX: TaintShape = shape("a pack index", Some(Disposition::PackIndex), &[Is("objects"), Is("pack"), Extension("idx")]);
-static SIGNATURE_TABLE: TaintShape = shape("a signature table", Some(Disposition::SignatureTable), &[Is("objects"), Is("pack"), Extension("sigs")]);
+static PACK: TaintShape = shape("a pack", Some(Disposition::PackData), &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT),
+    Is(crate::util::pack_utils::FOLDER_NAME_PACK), Extension(crate::util::pack_utils::FILE_EXTENSION_PACK_DATA)]);
+static PACK_INDEX: TaintShape = shape("a pack index", Some(Disposition::PackIndex), &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT),
+    Is(crate::util::pack_utils::FOLDER_NAME_PACK), Extension(crate::util::pack_utils::FILE_EXTENSION_PACK_INDEX)]);
+static SIGNATURE_TABLE: TaintShape = shape("a signature table", Some(Disposition::SignatureTable),
+    &[Is(crate::globals::FOLDER_NAME_OBJECTS_ROOT), Is(crate::util::pack_utils::FOLDER_NAME_PACK),
+        Extension(crate::util::signature_table::FILE_EXTENSION_SIGNATURE_TABLE)]);
 static SHARD: TaintShape = shape("a staged inventory shard", Some(Disposition::Shard), &[Is("inventory"), Names, Is("data")]);
 static BAY_SHARD: TaintShape = shape("a bay's staged inventory shard", Some(Disposition::Shard), &[Is("bays"), Name, Is("inventory"), Names, Is("data")]);
 
