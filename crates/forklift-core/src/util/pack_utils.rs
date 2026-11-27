@@ -1581,10 +1581,11 @@ pub(crate) fn pack_folder() -> PathBuf {
 }
 
 /// `Err` unless `folder` is the folder the pack folder's [`DurablePath`] constructors put their
-/// files in. A store operation checks it before it first lists, deletes or writes in the folder
-/// (a compaction, an ingest, a transport install, a signature-table publish and each store pack
-/// writer), so its temp files, its renames,
-/// the files it lists or deletes beside them and its taint records are all in one folder.
+/// files in. A compaction, an ingest, a transport install, a signature-table publish and each
+/// store pack writer check it before they list, delete or write a file in the folder, so their
+/// temp files, renames, the files they list or delete beside them and their taint records are
+/// all in one folder. It does not cover what their callers did first: a caller may already have
+/// created the folder, or committed state of its own, such as an eviction's record.
 /// [`pack_folder`] derives its path through the memoized objects root, the constructors from
 /// [`forklift_root`](crate::globals::forklift_root) directly, and a root whose name is not UTF-8
 /// is one where the two differ.
