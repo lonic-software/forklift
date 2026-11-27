@@ -5844,7 +5844,9 @@ pub(crate) mod tests {
         let dir = held_rename_dir("writers");
 
         for (name, write) in [
-            ("store", write_file_atomically as fn(&Path, &[u8]) -> Result<(), String>),
+            ("store", (|path: &Path, content: &[u8]|
+                write_file_atomically(&DurablePath::outside_warehouse(path.to_path_buf()), content))
+                as fn(&Path, &[u8]) -> Result<(), String>),
             ("config", replace_file_atomically),
         ] {
             let (path, probe) = (dir.join(name), dir.join(format!("{}-probe", name)));
