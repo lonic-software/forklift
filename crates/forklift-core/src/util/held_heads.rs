@@ -25,9 +25,10 @@ use crate::model::remote::HoldAnswer;
 use crate::util::lock_utils::RefLock;
 use crate::util::remote_utils::RemoteClient;
 use crate::util::{file_utils, merge_utils, object_utils, origin_move, pallet_utils, record_utils};
+use crate::util::taint_utils::DurablePath;
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
-const FILE_NAME: &str = "held-heads";
+pub(crate) const FILE_NAME: &str = "held-heads";
 const RECORD: &str = "held-heads";
 const VERSION: u32 = 2;
 
@@ -226,7 +227,7 @@ fn undecided(candidates: &[String], answers: &BTreeMap<String, HoldAnswer>) -> u
 fn write_held_heads(_lock: &RefLock, entries: &[HeldHead]) -> Result<(), String> {
     let lines = entries.iter().map(|entry| format!("{} {}", entry.head, entry.pallet));
 
-    file_utils::write_file_atomically(&record_path(), &record_utils::to_bytes(RECORD, VERSION, lines))
+    file_utils::write_file_atomically(&DurablePath::held_heads(), &record_utils::to_bytes(RECORD, VERSION, lines))
 }
 
 #[cfg(test)]

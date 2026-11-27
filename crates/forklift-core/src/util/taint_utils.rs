@@ -756,11 +756,11 @@ impl DurablePath {
     }
 
     pub fn fetch_ledger() -> DurablePath {
-        Self::declared(WriterShape::FetchLedger, PathBuf::from("fetched-heads"))
+        Self::declared(WriterShape::FetchLedger, PathBuf::from(crate::util::fetch_ledger::FILE_NAME_LEDGER))
     }
 
     pub fn held_heads() -> DurablePath {
-        Self::declared(WriterShape::HeldHeads, PathBuf::from("held-heads"))
+        Self::declared(WriterShape::HeldHeads, PathBuf::from(crate::util::held_heads::FILE_NAME))
     }
 
     pub fn mirror_roots() -> DurablePath {
@@ -768,15 +768,15 @@ impl DurablePath {
     }
 
     pub fn served() -> DurablePath {
-        Self::declared(WriterShape::Served, PathBuf::from("served"))
+        Self::declared(WriterShape::Served, PathBuf::from(crate::util::tombstone_utils::FILE_NAME_SERVED))
     }
 
     pub fn tombstones() -> DurablePath {
-        Self::declared(WriterShape::Tombstones, PathBuf::from("tombstones"))
+        Self::declared(WriterShape::Tombstones, PathBuf::from(crate::util::tombstone_utils::FILE_NAME_TOMBSTONES))
     }
 
     pub fn unvouched_heads() -> DurablePath {
-        Self::declared(WriterShape::UnvouchedHeads, PathBuf::from("unvouched-heads"))
+        Self::declared(WriterShape::UnvouchedHeads, PathBuf::from(crate::util::take_utils::FILE_NAME_UNVOUCHED))
     }
 
     pub fn trust() -> DurablePath {
@@ -1772,10 +1772,24 @@ mod tests {
         }
 
         fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-            self.note_fn(&item.sig);
-            self.within.push(item.sig.ident.to_string());
-            syn::visit::visit_impl_item_fn(self, item);
-            self.within.pop();
+            if !is_cfg_test(&item.attrs) {
+                self.note_fn(&item.sig);
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+                self.within.pop();
+            }
+        }
+
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            if !is_cfg_test(&item.attrs) {
+                // A trait's `Self` is its implementor, so a trait method is outside the impl.
+                self.durable_impl.push(false);
+                self.note_fn(&item.sig);
+                self.within.push(item.sig.ident.to_string());
+                syn::visit::visit_trait_item_fn(self, item);
+                self.within.pop();
+                self.durable_impl.pop();
+            }
         }
 
         fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
@@ -1853,6 +1867,26 @@ mod tests {
         assert_eq!(unlisted, Vec::<&String>::new());
         assert!(constructions.returned_by.contains("position") && constructions.returned_by.contains("loose_object"),
             "sanity: returns were read, bare and inside a Result: {:?}", constructions.returned_by);
+    }
+
+    /// What the constructor census reads, over literal sources: a trait's method that returns or
+    /// builds the type counts, as outside its impl; a `#[cfg(test)]` method inside the impl counts
+    /// for nothing, while its non-test sibling does.
+    /// Revert: drop `visit_trait_item_fn` → the trait's method is not named → red; drop the
+    /// `cfg(test)` skip in `visit_impl_item_fn` → the test-only method is counted → red.
+    #[test]
+    fn the_constructor_census_reads_what_it_claims() {
+        let read = |source: &str| {
+            let mut constructions = Constructions::default();
+            syn::visit::Visit::visit_file(&mut constructions, &syn::parse_file(source).unwrap());
+            (constructions.built_in, constructions.returned_by)
+        };
+        let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<BTreeSet<String>>();
+
+        assert_eq!(read("trait T { fn f() -> DurablePath { DurablePath(p) } }"),
+            (names(&["f"]), names(&["f (outside impl DurablePath)"])));
+        assert_eq!(read("impl DurablePath { #[cfg(test)] fn t() -> Self { Self(p) } fn u() -> Self { Self(p) } }"),
+            (names(&["u"]), names(&["u"])));
     }
 
     fn scratch(name: &str) -> PathBuf {

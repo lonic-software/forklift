@@ -40,6 +40,7 @@ use crate::util::pallet_utils::{self, AnchorPrecondition, OfficePrecondition, Pa
 use crate::util::progress_utils::Progress;
 use crate::util::remote_utils::{self, RemoteClient};
 use crate::util::scope_utils::PathScope;
+use crate::util::taint_utils::DurablePath;
 
 /// What a take is verified against.
 pub enum TakeTrust {
@@ -488,7 +489,7 @@ pub struct LocalJudgement {
 /// The record of heads an installed anchor does not vouch for, in the shared forklift root: a
 /// [`record_utils`] file of one `<genesis> <head>` entry per line. A warehouse that never installed
 /// an anchor over such a head has no file.
-const FILE_NAME_UNVOUCHED: &str = "unvouched-heads";
+pub(crate) const FILE_NAME_UNVOUCHED: &str = "unvouched-heads";
 const UNVOUCHED_RECORD: &str = "unvouched-heads";
 const UNVOUCHED_VERSION: u32 = 2;
 
@@ -522,7 +523,7 @@ fn read_unvouched_entries() -> Result<Vec<(String, String)>, String> {
 fn write_unvouched_entries(_lock: &RefLock, entries: &[(String, String)]) -> Result<(), String> {
     let lines = entries.iter().map(|(genesis, head)| format!("{} {}", genesis, head));
 
-    file_utils::write_file_atomically(&unvouched_path(), &record_utils::to_bytes(UNVOUCHED_RECORD, UNVOUCHED_VERSION, lines))
+    file_utils::write_file_atomically(&DurablePath::unvouched_heads(), &record_utils::to_bytes(UNVOUCHED_RECORD, UNVOUCHED_VERSION, lines))
 }
 
 /// The heads recorded as not vouched for by the anchor of `genesis`.
