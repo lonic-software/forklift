@@ -2832,7 +2832,7 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
 
     // The bay's shards sit where the main tree's would, under the bay's own inventory root.
     let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
-    let main_inventory = std::path::PathBuf::from(forklift_core::util::file_utils::get_path_inventory_root());
+    let main_inventory = forklift_core::util::file_utils::get_path_inventory_root();
     let bay_inventory = warehouse.root.join(".forklift").join("bays").join("scoped").join("inventory");
     let shard = |key: &str| {
         let main_path = forklift_core::util::file_utils::get_inventory_data_path_for_key(key).unwrap();

@@ -134,9 +134,10 @@ pub fn get_path_objects_root() -> String {
 ///
 /// # Returns
 /// * The path to the "inventory root" folder.
-pub fn get_path_inventory_root() -> String {
-    // The inventory is bay-local: each bay stages independently.
-    bay_root().to_string_lossy().into_owned().add(PATH_SEPARATOR).add(FOLDER_NAME_INVENTORY_ROOT)
+pub fn get_path_inventory_root() -> PathBuf {
+    // The inventory is bay-local: each bay stages independently. Built as a path, never through a
+    // string, so it is the folder the `DurablePath` constructors write in, whatever the root's name.
+    bay_root().join(FOLDER_NAME_INVENTORY_ROOT)
 }
 
 /// Get the path to the commit-graph root folder (the sharded, self-healing DAG cache, §B).
@@ -3622,7 +3623,7 @@ fn non_folder_in_shard_chain(data_path: &Path) -> Option<&Path> {
 
 /// The path of the inventory metadata file, whether or not it exists.
 pub fn get_inventory_metadata_path() -> PathBuf {
-    PathBuf::from(get_path_inventory_root()).join(FILE_NAME_INVENTORY_METADATA)
+    get_path_inventory_root().join(FILE_NAME_INVENTORY_METADATA)
 }
 
 /// Retrieve the contents of the inventory metadata file (i.e. the paths of existing inventory
@@ -3662,7 +3663,7 @@ pub fn retrieve_inventory_metadata_or_none() -> Result<(PathBuf, Option<BTreeSet
             ),
         ).into()),
         Err(e) => {
-            let inventory_root = PathBuf::from(get_path_inventory_root());
+            let inventory_root = get_path_inventory_root();
             if std::fs::symlink_metadata(&inventory_root).is_ok() && !std::fs::metadata(&inventory_root).is_ok_and(|meta| meta.is_dir()) {
                 return Err(unresolved_inventory_root(&inventory_root));
             }
@@ -3843,7 +3844,7 @@ pub(crate) fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String>
 /// * `Ok(PathBuf)` - The path of the store root.
 /// * `Err(String)` - If the inventory metadata is in another format version.
 pub fn get_inventory_store_root() -> Result<PathBuf, String> {
-    let inventory_root = PathBuf::from(get_path_inventory_root());
+    let inventory_root = get_path_inventory_root();
 
     gate_inventory_layout(&inventory_root)?;
 

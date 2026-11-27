@@ -12083,7 +12083,7 @@ mod tests {
     }
 
     fn shard_data_path(key: &str) -> PathBuf {
-        PathBuf::from(file_utils::get_path_inventory_root())
+        file_utils::get_path_inventory_root()
             .join(file_utils::shard_folder_relative(key))
             .join(file_utils::FILE_NAME_INVENTORY_DATA)
     }
@@ -12093,7 +12093,7 @@ mod tests {
     #[test]
     fn a_walker_error_names_the_directory_a_shard_belongs_to() {
         let (root, _scope) = staged_warehouse("walker-names-key", &["", "docs"]);
-        let inventory_root = PathBuf::from(file_utils::get_path_inventory_root());
+        let inventory_root = file_utils::get_path_inventory_root();
 
         std::fs::write(shard_data_path("docs"), b"not a shard").unwrap();
         let error = walk_shard_files(&inventory_root, &mut Vec::new()).unwrap_err();
@@ -12114,7 +12114,7 @@ mod tests {
     #[test]
     fn a_walk_over_an_inventory_root_out_of_reach_fails() {
         let (root, _scope) = staged_warehouse("walker-root-out-of-reach", &["", "docs"]);
-        let inventory_root = PathBuf::from(file_utils::get_path_inventory_root());
+        let inventory_root = file_utils::get_path_inventory_root();
         file_utils::rename(&inventory_root, root.join("drive")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("unmounted"), &inventory_root).unwrap();
@@ -12159,7 +12159,7 @@ mod tests {
             }
 
             let mut hashes = Vec::new();
-            let walked = walk_shard_files(&PathBuf::from(file_utils::get_path_inventory_root()), &mut hashes);
+            let walked = walk_shard_files(&file_utils::get_path_inventory_root(), &mut hashes);
 
             let error = walked.expect_err(level);
             assert!(error.contains("is a link") && error.contains("unload ."), "{level}: {error}");
@@ -12180,7 +12180,7 @@ mod tests {
 
         // Root reads through any mode, so there is no read error to name.
         if std::fs::read(&data).is_err() {
-            let error = walk_shard_files(&PathBuf::from(file_utils::get_path_inventory_root()), &mut Vec::new())
+            let error = walk_shard_files(&file_utils::get_path_inventory_root(), &mut Vec::new())
                 .unwrap_err();
             assert!(error.contains("reading the inventory of folder \"docs\""), "{}", error);
         }

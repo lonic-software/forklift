@@ -339,8 +339,7 @@ impl ShardLedger {
 
     /// The shard path of `key` in the active checkout, for a write. It is refused when `key` is
     /// not registered, or when its address is damaged, so that nothing is written through a link.
-    /// It is also refused when the path differs from the one the shard's readers use. The path
-    /// judged is the one returned.
+    /// The path judged is the one returned.
     fn shard_path_for_write(&self, key: &str) -> Result<DurablePath, String> {
         if !self.holds(key) {
             return Err(format!(
@@ -351,28 +350,12 @@ impl ShardLedger {
         }
 
         let shard_path = DurablePath::shard(&Checkout::active(), key)?;
-        require_read_path(key, shard_path.as_path(), &file_utils::get_inventory_data_path_for_key(key)?)?;
         file_utils::judge_shard_file(key, shard_path.as_path())?;
 
         Ok(shard_path)
     }
 }
 
-/// Refuses a shard write to `written` unless its readers read `read`. The readers build the path
-/// through [`file_utils::get_path_inventory_root`], a lossy string. The writers build it from
-/// [`forklift_root`](crate::globals::forklift_root) directly. The two differ for a root whose name
-/// is not UTF-8.
-fn require_read_path(key: &str, written: &Path, read: &Path) -> Result<(), String> {
-    if written == read {
-        return Ok(());
-    }
-
-    Err(format!(
-        "The inventory of folder \"{}\" was not written: it would go to \"{}\", but it is read from \
-        \"{}\".",
-        load_guard_utils::display_path(key), written.to_string_lossy(), read.to_string_lossy()
-    ))
-}
 
 /// Replace the whole staging area with the given shards, so that the store holds exactly them and
 /// the metadata registers exactly their directories. Used when `shift` repopulates the inventory
