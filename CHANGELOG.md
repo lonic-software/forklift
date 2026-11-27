@@ -236,12 +236,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   the wrong place there does not reach the log. An unrecognized config key is named by its table
   and line.
 
-- **While a durability taint stands, a refused write leaves the file as it was.** A write that a
-  standing taint refuses is now refused before it replaces or removes anything, where before it was
-  written and then reported as refused. That covers a single file on its own, such as a pallet's
-  ref, and the writes made in batches or in bulk: a batch of objects, a large object streamed in,
-  a pack that compaction or a git import writes, the packs a bundle installs, a signature table,
-  and a pallet's removal. A refused batch leaves none of its files in place and no temporary files behind. `heal`'s own
+- **While a durability taint stands, a refused write leaves the file as it was.** A write that
+  starts while a durability taint stands is now refused before it replaces or removes anything,
+  where before it was written and then reported as refused, and it leaves no temporary files
+  behind. That covers a single file on its own, such as a pallet's ref, and the writes made in
+  batches or in bulk: a batch of objects, a large object streamed in, the packs a bundle installs,
+  a signature table, a pallet's removal, and the packs that compaction or a git import writes,
+  which are refused before the first one. A taint recorded while one of these is under way still
+  lets what it wrote land, and refuses it once that is durable. `heal`'s own
   writes are not refused by the taint it is resolving, so `heal --ref <pallet>=<parcel>` now sets
   the ref and goes on to resolve the taint, where before it was refused until a plain `heal` had
   run.
