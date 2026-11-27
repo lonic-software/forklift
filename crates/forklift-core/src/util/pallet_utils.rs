@@ -159,6 +159,14 @@ pub(crate) fn get_pallet_ref_path(namespace: PalletNamespace, name: &str) -> Pat
 /// [`DurablePath`] of [`get_pallet_ref_path`]'s file. A meta pallet's name must be one of
 /// [`META_PALLET_NAMES`](crate::util::meta_tree::META_PALLET_NAMES); a debug build refuses any
 /// other.
+/// Refuse to write meta pallet `name`'s ref or copy unless it is a meta pallet this forklift knows.
+fn refuse_unknown_meta_pallet(name: &str, new: &str) -> Result<(), String> {
+    crate::util::meta_tree::check_meta_pallet_name(name).map_err(|why| format!(
+        "Refusing to set pallet \"@{}\" to {}: {} The pallet was not moved.",
+        name, &new[..new.len().min(12)], why
+    ))
+}
+
 pub(crate) fn ref_durable_path(namespace: PalletNamespace, name: &str) -> DurablePath {
     match namespace {
         PalletNamespace::User => DurablePath::pallet_ref(name),
@@ -2502,6 +2510,11 @@ fn write_head_locked(
     compensating: bool,
 ) -> Result<(), RefUpdateError> {
     debug_assert!(!compensating || namespace == PalletNamespace::User, "only a user ref is written as a compensating write");
+    if namespace == PalletNamespace::Meta {
+        // A name read from elsewhere, such as an undo entry, may be no meta pallet's, and only a
+        // meta pallet has a ref and a copy here.
+        refuse_unknown_meta_pallet(name, new)?;
+    }
     validate_head_write(name, new)?;
 
     if !redaction.is_for(namespace, name, expected, new) || !redaction.holds(lock)? {
@@ -2620,7 +2633,7 @@ fn write_copy_file(durable: &DurablePath, bytes: &[u8]) -> Result<(), String> {
     file_utils::write_file_atomically(durable, bytes)
 }
 
-/// Put a meta ref's copy at `path` back to `prior`, after the write `error` left the ref at its
+/// Put a meta ref's copy at `durable` back to `prior`, after the write `error` left the ref at its
 /// own prior head, and return the error to report. The restore is read back, since a write can
 /// land and still return an error; one that did not land leaves the copy at the new head, which
 /// passed every check of the write, and says so. A compensating write
@@ -2684,6 +2697,9 @@ pub enum CopyMend {
 ///                                       the copy back to tell.
 pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState) -> Result<CopyMend, CopyMendError> {
     validate_pallet_name(name).map_err(CopyMendError::Refused)?;
+    crate::util::meta_tree::check_meta_pallet_name(name).map_err(|why| CopyMendError::Refused(format!(
+        "Refusing to mend the copy of pallet \"@{}\": {}", name, why
+    )))?;
 
     let reference = PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() };
     let Some(head) = parse_ref_bytes(judged_ref) else {
@@ -2933,7 +2949,7 @@ pub fn remove_pallet_head_in(
     }
 }
 
-/// Unlink the ref file at `path` and every folder of a nested name it leaves empty, up to the
+/// Unlink the ref file at `durable` and every folder of a nested name it leaves empty, up to the
 /// namespace folder, syncing each removal's parent through the durability taint. Folder removal
 /// stops at the first that does not go (it holds another ref, or anything else).
 fn unlink_ref(namespace: PalletNamespace, durable: &DurablePath) -> Result<(), String> {
@@ -3693,9 +3709,37 @@ pub(crate) mod tests {
             }
         }
 
+        /// A meta pallet this forklift does not know, such as one an undo entry from a newer
+        /// forklift names, is refused before its ref or copy is written, in every build: a put-back
+        /// and a mend each return an error naming it, and leave the ref and the copy as they were.
+        /// Revert: drop either refusal → that call writes a stray (release) or panics (debug), red.
+        #[test]
+        fn a_meta_pallet_this_forklift_does_not_know_is_refused_before_any_write() {
+            let (_root, _scope) = scratch("meta-unknown-name");
+            let (h1, h2) = (stub_parcel("h1"), stub_parcel("h2"));
+            let reference = get_pallet_ref_path(PalletNamespace::Meta, "newpallet");
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            std::fs::write(&reference, ref_bytes_of(&h2)).unwrap();
+
+            let put_back = put_back_pallet_head_in(PalletNamespace::Meta, "newpallet", &h2, &h1);
+            let mend = mend_meta_copy("newpallet", &ref_bytes_of(&h2), &MetaCopyState::Absent);
+
+            let Err(RefUpdateError::Failed(message)) = put_back else { panic!("{:?}", put_back) };
+            assert!(message.contains("\"@newpallet\"") && message.contains("is not a meta pallet this forklift knows"), "{}", message);
+            let Err(CopyMendError::Refused(message)) = mend else { panic!("{:?}", mend) };
+            assert!(message.contains("\"@newpallet\"") && message.contains("is not a meta pallet this forklift knows"), "{}", message);
+            assert_eq!(std::fs::read(&reference).unwrap(), ref_bytes_of(&h2), "the ref is as it was");
+            assert!(std::fs::symlink_metadata(get_meta_copy_path("newpallet")).is_err(), "no copy is written");
+        }
+
+        fn ref_bytes_of(head: &str) -> Vec<u8> {
+            format!("{}\n", head).into_bytes()
+        }
+
         /// A copy put back to its absence, whose folder sync fails, records the copy's own path in
-        /// the taint and nothing else.
-        /// Revert: record another final path for the put-back's sync → red.
+        /// the taint and nothing else. The copy write before it lands with an error whose taint is
+        /// cleared, and its own folder sync passes, so the put-back's sync is the only record.
+        /// Revert: record another final path for the put-back's sync, or none → red.
         #[test]
         fn a_copy_put_back_to_its_absence_whose_folder_sync_fails_taints_the_copy() {
             let (_root, _scope) = scratch("meta-copy-restore-sync");
@@ -3703,12 +3747,11 @@ pub(crate) mod tests {
             write("tags", None, &h0).unwrap();
             file_utils::remove_file(get_meta_copy_path("tags")).unwrap();
             let before = copy_state("tags");
-            let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            taint_utils::activate();
+            let _landed = land_next_write_with_an_error();
 
             let written = {
                 let copies = get_meta_copy_path("tags").parent().unwrap().to_path_buf();
-                let _fault = file_utils::SyncDirFaultGuard::failing_exactly(&copies);
+                let _fault = file_utils::SyncDirFaultGuard::failing_exactly_after(&copies, 1);
                 write("tags", Some(&h0), &h1)
             };
 

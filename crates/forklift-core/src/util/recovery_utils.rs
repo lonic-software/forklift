@@ -5633,7 +5633,7 @@ mod tests {
         let mut one = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         one.add_child(TreeItem::new("d.txt".to_string(), parcel_leaf.clone(), DirEntryType::Normal));
         // The user pallet shares the meta pallet's name, so their parcels share a description.
-        let shared_name = crate::util::haul_utils::HAUL_PALLET_NAME;
+        let shared_name = crate::util::tag_utils::TAGS_PALLET_NAME;
         plant_head_over_tree(pallet_utils::PalletNamespace::Meta, shared_name, &one);
         plant_head_over_tree(pallet_utils::PalletNamespace::User, shared_name, &one);
         file_utils::forget_cached_objects();
