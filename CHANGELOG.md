@@ -954,10 +954,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **`heal` keeps a removed path's record when a folder above it cannot be examined.** When a
   recorded path is gone, `heal` syncs the nearest folder above it that still stands, then clears
-  the record. A folder it could not examine (no permission, or an I/O error) was taken
+  the record. A folder it could not examine (no permission, an I/O error, or a path too long
+  to pass) was taken
   for absent, so only the folders above it were synced and the record was cleared, though the
   entry's own folder may have stood unsynced. `heal` now names that folder and keeps the record.
-  A name that opens no folder (absent, too long, or a link loop) is still passed over.
+  A name that opens no folder (absent, or a link loop) is still passed over.
 - **A pack index `heal` rebuilds is recorded when its folder cannot be synced.** If the pack
   folder's sync fails after the rebuilt index is put in place, a durability taint now records that
   index, so the store is not trusted as durable until `heal` settles it, and `heal` says the index
