@@ -3224,6 +3224,27 @@ pub(crate) mod tests {
         assert!(attempted.contains(&copies), "the folders after the failure are synced: {:?}", attempted);
     }
 
+    /// A position and its copy land in their own checkout's folder, each under its own name: the
+    /// working tree's in the root, a bay's under its state folder.
+    /// Revert: build the copy's path from the position's constructor → no copy file → red.
+    #[test]
+    fn a_position_and_its_copy_land_in_their_checkouts_folder() {
+        let (root, _scope) = scratch("position-and-copy");
+        let dir = forklift_root();
+        std::fs::create_dir_all(dir.join("bays").join("b")).unwrap();
+
+        for (checkout, folder, pallet) in [(Checkout::Main, dir.clone(), "main"), (Checkout::Bay("b".to_string()), dir.join("bays/b"), "side")] {
+            let position = BayPosition::new(pallet, None);
+            write_position_for(&checkout, &position).unwrap();
+            for file in ["position", "position-copy"] {
+                let bytes = std::fs::read(folder.join(file)).unwrap_or_else(|e| panic!("{:?} has no {}: {}", checkout, file, e));
+                assert_eq!(decode_position(&bytes).ok(), Some(position.clone()), "{:?} {}", checkout, file);
+            }
+        }
+
+        let _ = file_utils::remove_dir_all(&root);
+    }
+
     /// A copy that can be neither written nor removed fails the write loudly, after the primary
     /// has landed, so a stale copy is never left standing in silence.
     /// Revert: map a failed copy removal to Ok → the write reports success → red.
