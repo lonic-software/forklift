@@ -353,7 +353,7 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
             _ => Marker::Other,
         },
     };
-    let checkout = match crate::globals::active_bay() {
+    let shown = match crate::globals::active_bay() {
         Some(name) => format!("bay \"{}\"", name),
         None => "the warehouse's own working tree".to_string(),
     };
@@ -370,6 +370,10 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
 
         let durable = record.durable(&place);
         let path = durable.as_path();
+        // The readers below name the record and its copy in `dir`, the writers in `place`.
+        debug_assert_eq!(path, dir.join(record.file_name()), "heal reads and writes one checkout's {}", record.what());
+        debug_assert_eq!(record.durable_copy(&place).as_path(), dir.join(record.copy_name()),
+            "heal reads and writes one checkout's copy of the {}", record.what());
         let was = match status(&dir, record, digest.as_deref())? {
             Status::Newer => continue,
             Status::Absent if record != MergeRecord::Skeleton => continue,
@@ -378,7 +382,7 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
                 if record == MergeRecord::State {
                     digest = Some(state_digest(&bytes));
                 }
-                resync_copy(&place, record, &bytes, &checkout, notes);
+                resync_copy(&place, record, &bytes, &shown, notes);
                 continue;
             }
             Status::Damaged(reason) => reason,
@@ -432,7 +436,7 @@ pub fn repair(agreement: Option<&Agreement>, notes: &mut Vec<String>) -> Result<
     }
 
     if !records.is_empty() {
-        repaired.restored = Some(MergeStateRestored { checkout, records });
+        repaired.restored = Some(MergeStateRestored { checkout: shown, records });
     }
     Ok(repaired)
 }
@@ -460,7 +464,7 @@ fn copy_is_newer(record: MergeRecord, bytes: &[u8]) -> bool {
 
 /// Rewrite the copy of a usable record when it is missing, damaged or different. A copy a newer
 /// Forklift wrote is left as it is. A failure is a note, not an error: the record is sound.
-fn resync_copy(place: &Checkout, record: MergeRecord, bytes: &[u8], checkout: &str, notes: &mut Vec<String>) {
+fn resync_copy(place: &Checkout, record: MergeRecord, bytes: &[u8], shown: &str, notes: &mut Vec<String>) {
     let copy = record.durable_copy(place);
     match merge_utils::read_record_bytes(copy.as_path()) {
         Ok(Some(held)) if held == bytes || copy_is_newer(record, &held) => return,
@@ -471,7 +475,7 @@ fn resync_copy(place: &Checkout, record: MergeRecord, bytes: &[u8], checkout: &s
         notes.push(format!(
             "The copy of the {} of {} could not be rewritten ({}), so a later loss of that record has no copy to \
             restore it from.",
-            record.what(), checkout, error.trim_end_matches('.')
+            record.what(), shown, error.trim_end_matches('.')
         ));
     }
 }

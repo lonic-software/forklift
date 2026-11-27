@@ -225,7 +225,7 @@ fn a_bays_merge_records_are_written_and_healed_in_the_bay() {
     }
     assert_eq!(std::fs::read(area.state("journal.json")).ok(), own_journal, "the bay's journal entry is not the working tree's");
 
-    for file in ["consolidation", "consolidation-skeleton"] {
+    for (file, record) in [("consolidation", "consolidation state"), ("consolidation-skeleton", "consolidation skeleton")] {
         let original = std::fs::read(bay_state(file)).unwrap();
         let copy = format!("{}-copy", file);
         flip(&bay_state(&copy));
@@ -234,19 +234,31 @@ fn a_bays_merge_records_are_written_and_healed_in_the_bay() {
 
         flip(&bay_state(file));
         let healed = parsed(&in_bay(&["--json", "heal"]))["data"].clone();
-        assert_eq!(names(&healed["merge_state_restored"]).len(), 1, "{}: {}", file, healed);
+        assert_eq!(names(&healed["merge_state_restored"]), vec![(record.to_string(), false)], "{}: {}", file, healed);
         assert_eq!(std::fs::read(bay_state(file)).unwrap(), original, "{}: heal restored the bay's record", file);
     }
 
     in_bay(&["abort"]);
 
     let source = area.head("other");
+    let bay_journal = std::fs::read(bay_state("journal.json")).unwrap();
     in_bay(&["pick", &source]);
     for name in ["cherry-pick", "cherry-pick-copy"] {
         assert!(bay_state(name).is_file(), "the bay's {} is in the bay", name);
     }
+    assert_ne!(std::fs::read(bay_state("journal.json")).unwrap(), bay_journal, "the pick's journal entry is in the bay");
+
+    let original = std::fs::read(bay_state("cherry-pick")).unwrap();
+    flip(&bay_state("cherry-pick-copy"));
+    in_bay(&["heal"]);
+    assert_eq!(std::fs::read(bay_state("cherry-pick-copy")).unwrap(), original, "heal rewrote the bay's copy of the pick state");
+    flip(&bay_state("cherry-pick"));
+    let healed = parsed(&in_bay(&["--json", "heal"]))["data"].clone();
+    assert_eq!(names(&healed["merge_state_restored"]), vec![("pick state".to_string(), false)], "{}", healed);
+    assert_eq!(std::fs::read(bay_state("cherry-pick")).unwrap(), original, "heal restored the bay's pick state");
     in_bay(&["abort"]);
 
+    assert_eq!(std::fs::read(area.state("journal.json")).ok(), own_journal, "no journal entry of the bay's is the working tree's");
     for name in MERGE_FILES {
         assert!(!area.state(name).exists(), "the working tree holds no {} of the bay's", name);
         assert!(!bay_state(name).exists(), "the bay's {} went with its merge", name);
