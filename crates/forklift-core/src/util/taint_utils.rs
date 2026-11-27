@@ -339,12 +339,12 @@ static BAY_CHERRY_PICK_COPY: TaintShape = shape("a bay's cherry-pick state's cop
 static CHERRY_PICK: TaintShape = shape("the cherry-pick state", Some(Disposition::MergeRecord), &[Is("cherry-pick")]);
 static CHERRY_PICK_COPY: TaintShape = shape("the cherry-pick state's copy", Some(Disposition::MergeRecordCopy), &[Is("cherry-pick-copy")]);
 static FETCH_SCOPE: TaintShape = shape("the fetch scope", Some(Disposition::FetchScope), &[Is("config"), Is("fetch-scope")]);
-static FETCH_LEDGER: TaintShape = shape("the fetch ledger", Some(Disposition::FetchLedger), &[Is("fetched-heads")]);
-static HELD_HEADS: TaintShape = shape("the held-heads record", None, &[Is("held-heads")]);
+static FETCH_LEDGER: TaintShape = shape("the fetch ledger", Some(Disposition::FetchLedger), &[Is(crate::util::fetch_ledger::FILE_NAME_LEDGER)]);
+static HELD_HEADS: TaintShape = shape("the held-heads record", None, &[Is(crate::util::held_heads::FILE_NAME)]);
 static MIRROR_ROOTS: TaintShape = shape("the mirror roots record", Some(Disposition::MirrorRoots), &[Is("mirror-roots")]);
-static SERVED: TaintShape = shape("the served record", None, &[Is("served")]);
-static TOMBSTONES: TaintShape = shape("the tombstones record", None, &[Is("tombstones")]);
-static UNVOUCHED_HEADS: TaintShape = shape("the unvouched-heads record", None, &[Is("unvouched-heads")]);
+static SERVED: TaintShape = shape("the served record", None, &[Is(crate::util::tombstone_utils::FILE_NAME_SERVED)]);
+static TOMBSTONES: TaintShape = shape("the tombstones record", None, &[Is(crate::util::tombstone_utils::FILE_NAME_TOMBSTONES)]);
+static UNVOUCHED_HEADS: TaintShape = shape("the unvouched-heads record", None, &[Is(crate::util::take_utils::FILE_NAME_UNVOUCHED)]);
 static TRUST: TaintShape = shape("the trust anchor", None, &[Is("trust")]);
 static TRUST_COPY: TaintShape = shape("the trust anchor's copy", None, &[Is("trust-copy")]);
 
@@ -1780,6 +1780,12 @@ mod tests {
             }
         }
 
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if !is_cfg_test(&item.attrs) {
+                syn::visit::visit_item_trait(self, item);
+            }
+        }
+
         fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
             if !is_cfg_test(&item.attrs) {
                 // A trait's `Self` is its implementor, so a trait method is outside the impl.
@@ -1870,10 +1876,12 @@ mod tests {
     }
 
     /// What the constructor census reads, over literal sources: a trait's method that returns or
-    /// builds the type counts, as outside its impl; a `#[cfg(test)]` method inside the impl counts
-    /// for nothing, while its non-test sibling does.
-    /// Revert: drop `visit_trait_item_fn` → the trait's method is not named → red; drop the
-    /// `cfg(test)` skip in `visit_impl_item_fn` → the test-only method is counted → red.
+    /// builds the type counts, as outside its impl, even where the trait sits in a method of the
+    /// impl; a `#[cfg(test)]` method, in the impl or a trait, or a `#[cfg(test)]` trait, counts for
+    /// nothing, while a non-test sibling does.
+    /// Revert: drop `visit_trait_item_fn` → the trait's method is not named → red; drop its
+    /// outside-the-impl push → the nested trait's `Self(..)` counts as the constructor → red; drop
+    /// any of the `cfg(test)` skips → the test-only item is counted → red.
     #[test]
     fn the_constructor_census_reads_what_it_claims() {
         let read = |source: &str| {
@@ -1887,6 +1895,12 @@ mod tests {
             (names(&["f"]), names(&["f (outside impl DurablePath)"])));
         assert_eq!(read("impl DurablePath { #[cfg(test)] fn t() -> Self { Self(p) } fn u() -> Self { Self(p) } }"),
             (names(&["u"]), names(&["u"])));
+        assert_eq!(read("impl DurablePath { fn m() { trait T { fn f() -> Self { Self(p) } } } }"),
+            (names(&[]), names(&[])));
+        assert_eq!(read("trait T { #[cfg(test)] fn t() -> DurablePath { DurablePath(p) } }"),
+            (names(&[]), names(&[])));
+        assert_eq!(read("#[cfg(test)] trait T { fn t() -> DurablePath { DurablePath(p) } }"),
+            (names(&[]), names(&[])));
     }
 
     fn scratch(name: &str) -> PathBuf {
