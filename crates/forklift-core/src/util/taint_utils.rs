@@ -341,12 +341,12 @@ static CHERRY_PICK_COPY: TaintShape = shape("the cherry-pick state's copy", Some
 static FETCH_SCOPE: TaintShape = shape("the fetch scope", Some(Disposition::FetchScope), &[Is("config"), Is("fetch-scope")]);
 static FETCH_LEDGER: TaintShape = shape("the fetch ledger", Some(Disposition::FetchLedger), &[Is(crate::util::fetch_ledger::FILE_NAME_LEDGER)]);
 static HELD_HEADS: TaintShape = shape("the held-heads record", None, &[Is(crate::util::held_heads::FILE_NAME)]);
-static MIRROR_ROOTS: TaintShape = shape("the mirror roots record", Some(Disposition::MirrorRoots), &[Is("mirror-roots")]);
+static MIRROR_ROOTS: TaintShape = shape("the mirror roots record", Some(Disposition::MirrorRoots), &[Is(crate::util::mirror_utils::FILE_NAME_MIRROR_ROOTS)]);
 static SERVED: TaintShape = shape("the served record", None, &[Is(crate::util::tombstone_utils::FILE_NAME_SERVED)]);
 static TOMBSTONES: TaintShape = shape("the tombstones record", None, &[Is(crate::util::tombstone_utils::FILE_NAME_TOMBSTONES)]);
 static UNVOUCHED_HEADS: TaintShape = shape("the unvouched-heads record", None, &[Is(crate::util::take_utils::FILE_NAME_UNVOUCHED)]);
-static TRUST: TaintShape = shape("the trust anchor", None, &[Is("trust")]);
-static TRUST_COPY: TaintShape = shape("the trust anchor's copy", None, &[Is("trust-copy")]);
+static TRUST: TaintShape = shape("the trust anchor", None, &[Is(crate::util::office_utils::FILE_NAME_TRUST)]);
+static TRUST_COPY: TaintShape = shape("the trust anchor's copy", None, &[Is(crate::util::office_utils::FILE_NAME_TRUST_COPY)]);
 
 /// Every shape a taint record may name, in match order; the first match wins. The pallets/,
 /// removed-refs/, meta/ and meta-copy/ entries come first, so a ref or keepsake whose name looks
