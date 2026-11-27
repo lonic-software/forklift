@@ -155,18 +155,23 @@ pub(crate) fn get_pallet_ref_path(namespace: PalletNamespace, name: &str) -> Pat
     path
 }
 
+/// Refuse `doing` (a write of meta pallet `name`'s ref or copy) unless `name` is a meta pallet
+/// this forklift knows. Nothing has been written when it refuses.
+fn refuse_unknown_meta_pallet(name: &str, doing: &str) -> Result<(), String> {
+    match crate::util::meta_tree::check_meta_pallet_name(name) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(format!(
+            "Refusing to {}: @{} is not a meta pallet this forklift knows. It may have been written \
+            by a newer forklift; upgrade to change it. Nothing was written.",
+            doing, name
+        )),
+    }
+}
+
 /// The final path of a write or a removal of pallet `name`'s ref in `namespace`: the
 /// [`DurablePath`] of [`get_pallet_ref_path`]'s file. A meta pallet's name must be one of
 /// [`META_PALLET_NAMES`](crate::util::meta_tree::META_PALLET_NAMES); a debug build refuses any
 /// other.
-/// Refuse to write meta pallet `name`'s ref or copy unless it is a meta pallet this forklift knows.
-fn refuse_unknown_meta_pallet(name: &str, new: &str) -> Result<(), String> {
-    crate::util::meta_tree::check_meta_pallet_name(name).map_err(|why| format!(
-        "Refusing to set pallet \"@{}\" to {}: {} The pallet was not moved.",
-        name, &new[..new.len().min(12)], why
-    ))
-}
-
 pub(crate) fn ref_durable_path(namespace: PalletNamespace, name: &str) -> DurablePath {
     match namespace {
         PalletNamespace::User => DurablePath::pallet_ref(name),
@@ -2513,7 +2518,7 @@ fn write_head_locked(
     if namespace == PalletNamespace::Meta {
         // A name read from elsewhere, such as an undo entry, may be no meta pallet's, and only a
         // meta pallet has a ref and a copy here.
-        refuse_unknown_meta_pallet(name, new)?;
+        refuse_unknown_meta_pallet(name, &format!("set pallet \"@{}\" to {}", name, &new[..new.len().min(12)]))?;
     }
     validate_head_write(name, new)?;
 
@@ -2697,9 +2702,8 @@ pub enum CopyMend {
 ///                                       the copy back to tell.
 pub fn mend_meta_copy(name: &str, judged_ref: &[u8], judged_copy: &MetaCopyState) -> Result<CopyMend, CopyMendError> {
     validate_pallet_name(name).map_err(CopyMendError::Refused)?;
-    crate::util::meta_tree::check_meta_pallet_name(name).map_err(|why| CopyMendError::Refused(format!(
-        "Refusing to mend the copy of pallet \"@{}\": {}", name, why
-    )))?;
+    refuse_unknown_meta_pallet(name, &format!("mend the copy of pallet \"@{}\"", name))
+        .map_err(CopyMendError::Refused)?;
 
     let reference = PalletRef { namespace: PalletNamespace::Meta, name: name.to_string() };
     let Some(head) = parse_ref_bytes(judged_ref) else {
@@ -3725,9 +3729,13 @@ pub(crate) mod tests {
             let mend = mend_meta_copy("newpallet", &ref_bytes_of(&h2), &MetaCopyState::Absent);
 
             let Err(RefUpdateError::Failed(message)) = put_back else { panic!("{:?}", put_back) };
-            assert!(message.contains("\"@newpallet\"") && message.contains("is not a meta pallet this forklift knows"), "{}", message);
+            assert!(message.starts_with("Refusing to set pallet \"@newpallet\" to ") && message.ends_with(
+                "@newpallet is not a meta pallet this forklift knows. It may have been written by a newer \
+                forklift; upgrade to change it. Nothing was written."), "{}", message);
             let Err(CopyMendError::Refused(message)) = mend else { panic!("{:?}", mend) };
-            assert!(message.contains("\"@newpallet\"") && message.contains("is not a meta pallet this forklift knows"), "{}", message);
+            assert_eq!(message, "Refusing to mend the copy of pallet \"@newpallet\": @newpallet is not a meta \
+                pallet this forklift knows. It may have been written by a newer forklift; upgrade to change it. \
+                Nothing was written.");
             assert_eq!(std::fs::read(&reference).unwrap(), ref_bytes_of(&h2), "the ref is as it was");
             assert!(std::fs::symlink_metadata(get_meta_copy_path("newpallet")).is_err(), "no copy is written");
         }
