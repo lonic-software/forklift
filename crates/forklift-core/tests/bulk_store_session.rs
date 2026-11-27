@@ -13,6 +13,13 @@ use std::sync::Mutex;
 use forklift_core::util::file_utils::{write_file_atomically, BulkStoreSession};
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::taint_utils;
+use forklift_core::util::taint_utils::DurablePath;
+
+/// A scratch file under a temporary folder that is no warehouse's, as the write entries take it:
+/// through the escape, since no warehouse records it.
+fn scratch_file(path: &std::path::Path) -> DurablePath {
+    DurablePath::outside_warehouse(path.to_path_buf())
+}
 
 /// Only this file's tests open a `BulkStoreSession` (exactly one may be active at a time), and
 /// this binary still runs its tests on multiple threads — so they still need to take turns.
@@ -33,7 +40,7 @@ fn a_bulk_store_session_defers_publication_until_finish() {
 
     let target = temp.join("staged-object");
     let session = BulkStoreSession::open().unwrap();
-    write_file_atomically(&target, b"bulk content").unwrap();
+    write_file_atomically(&scratch_file(&target), b"bulk content").unwrap();
 
     assert!(!target.exists(), "the final name must not exist while the session is still open");
 
@@ -57,7 +64,7 @@ fn dropping_a_bulk_store_session_without_finish_publishes_nothing() {
     let target = temp.join("never-published");
     {
         let _session = BulkStoreSession::open().unwrap();
-        write_file_atomically(&target, b"should vanish").unwrap();
+        write_file_atomically(&scratch_file(&target), b"should vanish").unwrap();
         assert!(!target.exists());
         // `_session` drops here without `finish` being called.
     }
@@ -90,13 +97,13 @@ fn writes_outside_any_session_are_unaffected_by_bulk_sessions() {
     // Use and finish a session first.
     let inside_target = temp.join("inside-session");
     let session = BulkStoreSession::open().unwrap();
-    write_file_atomically(&inside_target, b"staged").unwrap();
+    write_file_atomically(&scratch_file(&inside_target), b"staged").unwrap();
     session.finish().unwrap();
 
     // Now write with no session active: the final name must exist immediately, with no
     // registry-driven staging in play.
     let outside_target = temp.join("outside-session");
-    write_file_atomically(&outside_target, b"plain write").unwrap();
+    write_file_atomically(&scratch_file(&outside_target), b"plain write").unwrap();
 
     assert!(outside_target.exists(), "a write outside any session must publish immediately");
     assert_eq!(std::fs::read(&outside_target).unwrap(), b"plain write");
@@ -127,8 +134,8 @@ fn a_failed_finish_removes_every_staged_temp_and_publishes_nothing() {
     let target_a = temp.join("a");
     let target_b = temp.join("b");
     let session = BulkStoreSession::open().unwrap();
-    write_file_atomically(&target_a, b"alpha").unwrap();
-    write_file_atomically(&target_b, b"beta").unwrap();
+    write_file_atomically(&scratch_file(&target_a), b"alpha").unwrap();
+    write_file_atomically(&scratch_file(&target_b), b"beta").unwrap();
 
     let staged_temps: Vec<_> = std::fs::read_dir(&temp).unwrap()
         .filter_map(|e| e.ok())
@@ -189,10 +196,11 @@ fn a_trailing_directory_sync_failure_through_bulk_store_session_records_a_taint(
 
     let blocked_dir = forklift.join("objects").join("bb");
     std::fs::create_dir_all(&blocked_dir).unwrap();
-    let target = blocked_dir.join("b10c");
+    let target_path = DurablePath::loose_object("bbb10c").unwrap();
+    let target = target_path.as_path();
 
     let session = BulkStoreSession::open().unwrap();
-    write_file_atomically(&target, b"content").unwrap();
+    write_file_atomically(&target_path, b"content").unwrap();
     assert!(!target.exists(), "nothing may be visible before finish");
 
     // Block read access on the directory *after* staging — the rename inside `finish` still

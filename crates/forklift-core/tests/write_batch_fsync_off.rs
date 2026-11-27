@@ -11,6 +11,13 @@
 //! genuinely observe the disabled path rather than a already-latched default.
 
 use forklift_core::util::file_utils::WriteBatch;
+use forklift_core::util::taint_utils::DurablePath;
+
+/// A scratch file under a temporary folder that is no warehouse's, as the write entries take it:
+/// through the escape, since no warehouse records it.
+fn scratch_file(path: &std::path::Path) -> DurablePath {
+    DurablePath::outside_warehouse(path.to_path_buf())
+}
 
 #[test]
 fn staged_writes_stay_invisible_until_finish_even_with_fsync_disabled() {
@@ -29,7 +36,7 @@ fn staged_writes_stay_invisible_until_finish_even_with_fsync_disabled() {
 
     let target = temp.join("staged-with-fsync-off");
     let batch = WriteBatch::new();
-    batch.stage(&target, b"fsync-off content").unwrap();
+    batch.stage(&scratch_file(&target), b"fsync-off content").unwrap();
 
     assert!(!target.exists(), "the final name must not exist while the batch is still open, \
         even with FORKLIFT_FSYNC=0 — the rename is deferred regardless of the fsync setting");
@@ -70,7 +77,7 @@ fn a_dropped_batch_publishes_nothing_even_with_fsync_disabled() {
     let target = temp.join("never-published");
     {
         let batch = WriteBatch::new();
-        batch.stage(&target, b"should vanish").unwrap();
+        batch.stage(&scratch_file(&target), b"should vanish").unwrap();
         assert!(!target.exists());
         // `batch` drops here without `finish` being called.
     }
