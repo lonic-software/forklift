@@ -1,4 +1,4 @@
-use std::ops::Add;
+use std::path::PathBuf;
 use crate::enums::object_type::ObjectType;
 use crate::util::{file_utils, object_utils};
 use crate::util::taint_utils::DurablePath;
@@ -25,27 +25,27 @@ impl LooseObject {
     /// Compress and save the object to the object store.
     ///
     /// # Returns
-    /// * `Ok(String, bool)`:
-    ///    * `String`: The full path (relative to the root of the warehouse)
-    /// where the object is stored.
+    /// * `Ok(PathBuf, bool)`:
+    ///    * `PathBuf`: The object's loose path, under the forklift root: the path written when
+    ///      this call writes it.
     ///    * `bool`: True if a new object was stored, false if the object already existed.
     /// * `Err(String)`- The error message, if the operation failed.
-    pub fn store(&mut self) -> Result<(String, bool), String> {
+    pub fn store(&mut self) -> Result<(PathBuf, bool), String> {
         // The whole-object ceiling, on the way in from local authorship (`stack`, `git import`, a
         // meta write). Only a tree or a recipe can legitimately approach it; blobs and chunks are
         // bounded well below it by construction. Reads never re-store an object, so a grandfathered
         // giant authored before this policy stays readable — this gates new authorship only.
         object_utils::check_object_ceiling(&self.object_type, self.content.len())?;
 
+        let durable = DurablePath::loose_object(&self.hash)?;
         let does_exist = file_utils::does_object_exist(&self.hash)?;
-        let (path, file_name) = file_utils::get_path_for_object(&self.hash)?;
 
         if !does_exist {
             let compressed = self.compress()?;
-            file_utils::write_object_to_file(&DurablePath::loose_object(&self.hash)?, compressed)?;
+            file_utils::write_object_to_file(&durable, compressed)?;
         }
 
-        Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), !does_exist))
+        Ok((durable.as_path().to_path_buf(), !does_exist))
     }
 
     /// Stage this object's write into `batch` instead of writing (and fsyncing) it immediately.
@@ -64,34 +64,32 @@ impl LooseObject {
     /// reader expecting to find it): staging alone makes no promise about either.
     ///
     /// # Returns
-    /// * `Ok((String, bool))`:
-    ///    * `String`: The full path (relative to the root of the warehouse) where the object
-    ///      will be stored once `batch.finish()` runs.
+    /// * `Ok((PathBuf, bool))`:
+    ///    * `PathBuf`: The object's loose path, under the forklift root: the path written once
+    ///      `batch.finish()` runs, when this call stages it.
     ///    * `bool`: True if a write was staged, false if the object already existed (or was
     ///      already staged earlier in this batch) and nothing was staged here.
     /// * `Err(String)` - The error message, if the operation failed.
-    pub fn store_deferred(&mut self, batch: &file_utils::WriteBatch) -> Result<(String, bool), String> {
+    pub fn store_deferred(&mut self, batch: &file_utils::WriteBatch) -> Result<(PathBuf, bool), String> {
         object_utils::check_object_ceiling(&self.object_type, self.content.len())?;
 
-        let (path, file_name) = file_utils::get_path_for_object(&self.hash)?;
+        let final_path = DurablePath::loose_object(&self.hash)?;
 
         if file_utils::does_object_exist(&self.hash)? {
-            return Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), false));
+            return Ok((final_path.as_path().to_path_buf(), false));
         }
-
-        let final_path = DurablePath::loose_object(&self.hash)?;
 
         if !batch.reserve_final_path(&final_path) {
             // Already staged (by an earlier occurrence in this same batch, or a concurrent one
             // that reserved it first) — the dedupe this function exists for, see the doc comment
             // above.
-            return Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), false));
+            return Ok((final_path.as_path().to_path_buf(), false));
         }
 
         let compressed = self.compress()?;
         file_utils::write_object_to_file_deferred(&final_path, compressed, batch)?;
 
-        Ok((path.add(file_utils::PATH_SEPARATOR).add(&file_name), true))
+        Ok((final_path.as_path().to_path_buf(), true))
     }
 }
 
@@ -202,6 +200,28 @@ mod tests {
         assert_eq!(final_files, 1, "exactly one durable object file must exist after finish");
 
         drop(scratch);
+    }
+
+    /// `store` and `store_deferred` return the path the object is written at, whether or not this
+    /// call wrote it.
+    #[test]
+    fn a_stored_object_is_named_by_the_path_it_was_written_at() {
+        let scratch = Scratch::new("named");
+        let mut object = LooseObjectBuilder::build_blob(&Blob { content: b"named by its path".to_vec() });
+        let expected = scratch.root.join(".forklift").join("objects").join(&object.hash[..2]).join(&object.hash[2..]);
+
+        assert_eq!(object.store().unwrap(), (expected.clone(), true), "a new object");
+        assert!(expected.is_file(), "the object is written at that path");
+        assert_eq!(object.store().unwrap(), (expected.clone(), false), "an object already stored");
+
+        let mut other = LooseObjectBuilder::build_blob(&Blob { content: b"deferred".to_vec() });
+        let deferred = scratch.root.join(".forklift").join("objects").join(&other.hash[..2]).join(&other.hash[2..]);
+        let batch = file_utils::WriteBatch::new();
+        assert_eq!(other.store_deferred(&batch).unwrap(), (deferred.clone(), true), "a staged object");
+        assert_eq!(other.store_deferred(&batch).unwrap(), (deferred.clone(), false), "an object already staged");
+        batch.finish().unwrap();
+        assert!(deferred.is_file(), "the staged object is written at that path");
+        assert_eq!(other.store_deferred(&file_utils::WriteBatch::new()).unwrap(), (deferred, false), "an object already stored");
     }
 
     /// The companion case: distinct content hashes must each still stage their own write — the

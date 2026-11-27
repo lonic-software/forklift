@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::fs::Metadata;
-use std::ops::Add;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
@@ -99,10 +98,14 @@ pub fn create_folder_if_not_exists(path: &Path) -> Result<bool, String> {
 /// rebuilds the path. This returns a clone of the cached string while the scope is unchanged and
 /// recomputes the instant it changes — so a server switching warehouses (or a bay entered
 /// mid-process) is never served a stale root, while a walk within one scope pays the cost once.
+///
+/// The root is `forklift_root().join(folder)`, a path and never a string, so it is the folder the
+/// [`DurablePath`] constructors write in whatever the root's name: a lossy string of a root whose
+/// name is not UTF-8 named another folder.
 fn memoized_root(
-    memo: &'static std::thread::LocalKey<std::cell::RefCell<Option<((u64, u64), String)>>>,
+    memo: &'static std::thread::LocalKey<std::cell::RefCell<Option<((u64, u64), PathBuf)>>>,
     folder: &str,
-) -> String {
+) -> PathBuf {
     let fingerprint = crate::globals::scope_fingerprint();
     memo.with(|memo| {
         let mut memo = memo.borrow_mut();
@@ -111,7 +114,7 @@ fn memoized_root(
                 return root.clone();
             }
         }
-        let root = forklift_root().to_string_lossy().into_owned().add(PATH_SEPARATOR).add(folder);
+        let root = forklift_root().join(folder);
         *memo = Some((fingerprint, root.clone()));
         root
     })
@@ -121,9 +124,9 @@ fn memoized_root(
 ///
 /// # Returns
 /// * The path to the "objects root" folder.
-pub fn get_path_objects_root() -> String {
+pub fn get_path_objects_root() -> PathBuf {
     thread_local! {
-        static MEMO: std::cell::RefCell<Option<((u64, u64), String)>> =
+        static MEMO: std::cell::RefCell<Option<((u64, u64), PathBuf)>> =
             const { std::cell::RefCell::new(None) };
     }
     memoized_root(&MEMO, FOLDER_NAME_OBJECTS_ROOT)
@@ -147,9 +150,9 @@ pub fn get_path_inventory_root() -> PathBuf {
 ///
 /// # Returns
 /// * The path to the "graph root" folder.
-pub fn get_path_graph_root() -> String {
+pub fn get_path_graph_root() -> PathBuf {
     thread_local! {
-        static MEMO: std::cell::RefCell<Option<((u64, u64), String)>> =
+        static MEMO: std::cell::RefCell<Option<((u64, u64), PathBuf)>> =
             const { std::cell::RefCell::new(None) };
     }
     memoized_root(&MEMO, FOLDER_NAME_GRAPH_ROOT)
@@ -273,31 +276,33 @@ pub(crate) fn is_lowercase_hex(text: &str) -> bool {
 /// // In this example we assume that the objects root folder
 /// // is ".forklift/objects", which is the
 /// // case at the time of writing this example.
-/// assert_eq!(get_path_objects_root(), String::from(".forklift/objects"));
+/// assert_eq!(get_path_objects_root(), std::path::PathBuf::from(".forklift/objects"));
 ///
-/// assert_eq!(path, String::from(".forklift/objects/90"));
+/// assert_eq!(path, std::path::PathBuf::from(".forklift/objects/90"));
 ///
 /// assert_eq!(file_name, String::from("28a15ad613bcd9853a3e780cfe3c78361b56ce95a2430484ba75ade5198cdc"));
 /// ```
-pub fn get_path_for_object(hash: &str) -> Result<(String, String), String> {
+pub fn get_path_for_object(hash: &str) -> Result<(PathBuf, String), String> {
     // A corrupted or hand-entered hash must produce an error instead of a panic
     // (or a bogus path outside the object fan-out folders).
     if !is_object_hash_or_prefix(hash) {
         return Err(format!("\"{}\" is not a valid object hash.", hash));
     }
 
-    let folder_parts: Vec<String> = (&hash[0..OBJECT_HASH_FOLDER_PATH_CHARACTERS])
-        .chars()
-        .collect::<Vec<char>>()
-        .chunks(2)
-        .map(|c| c.iter().collect())
-        .collect();
-
-    let path = get_path_objects_root()
-        .add(PATH_SEPARATOR)
-        .add(folder_parts.join(PATH_SEPARATOR).as_str());
+    let mut path = get_path_objects_root();
+    for part in hash.as_bytes()[0..OBJECT_HASH_FOLDER_PATH_CHARACTERS].chunks(2) {
+        // Lowercase hex digits only (checked above), so every chunk is its own UTF-8 name.
+        path.push(std::str::from_utf8(part).expect("a hex digit is ASCII"));
+    }
 
     Ok((path, hash[OBJECT_HASH_FOLDER_PATH_CHARACTERS..].to_string()))
+}
+
+/// The loose file of the object `hash`: [`get_path_for_object`]'s folder joined with its file
+/// name, the path [`DurablePath::loose_object`] writes.
+pub fn get_path_for_object_file(hash: &str) -> Result<PathBuf, String> {
+    let (folder, file_name) = get_path_for_object(hash)?;
+    Ok(folder.join(file_name))
 }
 
 /// Recover the object hash a loose object's final on-disk path encodes — the exact inverse of
@@ -3093,8 +3098,7 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
     run_before_loose_read();
 
     // Loose fallback: a freshly written object not yet swept into a pack, or genuinely absent.
-    let (path, file_name) = get_path_for_object(hash)?;
-    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+    let file_path = get_path_for_object_file(hash)?;
 
     let compressed = match std::fs::read(&file_path) {
         Ok(bytes) => bytes,
@@ -3125,7 +3129,7 @@ pub(crate) fn read_object_classified(hash: &str) -> Result<StoreReadOutcome, Str
                 Err(e) => Err(e),
             };
         }
-        Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
+        Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path.display(), error)),
     };
 
     Ok(match decode_loose(hash, &compressed) {
@@ -3201,13 +3205,12 @@ pub(crate) fn decode_loose(hash: &str, compressed: &[u8]) -> Result<Vec<u8>, Str
 /// distinguish between them for. A genuine I/O error (not `NotFound`) still propagates as an
 /// environment failure, exactly as the ordinary loose branch below does.
 fn read_loose_if_verified(hash: &str) -> Result<Option<Vec<u8>>, String> {
-    let (path, file_name) = get_path_for_object(hash)?;
-    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+    let file_path = get_path_for_object_file(hash)?;
 
     let compressed = match std::fs::read(&file_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path, error)),
+        Err(error) => return Err(format!("Error while reading object from file \"{}\": {}", file_path.display(), error)),
     };
 
     Ok(decode_loose(hash, &compressed).ok())
@@ -3293,11 +3296,10 @@ fn read_absent(hash: &str, absence: Absence) -> Result<Vec<u8>, (String, Option<
     // design) since nothing about the message depends on which of the two `Absent`
     // sources in `read_object_classified` produced it.
     let records_decided = applied.is_ok() && unavailable.is_ok();
-    let (path, file_name) = get_path_for_object(hash).map_err(other)?;
-    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+    let file_path = get_path_for_object_file(hash).map_err(other)?;
     let missing = format!(
         "Error while reading object from file \"{}\": {}",
-        file_path, std::io::Error::from(std::io::ErrorKind::NotFound)
+        file_path.display(), std::io::Error::from(std::io::ErrorKind::NotFound)
     );
     let missing = match applied {
         Err(record) => format!(
@@ -3429,8 +3431,11 @@ fn read_cache() -> &'static super::two_gen_cache::TwoGenCache<Vec<u8>> {
 ///
 /// `pub(crate)` so `object_utils`'s parsed-tree cache can key itself identically — the two
 /// caches must never disagree about which warehouse a hash belongs to.
+///
+/// The root is spelled by its debug form, which escapes every byte that is not UTF-8, so two
+/// roots whose names differ only there never share a key.
 pub(crate) fn read_cache_key(hash: &str) -> String {
-    format!("{}\u{0}{}", get_path_objects_root(), hash)
+    format!("{:?}\u{0}{}", get_path_objects_root(), hash)
 }
 
 /// The read cache's copy of `hash`, if it holds one. Every entry hashed to its key before it was
@@ -3945,8 +3950,7 @@ fn whole_object_type(hash: &str) -> Result<crate::enums::object_type::ObjectType
 fn loose_header(hash: &str) -> Option<Vec<u8>> {
     use std::io::Read;
 
-    let (path, file_name) = get_path_for_object(hash).ok()?;
-    let file = std::fs::File::open(path.add(PATH_SEPARATOR).add(&file_name)).ok()?;
+    let file = std::fs::File::open(get_path_for_object_file(hash).ok()?).ok()?;
     let mut prefix = Vec::with_capacity(crate::util::object_utils::MAX_HEADER_BYTES);
     crate::util::object_utils::bounded_zstd_decoder(std::io::BufReader::new(file))
         .ok()?
@@ -3992,8 +3996,7 @@ pub(crate) fn is_present_for_sweep(hash: &str) -> Result<bool, String> {
 
 /// Whether the loose fan-out path for `hash` has a dentry (no content check).
 pub(crate) fn loose_dentry_exists(hash: &str) -> Result<bool, String> {
-    let (path, file_name) = get_path_for_object(hash)?;
-    let file_path = path.add(PATH_SEPARATOR).add(&file_name);
+    let file_path = get_path_for_object_file(hash)?;
 
     std::fs::exists(&file_path)
         .map_err(|e| format!("Error while checking if object exists: {}", e))

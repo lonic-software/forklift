@@ -1567,41 +1567,26 @@ impl PackSet {
 /// pack folder on every lookup that misses (see [`reloaded_if_stale`]), so a pack another process
 /// publishes — an external `compact` beside a live server — is seen by the next miss. `compact`
 /// still invalidates its own root's entry so a same-process read sees its packs at once.
-static PACK_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<PackSet>>>> = OnceLock::new();
+static PACK_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<PackSet>>>> = OnceLock::new();
 
-fn registry() -> &'static Mutex<HashMap<String, Arc<PackSet>>> {
+fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<PackSet>>> {
     PACK_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The pack folder for the active warehouse's object store. `pub(crate)` so the durability-taint
 /// recovery walk (`recovery_utils`) can recognize a recorded taint path as living under it,
 /// without duplicating the folder layout.
+///
+/// It is the folder the pack folder's [`DurablePath`] constructors put their files in: both join
+/// the same names onto [`forklift_root`](crate::globals::forklift_root) as paths, so a store
+/// write's temp files, renames, the files listed or deleted beside them and its taint records are
+/// all in one folder whatever the root's name.
 pub(crate) fn pack_folder() -> PathBuf {
-    PathBuf::from(file_utils::get_path_objects_root()).join(FOLDER_NAME_PACK)
-}
-
-/// `Err` unless `folder` is the folder the pack folder's [`DurablePath`] constructors put their
-/// files in. A compaction, an ingest, a transport install, a signature-table publish and each
-/// store pack writer check it before they list, delete or write a file in the folder, so their
-/// temp files, renames, the files they list or delete beside them and their taint records are
-/// all in one folder. It does not cover what their callers did first: a caller may already have
-/// created the folder, or committed state of its own, such as an eviction's record.
-/// [`pack_folder`] derives its path through the memoized objects root, the constructors from
-/// [`forklift_root`](crate::globals::forklift_root) directly, and a root whose name is not UTF-8
-/// is one where the two differ.
-fn require_durable_pack_folder(folder: &Path) -> Result<(), String> {
-    let durable = DurablePath::pack("0");
-    match durable.as_path().parent() {
-        Some(expected) if expected == folder => Ok(()),
-        expected => Err(format!(
-            "The pack folder \"{}\" is not the store's own, \"{}\"; nothing was written to it.",
-            folder.to_string_lossy(), expected.unwrap_or(Path::new("")).to_string_lossy()
-        )),
-    }
+    file_utils::get_path_objects_root().join(FOLDER_NAME_PACK)
 }
 
 /// [`file_utils::sync_dir_or_taint`] for `folder`, recording the files `written`, each renamed
-/// to its [`DurablePath`] in `folder`, which [`require_durable_pack_folder`] passed.
+/// to its [`DurablePath`] in `folder`.
 fn sync_pack_folder_or_taint(folder: &Path, written: &[DurablePath]) -> Result<(), String> {
     file_utils::sync_dir_or_taint(folder, &written.iter().collect::<Vec<_>>())
 }
@@ -1640,7 +1625,7 @@ pub fn pack_preload_count() -> u64 {
 /// other threads resolves this first, on its own thread.
 #[derive(Clone, Debug)]
 pub struct PackSetLocation {
-    key: String,
+    key: PathBuf,
     folder: PathBuf,
 }
 
@@ -1766,7 +1751,7 @@ fn reloaded_if_stale(cached: &PackSet) -> Result<Option<Arc<PackSet>>, String> {
 
 /// Serializes [`reloaded_if_stale`]'s reloads per warehouse object store (keyed like
 /// [`PACK_REGISTRY`]), so one warehouse's reload never holds up another's.
-static RELOAD_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+static RELOAD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 /// The check behind [`reloaded_if_stale`]. A `stat` or listing failure on the folder reads as
 /// "not current", so the reload that follows reports it as the environment failure it is.
@@ -2878,7 +2863,6 @@ pub(crate) fn import_transport_packs<R: Read, T>(
     }
 
     let folder = pack_folder();
-    require_durable_pack_folder(&folder)?;
     file_utils::create_folder_if_not_exists(&folder)?;
     remove_stale_temp_files(&folder);
     let mut staged: Vec<StagedTransportPack> = Vec::with_capacity(sections.len());
@@ -4265,9 +4249,6 @@ fn compact_held(all: bool,
                 evicted: &HashSet<String>,
                 kept: &HashSet<String>) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
-    // Before anything here lists or deletes in the folder, not only at its first pack writer:
-    // a run with nothing to pack still removes superseded packs.
-    require_durable_pack_folder(&pack_folder)?;
     remove_stale_temp_files(&pack_folder);
 
     // A repack rewrites every signature table, so one it cannot read would be lost with the rest
@@ -4503,7 +4484,7 @@ fn compact_held(all: bool,
 
             let pack = match writer.as_mut() {
                 Some(pack) => pack,
-                None => writer.insert(PackWriter::new(&pack_folder, PackPlace::Store)?),
+                None => writer.insert(PackWriter::new(PackPlace::Store)?),
             };
 
             // Copy an existing record verbatim — a repack's fast path: the original (good) delta
@@ -4721,7 +4702,7 @@ fn compact_held(all: bool,
         Some(tables) => tables,
         None => open_signature_tables(&pack_folder)?,
     };
-    sweep_signatures(&pack_folder, table_bound, all, signature_tables, &mut stats)?;
+    sweep_signatures(table_bound, all, signature_tables, &mut stats)?;
 
     // Populate the commit-graph for the whole reachable history while the lock is held and the
     // object caches are warm, so the first ancestry query (merge base, divergence check) after
@@ -4929,8 +4910,7 @@ fn parcel_presences_from(hashes: Vec<[u8; HASH_LEN]>, parallel_from: usize) -> R
 ///
 /// Names derive from content, so a rewrite that changes nothing lands on the name of a table it
 /// read: a just-published name is never deleted.
-fn sweep_signatures(pack_folder: &Path,
-                    bound: usize,
+fn sweep_signatures(bound: usize,
                     repack: bool,
                     tables: Vec<TableFile>,
                     stats: &mut CompactStats) -> Result<(), String> {
@@ -5067,7 +5047,7 @@ fn sweep_signatures(pack_folder: &Path,
     invalidate_cache();
 
     let entries: Vec<([u8; HASH_LEN], Vec<u8>)> = merged.into_iter().collect();
-    let published = write_signature_tables(pack_folder, &entries, bound, |path| {
+    let published = write_signature_tables(&entries, bound, |path| {
         inputs.iter().any(|input| input == path) || table_stands(path)
     })?;
     stats.signature_tables_written += published.written;
@@ -5128,11 +5108,10 @@ struct PublishedTables {
 /// A name is its content, so a table that `stands` under a chunk's name already holds its bytes:
 /// it is never rewritten over itself (a rename over a file another reader has mapped fails on
 /// Windows).
-fn write_signature_tables(pack_folder: &Path,
-                          entries: &[([u8; HASH_LEN], Vec<u8>)],
+fn write_signature_tables(entries: &[([u8; HASH_LEN], Vec<u8>)],
                           bound: usize,
                           stands: impl Fn(&Path) -> bool) -> Result<PublishedTables, String> {
-    require_durable_pack_folder(pack_folder)?;
+    let pack_folder = &pack_folder();
     let mut names: HashSet<PathBuf> = HashSet::new();
     let mut written: Vec<DurablePath> = Vec::new();
 
@@ -5176,7 +5155,7 @@ pub(crate) fn publish_signature_tables(entries: &[([u8; HASH_LEN], Vec<u8>)], bo
     let folder = pack_folder();
     file_utils::create_folder_if_not_exists(&folder)?;
 
-    Ok(write_signature_tables(&folder, entries, bound, table_stands)?.written)
+    Ok(write_signature_tables(entries, bound, table_stands)?.written)
 }
 
 /// The outcome of reading and decompressing one target's bytes for [`prepare_target`]. A loose
@@ -6761,14 +6740,24 @@ fn enumerate_loose_objects() -> Result<Vec<PackTarget>, String> {
 }
 
 /// Where a [`PackWriter`] publishes its pack.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PackPlace {
-    /// The active store's pack folder: each file is renamed to its [`DurablePath`], which the
-    /// folder sync then records.
+    /// The active store's pack folder, [`pack_folder`]: each file is renamed to its
+    /// [`DurablePath`], which the folder sync then records.
     Store,
     /// The writer's own folder, such as a transport bundle's staging folder, which no taint
     /// record names.
-    Staging,
+    Staging(PathBuf),
+}
+
+impl PackPlace {
+    /// The folder the writer's temp files and pack files go in.
+    fn folder(&self) -> PathBuf {
+        match self {
+            PackPlace::Store => pack_folder(),
+            PackPlace::Staging(folder) => folder.clone(),
+        }
+    }
 }
 
 /// Accumulates objects into one pack: an append-only data file plus the records for its
@@ -6787,12 +6776,10 @@ struct PackWriter {
 }
 
 impl PackWriter {
-    /// Start a new pack, writing to a temp data file in `pack_folder`, to be published at `place`.
-    fn new(pack_folder: &Path, place: PackPlace) -> Result<PackWriter, String> {
-        if place == PackPlace::Store {
-            require_durable_pack_folder(pack_folder)?;
-        }
-        let data_temp_path = temp_path(pack_folder, FILE_EXTENSION_PACK_DATA);
+    /// Start a new pack, writing to a temp data file in `place`'s folder, to be published there.
+    fn new(place: PackPlace) -> Result<PackWriter, String> {
+        let pack_folder = place.folder();
+        let data_temp_path = temp_path(&pack_folder, FILE_EXTENSION_PACK_DATA);
         let file = std::fs::File::create(&data_temp_path).map_err(|e| format!(
             "Error while creating pack file \"{}\": {}", data_temp_path.to_string_lossy(), e
         ))?;
@@ -6803,7 +6790,7 @@ impl PackWriter {
             .map_err(|e| format!("Error while writing pack header: {}", e))?;
 
         Ok(PackWriter {
-            pack_folder: pack_folder.to_path_buf(),
+            pack_folder,
             place,
             data_temp_path,
             data_writer,
@@ -6913,7 +6900,7 @@ impl PackWriter {
         // sync records are the files these renames put in place.
         let durable = match self.place {
             PackPlace::Store => vec![DurablePath::pack(&pack_id), DurablePath::pack_index(&pack_id)],
-            PackPlace::Staging => Vec::new(),
+            PackPlace::Staging(_) => Vec::new(),
         };
         let (data_final, index_final) = match durable.as_slice() {
             [data, index] => (data.as_path().to_path_buf(), index.as_path().to_path_buf()),
@@ -7023,7 +7010,7 @@ impl TransportPackBuilder {
 
     fn writer_mut(&mut self) -> Result<&mut PackWriter, String> {
         if self.writer.is_none() {
-            self.writer = Some(PackWriter::new(&self.folder, PackPlace::Staging)?);
+            self.writer = Some(PackWriter::new(PackPlace::Staging(self.folder.clone()))?);
         }
         Ok(self.writer.as_mut().expect("the transport pack writer was just created"))
     }
@@ -7115,7 +7102,6 @@ pub struct StoreIngest {
 impl StoreIngest {
     pub fn new() -> Result<StoreIngest, String> {
         let folder = pack_folder();
-        require_durable_pack_folder(&folder)?;
         file_utils::create_folder_if_not_exists(&folder)?;
         remove_stale_temp_files(&folder);
 
@@ -7237,7 +7223,7 @@ impl StoreIngest {
 
     fn writer_mut(&mut self) -> Result<&mut PackWriter, String> {
         if self.writer.is_none() {
-            self.writer = Some(PackWriter::new(&self.folder, PackPlace::Store)?);
+            self.writer = Some(PackWriter::new(PackPlace::Store)?);
         }
         Ok(self.writer.as_mut().expect("the ingest pack writer was just created"))
     }
@@ -8017,39 +8003,70 @@ pub(crate) mod tests {
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
 
-    // A store write in a folder other than its durable paths' is refused before it writes
-    // anything, so its temp files, renames, deletions and taint records never span two folders;
-    // a store write in the active pack folder, and a staging write anywhere, go ahead. Mutations:
-    // drop the check from `PackWriter::new` → red at its `expect_err`; from
-    // `write_signature_tables` → red at its `expect_err`.
+    // A store pack is written in the active pack folder and renamed to its durable paths there; a
+    // staging pack stays in its own folder and records none.
     #[test]
-    fn a_store_write_outside_its_durable_pack_folder_is_refused_before_it_writes() {
+    fn a_store_pack_lands_at_its_durable_paths_and_a_staging_pack_in_its_own_folder() {
         let temp = std::env::temp_dir().join(format!("forklift-pack-durable-place-{}", std::process::id()));
         let _ = crate::util::file_utils::remove_dir_all(&temp);
         let _scope = StorageRootScope::enter(&temp);
         let elsewhere = temp.join("elsewhere").join(FOLDER_NAME_PACK);
         std::fs::create_dir_all(&elsewhere).unwrap();
-        let active = crate::globals::forklift_root().join("objects").join("pack");
+        let active = temp.join(".forklift").join("objects").join("pack");
         std::fs::create_dir_all(&active).unwrap();
-        let listing = |folder: &Path| std::fs::read_dir(folder).unwrap().count();
-
-        let refused = PackWriter::new(&elsewhere, PackPlace::Store).err().expect("a store pack writer in another folder must be refused");
-        assert!(refused.contains("is not the store's own"), "got: {}", refused);
-        let refused = write_signature_tables(&elsewhere, &[([7u8; HASH_LEN], vec![1u8, 2, 3])], 16, |_| false)
-            .err().expect("a signature table in another folder must be refused");
-        assert!(refused.contains("is not the store's own"), "got: {}", refused);
-        assert_eq!(listing(&elsewhere), 0, "a refused store write must write nothing");
-
-        // The positives: a staging writer keeps its own folder, a store writer the active one.
-        assert!(PackWriter::new(&elsewhere, PackPlace::Staging).is_ok());
-        let mut writer = PackWriter::new(&active, PackPlace::Store).unwrap();
         let compressed = zstd::encode_all(&b"blob 1\0x"[..], 0).unwrap();
+
+        let mut writer = PackWriter::new(PackPlace::Store).unwrap();
         writer.append_full([9u8; HASH_LEN], &compressed, None).unwrap();
         let finalized = writer.finalize().unwrap();
-        assert!(finalized.files.iter().all(|path| path.parent() == Some(active.as_path()) && path.exists()));
+        assert!(finalized.files.iter().all(|path| path.parent() == Some(active.as_path()) && path.exists()),
+            "a store pack is in the active pack folder: {:?}", finalized.files);
         assert_eq!(finalized.durable.iter().map(|path| path.as_path().to_path_buf()).collect::<Vec<_>>(), finalized.files);
 
+        let mut writer = PackWriter::new(PackPlace::Staging(elsewhere.clone())).unwrap();
+        writer.append_full([9u8; HASH_LEN], &compressed, None).unwrap();
+        let finalized = writer.finalize().unwrap();
+        assert!(finalized.files.iter().all(|path| path.parent() == Some(elsewhere.as_path()) && path.exists()),
+            "a staging pack is in its own folder: {:?}", finalized.files);
+        assert!(finalized.durable.is_empty(), "a staging pack records no durable path");
+
         crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    /// Under a root whose name is not UTF-8, the object store's readers name the folders its
+    /// writers write in, and the per-warehouse caches keep it apart from a root whose name differs
+    /// only in that byte. The roots are paths, never lossy strings. Only paths are built, so the
+    /// root need not exist (APFS will not create one).
+    #[cfg(unix)]
+    #[test]
+    fn readers_writers_and_cache_keys_agree_under_a_root_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let hash = "ab".repeat(32);
+        let root = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"forklift-not-utf8-\xff"));
+        let other = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"forklift-not-utf8-\xfe"));
+        let (key, read_key, graph) = {
+            let _scope = StorageRootScope::enter(&root);
+            let objects = root.join(".forklift").join("objects");
+
+            assert_eq!(file_utils::get_path_objects_root(), objects, "the objects root");
+            assert_eq!(file_utils::get_path_graph_root(), root.join(".forklift").join("graph"), "the graph root");
+            assert_eq!(file_utils::get_path_for_object_file(&hash).unwrap(),
+                objects.join("ab").join("ab".repeat(31)), "a loose object's read path");
+            assert_eq!(DurablePath::loose_object(&hash).unwrap().as_path(),
+                file_utils::get_path_for_object_file(&hash).unwrap(), "a loose object is read where it is written");
+            for durable in [DurablePath::pack("p"), DurablePath::pack_index("p"), DurablePath::signature_table("p")] {
+                assert_eq!(durable.as_path().parent(), Some(objects.join("pack").as_path()), "{:?}", durable.as_path());
+                assert_eq!(durable.as_path().parent(), Some(pack_folder().as_path()), "{:?}", durable.as_path());
+            }
+            assert_eq!(PackPlace::Store.folder(), objects.join("pack"), "a store pack writer's folder");
+            (PackSetLocation::current().key, file_utils::read_cache_key(&hash), file_utils::get_path_graph_root())
+        };
+
+        let _scope = StorageRootScope::enter(&other);
+        assert_ne!(PackSetLocation::current().key, key, "the pack registry key");
+        assert_ne!(file_utils::read_cache_key(&hash), read_key, "the read cache key");
+        assert_ne!(file_utils::get_path_graph_root(), graph, "the graph root");
     }
 
     /// An incoming pack holding an object in a second spelling (here, padding before its header's
@@ -9184,7 +9201,7 @@ pub(crate) mod tests {
         // `PackWriter` primitive `compact` uses internally.
         file_utils::create_folder_if_not_exists(&pack_folder()).unwrap();
         let compressed = zstd::encode_all(giant.as_slice(), 0).unwrap();
-        let mut writer = PackWriter::new(&pack_folder(), PackPlace::Store).unwrap();
+        let mut writer = PackWriter::new(PackPlace::Store).unwrap();
         writer.append_full(giant_hash_bytes, &compressed, None).unwrap();
         writer.finalize().unwrap();
 
