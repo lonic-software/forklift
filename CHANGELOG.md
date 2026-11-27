@@ -952,6 +952,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- **A warehouse in a folder whose name is not valid UTF-8 keeps its objects inside it.** Its
+  object store and parcel graph were read and written under a copy of the folder's name with the
+  invalid bytes replaced, a different folder beside the warehouse, while some writes went to the
+  real one: objects could be written where they were then not found, and writing a pack was
+  refused. Every read and write now uses the folder's own name. Objects an earlier version put in
+  the replaced-name folder are not read from there; move its `.forklift/objects` and
+  `.forklift/graph` into the warehouse's.
 - **A stack no longer drops a merge an unfinished undo was putting back.** An undo of the `stack`
   that completed a consolidation or pick, stopped after it moved the bay back and before it put the
   merge back in progress, left a bay where the next `stack` recorded an ordinary parcel, losing the
