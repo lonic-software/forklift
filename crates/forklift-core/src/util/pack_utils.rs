@@ -2849,7 +2849,9 @@ struct StagedTransportPack {
 ///                                       this returns (see `file_utils::sync_dir_or_taint`). An
 ///                                       unactivated process skips that re-check entirely.
 /// * `Err(String)`                     - A section, a pack, `admit_rest`, a sync, or the trailing
-///                                       directory sync failed. On the trailing directory-sync failure specifically,
+///                                       directory sync failed, or a taint stood (or could not be
+///                                       read) before the first pack was published, which leaves
+///                                       the store as it was. On the trailing directory-sync failure specifically,
 ///                                       every pack pair actually renamed *this run* (never a pair kept
 ///                                       because an identical layout was already published) is visible
 ///                                       but its directory entries are not proven durable — once
@@ -2936,6 +2938,13 @@ pub(crate) fn import_transport_packs<R: Read, T>(
             sync_file(&pair.data_path, "bundle pack data")?;
             sync_file(&pair.index_path, "bundle pack index")?;
         }
+
+        // A taint already standing refuses the install before anything below is removed or
+        // renamed; the staged pairs are removed after this closure, as on every other refusal.
+        let finals: Vec<DurablePath> = pack_ids.iter()
+            .flat_map(|pack_id| [DurablePath::pack(pack_id), DurablePath::pack_index(pack_id)])
+            .collect();
+        file_utils::refuse_if_taint_standing(&finals.iter().collect::<Vec<_>>())?;
 
         // Every final path actually renamed this run — never the `(true, true)` case's paths,
         // which are kept exactly as they already stood and never renamed — so the trailing sync
@@ -5132,6 +5141,16 @@ fn write_signature_tables(entries: &[([u8; HASH_LEN], Vec<u8>)],
         }
         let temp = temp_path(pack_folder, FILE_EXTENSION_SIGNATURE_TABLE);
         write_and_sync(&temp, &signature_table::build(chunk))?;
+
+        // A taint already standing refuses the publish before its first rename, and the temp
+        // goes. The re-check after the folder sync below covers a taint recorded since.
+        if written.is_empty() {
+            if let Err(refused) = file_utils::refuse_if_taint_standing(&[&durable]) {
+                let _ = file_utils::remove_file(&temp);
+                return Err(refused);
+            }
+        }
+
         file_utils::rename(&temp, final_path).map_err(|e| format!(
             "Error while finalizing signature table \"{}\": {}", final_path.to_string_lossy(), e
         ))?;
@@ -6941,6 +6960,16 @@ impl PackWriter {
                 self.pack_folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_INDEX))),
         };
 
+        // A store pack is refused before its renames while a taint stands, and both temps go: a
+        // compaction or an ingest re-checks this way at every pack it finalizes, so a taint
+        // standing refuses the next pack, not only the first. A staging pack has no durable path,
+        // so nothing is re-checked for it.
+        if let Err(refused) = file_utils::refuse_if_taint_standing(&durable.iter().collect::<Vec<_>>()) {
+            let _ = file_utils::remove_file(&self.data_temp_path);
+            let _ = file_utils::remove_file(&index_temp_path);
+            return Err(refused);
+        }
+
         file_utils::rename(&self.data_temp_path, &data_final).map_err(|e| format!(
             "Error while finalizing pack data \"{}\": {}", data_final.to_string_lossy(), e
         ))?;
@@ -8033,6 +8062,57 @@ pub(crate) mod tests {
         let state = taint_utils::read_taints(&forklift).unwrap();
         let expected = PathBuf::from("objects").join("pack").join(format!("{}.sigs", signature_table::table_id(&entries)));
         assert_eq!(state.recorded.iter().collect::<Vec<_>>(), vec![&expected]);
+
+        crate::util::file_utils::remove_dir_all(&temp).ok();
+    }
+
+    // A taint already standing refuses a bundle's pack install and a signature table's publish
+    // before the first rename: the pack folder is left empty, its staged files gone.
+    // Revert: drop the install's check → the pair lands (the re-check after the sync still
+    // refuses) → red at the install row. Revert: drop the table's check, or keep its temp → red at
+    // the table row.
+    #[test]
+    fn a_standing_taint_refuses_a_pack_install_and_a_table_publish_before_their_renames() {
+        use crate::util::taint_utils;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let temp = std::env::temp_dir().join(format!("forklift-pack-standing-taint-{}", std::process::id()));
+        let _ = crate::util::file_utils::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        let forklift = crate::globals::forklift_root();
+
+        let staging = temp.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let mut builder = TransportPackBuilder::new(&staging).unwrap();
+        let content = crate::util::object_utils::blob_bytes(b"pack-standing-taint content");
+        builder.append_full(&blake3::hash(&content).to_hex().to_string(), &content).unwrap();
+        let artifacts = builder.finish().unwrap();
+        let data_bytes = std::fs::read(&artifacts[0].data_path).unwrap();
+        let index_bytes = std::fs::read(&artifacts[0].index_path).unwrap();
+        let sections = vec![(data_bytes.len() as u64, index_bytes.len() as u64)];
+        let mut combined = data_bytes;
+        combined.extend_from_slice(&index_bytes);
+
+        let taint = forklift.join("taint");
+        std::fs::create_dir_all(&taint).unwrap();
+        std::fs::write(taint.join("taint-99999-0"), taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
+        let listing = || std::fs::read_dir(pack_folder()).map(|entries| entries.count()).unwrap_or(0);
+
+        let error = match import_transport_packs(&mut std::io::Cursor::new(combined), &sections, |_, _| Ok(())) {
+            Err(e) => e,
+            Ok(_) => panic!("a standing taint must refuse the install"),
+        };
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "install: got: {}", error);
+        assert_eq!(listing(), 0, "install: a refused install publishes nothing and leaves no staged file");
+
+        let entries = vec![([7u8; HASH_LEN], vec![1u8, 2, 3])];
+        let error = publish_signature_tables(&entries, 16).expect_err("a standing taint must refuse the table");
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "table: got: {}", error);
+        assert_eq!(listing(), 0, "table: a refused publish renames nothing and leaves no temp");
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
@@ -9379,6 +9459,13 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
 
+        let listing = || {
+            let mut names: Vec<_> = std::fs::read_dir(pack_folder()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+            names.sort();
+            names
+        };
+        let packs_before = listing();
+
         let error = match compact(false, false, false, &Progress::NONE) {
             Err(e) => e,
             Ok(_) => panic!("a standing taint must fail compact's re-check even with a clean sync"),
@@ -9387,6 +9474,9 @@ pub(crate) mod tests {
         assert!(loose_path_b.exists(),
             "compact must not remove a loose source while a taint is standing, even with a \
             clean directory sync");
+        // Revert: drop the check before a store pack's renames → the new pack lands (the
+        // re-check after the sync still refuses) → red. Revert: keep its temps → red.
+        assert_eq!(listing(), packs_before, "a refused compaction publishes no pack and leaves no temp");
 
         crate::util::file_utils::remove_dir_all(&temp).ok();
     }
