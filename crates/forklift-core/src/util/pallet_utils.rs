@@ -2515,12 +2515,13 @@ fn write_head_locked(
     compensating: bool,
 ) -> Result<(), RefUpdateError> {
     debug_assert!(!compensating || namespace == PalletNamespace::User, "only a user ref is written as a compensating write");
+    validate_head_write(name, new)?;
     if namespace == PalletNamespace::Meta {
         // A name read from elsewhere, such as an undo entry, may be no meta pallet's, and only a
-        // meta pallet has a ref and a copy here.
+        // meta pallet has a ref and a copy here. After the head's own check, which the message's
+        // cut of it relies on.
         refuse_unknown_meta_pallet(name, &format!("set pallet \"@{}\" to {}", name, &new[..new.len().min(12)]))?;
     }
-    validate_head_write(name, new)?;
 
     if !redaction.is_for(namespace, name, expected, new) || !redaction.holds(lock)? {
         return Err(RefUpdateError::Failed(format!(
@@ -3738,6 +3739,11 @@ pub(crate) mod tests {
                 Nothing was written.");
             assert_eq!(std::fs::read(&reference).unwrap(), ref_bytes_of(&h2), "the ref is as it was");
             assert!(std::fs::symlink_metadata(get_meta_copy_path("newpallet")).is_err(), "no copy is written");
+
+            // A head that is no head, with a character across the message's 12-byte cut, is the
+            // head check's refusal, never a panic on the cut.
+            let malformed = put_back_pallet_head_in(PalletNamespace::Meta, "newpallet", &h2, "0123456789aé-not-a-head");
+            assert!(matches!(&malformed, Err(error) if !error.to_string().contains("is not a meta pallet")), "{:?}", malformed);
         }
 
         fn ref_bytes_of(head: &str) -> Vec<u8> {
