@@ -1607,7 +1607,12 @@ pub fn store_object_stream(claimed_hash: &str,
     // immediate branch belongs to — this path exists only because it cannot reuse that function's
     // temp-naming scheme, not because its durability contract differs); a sync success is
     // re-checked against any taint already standing for this root before this function may report
-    // `Ok(true)` — see `file_utils::sync_dir_or_taint`.
+    // `Ok(true)` — see `file_utils::sync_dir_or_taint`. A taint already standing refuses the
+    // promotion before the rename, and the temp goes.
+    if let Err(refused) = file_utils::refuse_if_taint_standing(&[&final_path]) {
+        let _ = file_utils::remove_file(&temp_path);
+        return Err(refused);
+    }
     file_utils::rename(&temp_path, final_path.as_path())
         .map_err(|e| format!("Error while moving a streamed object into place: {}", e))?;
     file_utils::sync_dir_or_taint(folder_path, &[&final_path])?;
@@ -2482,6 +2487,36 @@ mod tests {
             "the taint must record exactly the single final path, root-relative");
 
         drop(scratch);
+    }
+
+    /// A taint already standing refuses a streamed object before its rename: nothing lands, and
+    /// the temp file goes.
+    /// Revert: drop the check before the rename → the object lands (the re-check after the sync
+    /// still refuses) → red. Revert: keep the temp on the refusal → red.
+    #[test]
+    fn store_object_stream_refuses_under_a_standing_taint_and_leaves_nothing() {
+        use crate::util::taint_utils;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        taint_utils::activate();
+
+        let scratch = Scratch::new("stream-standing-taint");
+        let taint = crate::globals::forklift_root().join("taint");
+        std::fs::create_dir_all(&taint).unwrap();
+        std::fs::write(taint.join("taint-99999-0"), taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
+
+        let content = vec![0x33u8; STREAM_STORE_THRESHOLD_BYTES + 10_000];
+        let object = LooseObjectBuilder::build_blob(&Blob { content });
+        let raw = object.content.clone();
+
+        let mut reader = std::io::Cursor::new(raw.clone());
+        let error = store_object_stream(&object.hash, &mut reader, raw.len() as u64)
+            .expect_err("a standing taint must refuse the promote");
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
+
+        let (folder, file_name) = file_utils::get_path_for_object(&object.hash).unwrap();
+        assert!(!std::path::Path::new(&folder).join(&file_name).exists(), "a refused promote renames nothing");
+        assert!(no_temp_files_left(&scratch.root), "the temp file must be cleaned up");
     }
 
     /// A streamed object whose bytes do not match the claimed hash is refused, nothing lands, and

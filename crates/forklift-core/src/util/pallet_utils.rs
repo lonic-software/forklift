@@ -2956,9 +2956,11 @@ pub fn remove_pallet_head_in(
 
 /// Unlink the ref file at `durable` and every folder of a nested name it leaves empty, up to the
 /// namespace folder, syncing each removal's parent through the durability taint. Folder removal
-/// stops at the first that does not go (it holds another ref, or anything else).
+/// stops at the first that does not go (it holds another ref, or anything else). A taint already
+/// standing refuses it before the file is removed.
 fn unlink_ref(namespace: PalletNamespace, durable: &DurablePath) -> Result<(), String> {
     let path = durable.as_path();
+    file_utils::refuse_if_taint_standing(&[durable])?;
     file_utils::remove_file(path).map_err(|e| format!(
         "Error while removing the ref file \"{}\": {}", path.to_string_lossy(), e
     ))?;
@@ -3615,6 +3617,29 @@ pub(crate) mod tests {
         });
         parcel.store().unwrap();
         parcel.hash
+    }
+
+    /// A taint already standing refuses a ref's unlink before the file is removed.
+    /// Revert: drop the check before the removal → the ref is gone (the re-check after the
+    /// folder sync still refuses) → red.
+    #[test]
+    fn a_standing_taint_refuses_a_refs_unlink_before_it_is_removed() {
+        use crate::util::taint_utils;
+
+        let _serial = taint_utils::ACTIVATION_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_root, _scope) = scratch("unlink-standing-taint");
+        let durable = ref_durable_path(PalletNamespace::User, "feature");
+        std::fs::create_dir_all(durable.as_path().parent().unwrap()).unwrap();
+        std::fs::write(durable.as_path(), "abc\n").unwrap();
+
+        let taint = forklift_root().join("taint");
+        std::fs::create_dir_all(&taint).unwrap();
+        std::fs::write(taint.join("taint-99999-0"), taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
+        taint_utils::activate();
+
+        let error = unlink_ref(PalletNamespace::User, &durable).unwrap_err();
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
+        assert_eq!(std::fs::read(durable.as_path()).unwrap(), b"abc\n", "a refused unlink removes nothing");
     }
 
     /// A meta ref's copy: written beside every head change of the ref, under the same hold, in the

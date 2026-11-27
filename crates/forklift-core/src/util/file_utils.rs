@@ -1031,9 +1031,9 @@ pub(crate) fn sync_dir_attempts() -> Vec<PathBuf> {
 ///   sync and the re-check have passed (see [`taint_recheck`]). Every recorder that durably
 ///   records a reference off the back of this call (a pallet head, a parked-list entry) must
 ///   write that reference only after this returns `Ok`. This re-check comes after the effect, so
-///   its refusal is of something already visible; [`write_file_atomically`] also checks before
-///   its rename, so on that path this one refuses only a taint recorded while the write was in
-///   flight, or a taint state it cannot read.
+///   its refusal is of something already visible; every writer that reaches it also checks before
+///   its first effect ([`refuse_if_taint_standing`]), so this one refuses only a taint recorded
+///   while the write was in flight, or a taint state it cannot read.
 ///
 /// Both halves are no-ops beyond returning `sync_result` unchanged on failure, or always
 /// `Ok(())` on success — unless [`taint_utils::activate`] has been called in this process: both
@@ -1068,6 +1068,16 @@ pub(crate) fn sync_dir_or_taint(dir: &Path, final_paths: &[&DurablePath]) -> Res
 pub(crate) fn sync_dir_again_or_taint(dir: &Path, final_paths: &[&DurablePath]) -> Result<(), String> {
     let final_paths = final_paths_of(final_paths);
     sync_dir(dir).map_err(|sync_error| taint_after_sync_failure(sync_error, &final_paths))
+}
+
+/// The standing-taint re-check a writer runs before its first effect (a rename into place, or a
+/// removal) on `final_paths`, the paths that effect would change: `Err` while a taint stands for
+/// their storage root, or its state cannot be read, so a refused write changes nothing. The
+/// writer then discards what it staged for them. The re-check after its folder sync stays, for a
+/// taint recorded while the write was in flight. [`write_file_atomically`] and
+/// [`run_write_barrier`] run the same check themselves.
+pub(crate) fn refuse_if_taint_standing(final_paths: &[&DurablePath]) -> Result<(), String> {
+    taint_recheck(&final_paths_of(final_paths))
 }
 
 fn final_paths_of<'a>(final_paths: &[&'a DurablePath]) -> Vec<&'a Path> {
@@ -1159,8 +1169,9 @@ struct SeamArming {
 }
 
 /// A test-only stand-in for a taint recorded while a write is in flight. Armed, the next
-/// [`write_file_atomically`] on this thread (one-shot: the arming is spent by that call) plants a
-/// complete taint file under its storage root after the rename and before the folder sync, so
+/// [`write_file_atomically`] or batch barrier ([`run_write_barrier`], which matches on its first
+/// final path) on this thread (one-shot: the arming is spent by that call) plants a
+/// complete taint file under its storage root after the rename(s) and before the folder sync, so
 /// the re-check after the sync refuses a write that has landed. The planted file is removed
 /// before that call returns (self-clearing), so no taint stands for the writes that follow. The
 /// planted taint is read only once activated, as every taint is. Dropping the guard disarms a
@@ -1334,8 +1345,10 @@ impl Drop for SelfTripExemptionGuard {
 /// returns, and the taint keeps the warehouse gated until heal.
 ///
 /// It exempts this one write, not the writes a caller makes around it. Inside a bulk-store
-/// session, which is process-wide, the write is only staged, as any write is, and the session's
-/// finish re-checks it.
+/// session, which is process-wide, it is refused with nothing written or staged: a session
+/// admits forward writes only, since its writes have not landed when they return, so there is
+/// nothing yet for a put-back to restore, and neither staging it nor landing it at once would
+/// leave what stood before.
 pub(crate) fn write_file_compensating(file_path: &DurablePath, content: &[u8]) -> Result<(), String> {
     write_file_atomically_as(file_path, content, true)
 }
@@ -1377,10 +1390,12 @@ pub(crate) fn put_back_as_read<T: ?Sized, R: PartialEq<T>>(
 /// The durable-taint re-check: refuse if a taint is standing for the storage root that owns
 /// `final_paths`. It reads the durable taint files rather than only the in-memory gate
 /// [`taint_utils::gate_check`] covers, so it sees this process's own earlier failure and a
-/// sibling process's alike. Two places call it:
+/// sibling process's alike. It runs at two points:
 ///
-/// - [`write_file_atomically`], before its rename: a taint already standing when the write begins
-///   refuses it with nothing visible, so a refused immediate write never lands.
+/// - Before a write's first effect: [`write_file_atomically`] before its rename,
+///   [`run_write_barrier`] before a batch's first rename, and every other writer through
+///   [`refuse_if_taint_standing`]. A taint already standing when the write begins refuses it with
+///   nothing visible, so a refused write never lands.
 /// - [`sync_result_or_taint`], on a directory sync's success path: closing the window between a
 ///   failed sync elsewhere and this call's own success, after the effect. A recorder must not
 ///   durably reference anything that call covered until it has returned `Ok`.
@@ -1608,9 +1623,9 @@ fn first_new<T>(candidates: impl IntoIterator<Item = PathBuf>,
 ///
 /// [`write_file_compensating`] runs neither re-check.
 ///
-/// Inside a bulk-store session the write is only staged and returns `Ok`: its rename and its
-/// re-check run in `BulkStoreSession::finish`, which renames every staged file and then re-checks,
-/// so a taint standing there is reported after the files were replaced.
+/// Inside a bulk-store session the write is only staged and returns `Ok`: its rename and both
+/// re-checks run in `BulkStoreSession::finish`, which refuses the whole batch before its first
+/// rename while a taint stands.
 pub fn write_file_atomically(file_path: &DurablePath, content: &[u8]) -> Result<(), String> {
     write_file_atomically_as(file_path, content, false)
 }
@@ -1625,9 +1640,21 @@ fn write_file_atomically_as(durable: &DurablePath, content: &[u8], compensating:
     // durability barrier and every rename as one batch. The invariant this function otherwise
     // enforces per-write (a final name never exists before its bytes are durable) still holds:
     // the rename simply has not happened yet, so `file_path` stays invisible until it does.
+    // A session admits forward writes only. Its writes have not landed when they return, so a
+    // put-back inside one would compensate for effects that have not happened, and neither
+    // staging it (a batch a taint refuses whole) nor landing it at once (a staged write to the
+    // same path renames over it at finish) restores what stood before. It is refused, with
+    // nothing written or staged.
     {
         let mut session = bulk_session_registry().lock().expect("bulk store session lock poisoned");
         if let Some(pending) = session.as_mut() {
+            if compensating {
+                return Err(format!(
+                    "Refusing to put back \"{}\" while a bulk store session is open: a session admits \
+                    forward writes only.",
+                    file_path.to_string_lossy()
+                ));
+            }
             create_and_write_file(&temporary_file_path, content)?;
             pending.push((temporary_file_path, file_path.to_path_buf()));
             return Ok(());
@@ -1886,8 +1913,9 @@ impl BulkStoreSession {
     ///    `File::sync_all` per file.
     /// 2. macOS only: one `F_FULLFSYNC` on any single staged file. The drive's write cache is
     ///    flushed device-wide, not per file, so one flush covers every write queued in step 1.
-    /// 3. Only now: rename every temp file to its final name (metadata-only, so fast) and record
-    ///    each distinct parent directory touched.
+    /// 3. Only now: re-check for a standing taint, which refuses the batch with nothing renamed
+    ///    (see [`run_write_barrier`]); then rename every temp file to its final name
+    ///    (metadata-only, so fast) and record each distinct parent directory touched.
     /// 4. Fsync every touched parent directory, so the renames themselves survive power loss —
     ///    using the exact same cheap-then-shared-flush structure as steps 1-2, one level up: a
     ///    cheap per-directory `fsync` (Unix only — matching [`sync_dir`]'s own read-only open;
@@ -2005,6 +2033,12 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         macos_flush_device_cache(&pending[0].0)?;
     }
 
+    // A taint already standing refuses the whole batch before its first rename, as it refuses a
+    // single write (see `write_file_atomically`), with fsync on or off: nothing becomes visible,
+    // and the caller discards every staged temp. The re-check after the trailing sync stays, for
+    // a taint recorded while the renames ran.
+    taint_recheck(&pending.iter().map(|(_, final_path)| final_path.as_path()).collect::<Vec<_>>())?;
+
     let mut touched_parents: BTreeSet<PathBuf> = BTreeSet::new();
     let mut first_renamed: Option<&Path> = None;
     // Every final path successfully renamed so far, in rename order — the visible prefix a
@@ -2057,6 +2091,22 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         }
     }
 
+    #[cfg(test)]
+    let seam_taint = plant_post_rename_taint(&pending[0].1);
+
+    let synced = barrier_sync(pending, &touched_parents, &renamed_finals);
+
+    #[cfg(test)]
+    if let Some(planted) = seam_taint {
+        remove_file(&planted).expect("the seam's planted taint file is removed");
+    }
+
+    synced
+}
+
+/// The trailing step of [`run_write_barrier`]: every rename in `pending` ran, so sync the folders
+/// they touched, then re-check.
+fn barrier_sync(pending: &[(PathBuf, PathBuf)], touched_parents: &BTreeSet<PathBuf>, renamed_finals: &[&Path]) -> Result<(), String> {
     if fsync_enabled() {
         // `pending[0].1` (a final path) is guaranteed to exist now (every rename above already
         // ran) and is an ordinary file, safely opened write-mode by `macos_flush_device_cache` —
@@ -2074,7 +2124,7 @@ fn run_write_barrier(pending: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         // Every rename above ran, so on failure this taints the batch's full set of final paths
         // (`renamed_finals` now covers every entry in `pending`); on success it re-checks for a
         // standing taint before this function may return `Ok` — see `sync_result_or_taint`.
-        sync_result_or_taint(sync_touched_directories(&touched_parents, &pending[0].1), &renamed_finals)?;
+        sync_result_or_taint(sync_touched_directories(touched_parents, &pending[0].1), renamed_finals)?;
     }
 
     // One barrier no matter how many files `pending` covers — see `BARRIER_COUNT`'s doc comment.
@@ -2560,13 +2610,15 @@ impl WriteBatch {
     ///                   taint was found standing for this batch's storage root on the re-check
     ///                   that runs right before this returns — see [`sync_result_or_taint`]. An
     ///                   unactivated process skips that re-check entirely.
-    /// * `Err(String)` - A reserved path was never staged, or a temp-fsync, rename, or
+    /// * `Err(String)` - A reserved path was never staged, a taint stood before the first rename,
+    ///                   or a temp-fsync, rename, or
     ///                   directory-sync step of the barrier failed. Either way the batch is dead:
     ///                   every remaining staged temp was best-effort removed before returning, so
     ///                   nothing staged here survives to be published later — but what is already
     ///                   on disk depends on which step failed. A leaked reservation is caught
     ///                   before the barrier ever runs, so nothing in this batch was renamed. A
-    ///                   temp-fsync failure means the same: no rename has happened yet, so no
+    ///                   temp-fsync failure, or a taint standing (or unreadable) when the renames
+    ///                   would begin, means the same: no rename has happened yet, so no
     ///                   final path is visible. A rename failure means every entry renamed before
     ///                   it is visible, and — when [`fsync_enabled`] (skipped, like every other
     ///                   sync step, when it is off) — its directory got a best-effort attempt at
@@ -8334,40 +8386,72 @@ pub(crate) mod tests {
 
     #[test]
     fn write_batch_finish_refuses_when_a_taint_is_already_standing_once_activated() {
-        // The success-path re-check: a taint file already standing for the root (simulating a
-        // sibling write's earlier failure, or a crash survivor) must fail a batch whose own sync
-        // succeeds cleanly. Reverting the `taint_recheck` call inside
-        // `sync_result_or_taint` (i.e. returning `Ok(())` unconditionally on sync success) kills
-        // this test.
+        // A taint file already standing for the root (a sibling write's earlier failure, or a
+        // crash survivor) refuses a batch before its first rename, with fsync off and on: no
+        // staged final lands, and no staged temp is left.
+        // Revert: drop the check before the renames → with fsync off the batch lands and
+        // returns Ok, with fsync on it lands and the re-check after the sync refuses → red on
+        // the absence assertion. Revert: run that check only with fsync on → the fsync-off row
+        // lands → red. Revert: keep the temps on a refusal → red on the folder listing.
+        let _serial = lock_taint_activation();
+        taint_utils::activate();
+
+        for (row, real) in [("fsync off", false), ("fsync on", true)] {
+            let _syncs = real.then(real_syncs);
+            let temp = std::env::temp_dir().join(format!("forklift-taint-recheck-batch-{}", std::process::id()));
+            let _ = remove_dir_all(&temp);
+            std::fs::create_dir_all(&temp).unwrap();
+            let _scope = StorageRootScope::enter(&temp);
+            let forklift = forklift_root();
+
+            // Hand-write a complete taint file under this root, mirroring `taint_utils`'s own
+            // format (a taint neither this batch nor this process caused).
+            let taint_dir = forklift.join("taint");
+            std::fs::create_dir_all(&taint_dir).unwrap();
+            std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
+
+            let target_path = DurablePath::loose_object("ddf5e5").unwrap();
+            let target = target_path.as_path();
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+            let batch = WriteBatch::new();
+            batch.stage(&target_path, b"content").unwrap();
+            assert_eq!(std::fs::read_dir(target.parent().unwrap()).unwrap().count(), 1, "{}: sanity: the write is staged", row);
+
+            let error = batch.finish().unwrap_err();
+            assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
+                "{}: the refusal must be machine-recognizable, got: {}", row, error);
+            assert!(!target.exists(), "{}: a refused batch renames nothing", row);
+            assert_eq!(std::fs::read_dir(target.parent().unwrap()).unwrap().count(), 0, "{}: no staged temp is left", row);
+
+            remove_dir_all(&temp).ok();
+        }
+    }
+
+    #[test]
+    fn write_batch_finish_refuses_a_taint_recorded_while_it_was_in_flight() {
+        // The re-check after the barrier's folder sync stays: a taint recorded between the
+        // renames and the sync (the seam plants one there) refuses the batch, which has landed.
+        // Revert: sync the barrier's folders without the re-check after it → Ok → red.
         let _serial = lock_taint_activation();
         let _syncs = real_syncs();
         taint_utils::activate();
 
-        let temp = std::env::temp_dir().join(format!("forklift-taint-recheck-batch-{}", std::process::id()));
+        let temp = std::env::temp_dir().join(format!("forklift-taint-recheck-batch-in-flight-{}", std::process::id()));
         let _ = remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let _scope = StorageRootScope::enter(&temp);
-        let forklift = forklift_root();
 
-        // Hand-write a complete taint file under this root, mirroring `taint_utils`'s own format
-        // (a crash-survivor / sibling-process taint neither this batch nor this process caused).
-        let taint_dir = forklift.join("taint");
-        std::fs::create_dir_all(&taint_dir).unwrap();
-        std::fs::write(taint_dir.join("taint-99999-0"), crate::util::taint_utils::taint_file_bytes(["objects/zz/preexisting"])).unwrap();
-
-        let target_path = DurablePath::loose_object("ddf5e5").unwrap();
+        let target_path = DurablePath::loose_object("de1f11").unwrap();
         let target = target_path.as_path();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
+        let _seam = PostRenameTaintSeam::arm();
         let batch = WriteBatch::new();
         batch.stage(&target_path, b"content").unwrap();
         let error = batch.finish().unwrap_err();
-        assert!(error.contains(taint_utils::GATE_TAINT_MARKER),
-            "the refusal must be machine-recognizable, got: {}", error);
-
-        // The write itself (rename + directory sync) already succeeded — only the re-check
-        // refuses to let the caller report `Ok`.
-        assert!(target.exists(), "the write itself must have landed; only the re-check refuses");
+        assert!(error.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", error);
+        assert_eq!(std::fs::read(target).unwrap(), b"content", "the refused batch has landed");
 
         remove_dir_all(&temp).ok();
     }
@@ -8479,6 +8563,16 @@ pub(crate) mod tests {
         let ordinary = write_file_atomically(&target_path, b"an ordinary write").expect_err("an ordinary write keeps the check");
         assert!(ordinary.contains(taint_utils::GATE_TAINT_MARKER), "got: {}", ordinary);
         assert_eq!(std::fs::read(&target).unwrap(), b"before the command");
+
+        // Inside a bulk-store session a put-back is refused, with nothing written or staged.
+        // Revert: land it at once → the bytes change → red. Revert: stage it like any write →
+        // Ok, and the session's batch holds it → red.
+        let session = BulkStoreSession::open().unwrap();
+        let put_back = write_file_compensating(&target_path, b"put back inside a session");
+        assert!(put_back.as_ref().is_err_and(|e| e.contains("admits forward writes only")), "got: {:?}", put_back);
+        assert_eq!(std::fs::read(target).unwrap(), b"before the command", "a refused put-back writes nothing");
+        assert_eq!(std::fs::read_dir(target.parent().unwrap()).unwrap().count(), 1, "and leaves no temp");
+        session.finish().unwrap();
 
         remove_dir_all(&temp).ok();
     }
@@ -9555,7 +9649,8 @@ pub(crate) mod tests {
             ("forklift-core/src/util/file_utils.rs", "sync_dir_again_or_taint", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "sync_dir_or_taint", "sync_result_or_taint"),
-            ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "sync_result_or_taint"),
+            // The barrier's trailing folder sync and its re-check.
+            ("forklift-core/src/util/file_utils.rs", "barrier_sync", "sync_result_or_taint"),
             // The batch barrier's two callers: a bulk-store session's finish and a write batch's.
             // Their lists hold bare paths; at this writing only write_file_atomically_as and
             // stage push into them, both from a DurablePath, and nothing here pins that.
