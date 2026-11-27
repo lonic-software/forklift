@@ -1066,7 +1066,8 @@ pub(crate) fn sync_dir_again_or_taint<P: FinalPath + ?Sized>(dir: &Path, final_p
 }
 
 /// The final path a write entry hands the taint funnel: a [`DurablePath`], or, until every
-/// caller builds one, any path. Sealed, so nothing outside this module adds a kind.
+/// caller builds one, any path. Sealed, but while the blanket impl below stands every
+/// `AsRef<Path>` type is one; once it goes, nothing outside this module adds a kind.
 pub trait FinalPath: final_path_seal::Sealed {
     fn final_path(&self) -> &Path;
 }
@@ -3785,13 +3786,13 @@ pub fn shard_folder_relative(key: &str) -> PathBuf {
 static PASSED_INVENTORY_ROOTS: std::sync::RwLock<BTreeSet<PathBuf>> = std::sync::RwLock::new(BTreeSet::new());
 
 /// Refuse an inventory root whose metadata header names another format version, once per process
-/// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
+/// per root. [`get_inventory_store_root`] and `DurablePath::shard` both run it, so it guards the paths
 /// that reach a shard without reading the metadata first (`git import` resets the inventory without
 /// reading it). A damaged, unreadable or absent metadata file passes, as does one that is not a
 /// regular file, which is never opened (a link is never followed): the metadata read reports each
 /// of them, the absent one only while the store holds a shard, and a reset rewrites the file
 /// without reading it.
-fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
+pub(crate) fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
     use std::io::BufRead;
 
     if PASSED_INVENTORY_ROOTS.read().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(inventory_root) {
@@ -3824,9 +3825,9 @@ fn gate_inventory_layout(inventory_root: &Path) -> Result<(), String> {
 /// The root of the shard store, `inv_` under the inventory root: the one folder that holds every
 /// shard, so removing it clears the whole store.
 ///
-/// Fallible because it is the single producer of shard paths: it refuses an inventory whose
-/// metadata names another format version (see [`gate_inventory_layout`]), so no shard is read or
-/// written over a layout this build does not know.
+/// Fallible because it refuses an inventory whose metadata names another format version (see
+/// [`gate_inventory_layout`]), as `DurablePath::shard` does, so no shard path either builds is
+/// read or written over a layout this build does not know.
 ///
 /// # Returns
 /// * `Ok(PathBuf)` - The path of the store root.
@@ -5544,7 +5545,7 @@ pub(crate) fn copy_aside(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// A put-back says what holds by reading the record back: unchanged, the record is not
     /// written and the error is as given; a write that lands and still fails is put back but may
     /// not be durable; one that does not land could not be put back; one that goes says nothing.
@@ -9385,7 +9386,7 @@ mod tests {
         }
     }
 
-    fn is_test_only(attributes: &[syn::Attribute]) -> bool {
+    pub(crate) fn is_test_only(attributes: &[syn::Attribute]) -> bool {
         attributes.iter().any(|attribute| {
             attribute.path().is_ident("cfg") && attribute.parse_args::<syn::Meta>().is_ok_and(|meta| cfg_requires_test(&meta))
         })

@@ -571,9 +571,11 @@ impl WriterShape {
 
 /// The final path of a durable write: what the write entries of
 /// [`file_utils`](crate::util::file_utils) hand a taint record. Its field is private, so outside
-/// this module one is had only from its constructors: one per writer shape, each building its
-/// path under [`forklift_root`] from the shape's parts, or [`DurablePath::outside_warehouse`] for
-/// a file no warehouse records. It converts to and from no other path type. A constructor reads
+/// this module one is had only from its constructors: one per record, taking a [`Checkout`]
+/// where the record is checkout-local, each building its path under [`forklift_root`] from the
+/// record's parts, or [`DurablePath::outside_warehouse`] for a file no warehouse records. It
+/// implements no `From`, `AsRef` or `Deref` to or from a path type; [`DurablePath::as_path`]
+/// lends its path. A constructor reads
 /// [`forklift_root`] when it is called, and that changes when a bay context is entered, so one
 /// built before the switch names the old root.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,7 +635,7 @@ impl DurablePath {
     }
 
     /// A loose object, by its full hash, at its fan-out folder. `Err` for a hash too short to
-    /// split.
+    /// split or not all lowercase hex.
     pub fn loose_object(hash: &str) -> Result<DurablePath, String> {
         let (fan_out, rest) = split_object_hash(hash)?;
         Ok(Self::declared(WriterShape::LooseObject, Path::new(crate::globals::FOLDER_NAME_OBJECTS_ROOT).join(fan_out).join(rest)))
@@ -659,11 +661,18 @@ impl DurablePath {
             pack_folder_file(id, crate::util::signature_table::FILE_EXTENSION_SIGNATURE_TABLE))
     }
 
-    /// A staged inventory shard, by its folder under the checkout's inventory.
-    pub fn shard(checkout: &Checkout, folder: &Path) -> DurablePath {
-        let file = Path::new(crate::globals::FOLDER_NAME_INVENTORY_ROOT).join(folder).join(file_utils::FILE_NAME_INVENTORY_DATA);
+    /// The staged inventory shard of the directory whose warehouse path key is `key`, at its
+    /// shard address in the checkout's inventory. `Err` when that inventory's metadata names
+    /// another format version, as [`file_utils::get_inventory_data_path_for_key`] refuses it.
+    pub fn shard(checkout: &Checkout, key: &str) -> Result<DurablePath, String> {
+        let (_, inventory) = checkout.place(WriterShape::Shard, WriterShape::BayShard,
+            Path::new(crate::globals::FOLDER_NAME_INVENTORY_ROOT));
+        file_utils::gate_inventory_layout(&forklift_root().join(&inventory))?;
+
+        let file = Path::new(crate::globals::FOLDER_NAME_INVENTORY_ROOT).join(file_utils::shard_folder_relative(key))
+            .join(file_utils::FILE_NAME_INVENTORY_DATA);
         let (shape, relative) = checkout.place(WriterShape::Shard, WriterShape::BayShard, &file);
-        Self::declared(shape, relative)
+        Ok(Self::declared(shape, relative))
     }
 
     pub fn load_marker(checkout: &Checkout) -> DurablePath {
@@ -779,13 +788,14 @@ impl DurablePath {
     }
 }
 
-/// A full object hash split at its fan-out folder, or `Err` for one too short to split or not
-/// on a character boundary there.
+/// A full object hash split at its fan-out folder, or `Err` for anything
+/// [`file_utils::get_path_for_object`] refuses: too short to split, or not all lowercase hex.
 fn split_object_hash(hash: &str) -> Result<(&str, &str), String> {
-    match (hash.get(..file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS), hash.get(file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS..)) {
-        (Some(fan_out), Some(rest)) if !rest.is_empty() => Ok((fan_out, rest)),
-        _ => Err(format!("\"{}\" is not a valid object hash.", hash)),
+    if !file_utils::is_object_hash_or_prefix(hash) {
+        return Err(format!("\"{}\" is not a valid object hash.", hash));
     }
+
+    Ok(hash.split_at(file_utils::OBJECT_HASH_FOLDER_PATH_CHARACTERS))
 }
 
 /// `<id>.<extension>` in the pack folder, root-relative.
@@ -1494,7 +1504,7 @@ mod tests {
     /// does not compile without one.
     fn writer_shape_example(shape: WriterShape) -> DurablePath {
         let bay = Checkout::Bay("side".to_string());
-        let shard = Path::new("src").join("lib");
+        let shard = "src/lib";
         match shape {
             WriterShape::PalletRef => DurablePath::pallet_ref("team/main"),
             WriterShape::Keepsake => DurablePath::keepsake("team%2Fmain+1"),
@@ -1505,8 +1515,8 @@ mod tests {
             WriterShape::Pack => DurablePath::pack("p1"),
             WriterShape::PackIndex => DurablePath::pack_index("p1"),
             WriterShape::SignatureTable => DurablePath::signature_table("p1"),
-            WriterShape::Shard => DurablePath::shard(&Checkout::Main, &shard),
-            WriterShape::BayShard => DurablePath::shard(&bay, &shard),
+            WriterShape::Shard => DurablePath::shard(&Checkout::Main, shard).unwrap(),
+            WriterShape::BayShard => DurablePath::shard(&bay, shard).unwrap(),
             WriterShape::LoadMarker => DurablePath::load_marker(&Checkout::Main),
             WriterShape::BayLoadMarker => DurablePath::load_marker(&bay),
             WriterShape::Position => DurablePath::position(&Checkout::Main),
@@ -1565,8 +1575,8 @@ mod tests {
             (WriterShape::Pack, "objects/pack/p1.pack", "a pack"),
             (WriterShape::PackIndex, "objects/pack/p1.idx", "a pack index"),
             (WriterShape::SignatureTable, "objects/pack/p1.sigs", "a signature table"),
-            (WriterShape::Shard, "inventory/src/lib/data", "a staged inventory shard"),
-            (WriterShape::BayShard, "bays/side/inventory/src/lib/data", "a bay's staged inventory shard"),
+            (WriterShape::Shard, "inventory/inv_/32/ae56798cd16a1f7d10d50387731aaceed83ae94f48bcf50fc30b7444c43191/data", "a staged inventory shard"),
+            (WriterShape::BayShard, "bays/side/inventory/inv_/32/ae56798cd16a1f7d10d50387731aaceed83ae94f48bcf50fc30b7444c43191/data", "a bay's staged inventory shard"),
             (WriterShape::LoadMarker, "inventory/incomplete-load", "the incomplete-load marker"),
             (WriterShape::BayLoadMarker, "bays/side/inventory/incomplete-load", "a bay's incomplete-load marker"),
             (WriterShape::Position, "position", "the checkout position"),
@@ -1621,10 +1631,46 @@ mod tests {
 
         let outside = root.join("elsewhere").join("record");
         assert_eq!(DurablePath::outside_warehouse(outside.clone()).as_path(), outside);
+
+        // The main tree's shard is the path the reader of that key opens.
+        let read = file_utils::get_inventory_data_path_for_key("src/lib").unwrap();
+        assert_eq!(DurablePath::shard(&Checkout::Main, "src/lib").unwrap().as_path(), Path::new(&read));
+    }
+
+    /// A constructor refuses what its writer's own path builder refuses today: a hash that is not
+    /// lowercase hex, whatever its length, and a shard of an inventory whose metadata names
+    /// another format version, in the main tree and in a bay. A well-formed hash and a shard of
+    /// an inventory this build knows are built (the table test above).
+    /// Revert: drop the hex check in `split_object_hash`, or the gate in `shard` → `Ok` → red.
+    #[test]
+    fn a_constructor_refuses_what_its_writers_path_builder_refuses() {
+        let (_scope, root) = absolute_root("writer-refusals");
+        let _ = std::fs::remove_dir_all(&root);
+
+        for hash in ["ZZ1234", "../../etc/x", "AB12CD"] {
+            assert!(file_utils::get_path_for_object(hash).is_err(), "sanity: the writer refuses {}", hash);
+            assert_eq!(DurablePath::loose_object(hash), Err(format!("\"{}\" is not a valid object hash.", hash)));
+            assert_eq!(DurablePath::loose_signature(hash), Err(format!("\"{}\" is not a valid object hash.", hash)));
+        }
+
+        let bay = Checkout::Bay("side".to_string());
+        for (checkout, inventory) in [(&Checkout::Main, Path::new("inventory")), (&bay, Path::new("bays/side/inventory"))] {
+            // Each inventory is a root the gate has not passed in this process.
+            let inventory = forklift_root().join(inventory);
+            std::fs::create_dir_all(&inventory).unwrap();
+            let newer = record_utils::to_bytes(file_utils::INVENTORY_METADATA_RECORD,
+                file_utils::INVENTORY_METADATA_VERSION + 1, ["./"]);
+            std::fs::write(inventory.join(file_utils::FILE_NAME_INVENTORY_METADATA), newer).unwrap();
+
+            let refused = DurablePath::shard(checkout, "src/lib");
+            assert!(refused.as_ref().is_err_and(|e| e.contains("does not know")), "{:?}: {:?}", checkout, refused);
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A constructor refuses a path that classifies as another entry: a meta copy built for an
-    /// ordinary pallet's name takes the heal-only entry that precedes no other.
+    /// ordinary pallet's name classifies as the heal-only meta-copy entry, the first entry it
+    /// matches.
     /// Revert: drop the check in `declared` → no panic → red.
     #[test]
     #[should_panic(expected = "a MetaCopy writer built \"meta-copy/main\", which is a copy of a ref that is no meta pallet's, not a meta pallet ref's copy")]
@@ -1683,17 +1729,17 @@ mod tests {
             self.built_in.insert(within);
         }
 
+        /// A function returning a `DurablePath`, by its name inside `impl DurablePath`, and
+        /// marked as outside it anywhere else, so no allowed name passes there.
         fn note_fn(&mut self, sig: &syn::Signature) {
             if mentions_durable_path(&sig.output, self.in_durable_impl()) {
-                self.returned_by.insert(sig.ident.to_string());
+                let name = sig.ident.to_string();
+                self.returned_by.insert(if self.in_durable_impl() { name } else { format!("{} (outside impl DurablePath)", name) });
             }
         }
     }
 
-    fn is_cfg_test(attributes: &[syn::Attribute]) -> bool {
-        attributes.iter().any(|attribute| attribute.path().is_ident("cfg")
-            && attribute.parse_args::<syn::Meta>().is_ok_and(|meta| meta.path().is_ident("test")))
-    }
+    use crate::util::file_utils::tests::is_test_only as is_cfg_test;
 
     impl<'ast> syn::visit::Visit<'ast> for Constructions {
         fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
@@ -1715,10 +1761,13 @@ mod tests {
 
         fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
             if !is_cfg_test(&item.attrs) {
+                // A free function, even one nested in a method's body, is outside the impl.
+                self.durable_impl.push(false);
                 self.note_fn(&item.sig);
                 self.within.push(item.sig.ident.to_string());
                 syn::visit::visit_item_fn(self, item);
                 self.within.pop();
+                self.durable_impl.pop();
             }
         }
 
@@ -1747,8 +1796,9 @@ mod tests {
     /// The constructor census over this file's non-test source: a `DurablePath` is built, by a
     /// call, a braced literal or the constructor taken as a value, spelled `DurablePath` or
     /// `Self` in any impl for it, only in `declared` and `outside_warehouse`; and every function
-    /// returning one, bare or inside another type, is one the writer-shape example calls, or one
-    /// of those two.
+    /// returning one, bare or inside another type, is a function of `impl DurablePath` the
+    /// writer-shape example calls, or one of those two. The type derives only the traits listed
+    /// here, so no derive (`Default`, `Deserialize`) builds one either.
     /// Revert: add `fn sneaky(p: &Path) -> Result<DurablePath, String> { Ok(Self(p.to_path_buf())) }`
     /// to `impl DurablePath` → red.
     #[test]
@@ -1756,6 +1806,20 @@ mod tests {
         let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/util/taint_utils.rs");
         let source = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {}", file.display(), e));
         let parsed = syn::parse_file(&source).unwrap();
+
+        let definition = parsed.items.iter().find_map(|item| match item {
+            syn::Item::Struct(definition) if definition.ident == "DurablePath" => Some(definition),
+            _ => None,
+        }).expect("the type is defined in this file");
+        let mut derived = Vec::new();
+        for attribute in definition.attrs.iter().filter(|attribute| !attribute.path().is_ident("doc")) {
+            assert!(attribute.path().is_ident("derive"), "an attribute other than a derive: {:?}", attribute.path().get_ident());
+            attribute.parse_nested_meta(|meta| {
+                derived.push(meta.path.get_ident().map(|ident| ident.to_string()).unwrap_or_default());
+                Ok(())
+            }).unwrap();
+        }
+        assert_eq!(derived, ["Clone", "Debug", "PartialEq", "Eq"]);
 
         let mut constructions = Constructions::default();
         syn::visit::Visit::visit_file(&mut constructions, &parsed);
