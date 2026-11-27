@@ -163,7 +163,7 @@ fn heals_from_the_copy(area: &Area, root: &Path, dir: &Path, bay: Option<&str>, 
 }
 
 // Revert: read_position_at mapping every failure to a plain String → the refusal is "error", not
-// bay_position_damaged. Drop the copy write from write_position_files → heal finds no copy.
+// bay_position_damaged. Drop the copy write from write_position_for → heal finds no copy.
 #[test]
 fn a_damaged_position_in_the_working_tree_is_rebuilt_from_its_copy() {
     for kind in DAMAGES {

@@ -5143,6 +5143,7 @@ fn walk_failure_refusal(root: &Path, error: &str) -> CoreError {
 mod tests {
     use super::*;
     use crate::util::file_utils;
+    use crate::util::taint_utils::Checkout;
     use std::collections::HashMap;
 
     /// The store-wide restage listing names a respelled loose entry by the path builder's
@@ -6622,7 +6623,7 @@ mod tests {
             .join(file_utils::shard_folder_relative(""))
             .join(file_utils::FILE_NAME_INVENTORY_DATA);
         std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_utils::bay_state_dir("b"), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(&shard_path, bytes).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
@@ -6652,7 +6653,7 @@ mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         crate::util::park_utils::park_for_test(&[&target_hash]);
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
@@ -6687,7 +6688,7 @@ mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         let targets: BTreeSet<String> = ["a".repeat(64)].into_iter().collect();
@@ -6723,7 +6724,7 @@ mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: target_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: "e".repeat(64), our_pallet: "main".to_string(),
             skeleton_digest: "0".repeat(64),
@@ -8120,7 +8121,7 @@ mod tests {
             std::fs::create_dir_all(&folder).unwrap();
             {
                 let _fault = SyncDirFaultGuard::failing_exactly(&folder);
-                pallet_utils::write_position_in(&folder, &pallet_utils::BayPosition::new("b", None))
+                pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &pallet_utils::BayPosition::new("b", None))
                     .expect_err("a position write whose folder sync fails fails");
             }
             assert_eq!(taint_utils::read_taints(&forklift).unwrap().recorded,
@@ -8690,7 +8691,11 @@ mod tests {
                 Beside::DamagedWithStateCopy => {
                     std::fs::write(&state, b"not a state\n").unwrap();
                     std::fs::write(dir.join(merge_utils::FILE_NAME_CONSOLIDATION_COPY), state_of("0".repeat(64))).unwrap();
-                    crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", Some(head.clone()))).unwrap();
+                    let checkout = match relative.strip_prefix("bays/").and_then(|rest| rest.split_once('/')) {
+                        Some((bay, _)) => Checkout::Bay(bay.to_string()),
+                        None => Checkout::Main,
+                    };
+                    crate::util::pallet_utils::write_position_for(&checkout, &crate::util::pallet_utils::BayPosition::new("main", Some(head.clone()))).unwrap();
                 }
                 Beside::NewerStateAndMarker => {
                     std::fs::write(&state, record_utils::to_bytes(
@@ -9030,7 +9035,7 @@ mod tests {
         use crate::util::pallet_utils::{self, PalletNamespace, tests::{scratch, stub_parcel, update_pallet_head_unverified}};
 
         let (root, _scope) = scratch("recovery-reaching-unread");
-        pallet_utils::write_position_in(&crate::globals::forklift_root(), &pallet_utils::BayPosition::new("main", None)).unwrap();
+        pallet_utils::write_position_for(&Checkout::Main, &pallet_utils::BayPosition::new("main", None)).unwrap();
         let p = stub_parcel("p");
         update_pallet_head_unverified("p", None, &p, &pallet_utils::RefPreconditions::NONE).unwrap();
         // X: the tree p's head names, gone from the store.
@@ -9065,7 +9070,7 @@ mod tests {
         use crate::util::pallet_utils::{self, tests::{scratch, stub_parcel}};
 
         let (_root, _scope) = scratch("recovery-copy-ahead");
-        pallet_utils::write_position_in(&crate::globals::forklift_root(), &pallet_utils::BayPosition::new("main", None)).unwrap();
+        pallet_utils::write_position_for(&Checkout::Main, &pallet_utils::BayPosition::new("main", None)).unwrap();
         let (h1, h2) = (stub_parcel("h1"), stub_parcel("h2"));
         pallet_utils::update_meta_pallet_head("tags", None, &h1, &pallet_utils::RefPreconditions::NONE).unwrap();
         std::fs::write(pallet_utils::get_meta_copy_path("tags"), format!("{}\n", h2)).unwrap();
@@ -11294,7 +11299,7 @@ mod tests {
         // halves of this fix are about.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         // A genuinely vanished object recorded as tainted, unrelated to bay "b"'s own state — so
@@ -11372,7 +11377,7 @@ mod tests {
         // corrupt, so that one reference is unreadable along with the rest of the file.
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
@@ -11414,7 +11419,7 @@ mod tests {
 
         let record = mirror_utils::mirror_roots_path();
         std::fs::create_dir_all(forklift.join(crate::globals::FOLDER_NAME_OBJECTS_ROOT)).unwrap();
-        crate::util::pallet_utils::write_position_in(&forklift, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Main, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(&record, b"/forklift-mirror-roots 99\n").unwrap();
         let record_name = record.display().to_string();
 
@@ -11473,7 +11478,7 @@ mod tests {
 
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
-        crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::pallet_utils::write_position_for(&Checkout::Bay("b".to_string()), &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
         std::fs::write(bay_b_dir.join("consolidation"), b"not a consolidation record\n").unwrap();
 
         plant_torn_taint(&forklift, &[]);

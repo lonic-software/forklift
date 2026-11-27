@@ -4,7 +4,6 @@ use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 use crate::util::scope_utils::PathScope;
 use crate::util::sealed_utils::Tolerated;
-use crate::util::file_utils::FinalPath;
 use crate::util::taint_utils::{Checkout, DurablePath};
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
@@ -839,29 +838,19 @@ pub fn landed_but(pallet: &str, head: &str, error: &str) -> String {
 /// position the bay has left; only when neither can be done does the write fail (the position
 /// itself stands).
 pub fn write_position_for(checkout: &Checkout, position: &BayPosition) -> Result<(), String> {
-    write_position_files(&DurablePath::position(checkout), &DurablePath::position_copy(checkout), position)
-}
-
-/// [`write_position_for`] into the folder `dir`, for the tests that still name a folder.
-#[cfg(test)]
-pub(crate) fn write_position_in(dir: &Path, position: &BayPosition) -> Result<(), String> {
-    write_position_files(&dir.join(FILE_NAME_POSITION), &dir.join(FILE_NAME_POSITION_COPY), position)
-}
-
-/// Write `position` to `path`, then to its copy at `copy`, as [`write_position_for`] says.
-fn write_position_files<P: FinalPath + ?Sized>(path: &P, copy: &P, position: &BayPosition) -> Result<(), String> {
     validate_pallet_name(&position.pallet)?;
 
     let bytes = position_bytes(position);
+    let (path, copy) = (DurablePath::position(checkout), DurablePath::position_copy(checkout));
 
-    file_utils::write_file_atomically(path, &bytes)?;
+    file_utils::write_file_atomically(&path, &bytes)?;
 
-    file_utils::write_file_atomically(copy, &bytes).or_else(|written| match file_utils::remove_file(copy.final_path()) {
+    file_utils::write_file_atomically(&copy, &bytes).or_else(|written| match file_utils::remove_file(copy.as_path()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(removed) => Err(format!(
             "The bay position was written, but its copy \"{}\" could neither be written ({}) nor removed ({}).",
-            copy.final_path().to_string_lossy(), written.trim_end_matches('.'), removed
+            copy.as_path().to_string_lossy(), written.trim_end_matches('.'), removed
         )),
     })
 }
@@ -3233,6 +3222,27 @@ pub(crate) mod tests {
         assert_eq!(sync_ref_folders(), Err(format!("injected directory-sync failure for \"{}\"", failing.to_string_lossy())));
         let attempted = attempts();
         assert!(attempted.contains(&copies), "the folders after the failure are synced: {:?}", attempted);
+    }
+
+    /// A position and its copy land in their own checkout's folder, each under its own name: the
+    /// working tree's in the root, a bay's under its state folder.
+    /// Revert: build the copy's path from the position's constructor → no copy file → red.
+    #[test]
+    fn a_position_and_its_copy_land_in_their_checkouts_folder() {
+        let (root, _scope) = scratch("position-and-copy");
+        let dir = forklift_root();
+        std::fs::create_dir_all(dir.join("bays").join("b")).unwrap();
+
+        for (checkout, folder, pallet) in [(Checkout::Main, dir.clone(), "main"), (Checkout::Bay("b".to_string()), dir.join("bays/b"), "side")] {
+            let position = BayPosition::new(pallet, None);
+            write_position_for(&checkout, &position).unwrap();
+            for file in ["position", "position-copy"] {
+                let bytes = std::fs::read(folder.join(file)).unwrap_or_else(|e| panic!("{:?} has no {}: {}", checkout, file, e));
+                assert_eq!(decode_position(&bytes).ok(), Some(position.clone()), "{:?} {}", checkout, file);
+            }
+        }
+
+        let _ = file_utils::remove_dir_all(&root);
     }
 
     /// A copy that can be neither written nor removed fails the write loudly, after the primary

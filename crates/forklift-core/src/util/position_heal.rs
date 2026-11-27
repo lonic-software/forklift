@@ -16,7 +16,6 @@
 use serde::Serialize;
 
 use crate::error::{CoreError, RefusalCode};
-use crate::globals::bay_root;
 use crate::util::pallet_utils::{self, BayPosition, PositionCopy, PositionUnread};
 use crate::util::taint_utils::{Checkout, DurablePath};
 use crate::util::{file_utils, journal_utils, operation_utils};
@@ -79,9 +78,10 @@ impl PositionRebuilt {
 ///                                 read or write. Nothing was changed but what a write says.
 pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<PositionRebuilt>, String> {
     let checkout = Checkout::active();
-    let path = bay_root().join(pallet_utils::FILE_NAME_POSITION);
+    let durable = DurablePath::position(&checkout);
+    let path = durable.as_path();
 
-    let unread = match std::fs::read(&path) {
+    let unread = match std::fs::read(path) {
         Ok(bytes) => match pallet_utils::decode_position(&bytes) {
             Ok(position) => return keep(&checkout, position, chosen, notes),
             Err(PositionUnread::Newer(reason)) => return match chosen {
@@ -145,10 +145,10 @@ pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<Po
         )),
         (Some(evidence), None) => evidence,
         (None, Some(pallet)) => (chosen_position(pallet)?, PositionSource::Chosen),
-        (None, None) => return Err(no_evidence(&path, &unread)),
+        (None, None) => return Err(no_evidence(path, &unread)),
     };
 
-    pallet_utils::write_position(&position)?;
+    pallet_utils::write_position_for(&checkout, &position)?;
 
     Ok(Some(PositionRebuilt { pallet: position.pallet, base: position.base, from }))
 }
@@ -157,9 +157,9 @@ pub fn repair(chosen: Option<&str>, notes: &mut Vec<String>) -> Result<Option<Po
 /// neither a copy nor an operation left unfinished says where it stood. Otherwise it refuses
 /// `--position` before writing anything.
 pub fn sets_chosen() -> Result<bool, String> {
-    let dir = bay_root();
+    let checkout = Checkout::active();
 
-    match std::fs::read(dir.join(pallet_utils::FILE_NAME_POSITION)) {
+    match std::fs::read(DurablePath::position(&checkout).as_path()) {
         Ok(bytes) => if !matches!(pallet_utils::decode_position(&bytes), Err(PositionUnread::Damaged(_))) {
             return Ok(false);
         },
@@ -167,7 +167,7 @@ pub fn sets_chosen() -> Result<bool, String> {
         Err(_) => return Ok(false),
     }
 
-    Ok(matches!(pallet_utils::read_position_copy_for(&Checkout::active()), PositionCopy::Unusable) && operation_utils::read()?.is_none())
+    Ok(matches!(pallet_utils::read_position_copy_for(&checkout), PositionCopy::Unusable) && operation_utils::read()?.is_none())
 }
 
 /// A position that reads: `--position` is refused over it, and its copy is rewritten if it does
@@ -317,6 +317,62 @@ mod tests {
 
         taint_utils::reset_activation_for_test();
         drop(_serial);
+        let _ = file_utils::remove_dir_all(&root);
+    }
+
+    /// `--position` is set only over a position that is lost or damaged with no copy and no
+    /// operation left unfinished to witness it: a position that reads, that a newer version wrote,
+    /// or that cannot be read now is kept, and a copy that reads is the evidence.
+    /// Revert: read the copy where the position is read → a sound position with no copy reads
+    /// as lost → red.
+    #[test]
+    fn a_chosen_position_is_set_only_where_nothing_witnesses_the_position() {
+        #[derive(Debug)]
+        enum File<'a> { Absent, Bytes(&'a [u8]), Folder }
+
+        let root = std::env::temp_dir().join(format!("forklift-position-heal-sets-chosen-{}", std::process::id()));
+        let _ = file_utils::remove_dir_all(&root);
+        let dir = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        let main = BayPosition::new("main", None);
+        pallet_utils::write_position_for(&Checkout::Main, &main).unwrap();
+        let sound = std::fs::read(dir.join("position")).unwrap();
+        let newer = crate::util::record_utils::to_bytes("position", 99, ["main", ""]);
+        let damaged = &b"not a position\n"[..];
+
+        for (position, copy, marker, sets) in [
+            (File::Absent, File::Absent, false, true),
+            (File::Bytes(damaged), File::Absent, false, true),
+            (File::Absent, File::Bytes(damaged), false, true),
+            (File::Bytes(&sound), File::Absent, false, false),
+            (File::Absent, File::Bytes(&sound), false, false),
+            (File::Bytes(damaged), File::Bytes(&sound), false, false),
+            (File::Bytes(&newer), File::Absent, false, false),
+            (File::Folder, File::Absent, false, false),
+            (File::Absent, File::Folder, false, false),
+            (File::Absent, File::Bytes(&newer), false, false),
+            (File::Absent, File::Absent, true, false),
+        ] {
+            for (file, state) in [("position", &position), ("position-copy", &copy)] {
+                let path = dir.join(file);
+                let _ = file_utils::remove_dir_all(&path);
+                let _ = file_utils::remove_file(&path);
+                match state {
+                    File::Absent => {}
+                    File::Bytes(bytes) => std::fs::write(&path, bytes).unwrap(),
+                    File::Folder => std::fs::create_dir(&path).unwrap(),
+                }
+            }
+            let _ = file_utils::remove_file(dir.join(operation_utils::FILE_NAME_OPERATION));
+            if marker {
+                let operation = operation_utils::Operation::new(operation_utils::OperationKind::Shift, main.clone(), None, main.clone());
+                operation_utils::raise_in(&dir, &operation).unwrap();
+            }
+            assert_eq!(sets_chosen(), Ok(sets), "position {:?}, copy {:?}, marker {}", position, copy, marker);
+        }
+
         let _ = file_utils::remove_dir_all(&root);
     }
 }
