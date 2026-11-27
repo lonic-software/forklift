@@ -9525,9 +9525,9 @@ pub(crate) mod tests {
     /// The census of the taint family's callers: every non-test caller, in every crate's `src/`,
     /// of the record writer, heal's remainder writer and the funnel, as a literal multiset. A new
     /// direct caller of `record_taint` or `resolve_taints`, or a new way into the funnel that
-    /// passes by its typed entries, turns it red; so does a new caller of the batch barrier. It sees what a source scan names, not what is
-    /// reachable: a call through a function pointer stored elsewhere is outside it, and so is test
-    /// code, which may call any of them.
+    /// passes by its typed entries, turns it red; so does a new caller of the batch barrier. It
+    /// sees what a source scan names, not what is reachable: a call through a function pointer
+    /// stored elsewhere is outside it, and so is test code, which may call any of them.
     /// Revert: add a `record_taint` call to a non-test function under any crate's `src/` → red;
     /// add a `resolve_taints` call outside heal's five sites → red.
     #[test]
@@ -9550,8 +9550,9 @@ pub(crate) mod tests {
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "taint_after_sync_failure"),
             ("forklift-core/src/util/file_utils.rs", "sync_dir_or_taint", "sync_result_or_taint"),
             ("forklift-core/src/util/file_utils.rs", "run_write_barrier", "sync_result_or_taint"),
-            // The batch barrier's two callers: a bulk-store session's finish, whose list only
-            // write_file_atomically_as fills, and a write batch's, whose list only stage fills.
+            // The batch barrier's two callers: a bulk-store session's finish and a write batch's.
+            // Their lists hold bare paths; at this writing only write_file_atomically_as and
+            // stage push into them, both from a DurablePath, and nothing here pins that.
             ("forklift-core/src/util/file_utils.rs", "run_barrier", "run_write_barrier"),
             ("forklift-core/src/util/file_utils.rs", "finish", "run_write_barrier"),
             // The funnel's callers.
