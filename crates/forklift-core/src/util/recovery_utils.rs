@@ -2648,13 +2648,19 @@ fn sync_nearest_ancestor_when(syncs: bool, root: &Path, relative: &Path) -> Resu
 }
 
 /// The deepest folder above `relative` (under `root`, every component a plain name) that opens as
-/// a folder, links followed. A spelling that opens no folder is not standing, and the search goes
-/// up: [`lookup_opens_no_folder`] says which answers mean that, and so does a name that opens
-/// something other than a folder. Any other answer (no permission, an I/O error, a spelling too
-/// long to pass) is an error, never taken for "absent": the folder may stand and hold the entry.
-/// A dangling link reads as absent, even where its target is only away. With no folder standing,
-/// `root` itself, spelled exactly, so a sync fault or record keyed by the root's path matches it
-/// (not `root` with a trailing separator).
+/// a folder, links followed.
+///
+/// The search goes up only on an answer that proves the spelling opens no folder: the lookup
+/// finished and found nothing (`NotFound`, a dangling link included, even where its target is only
+/// away), found a non-folder on the way (`NotADirectory`), or opened something that is not a
+/// folder. Every other answer leaves the lookup unfinished, so the folder may stand and hold the
+/// entry, and it is an error that keeps the record: no permission, an I/O error, and the host's
+/// limits, a spelling too long to pass or a link chain the host stopped following (a true loop and
+/// a chain over the hop limit answer alike). A record names a spelling the host could pass when it
+/// was written, so a limit met now means the root or the host has changed since.
+///
+/// With no folder standing, `root` itself, spelled exactly, so a sync fault or record keyed by the
+/// root's path matches it (not `root` with a trailing separator).
 fn nearest_opened_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, String> {
     let mut dir = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
 
@@ -2664,7 +2670,7 @@ fn nearest_opened_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, Stri
         match std::fs::metadata(&absolute) {
             Ok(metadata) if metadata.is_dir() => return Ok(absolute),
             Ok(_) => {}
-            Err(error) if lookup_opens_no_folder(&error) => {}
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
             Err(error) => return Err(format!("\"{}\": {}", absolute.to_string_lossy(), error)),
         }
 
@@ -2672,22 +2678,6 @@ fn nearest_opened_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, Stri
     }
 
     Ok(root.to_path_buf())
-}
-
-/// Whether a lookup that failed with `error` finished resolving the spelling and found no folder
-/// there: the name is absent or a dangling link (`NotFound`), a parent on the way is not a folder
-/// (`NotADirectory`), or the spelling runs into a link loop. This is a closed list: any other
-/// answer leaves the lookup unfinished, and the folder may stand. A spelling too long to pass
-/// (`InvalidFilename`) is one of those: a record names a path this host could spell when it was
-/// written, so the root or the host has changed since, and the folder may stand unsynced.
-fn lookup_opens_no_folder(error: &std::io::Error) -> bool {
-    // A loop's kind (`FilesystemLoop`) is not stable to name, so it is read by its errno.
-    #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::ELOOP) {
-        return true;
-    }
-
-    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
 }
 
 /// Every durable ref source's roots for the closure walk (§3.2: "every durable ref source", never
@@ -11211,12 +11201,11 @@ mod tests {
     /// opens under another spelling (case or Unicode normalization, as probed on folders no row
     /// names) or through a link syncs the folder it opens, and `pallets`, which lists it exactly,
     /// above it. The other rows: a folder one and two deep, an absent name, a top-level path (the
-    /// root, spelled exactly), a file, a link loop, and a trailing `.` (absent on the volumes this
-    /// suite runs on). The loop is absent, not an error: no folder opens under it.
+    /// root, spelled exactly), a file, and a trailing `.` (absent on the volumes this suite runs
+    /// on).
     ///
-    /// Mutations: the sync bounded by the process's storage root instead of `root` (main's
-    /// `sync_dir`) → no folder above the opened one is synced → red; a link loop taken as an
-    /// error → red.
+    /// Mutation: the sync bounded by the process's storage root instead of `root` (main's
+    /// `sync_dir`) → no folder above the opened one is synced → red.
     #[cfg(unix)]
     #[test]
     fn a_removal_is_synced_in_every_folder_that_could_hold_it() {
@@ -11231,7 +11220,6 @@ mod tests {
         std::fs::create_dir_all(root.join("elsewhere")).unwrap();
         std::fs::write(pallets.join("plain"), "a file").unwrap();
         std::os::unix::fs::symlink(root.join("elsewhere"), pallets.join("link")).unwrap();
-        std::os::unix::fs::symlink(pallets.join("loop"), pallets.join("loop")).unwrap();
 
         // The volume's own answers, probed on folders no row names: whether it opens a name under
         // another case, or under another Unicode normalization.
@@ -11255,8 +11243,6 @@ mod tests {
             ("gone/x", vec![root.clone()]),
             ("pallets/plain/x", vec![root.clone(), pallets.clone()]),
             ("pallets/link/x", vec![pallets.clone(), root.clone(), pallets.join("link")]),
-            ("pallets/loop/x", vec![root.clone(), pallets.clone()]),
-            ("pallets/loop/deeper/x", vec![root.clone(), pallets.clone()]),
             // The volumes this suite runs on do not open `a.` as `a`.
             ("pallets/a./x", vec![root.clone(), pallets.clone()]),
             ("pallets/Foo/x", opened_when(folds_case, "Foo")),
@@ -11291,14 +11277,14 @@ mod tests {
         }
     }
 
-    /// A folder on the way that cannot be examined (a spelling too long to pass, or no search
-    /// permission) is an error, never taken for absent: it may stand and hold the entry, so
-    /// nothing is synced and the caller keeps the record. Where a sync does nothing, nothing is
-    /// examined, and the same state is `Ok`.
+    /// A folder on the way that cannot be examined (a host limit, a spelling too long to pass or a
+    /// link chain the host stopped following, or no search permission) is an error, never taken
+    /// for absent: it may stand and hold the entry, so nothing is synced and the caller keeps the
+    /// record. Once the link chain is gone the same path is absent and syncs, so the error clears.
+    /// Where a sync does nothing, nothing is examined, and the same state is `Ok`.
     ///
-    /// Mutations: any metadata error taken as absent → `pallets` synced and `Ok` → red; a spelling
-    /// too long taken as absent → red; the probe run where a sync does nothing → that arm's `Ok` is
-    /// an error → red.
+    /// Mutations: any metadata error taken as absent → `pallets` synced and `Ok` → red (each host
+    /// limit row too); the probe run where a sync does nothing → that arm's `Ok` is an error → red.
     #[cfg(unix)]
     #[test]
     fn a_folder_that_cannot_be_examined_fails_the_sync() {
@@ -11309,15 +11295,28 @@ mod tests {
         let pallets = root.join("pallets");
         std::fs::create_dir_all(pallets.join("real")).unwrap();
 
-        // Too long to pass: the host answers the same way when the whole path is over its limit
-        // and the folder stands, so the record is kept.
-        let too_long = pallets.join("n".repeat(300));
+        // Host limits: the host answers a path over its length limit, and a chain over its hop
+        // limit, as it answers these, with the folder standing, so the record is kept.
+        std::os::unix::fs::symlink(pallets.join("loop"), pallets.join("loop")).unwrap();
+        let too_long = "n".repeat(300);
+        for (relative, examined) in [
+            (Path::new("pallets").join(&too_long).join("x"), pallets.join(&too_long)),
+            (PathBuf::from("pallets/loop/x"), pallets.join("loop")),
+            (PathBuf::from("pallets/loop/deeper/x"), pallets.join("loop").join("deeper")),
+        ] {
+            let _syncs = file_utils::SyncDirFaultGuard::recording();
+            let error = sync_nearest_ancestor_when(true, &root, &relative)
+                .expect_err(&format!("{}: a host limit must fail the sync", relative.to_string_lossy()));
+            assert!(error.contains(&format!("\"{}\"", examined.to_string_lossy())), "{}", error);
+            assert_eq!(file_utils::sync_dir_attempts(), Vec::<PathBuf>::new(), "{}", relative.to_string_lossy());
+        }
+
+        // The way out: with the chain removed, the same path is absent and its parent syncs.
+        file_utils::remove_file(&pallets.join("loop")).unwrap();
         {
             let _syncs = file_utils::SyncDirFaultGuard::recording();
-            let error = sync_nearest_ancestor_when(true, &root, &Path::new("pallets").join("n".repeat(300)).join("x"))
-                .expect_err("a spelling too long to pass must fail the sync");
-            assert!(error.contains(&format!("\"{}\"", too_long.to_string_lossy())), "{}", error);
-            assert_eq!(file_utils::sync_dir_attempts(), Vec::<PathBuf>::new());
+            sync_nearest_ancestor_when(true, &root, Path::new("pallets/loop/x")).unwrap();
+            assert_eq!(file_utils::sync_dir_attempts(), vec![root.clone(), pallets.clone()]);
         }
 
         // Readable but not searchable: `pallets` opens, `pallets/real` cannot be examined.
