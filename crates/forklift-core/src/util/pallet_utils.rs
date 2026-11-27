@@ -3738,7 +3738,8 @@ pub(crate) mod tests {
                 pallet this forklift knows. It may have been written by a newer forklift; upgrade to change it. \
                 Nothing was written.");
             assert_eq!(std::fs::read(&reference).unwrap(), ref_bytes_of(&h2), "the ref is as it was");
-            assert!(std::fs::symlink_metadata(get_meta_copy_path("newpallet")).is_err(), "no copy is written");        }
+            assert!(std::fs::symlink_metadata(get_meta_copy_path("newpallet")).is_err(), "no copy is written");
+        }
 
         fn ref_bytes_of(head: &str) -> Vec<u8> {
             format!("{}\n", head).into_bytes()
