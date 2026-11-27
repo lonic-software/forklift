@@ -1603,12 +1603,17 @@ fn read_from(path: &Path) -> Result<Vec<JournalEntry>, String> {
 
 /// Write the journal atomically.
 fn write(entries: &[JournalEntry]) -> Result<(), String> {
-    file_utils::write_file_atomically(&DurablePath::journal(&Checkout::active()), &journal_bytes(entries)?)
+    file_utils::write_file_atomically(&durable(), &journal_bytes(entries)?)
 }
 
 /// Write the journal as a put-back does, through [`file_utils::write_file_compensating`].
 fn write_compensating(entries: &[JournalEntry]) -> Result<(), String> {
-    file_utils::write_file_compensating(&DurablePath::journal(&Checkout::active()), &journal_bytes(entries)?)
+    file_utils::write_file_compensating(&durable(), &journal_bytes(entries)?)
+}
+
+/// The journal of the checkout in scope, as both writers name it.
+fn durable() -> DurablePath {
+    DurablePath::journal(&Checkout::active())
 }
 
 /// The bytes of the journal file holding `entries`.

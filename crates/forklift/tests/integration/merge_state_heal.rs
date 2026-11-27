@@ -197,6 +197,62 @@ fn heal_writes_a_damaged_merge_record_back_from_its_copy() {
     assert_eq!(std::fs::read(area.state("consolidation")).unwrap(), original, "the folder is replaced by the record");
 }
 
+/// A bay's merge records are its own: a conflicted consolidate and a conflicted pick in a bay write
+/// their records and copies, and the journal its entries, in the bay's state, never in the
+/// warehouse's own working tree's. Heal in the bay rewrites a damaged copy and restores a damaged
+/// record there.
+///
+/// Revert: name the warehouse's own working tree in place of the checkout in scope at a record's
+/// writer, the journal's or heal's → the bay's file is missing or left damaged, red. Re-sync a copy
+/// into its record's place → the damaged copy stays, red.
+#[test]
+fn a_bays_merge_records_are_written_and_healed_in_the_bay() {
+    let area = Area::new("bay");
+    let bay = area.base.join("b");
+    area.ok(&["bay", "add", "b", bay.to_str().unwrap()]);
+    let in_bay = |args: &[&str]| -> Output {
+        let output = area.command(args).current_dir(&bay).output().unwrap();
+        assert!(output.status.success(), "{:?} in the bay failed: {}{}", args, text(&output.stdout), text(&output.stderr));
+        output
+    };
+    let bay_state = |name: &str| area.state("bays").join("b").join(name);
+    let own_journal = std::fs::read(area.state("journal.json")).ok();
+
+    let merge = in_bay(&["consolidate", "other"]);
+    assert!(text(&merge.stdout).contains("conflict: f.txt"), "{}", text(&merge.stdout));
+    for name in ["consolidation", "consolidation-copy", "consolidation-skeleton", "consolidation-skeleton-copy", "journal.json"] {
+        assert!(bay_state(name).is_file(), "the bay's {} is in the bay", name);
+    }
+    assert_eq!(std::fs::read(area.state("journal.json")).ok(), own_journal, "the bay's journal entry is not the working tree's");
+
+    for file in ["consolidation", "consolidation-skeleton"] {
+        let original = std::fs::read(bay_state(file)).unwrap();
+        let copy = format!("{}-copy", file);
+        flip(&bay_state(&copy));
+        in_bay(&["heal"]);
+        assert_eq!(std::fs::read(bay_state(&copy)).unwrap(), original, "{}: heal rewrote the bay's copy", file);
+
+        flip(&bay_state(file));
+        let healed = parsed(&in_bay(&["--json", "heal"]))["data"].clone();
+        assert_eq!(names(&healed["merge_state_restored"]).len(), 1, "{}: {}", file, healed);
+        assert_eq!(std::fs::read(bay_state(file)).unwrap(), original, "{}: heal restored the bay's record", file);
+    }
+
+    in_bay(&["abort"]);
+
+    let source = area.head("other");
+    in_bay(&["pick", &source]);
+    for name in ["cherry-pick", "cherry-pick-copy"] {
+        assert!(bay_state(name).is_file(), "the bay's {} is in the bay", name);
+    }
+    in_bay(&["abort"]);
+
+    for name in MERGE_FILES {
+        assert!(!area.state(name).exists(), "the working tree holds no {} of the bay's", name);
+        assert!(!bay_state(name).exists(), "the bay's {} went with its merge", name);
+    }
+}
+
 /// A heal stopped at any rename while it writes a record back leaves that record present, damaged
 /// or restored, never absent: an absent state reads as no merge at all.
 ///
