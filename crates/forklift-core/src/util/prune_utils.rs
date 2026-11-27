@@ -1935,7 +1935,7 @@ mod tests {
             if matches!(how, Unreadable::CorruptBucket) {
                 pack_utils::compact(true, false, true, &crate::util::progress_utils::Progress::NONE).unwrap();
             } else {
-                for entry in std::fs::read_dir(PathBuf::from(file_utils::get_path_objects_root()).join("pack")).unwrap() {
+                for entry in std::fs::read_dir(file_utils::get_path_objects_root().join("pack")).unwrap() {
                     crate::util::file_utils::remove_file(entry.unwrap().path()).unwrap();
                 }
                 pack_utils::forget_warehouse();

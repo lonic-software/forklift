@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn store_deferred_dedupes_repeated_identical_content_within_one_batch() {
         let scratch = Scratch::new("dedupe");
-        let objects_root = std::path::PathBuf::from(file_utils::get_path_objects_root());
+        let objects_root = file_utils::get_path_objects_root();
 
         let content = vec![0x42u8; 5000];
         let batch = file_utils::WriteBatch::new();
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn store_deferred_still_stages_every_distinct_content_hash() {
         let scratch = Scratch::new("dedupe-distinct");
-        let objects_root = std::path::PathBuf::from(file_utils::get_path_objects_root());
+        let objects_root = file_utils::get_path_objects_root();
 
         let batch = file_utils::WriteBatch::new();
         const DISTINCT: usize = 10;

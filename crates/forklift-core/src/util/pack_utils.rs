@@ -465,7 +465,7 @@ fn config_threshold(key: &str, default: usize) -> Result<usize, String> {
 /// which the sweep leaves loose as a conflict, would otherwise trigger a compaction that cannot
 /// discharge it, on every command.
 fn estimate_loose_count() -> Result<usize, String> {
-    let folder = PathBuf::from(file_utils::get_path_objects_root()).join(AUTO_SAMPLE_FOLDER);
+    let folder = file_utils::get_path_objects_root().join(AUTO_SAMPLE_FOLDER);
 
     let entries = match std::fs::read_dir(&folder) {
         Ok(entries) => entries,
@@ -4916,7 +4916,7 @@ fn sweep_signatures(bound: usize,
                     repack: bool,
                     tables: Vec<TableFile>,
                     stats: &mut CompactStats) -> Result<(), String> {
-    let objects_root = PathBuf::from(file_utils::get_path_objects_root());
+    let objects_root = file_utils::get_path_objects_root();
     let sidecars = list_signature_sidecars(&objects_root)?;
 
     // The tables this run consumes, the entries they and the sidecars contribute, and the tables
@@ -6690,7 +6690,7 @@ pub(crate) fn stored_object_hashes() -> Result<(Vec<String>, usize), String> {
 /// folders, excluding signature sidecars, in-progress temp files, and anything that is not a
 /// valid object hash. Each carries its compressed on-disk size (for the packing order).
 fn enumerate_loose_objects() -> Result<Vec<PackTarget>, String> {
-    let objects_root = PathBuf::from(file_utils::get_path_objects_root());
+    let objects_root = file_utils::get_path_objects_root();
     let mut loose = Vec::new();
 
     let folders = std::fs::read_dir(&objects_root)

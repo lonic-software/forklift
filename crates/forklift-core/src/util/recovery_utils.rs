@@ -1758,7 +1758,7 @@ fn enumerate_store_wide_paths(root: &Path) -> Result<StoreWidePaths, String> {
 /// `pack_utils`'s loose-object enumeration for `compact` (same `.sig`/`.tmp` skip rule), applied
 /// here for restaging instead of collection or packing.
 fn walk_loose_object_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let objects_root = PathBuf::from(file_utils::get_path_objects_root());
+    let objects_root = file_utils::get_path_objects_root();
     if !objects_root.exists() {
         return Ok(());
     }
@@ -5245,7 +5245,7 @@ mod tests {
         let _sync_dir_guard = file_utils::SyncDirFaultGuard::recording();
         let _barrier_dir_guard = file_utils::DirSyncFaultGuard::recording();
 
-        let graph_root = std::path::PathBuf::from(file_utils::get_path_graph_root());
+        let graph_root = file_utils::get_path_graph_root();
         assert!(!graph_root.exists(), "sanity: the fixture writes no commit-graph shard");
 
         let targets: BTreeSet<String> = ["a".repeat(64), "b".repeat(64)].into_iter().collect();

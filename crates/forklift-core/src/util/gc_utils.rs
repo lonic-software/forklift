@@ -67,7 +67,7 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 
     let live = collect_live_set()?;
 
-    let objects_root = std::path::PathBuf::from(file_utils::get_path_objects_root());
+    let objects_root = file_utils::get_path_objects_root();
     let now = SystemTime::now();
 
     let mut stats = GcStats { scanned: 0, deleted: 0, kept_recent: 0, kept_for_deltas: 0 };

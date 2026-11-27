@@ -1255,7 +1255,7 @@ mod tests {
             }
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
         }
-        let objects = std::path::PathBuf::from(file_utils::get_path_objects_root());
+        let objects = file_utils::get_path_objects_root();
         let locked = objects.clone();
         BEFORE_MERGE_STACK.with(|seam| seam.set(Some(Box::new(move || set_dirs(&locked, 0o555)))));
 

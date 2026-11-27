@@ -82,9 +82,9 @@ impl StorageRootScope {
 /// Windows (`\\?\C:\…`, or `\\?\UNC\server\share`), and three unrelated things in this
 /// repo break on them, each for its own reason:
 ///
-/// * [`normalize_root`] — verbatim paths take their separators **literally**, so a forward
-///   slash becomes a filename character and the storage layer's `\\?\C:\…\.forklift/objects`
-///   is rejected as invalid (os error 123).
+/// * [`normalize_root`] — verbatim paths take their separators **literally**, so any forward
+///   slash a path built on the storage root carries (a written-out relative path, a record's
+///   `/`-keyed name) becomes a filename character and is rejected as invalid (os error 123).
 /// * `commands::alias`'s shim — `cmd.exe` cannot execute a `\\?\`-prefixed path at all
 ///   ("The system cannot find the path specified").
 /// * `config_utils`'s not-valid refusal — the one message whose whole job is naming a file
